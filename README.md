@@ -1,8 +1,6 @@
 <div align="center">
 
-# PyRAG-Kit
-
-**Py**thon **R**etrieval-**A**ugmented **G**eneration **Kit**
+![Logo](imgs/logo.jpg)
 
 </div>
 
@@ -29,9 +27,7 @@
 
 ## 📸 程序截图
 
-*在这里可以添加一张程序运行时的截图，以更直观地展示其效果。*
-
-![image](https://github.com/user-attachments/assets/e479392b-86a1-45f6-809d-37f8c114513d)
+![Main Screenshot](imgs/main.jpg)
 
 
 ## 📂 项目结构
