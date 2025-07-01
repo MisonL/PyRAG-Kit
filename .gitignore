@@ -41,3 +41,9 @@ venv.bak
 
 # 知识库文档
 /knowledge_base/
+
+# 配置文件 (包含敏感信息)
+config.ini
+
+# 缓存目录
+.cache/

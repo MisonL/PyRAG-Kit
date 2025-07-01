@@ -11,8 +11,8 @@ from rank_bm25 import BM25Okapi
 from rich.console import Console
 
 # 使用相对导入来引用同一 src 目录下的模块
-from ..utils.config import CHAT_CONFIG, RetrievalMethod
-from ..providers.model_providers import ModelFactory
+from ..utils.config import CHAT_CONFIG, KB_CONFIG, RetrievalMethod
+from ..providers.factory import ModelProviderFactory
 
 # =================================================================
 # 2. 向量存储与搜索 (VECTOR STORE & SEARCH)
@@ -79,7 +79,8 @@ def retrieve_documents(query: str, vector_store: VectorStore, console: Console) 
     score_threshold = CHAT_CONFIG["score_threshold"]
     
     # 语义搜索
-    embedding_provider = ModelFactory.get_model_provider("embedding")
+    active_embedding_key = KB_CONFIG['active_embedding_configuration']
+    embedding_provider = ModelProviderFactory.get_embedding_provider(active_embedding_key)
     query_embedding = np.array(embedding_provider.embed_documents([query])[0])
     semantic_results = vector_store.semantic_search(query_embedding, top_k, score_threshold)
     for doc in semantic_results: doc["semantic_score"] = doc.pop("score", 0)
@@ -103,10 +104,19 @@ def retrieve_documents(query: str, vector_store: VectorStore, console: Console) 
 
     # 使用Reranker（如果启用）
     if CHAT_CONFIG["rerank_enabled"]:
-        rerank_provider = ModelFactory.get_model_provider("rerank")
-        if rerank_provider:
-            console.print(f"[dim]正在使用 '{CHAT_CONFIG['active_rerank_configuration']}' 进行重排...[/dim]")
-            reranked_docs = rerank_provider.rerank(query, ranked_results)
+        active_rerank_key = CHAT_CONFIG['active_rerank_configuration']
+        rerank_provider = ModelProviderFactory.get_rerank_provider(active_rerank_key)
+        if rerank_provider and ranked_results:
+            console.print(f"[dim]正在使用 '{active_rerank_key}' 进行重排...[/dim]")
+            # 1. 提取文档内容用于重排
+            docs_to_rerank = [doc.get("page_content", "") for doc in ranked_results]
+            
+            # 2. 调用 rerank 方法获取重排后的索引
+            reranked_indices = rerank_provider.rerank(query, docs_to_rerank, top_n=top_k)
+            
+            # 3. 根据索引重新排序原始文档列表
+            reranked_docs = [ranked_results[i] for i in reranked_indices]
+            
             return reranked_docs[:top_k]
     
     return ranked_results[:top_k]

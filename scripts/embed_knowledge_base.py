@@ -23,8 +23,9 @@ from rich.console import Group
 
 # 从 src 导入重构后的模块
 from src.utils.config import KB_CONFIG, CHAT_CONFIG, API_CONFIG
-from src.providers.model_providers import ModelFactory
+from src.providers.factory import ModelProviderFactory
 from src.retrieval.retriever import VectorStore # VectorStore现在从这里导入
+from src.ui.display_utils import CONSOLE_WIDTH, get_relative_path
 
 # =================================================================
 # 2. 文本处理 (TEXT PROCESSING)
@@ -103,7 +104,8 @@ def process_documents(vector_store: VectorStore):
     vector_store.documents = documents_to_embed
     
     console.print("  [bold]开始生成文本嵌入...[/bold]")
-    embedding_provider = ModelFactory.get_model_provider("embedding")
+    active_embedding_key = KB_CONFIG['active_embedding_configuration']
+    embedding_provider = ModelProviderFactory.get_embedding_provider(active_embedding_key)
     batch_size = KB_CONFIG["embedding_batch_size"]
     all_embeddings = []
     for i in range(0, len(all_texts), batch_size):
@@ -137,8 +139,8 @@ def display_config_and_confirm():
     active_embedding = KB_CONFIG['active_embedding_configuration']
     embedding_model_details = KB_CONFIG['embedding_configurations'][active_embedding]
     kb_table.add_row("激活的嵌入模型:", f"{active_embedding} ({embedding_model_details['provider']}: {embedding_model_details['model_name']})")
-    kb_table.add_row("知识库目录:", KB_CONFIG['kb_dir'])
-    kb_table.add_row("输出文件:", KB_CONFIG['output_file'])
+    kb_table.add_row("知识库目录:", get_relative_path(KB_CONFIG['kb_dir']))
+    kb_table.add_row("输出文件:", get_relative_path(KB_CONFIG['output_file']))
     
     api_table = Table(title="[bold green]相关API配置[/bold green]", show_header=False, box=None, padding=(0, 1))
     api_table.add_column(style="cyan")
@@ -151,7 +153,7 @@ def display_config_and_confirm():
     if url_name in API_CONFIG and API_CONFIG.get(url_name):
         api_table.add_row(f"{url_name}:", API_CONFIG.get(url_name))
 
-    console.print(Panel(Group(kb_table, api_table), title="[bold yellow]向量化脚本配置总览[/bold yellow]", border_style="blue"))
+    console.print(Panel(Group(kb_table, api_table), title="[bold yellow]向量化脚本配置总览[/bold yellow]", border_style="blue", width=CONSOLE_WIDTH))
     console.print("[yellow]配置信息来源于 [bold]src/utils/config.py[/bold] 和 [bold].env[/bold] 文件。[/yellow]")
     
     choice = console.input("是否使用以上配置继续处理？ ([bold green]y[/bold green]/[bold red]n[/bold red]): ").lower()

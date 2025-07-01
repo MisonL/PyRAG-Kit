@@ -12,5 +12,5 @@ pandas
 openpyxl
 rank_bm25
 questionary
-
-python-dotenv
+pyfiglet
+prompt_toolkit

@@ -14,9 +14,12 @@ from rich.table import Table
 from rich.style import Style
 from rich.text import Text
 from rich.live import Live
+from prompt_toolkit import prompt
+from prompt_toolkit.formatted_text import HTML
 
 # 使用相对导入
-from ..providers.model_providers import ModelFactory, LLM
+from ..providers.factory import ModelProviderFactory
+from ..providers.__base__.model_provider import LargeLanguageModel
 from ..utils.config import CHAT_CONFIG, KB_CONFIG, LOG_PATH
 from ..ui.config_menu import launch_config_editor
 from ..ui.display_utils import display_chat_config
@@ -51,7 +54,7 @@ class Chatbot:
     def __init__(self, console: Console):
         self.console = console
         self.vector_store = self._load_vector_store()
-        self.llm_model: Optional[LLM] = None
+        self.llm_model: Optional[LargeLanguageModel] = None
         self.logger = ChatLogger()
         self.reload_llm() # 初始加载
 
@@ -75,10 +78,11 @@ class Chatbot:
     def reload_llm(self) -> bool:
         """重新加载或初始化LLM模型。"""
         try:
-            self.console.print(f"[dim]正在加载LLM: [bold cyan]{CHAT_CONFIG['active_llm_configuration']}[/bold cyan]...[/dim]")
-            self.llm_model = ModelFactory.get_model_provider("llm")
+            active_llm_key = CHAT_CONFIG['active_llm_configuration']
+            self.console.print(f"[dim]正在加载LLM: [bold cyan]{active_llm_key}[/bold cyan]...[/dim]")
+            self.llm_model = ModelProviderFactory.get_llm_provider(active_llm_key)
             if self.llm_model:
-                self.console.print(f"[green]LLM [bold cyan]{CHAT_CONFIG['active_llm_configuration']}[/bold cyan] 加载成功。[/green]")
+                self.console.print(f"[green]LLM [bold cyan]{active_llm_key}[/bold cyan] 加载成功。[/green]")
                 return True
             return False
         except Exception as e:
@@ -90,7 +94,9 @@ class Chatbot:
         if not self.llm_model: return "未知意图"
         prompt = f"你是一个意图识别助手。请根据用户的问题，判断其意图。\n用户问题: {user_query}\n请直接输出用户意图的简短描述。"
         try:
-            return self.llm_model.generate_content(prompt)
+            # 使用invoke并设置stream=False来获取完整结果
+            response_generator = self.llm_model.invoke(prompt=prompt, stream=False)
+            return "".join(list(response_generator))
         except Exception as e:
             self.console.print(f"[red]意图识别时出错: {e}[/red]")
             return "未知意图"
@@ -113,7 +119,8 @@ class Chatbot:
             prompt = f"你是一个智能客服助手。用户问题: {user_query}\n用户意图: {intent}\n没有找到相关知识。请礼貌地告知用户无法回答，并建议他们提供更多信息或尝试其他问题。"
         
         try:
-            yield from self.llm_model.generate_content_stream(prompt)
+            # 使用新的invoke方法并确保以流式传输
+            yield from self.llm_model.invoke(prompt=prompt, stream=True)
         except Exception as e:
             self.console.print(f"[red]LLM 生成最终回答时出错: {e}[/red]")
             yield "抱歉，我在生成回答时遇到了一些问题。"
@@ -178,7 +185,8 @@ def start_chat_session():
         
         while True:
             try:
-                user_query = console.input("[bold]你: [/bold]")
+                # 使用 prompt_toolkit 替代 console.input，并优化样式
+                user_query = prompt(HTML('<skyblue><b>你: </b></skyblue>'))
                 if user_query.lower() == '/quit':
                     console.print("[bold yellow]再见！[/bold yellow]")
                     break

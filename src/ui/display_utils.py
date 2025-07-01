@@ -1,10 +1,23 @@
 # -*- coding: utf-8 -*-
+import os
 from typing import Optional
 from rich.console import Console, Group
 from rich.panel import Panel
 from rich.table import Table
 
-from ..utils.config import CHAT_CONFIG, API_CONFIG
+from ..utils.config import CHAT_CONFIG, API_CONFIG, ROOT_DIR
+
+# 全局UI宽度定义
+CONSOLE_WIDTH = 120
+
+def get_relative_path(absolute_path: str) -> str:
+    """将绝对路径转换为相对于项目根目录的路径，方便显示。"""
+    try:
+        # 使用 os.path.relpath 计算相对路径
+        return os.path.relpath(str(absolute_path), str(ROOT_DIR))
+    except ValueError:
+        # 如果路径不在同一驱动器上（例如Windows），则返回原始路径
+        return str(absolute_path)
 
 def display_chat_config(console: Console):
     """显示聊天机器人相关的全面配置信息。"""
@@ -48,4 +61,4 @@ def display_chat_config(console: Console):
              api_table.add_row(f"{url_key_name}:", API_CONFIG[url_key_name] or "[dim]未设置[/dim]")
 
 
-    console.print(Panel(Group(chat_table, api_table), title="[bold yellow]当前聊天会话配置[/bold yellow]", border_style="blue"))
+    console.print(Panel(Group(chat_table, api_table), title="[bold yellow]当前聊天会话配置[/bold yellow]", border_style="blue", width=CONSOLE_WIDTH))

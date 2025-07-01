@@ -14,22 +14,25 @@
 
 </div>
 
-**PyRAG-Kit** 是一个功能强大的本地化、模块化的Python RAG（检索增强生成）工具包。它能够读取您本地的文档，通过先进的检索技术和大型语言模型（LLM），为您提供基于私有知识的智能问答。
+> **PyRAG-Kit** 是一个 **Dify 核心逻辑的 Python 实现**，旨在提供一个轻量级的本地化工具，用于快速验证和理解 Dify 的知识库核心工作流程，包括文档的**向量化、分段处理**以及**混合检索**策略。
 
 ---
 
 ## ✨ 核心功能
 
 - **🔌 多模型支持**: 无缝集成多种主流和本地大语言模型，包括 Google Gemini, OpenAI GPT, Anthropic Claude, 阿里云通义千问, 豆包, DeepSeek, Grok, 以及通过 Ollama 或 LM Studio 运行的本地模型。
-- **🚀 高级检索策略**:
-    - **向量检索**: 基于语义相似度进行搜索。
-    - **全文检索**: 使用 BM25 算法进行关键词匹配。
-    - **混合检索**: 智能结合向量与全文检索的优势，并通过权重调整优化排序。
-- **🔄 Rerank 精排**: 支持接入 Jina, SiliconFlow 等重排模型，对检索结果进行二次精排，显著提升答案的相关性。
-- **⚙️ 动态交互式配置**: 无需修改代码，在程序运行时通过美观的交互式菜单动态切换LLM、调整检索策略、修改权重等。
+- **🚀 高级检索策略**: 支持向量检索、全文检索和混合检索，并通过 Rerank 模型二次精排，提升答案相关性。
+- **⚙️ 动态交互配置**: 运行时通过 `/config` 命令打开交互式菜单，动态切换LLM、调整检索策略、修改权重等。
 - **📄 流式响应**: 客服回答采用打字机流式输出，提升用户交互体验。
-- **📊 Excel日志记录**: 自动将每一次对话的详细信息（时间、问题、意图、上下文、回答）记录到 Excel 文件中，便于审计和分析。
-- **🧹 自动清理**: 程序退出时自动清理生成的缓存文件，保持项目目录整洁。
+- **📊 Excel日志**: 自动将每一次对话的详细信息记录到 Excel 文件中，便于审计和分析。
+- **🧹 智能缓存与清理**: 自动处理知识库向量化，并在程序退出时清理缓存，保持项目整洁。
+
+## 📸 程序截图
+
+*在这里可以添加一张程序运行时的截图，以更直观地展示其效果。*
+
+![image](https://github.com/user-attachments/assets/e479392b-86a1-45f6-809d-37f8c114513d)
+
 
 ## 📂 项目结构
 
@@ -51,7 +54,7 @@
 │   └── utils/           # 辅助工具 (配置、清理)
 ├── tests/               # (预留) 自动化测试
 ├── main.py              # 程序主入口
-├── .env.example         # 环境变量配置模板
+├── config.ini.example   # 配置文件模板
 ├── .gitignore           # Git忽略文件配置
 ├── README.md            # 就是你正在看的这个文件
 └── requirements.txt     # Python依赖项
@@ -62,8 +65,8 @@
 ### 1. 克隆项目
 
 ```bash
-git clone <your-repository-url>
-cd <repository-name>
+git clone https://github.com/MisonL/PyRAG-Kit.git
+cd PyRAG-Kit
 ```
 
 ### 2. 安装依赖
@@ -74,31 +77,33 @@ cd <repository-name>
 pip install -r requirements.txt
 ```
 
-### 3. 配置环境变量
+### 3. 进行配置
 
-复制 `.env.example` 文件并重命名为 `.env`。
+项目使用 `config.ini` 文件进行配置。请先复制模板文件：
 
 ```bash
-cp .env.example .env
+cp config.ini.example config.ini
 ```
 
-然后，编辑 `.env` 文件，填入你需要的 API 密钥。例如：
+然后，编辑 `config.ini` 文件，填入你需要的 API 密钥和自定义设置。
 
-```env
-# .env
+```ini
+# config.ini
 
-# --- 必填项 ---
-# 至少需要配置一个你希望使用的模型的API Key
-OPENAI_API_KEY="sk-..."
-GOOGLE_API_KEY="AIzaSy..."
+[API_KEYS]
+# 填入你希望使用的模型的API Key
+OPENAI_API_KEY = "sk-..."
+GOOGLE_API_KEY = "AIzaSy..."
 # ... 其他API Key
 
-# --- 可选项 ---
-# 如果使用代理或第三方服务，可以在这里配置 Base URL
-# OPENAI_API_BASE="https://my-proxy.com/v1"
+[BEHAVIOR]
+# 默认使用的LLM提供商 (例如: google, openai, anthropic)
+DEFAULT_LLM_PROVIDER = google
+
+# ... 其他行为配置
 ```
 
-你也可以在 `src/utils/config.py` 文件中修改默认的模型配置和程序行为。
+> **注意**: 你也可以通过设置**环境变量**来覆盖 `config.ini` 中的 `API_KEYS`，例如 `export OPENAI_API_KEY="sk-..."`，这在服务器部署时非常有用。
 
 ### 4. 准备知识库
 
@@ -112,14 +117,13 @@ GOOGLE_API_KEY="AIzaSy..."
 python main.py
 ```
 
-程序启动后，你将看到一个主菜单：
+**程序会自动完成以下工作:**
+1.  **检查知识库**: 如果 `knowledge_base` 目录中有新的或更新的文档，程序会自动进行向量化并更新 `data/employee_kb.pkl` 文件。
+2.  **启动聊天**: 直接进入交互式聊天会话。
 
-1.  **首次运行，请选择 `1. 知识库文档向量化处理`**。
-    -   该脚本会读取 `knowledge_base` 目录下的所有文档，将其处理并生成 `data/employee_kb.pkl` 向量文件。
-2.  **向量化处理完成后，选择 `2. 启动聊天机器人会话`**。
-    -   现在你可以开始与你的本地知识库进行对话了！
-    -   在聊天中，输入 `/config` 可以随时打开动态配置菜单。
-    -   输入 `/quit` 可以退出聊天。
+**常用命令:**
+-   输入 `/config` 可以随时打开动态配置菜单。
+-   输入 `/quit` 或 `exit` 可以退出聊天。
 
 ---
 

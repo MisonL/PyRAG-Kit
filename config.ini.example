@@ -1,0 +1,109 @@
+# =================================================================
+# 本地知识库AI聊天机器人 - 配置文件 (config.ini.example)
+# =================================================================
+# 使用方法:
+# 1. 将此文件复制并重命名为 config.ini
+# 2. 根据您的需求，仔细检查并修改文件中的所有配置项。
+# 3. 修改此文件后，需要重启程序才能生效。
+# =================================================================
+
+[API_KEYS]
+# 请在此处填入您所使用的模型提供商的API密钥。
+ANTHROPIC_API_KEY = # Anthropic (Claude系列模型) 的API密钥
+GOOGLE_API_KEY = # Google (Gemini系列模型) 的API密钥
+SILICONFLOW_API_KEY = # SiliconFlow (一个集成了多种开源模型的平台) 的API密钥
+OPENAI_API_KEY = # OpenAI (GPT系列模型) 的API密钥
+QWEN_API_KEY = # 阿里云通义千问 (Qwen系列模型) 的API密钥
+VOLC_ACCESS_KEY = # 火山引擎 (豆包系列模型) 的Access Key
+VOLC_SECRET_KEY = # 火山引擎 (豆包系列模型) 的Secret Key
+JINA_API_KEY = # Jina AI (用于Rerank模型) 的API密钥
+DEEPSEEK_API_KEY = # 深度求索 (DeepSeek系列模型) 的API密钥
+GROK_API_KEY = # xAI (Grok系列模型) 的API密钥
+LM_STUDIO_API_KEY = lm-studio # LM Studio本地模型服务的API密钥 (通常是固定值)
+
+[BASE_URLS]
+# 如果您使用代理、第三方中转服务或本地部署的模型，请在此处配置API的访问地址。
+OPENAI_API_BASE = https://api.openai.com/v1
+SILICONFLOW_BASE_URL = https://api.siliconflow.cn/v1
+QWEN_BASE_URL = https://dashscope.aliyuncs.com/api/v1
+DEEPSEEK_BASE_URL = https://api.deepseek.com
+OLLAMA_BASE_URL = http://localhost:11434/v1
+LM_STUDIO_BASE_URL = http://localhost:1234/v1
+VOLC_BASE_URL = https://maas-api.ml-platform-cn-beijing.volces.com
+GROK_BASE_URL = https://api.x.ai/v1
+
+[PATHS]
+# 路径配置
+KNOWLEDGE_BASE_PATH = knowledge_base # 存放原始知识库文档的目录
+PKL_PATH = data/employee_kb.pkl # 处理和向量化后的知识库数据存储路径 (pickle文件)
+LOG_PATH = data/logs # 程序运行日志的存放目录
+LOG_RETENTION_DAYS = 15 # 日志文件的最长保留天数（例如，15天）
+
+[KNOWLEDGE_BASE]
+# 知识库构建与文本处理相关的配置
+KB_REPLACE_WHITESPACE = False # 是否在文本预处理时将所有连续的空白字符(如换行、制表符)替换为一个空格
+KB_REMOVE_SPACES = False # 是否在文本预处理时移除所有空格 (请谨慎使用)
+KB_REMOVE_URLS = False # 是否在文本预处理时移除URL和电子邮件地址
+KB_USE_QA_SEGMENTATION = False # 是否启用QA对分割模式 (将文档按预设的问答对格式进行切分)
+KB_SPLITTER_SEPARATORS = ### # 文本分割器使用的分隔符，可以设置多个，用逗号隔开
+KB_CHUNK_SIZE = 1500 # 文本切块的最大长度 (单位：字符)
+KB_CHUNK_OVERLAP = 150 # 文本切块之间的重叠长度 (单位：字符)
+KB_EMBEDDING_BATCH_SIZE = 32 # 向量化处理时，每批处理的文本数量 (可根据显存或API限制调整)
+
+[BEHAVIOR]
+# 程序启动时的默认行为配置
+DEFAULT_LLM_PROVIDER = google # 程序启动时默认加载的LLM提供商 (必须是下面LLM_CONFIGURATIONS中定义的key)
+DEFAULT_EMBEDDING_PROVIDER = google # 构建知识库时默认使用的向量化模型 (必须是下面EMBEDDING_CONFIGURATIONS中定义的key)
+DEFAULT_RERANK_PROVIDER = siliconflow # 默认使用的Rerank模型 (必须是下面RERANK_CONFIGURATIONS中定义的key)
+
+[CHAT]
+# 聊天机器人核心功能配置
+CHAT_RETRIEVAL_METHOD = HYBRID_SEARCH # 检索方法, 可选: SEMANTIC_SEARCH (向量搜索), FULL_TEXT_SEARCH (关键词搜索), HYBRID_SEARCH (混合搜索)
+CHAT_VECTOR_WEIGHT = 0.3 # 混合搜索中，向量搜索结果的权重 (与关键词权重相加建议为1)
+CHAT_KEYWORD_WEIGHT = 0.7 # 混合搜索中，关键词搜索结果的权重 (与向量权重相加建议为1)
+CHAT_RERANK_ENABLED = False # 是否启用Rerank精排模型对检索结果进行二次排序
+CHAT_TOP_K = 5 # 检索返回的最相关文档数量
+CHAT_SCORE_THRESHOLD = 0.4 # 向量搜索的得分阈值，低于此分数的文档将被过滤
+
+[MODEL_CONFIGURATIONS]
+# 模型配置 (JSON格式)
+# 您可以自由增删改查其中的模型条目。
+# "key" (如 "google", "openai-gpt4o") 是您在程序中选择模型时使用的名称。
+# "provider" 必须与 `src/providers/` 目录下的模型提供商实现相对应。
+# "model_name" 是传递给API的实际模型名称。
+EMBEDDING_CONFIGURATIONS = 
+	{
+	    "google": {"provider": "google", "model_name": "models/text-embedding-004"},
+	    "openai": {"provider": "openai", "model_name": "text-embedding-3-large"},
+	    "qwen": {"provider": "qwen", "model_name": "text-embedding-v4"},
+	    "volcengine": {"provider": "volcengine", "model_name": "bge-large-zh"},
+	    "ollama": {"provider": "ollama", "model_name": "mxbai-embed-large"},
+	    "siliconflow": {"provider": "siliconflow", "model_name": "BAAI/bge-m3"}
+	}
+
+RERANK_CONFIGURATIONS = 
+	{
+	    "siliconflow": {"provider": "siliconflow", "model_name": "BAAI/bge-reranker-v2-m3"},
+	    "jina": {"provider": "jina", "model_name": "jina-reranker-v2-base-multilingual"},
+	    "qwen": {"provider": "qwen", "model_name": "Qwen/Qwen3-Reranker-4B"}
+	}
+
+LLM_CONFIGURATIONS = 
+	{
+	    "google": {"provider": "google", "model_name": "gemini-2.5-flash"},
+	    "google-pro": {"provider": "google", "model_name": "gemini-2.5-pro"},
+	    "openai-gpt4o": {"provider": "openai", "model_name": "gpt-4o"},
+	    "openai-gpt3.5": {"provider": "openai", "model_name": "gpt-3.5-turbo"},
+	    "qwen-max": {"provider": "qwen", "model_name": "qwen-max"},
+	    "qwen-plus": {"provider": "qwen", "model_name": "qwen-plus"},
+	    "volc-doubao-pro-32k": {"provider": "volcengine", "model_name": "doubao-pro-32k"},
+	    "sf-qwen2-7b": {"provider": "siliconflow", "model_name": "Qwen/Qwen2-7B-Instruct"},
+	    "sf-llama3-8b": {"provider": "siliconflow", "model_name": "meta-llama/Meta-Llama-3-8B-Instruct"},
+	    "ollama-llama3": {"provider": "ollama", "model_name": "llama3"},
+	    "ollama-gemma": {"provider": "ollama", "model_name": "gemma"},
+	    "lm-studio": {"provider": "lm-studio", "model_name": "local-model/gguf-model-name"},
+	    "deepseek-chat": {"provider": "deepseek", "model_name": "deepseek-chat"},
+	    "deepseek-v2": {"provider": "deepseek", "model_name": "deepseek-v2"},
+	    "grok-llama3-70b": {"provider": "grok", "model_name": "llama3-70b-8192"},
+	    "anthropic-sonnet-3.5": {"provider": "anthropic", "model_name": "claude-3-5-sonnet-20240620"}
+	}
