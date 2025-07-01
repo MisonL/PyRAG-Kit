@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*build/
+*develop-eggs/
+*dist/
+*downloads/
+*eggs/
+*.egg-info/
+*lib/
+*lib64/
+*parts/
+*sdist/
+*var/
+*wheels/
+*.egg
+*instance/
+# 虚拟环境
+/.env*
+.venv
+env/
+venv/
+ENV/
+env.bak
+venv.bak
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# 生成的数据和日志
+/data/logs/
+*.pkl
+
+# 知识库文档
+/knowledge_base/
+*.md

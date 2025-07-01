@@ -1,0 +1,16 @@
+google-generativeai
+scikit-learn
+numpy
+pydantic
+tiktoken
+requests
+openai
+jieba
+anthropic
+rich
+pandas
+openpyxl
+rank_bm25
+questionary
+
+python-dotenv
