@@ -4,7 +4,7 @@ from typing import Any, Dict, Generator, List
 import requests
 
 from src.providers.__base__.model_provider import LargeLanguageModel
-from src.utils.config import API_CONFIG
+from src.utils.config import settings
 
 
 class GrokProvider(LargeLanguageModel):
@@ -14,10 +14,10 @@ class GrokProvider(LargeLanguageModel):
 
     def __init__(self, model_name: str):
         self._model_name = model_name
-        self._api_key = API_CONFIG.get("GROK_API_KEY")
+        self._api_key = settings.grok_api_key
         if not self._api_key:
             raise ValueError("Grok配置不完整：缺少 GROK_API_KEY。")
-        self._base_url = API_CONFIG.get("GROK_BASE_URL", "https://api.x.ai/v1")
+        self._base_url = str(settings.grok_base_url)
 
     def invoke(
         self,

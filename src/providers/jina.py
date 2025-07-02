@@ -4,7 +4,7 @@ from typing import Dict, List
 import requests
 
 from src.providers.__base__.model_provider import RerankModel
-from src.utils.config import API_CONFIG
+from src.utils.config import settings
 
 
 class JinaProvider(RerankModel):
@@ -14,7 +14,7 @@ class JinaProvider(RerankModel):
 
     def __init__(self, model_name: str):
         self._model_name = model_name
-        self._api_key = API_CONFIG.get("JINA_API_KEY")
+        self._api_key = settings.jina_api_key
         if not self._api_key:
             raise ValueError("错误：Jina Rerank 提供商需要 API 密钥。")
         self._base_url = "https://api.jina.ai/v1/rerank"

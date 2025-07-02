@@ -20,7 +20,7 @@ from prompt_toolkit.formatted_text import HTML
 # 使用相对导入
 from ..providers.factory import ModelProviderFactory
 from ..providers.__base__.model_provider import LargeLanguageModel
-from ..utils.config import CHAT_CONFIG, KB_CONFIG, LOG_PATH
+from ..utils.config import CHAT_CONFIG, KB_CONFIG, LOG_PATH, PKL_PATH, settings
 from ..ui.config_menu import launch_config_editor
 from ..ui.display_utils import display_chat_config
 from ..retrieval.retriever import VectorStore, retrieve_documents
@@ -59,7 +59,7 @@ class Chatbot:
         self.reload_llm() # 初始加载
 
     def _load_vector_store(self) -> Optional[VectorStore]:
-        file_path = KB_CONFIG["output_file"]
+        file_path = str(PKL_PATH)
         try:
             with open(file_path, "rb") as f:
                 data = pickle.load(f)
@@ -78,7 +78,7 @@ class Chatbot:
     def reload_llm(self) -> bool:
         """重新加载或初始化LLM模型。"""
         try:
-            active_llm_key = CHAT_CONFIG['active_llm_configuration']
+            active_llm_key = settings.default_llm_provider
             self.console.print(f"[dim]正在加载LLM: [bold cyan]{active_llm_key}[/bold cyan]...[/dim]")
             self.llm_model = ModelProviderFactory.get_llm_provider(active_llm_key)
             if self.llm_model:
@@ -103,7 +103,7 @@ class Chatbot:
 
     def _retrieve_knowledge(self, query: str) -> List[Dict[str, Any]]:
         if not self.vector_store: return []
-        self.console.print(f"[dim]正在使用 '[yellow]{CHAT_CONFIG['retrieval_method'].value}[/yellow]' 模式检索...[/dim]")
+        self.console.print(f"[dim]正在使用 '[yellow]{settings.chat_retrieval_method.value}[/yellow]' 模式检索...[/dim]")
         return retrieve_documents(query, self.vector_store, self.console)
 
     def _generate_answer_stream(self, user_query: str, intent: str, retrieved_docs: List[Dict[str, Any]]) -> "Generator[str, None, None]":
@@ -181,7 +181,7 @@ def start_chat_session():
     
     if bot.llm_model:
         display_chat_config(console)
-        console.print(f"我是你的智能客服（由 [bold green]{CHAT_CONFIG['active_llm_configuration']}[/bold green] 支持），请输入问题（输入'[bold]/quit[/bold]'或'[bold]/config[/bold]'）：")
+        console.print(f"我是你的智能客服（由 [bold green]{settings.default_llm_provider}[/bold green] 支持），请输入问题（输入'[bold]/quit[/bold]'或'[bold]/config[/bold]'）：")
         
         while True:
             try:
@@ -197,7 +197,7 @@ def start_chat_session():
                         console.print("[yellow]检测到LLM配置变更，正在重载模型...[/yellow]")
                         bot.reload_llm()
                     display_chat_config(console)
-                    console.print(f"我是你的智能客服（由 [bold green]{CHAT_CONFIG['active_llm_configuration']}[/bold green] 支持），请输入问题（输入'[bold]/quit[/bold]'或'[bold]/config[/bold]'）：")
+                    console.print(f"我是你的智能客服（由 [bold green]{settings.default_llm_provider}[/bold green] 支持），请输入问题（输入'[bold]/quit[/bold]'或'[bold]/config[/bold]'）：")
                     continue
 
                 answer_stream = bot.chat(user_query)

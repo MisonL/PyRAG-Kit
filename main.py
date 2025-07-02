@@ -62,7 +62,8 @@ def display_banner():
     welcome_text.append("Mison", style="default")
     welcome_text.append("  ·  邮箱: ", style="bold")
     welcome_text.append("1360962086@qq.com", style="default")
-    welcome_text.append("  ·  GitHub: ", style="bold")
+    welcome_text.append("\n") # 换行
+    welcome_text.append("GitHub: ", style="bold")
     # 使用正确的 GitHub 仓库地址
     github_url = "https://github.com/MisonL/PyRAG-Kit"
     welcome_text.append(github_url, style=f"link {github_url}")

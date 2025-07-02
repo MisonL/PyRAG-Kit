@@ -45,7 +45,8 @@ KB_REPLACE_WHITESPACE = False # 是否在文本预处理时将所有连续的空
 KB_REMOVE_SPACES = False # 是否在文本预处理时移除所有空格 (请谨慎使用)
 KB_REMOVE_URLS = False # 是否在文本预处理时移除URL和电子邮件地址
 KB_USE_QA_SEGMENTATION = False # 是否启用QA对分割模式 (将文档按预设的问答对格式进行切分)
-KB_SPLITTER_SEPARATORS = ### # 文本分割器使用的分隔符，可以设置多个，用逗号隔开
+KB_SPLITTER_SEPARATORS = ### 
+# 文本分割器使用的分隔符。如果要使用多个，请用英文逗号隔开，例如: ###,---,===
 KB_CHUNK_SIZE = 1500 # 文本切块的最大长度 (单位：字符)
 KB_CHUNK_OVERLAP = 150 # 文本切块之间的重叠长度 (单位：字符)
 KB_EMBEDDING_BATCH_SIZE = 32 # 向量化处理时，每批处理的文本数量 (可根据显存或API限制调整)
@@ -58,7 +59,7 @@ DEFAULT_RERANK_PROVIDER = siliconflow # 默认使用的Rerank模型 (必须是�
 
 [CHAT]
 # 聊天机器人核心功能配置
-CHAT_RETRIEVAL_METHOD = HYBRID_SEARCH # 检索方法, 可选: SEMANTIC_SEARCH (向量搜索), FULL_TEXT_SEARCH (关键词搜索), HYBRID_SEARCH (混合搜索)
+CHAT_RETRIEVAL_METHOD = HYBRID_SEARCH # 检索方法。可选值: SEMANTIC_SEARCH (或 "向量检索"), FULL_TEXT_SEARCH (或 "全文检索"), HYBRID_SEARCH (或 "混合检索")
 CHAT_VECTOR_WEIGHT = 0.3 # 混合搜索中，向量搜索结果的权重 (与关键词权重相加建议为1)
 CHAT_KEYWORD_WEIGHT = 0.7 # 混合搜索中，关键词搜索结果的权重 (与向量权重相加建议为1)
 CHAT_RERANK_ENABLED = False # 是否启用Rerank精排模型对检索结果进行二次排序

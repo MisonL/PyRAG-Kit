@@ -14,3 +14,5 @@ rank_bm25
 questionary
 pyfiglet
 prompt_toolkit
+pydantic
+pydantic-settings

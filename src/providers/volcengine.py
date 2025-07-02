@@ -11,7 +11,7 @@ from src.providers.__base__.model_provider import (
     LargeLanguageModel,
     TextEmbeddingModel,
 )
-from src.utils.config import API_CONFIG
+from src.utils.config import settings
 
 
 class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
@@ -21,9 +21,9 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
 
     def __init__(self, model_name: str):
         self._model_name = model_name
-        self._access_key = API_CONFIG.get("VOLC_ACCESS_KEY")
-        self._secret_key = API_CONFIG.get("VOLC_SECRET_KEY")
-        self._base_url = API_CONFIG.get("VOLC_BASE_URL")
+        self._access_key = settings.volc_access_key
+        self._secret_key = settings.volc_secret_key
+        self._base_url = str(settings.volc_base_url)
 
         if not all([self._access_key, self._secret_key, self._base_url]):
             raise ValueError("火山引擎配置不完整：缺少 VOLC_ACCESS_KEY, VOLC_SECRET_KEY, 或 VOLC_BASE_URL。")

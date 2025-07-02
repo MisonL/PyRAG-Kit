@@ -11,7 +11,7 @@ from rank_bm25 import BM25Okapi
 from rich.console import Console
 
 # 使用相对导入来引用同一 src 目录下的模块
-from ..utils.config import CHAT_CONFIG, KB_CONFIG, RetrievalMethod
+from ..utils.config import CHAT_CONFIG, KB_CONFIG, RetrievalMethod, settings
 from ..providers.factory import ModelProviderFactory
 
 # =================================================================
@@ -74,12 +74,12 @@ class HybridReranker:
         return sorted(documents, key=lambda x: x["score"], reverse=True)
 
 def retrieve_documents(query: str, vector_store: VectorStore, console: Console) -> List[Dict]:
-    retrieval_method = CHAT_CONFIG["retrieval_method"]
-    top_k = CHAT_CONFIG["top_k"]
-    score_threshold = CHAT_CONFIG["score_threshold"]
+    retrieval_method = settings.chat_retrieval_method
+    top_k = settings.chat_top_k
+    score_threshold = settings.chat_score_threshold
     
     # 语义搜索
-    active_embedding_key = KB_CONFIG['active_embedding_configuration']
+    active_embedding_key = settings.default_embedding_provider
     embedding_provider = ModelProviderFactory.get_embedding_provider(active_embedding_key)
     query_embedding = np.array(embedding_provider.embed_documents([query])[0])
     semantic_results = vector_store.semantic_search(query_embedding, top_k, score_threshold)
@@ -103,8 +103,8 @@ def retrieve_documents(query: str, vector_store: VectorStore, console: Console) 
         ranked_results = sorted(full_text_results, key=lambda x: x.get("keyword_score", 0), reverse=True)
 
     # 使用Reranker（如果启用）
-    if CHAT_CONFIG["rerank_enabled"]:
-        active_rerank_key = CHAT_CONFIG['active_rerank_configuration']
+    if settings.chat_rerank_enabled:
+        active_rerank_key = settings.default_rerank_provider
         rerank_provider = ModelProviderFactory.get_rerank_provider(active_rerank_key)
         if rerank_provider and ranked_results:
             console.print(f"[dim]正在使用 '{active_rerank_key}' 进行重排...[/dim]")
