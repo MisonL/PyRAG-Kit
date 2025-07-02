@@ -7,6 +7,10 @@ import pickle
 import pandas as pd
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Generator
+import os # 保持 os 导入，因为 ChatLogger 仍然需要
+import pickle # 保持 pickle 导入，因为 ChatLogger 仍然需要
+import pandas as pd # 保持 pandas 导入，因为 ChatLogger 仍然需要
+from datetime import datetime # 保持 datetime 导入，因为 ChatLogger 仍然需要
 
 from rich.console import Console
 from rich.panel import Panel
@@ -20,10 +24,12 @@ from prompt_toolkit.formatted_text import HTML
 # 使用相对导入
 from ..providers.factory import ModelProviderFactory
 from ..providers.__base__.model_provider import LargeLanguageModel
-from ..utils.config import CHAT_CONFIG, KB_CONFIG, LOG_PATH, PKL_PATH, settings
+from ..utils.config import settings, LOG_PATH # 移除 CHAT_CONFIG, KB_CONFIG, PKL_PATH
 from ..ui.config_menu import launch_config_editor
 from ..ui.display_utils import display_chat_config
-from ..retrieval.retriever import VectorStore, retrieve_documents
+from ..retrieval.retriever import retrieve_documents # 移除 VectorStore
+from ..retrieval.vdb.base import VectorStoreBase # 导入 VectorStoreBase
+from ..retrieval.vdb.factory import VectorStoreFactory # 导入 VectorStoreFactory
 
 # =================================================================
 # 2. 日志记录器 (LOGGER)
@@ -53,27 +59,22 @@ class ChatLogger:
 class Chatbot:
     def __init__(self, console: Console):
         self.console = console
-        self.vector_store = self._load_vector_store()
+        self.vector_store: Optional[VectorStoreBase] = None # 更改类型提示
         self.llm_model: Optional[LargeLanguageModel] = None
         self.logger = ChatLogger()
+        self._initialize_vector_store() # 新增初始化向量存储的方法
         self.reload_llm() # 初始加载
 
-    def _load_vector_store(self) -> Optional[VectorStore]:
-        file_path = str(PKL_PATH)
+    def _initialize_vector_store(self):
+        """初始化向量存储，并尝试加载现有知识库。"""
+        self.vector_store = VectorStoreFactory.get_default_vector_store()
         try:
-            with open(file_path, "rb") as f:
-                data = pickle.load(f)
-                vs = VectorStore(file_path)
-                vs.documents = data.get("documents", [])
-                vs.embeddings = data.get("embeddings")
-                vs._initialize_bm25() # 确保BM25被初始化
-                self.console.print(f"[green]知识库 '[cyan]{os.path.basename(file_path)}[/cyan]' 已加载。[/green]")
-                return vs
+            self.vector_store.load(settings.pkl_path)
+            self.console.print(f"[green]知识库 '[cyan]{os.path.basename(settings.pkl_path)}[/cyan]' 已加载。[/green]")
         except FileNotFoundError:
-            self.console.print(f"[bold red]警告：知识库文件 '{file_path}' 未找到。请先运行向量化脚本。[/bold red]")
+            self.console.print(f"[bold red]警告：知识库文件 '{settings.pkl_path}' 未找到。请先运行向量化脚本。[/bold red]")
         except Exception as e:
             self.console.print(f"[bold red]加载知识库时出错: {e}[/bold red]")
-        return None
 
     def reload_llm(self) -> bool:
         """重新加载或初始化LLM模型。"""
@@ -164,7 +165,7 @@ class Chatbot:
             red = int(255 * (1 - normalized_score))
             blue = int(255 * normalized_score)
             color_style = Style(color=f"rgb({red},80,{blue})")
-
+            
             preview = doc.get("page_content", "")[:100].replace("\n", " ") + "..."
             table.add_row(doc["metadata"]["source"], preview, Text(f"{score:.4f}", style=color_style))
         

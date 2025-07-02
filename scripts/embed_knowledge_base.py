@@ -22,9 +22,10 @@ from rich.table import Table
 from rich import box
 
 # 从 src 导入重构后的模块
-from src.utils.config import settings, KB_CONFIG, API_CONFIG
+from src.utils.config import settings # 移除 KB_CONFIG, API_CONFIG
 from src.providers.factory import ModelProviderFactory
-from src.retrieval.retriever import VectorStore # VectorStore现在从这里导入
+from src.retrieval.vdb.base import VectorStoreBase # 导入 VectorStoreBase
+from src.retrieval.vdb.factory import VectorStoreFactory # 导入 VectorStoreFactory
 from src.ui.display_utils import CONSOLE_WIDTH, get_relative_path
 
 # =================================================================
@@ -75,9 +76,9 @@ class EnhanceRecursiveCharacterTextSplitter(TextSplitter):
 # =================================================================
 # 3. 知识库核心 (KNOWLEDGE BASE CORE)
 # =================================================================
-def process_documents(vector_store: VectorStore):
+def process_documents(vector_store: VectorStoreBase): # 更改类型提示
     console = Console()
-    kb_dir = KB_CONFIG["kb_dir"]
+    kb_dir = settings.knowledge_base_path # 使用 settings
     all_texts = []
     all_metadatas = []
     console.print("[bold]开始处理文档...[/bold]")
@@ -88,9 +89,9 @@ def process_documents(vector_store: VectorStore):
             with open(file_path, "r", encoding="utf-8") as f:
                 content = f.read()
                 text_splitter = EnhanceRecursiveCharacterTextSplitter(
-                    chunk_size=KB_CONFIG["chunk_size"],
-                    chunk_overlap=KB_CONFIG["chunk_overlap"],
-                    separators=KB_CONFIG["text_splitter_separators"]
+                    chunk_size=settings.kb_chunk_size, # 使用 settings
+                    chunk_overlap=settings.kb_chunk_overlap, # 使用 settings
+                    separators=settings.kb_splitter_separators # 使用 settings
                 )
                 chunks = text_splitter.split_text(content)
                 for chunk in chunks:
@@ -101,26 +102,15 @@ def process_documents(vector_store: VectorStore):
     
     # 将文档内容和元数据存入 VectorStore 实例
     documents_to_embed = [{"page_content": text, "metadata": meta} for text, meta in zip(all_texts, all_metadatas)]
-    vector_store.documents = documents_to_embed
-    
-    console.print("  [bold]开始生成文本嵌入...[/bold]")
-    active_embedding_key = KB_CONFIG['active_embedding_configuration']
-    embedding_provider = ModelProviderFactory.get_embedding_provider(active_embedding_key)
-    batch_size = KB_CONFIG["embedding_batch_size"]
-    all_embeddings = []
-    for i in range(0, len(all_texts), batch_size):
-        batch_texts = all_texts[i : i + batch_size]
-        batch_embeddings = embedding_provider.embed_documents(texts=batch_texts)
-        all_embeddings.extend(batch_embeddings)
-        console.print(f"    [dim]已处理 {min(i + batch_size, len(all_texts))} / {len(all_texts)} 个文本块。[/dim]")
+    vector_store.add_documents(documents_to_embed) # 调用 add_documents 方法
 
-    vector_store.embeddings = np.array(all_embeddings, dtype=np.float32)
+    console.print("  [bold]开始生成文本嵌入...[/bold]")
+    # 嵌入生成逻辑已移至 FaissStore.add_documents
     
     # 保存到文件
-    with open(vector_store.file_path, "wb") as f:
-        pickle.dump({"documents": vector_store.documents, "embeddings": vector_store.embeddings}, f)
+    vector_store.save(settings.pkl_path) # 使用 vector_store.save 和 settings.pkl_path
 
-    console.print(f"\n[bold green]知识库已成功处理并保存到 '[cyan]{vector_store.file_path}[/cyan]'。[/bold green]")
+    console.print(f"\n[bold green]知识库已成功处理并保存到 '[cyan]{settings.pkl_path}[/cyan]'。[/bold green]") # 使用 settings.pkl_path
 
 # =================================================================
 # 4. 辅助与主函数 (HELPERS & MAIN)
@@ -198,12 +188,12 @@ def main():
     console = Console()
     display_config_and_confirm()
     
-    kb_dir = KB_CONFIG["kb_dir"]
+    kb_dir = settings.knowledge_base_path # 使用 settings
     if not os.path.exists(kb_dir) or not any(f.endswith('.md') for f in os.listdir(kb_dir)):
          console.print(f"[bold red]错误: 知识库目录 '{kb_dir}' 不存在或为空。请先添加Markdown文档。[/bold red]")
          sys.exit(1)
 
-    vector_store = VectorStore(KB_CONFIG["output_file"])
+    vector_store = VectorStoreFactory.get_default_vector_store() # 通过工厂获取实例
     process_documents(vector_store)
     console.print("\n[bold green]知识库嵌入完成。现在可以启动聊天机器人会话进行测试。[/bold green]")
 

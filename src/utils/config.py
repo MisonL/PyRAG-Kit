@@ -81,6 +81,7 @@ class Settings(BaseSettings):
     default_llm_provider: str = "google"
     default_embedding_provider: str = "google"
     default_rerank_provider: str = "siliconflow"
+    default_vector_store: str = "faiss" # 新增向量存储默认提供商
 
     # --- [CHAT] ---
     chat_retrieval_method: RetrievalMethod = RetrievalMethod.HYBRID_SEARCH

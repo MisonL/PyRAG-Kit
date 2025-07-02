@@ -16,3 +16,4 @@ pyfiglet
 prompt_toolkit
 pydantic
 pydantic-settings
+faiss-cpu

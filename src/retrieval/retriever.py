@@ -6,55 +6,15 @@ import numpy as np
 import jieba
 import copy
 from typing import Any, Dict, List, Optional
-from sklearn.metrics.pairwise import cosine_similarity
-from rank_bm25 import BM25Okapi
 from rich.console import Console
 
 # 使用相对导入来引用同一 src 目录下的模块
-from ..utils.config import CHAT_CONFIG, KB_CONFIG, RetrievalMethod, settings
+from ..utils.config import RetrievalMethod, settings # 移除 CHAT_CONFIG, KB_CONFIG
 from ..providers.factory import ModelProviderFactory
+from .vdb.base import VectorStoreBase # 导入 VectorStoreBase
 
 # =================================================================
-# 2. 向量存储与搜索 (VECTOR STORE & SEARCH)
-# =================================================================
-class VectorStore:
-    def __init__(self, file_path: str):
-        self.file_path = file_path
-        self.documents: List[Dict] = []
-        self.embeddings: Optional[np.ndarray] = None
-        self.bm25_index: Optional[BM25Okapi] = None
-        self._initialize_bm25()
-
-    def _initialize_bm25(self):
-        """在加载文档后初始化BM25索引。"""
-        if self.documents:
-            tokenized_corpus = [list(jieba.cut(doc.get("page_content", ""))) for doc in self.documents]
-            self.bm25_index = BM25Okapi(tokenized_corpus)
-
-    def semantic_search(self, query_embedding: np.ndarray, top_k: int, score_threshold: float) -> List[Dict]:
-        if self.embeddings is None or len(self.embeddings) == 0: return []
-        similarities = cosine_similarity(query_embedding.reshape(1, -1), self.embeddings)[0]
-        top_indices = np.argsort(similarities)[-top_k:][::-1]
-        results = [
-            {**copy.deepcopy(self.documents[i]), "score": similarities[i]}
-            for i in top_indices if similarities[i] >= score_threshold
-        ]
-        return results
-
-    def bm25_search(self, query: str, top_k: int) -> List[Dict]:
-        """使用BM25算法进行全文搜索。"""
-        if not self.bm25_index: return []
-        tokenized_query = list(jieba.cut(query))
-        doc_scores = self.bm25_index.get_scores(tokenized_query)
-        top_indices = np.argsort(doc_scores)[-top_k:][::-1]
-        results = [
-            {**copy.deepcopy(self.documents[i]), "score": doc_scores[i]}
-            for i in top_indices if doc_scores[i] > 0
-        ]
-        return results
-
-# =================================================================
-# 3. 检索逻辑 (RETRIEVAL LOGIC)
+# 2. 检索逻辑 (RETRIEVAL LOGIC)
 # =================================================================
 class HybridReranker:
     def rerank(self, documents: List[Dict]) -> List[Dict]:
@@ -69,38 +29,16 @@ class HybridReranker:
         normalized_semantic_scores = [s / max_semantic_score for s in semantic_scores]
         
         for i, doc in enumerate(documents):
-            doc["score"] = (CHAT_CONFIG["vector_weight"] * normalized_semantic_scores[i] +
-                            CHAT_CONFIG["keyword_weight"] * normalized_keyword_scores[i])
+            doc["score"] = (settings.chat_vector_weight * normalized_semantic_scores[i] + # 使用 settings
+                            settings.chat_keyword_weight * normalized_keyword_scores[i]) # 使用 settings
         return sorted(documents, key=lambda x: x["score"], reverse=True)
 
-def retrieve_documents(query: str, vector_store: VectorStore, console: Console) -> List[Dict]:
+def retrieve_documents(query: str, vector_store: VectorStoreBase, console: Console) -> List[Dict]: # 更改类型提示
     retrieval_method = settings.chat_retrieval_method
     top_k = settings.chat_top_k
-    score_threshold = settings.chat_score_threshold
     
-    # 语义搜索
-    active_embedding_key = settings.default_embedding_provider
-    embedding_provider = ModelProviderFactory.get_embedding_provider(active_embedding_key)
-    query_embedding = np.array(embedding_provider.embed_documents([query])[0])
-    semantic_results = vector_store.semantic_search(query_embedding, top_k, score_threshold)
-    for doc in semantic_results: doc["semantic_score"] = doc.pop("score", 0)
-    
-    # 全文搜索 (BM25)
-    full_text_results = vector_store.bm25_search(query, top_k)
-    for doc in full_text_results: doc["keyword_score"] = doc.pop("score", 0)
-
-    # 合并和重排
-    if retrieval_method == RetrievalMethod.HYBRID_SEARCH:
-        all_docs = {doc["metadata"]["source"] + doc["page_content"]: doc for doc in semantic_results}
-        for doc in full_text_results:
-            key = doc["metadata"]["source"] + doc["page_content"]
-            if key in all_docs: all_docs[key].update(doc)
-            else: all_docs[key] = doc
-        ranked_results = HybridReranker().rerank(list(all_docs.values()))
-    elif retrieval_method == RetrievalMethod.SEMANTIC_SEARCH:
-        ranked_results = sorted(semantic_results, key=lambda x: x.get("semantic_score", 0), reverse=True)
-    else: # FULL_TEXT_SEARCH
-        ranked_results = sorted(full_text_results, key=lambda x: x.get("keyword_score", 0), reverse=True)
+    # 直接通过 vector_store.search 获取结果，它会处理混合检索逻辑
+    ranked_results = vector_store.search(query, top_k)
 
     # 使用Reranker（如果启用）
     if settings.chat_rerank_enabled:
