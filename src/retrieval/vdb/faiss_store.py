@@ -1,3 +1,7 @@
+# 本文件包含部分从 Dify 项目移植的代码。
+# 原始来源: https://github.com/langgenius/dify
+# 遵循修改后的 Apache License 2.0 许可证。详情请参阅项目根目录下的 DIFY_LICENSE 文件。
+
 import numpy as np
 import jieba
 import copy
@@ -17,8 +21,11 @@ except ImportError:
     )
 
 from .base import VectorStoreBase
-from ...utils.config import settings, RetrievalMethod # 导入 RetrievalMethod
+from ...utils.config import get_settings, RetrievalMethod # 导入 get_settings 函数和 RetrievalMethod
 from ...providers.factory import ModelProviderFactory
+from ...utils.log_manager import get_module_logger # 导入日志管理器
+
+logger = get_module_logger(__name__) # 获取当前模块的日志器
 
 class FaissStore(VectorStoreBase):
     """
@@ -31,21 +38,32 @@ class FaissStore(VectorStoreBase):
         self.bm25_index: Optional[BM25Okapi] = None
         self.faiss_index: Optional[faiss.IndexFlatL2] = None
         self.embedding_model = None # 在加载或添加文档时设置
-
+        logger.info(f"FaissStore 初始化完成，文件路径: {file_path if file_path else '未指定'}")
+    
     def _initialize_bm25(self):
         """在加载文档或添加新文档后初始化/更新BM25索引。"""
         if self.documents:
+            logger.debug("正在初始化 BM25 索引...")
             tokenized_corpus = [list(jieba.cut(doc.get("page_content", ""))) for doc in self.documents]
             self.bm25_index = BM25Okapi(tokenized_corpus)
+            logger.info("BM25 索引初始化完成。")
+        else:
+            logger.debug("没有文档，跳过 BM25 索引初始化。")
 
     def _initialize_faiss_index(self):
         """根据当前嵌入初始化FAISS索引。"""
         if self.embeddings is not None and len(self.embeddings) > 0:
+            logger.debug("正在初始化 FAISS 索引...")
             dimension = self.embeddings.shape[1]
             self.faiss_index = faiss.IndexFlatL2(dimension)
             # 确保 self.faiss_index 不为 None 且 self.embeddings 是有效的 numpy 数组
             if self.faiss_index is not None and isinstance(self.embeddings, np.ndarray):
                 self.faiss_index.add(self.embeddings) # type: ignore
+                logger.info("FAISS 索引初始化完成。")
+            else:
+                logger.warning("FAISS 索引或嵌入数据无效，无法添加。")
+        else:
+            logger.debug("没有嵌入数据，跳过 FAISS 索引初始化。")
 
     def add_documents(self, documents: List[Dict[str, Any]]):
         """
@@ -57,16 +75,32 @@ class FaissStore(VectorStoreBase):
                        每个字典应至少包含 'page_content' 键。
         """
         if not documents:
+            logger.warning("尝试添加空文档列表，操作取消。")
             return
+        
+        logger.info(f"正在添加 {len(documents)} 个文档到 FaissStore。")
 
         # 获取嵌入模型
         if self.embedding_model is None:
-            active_embedding_key = settings.default_embedding_provider
-            self.embedding_model = ModelProviderFactory.get_embedding_provider(active_embedding_key)
+            logger.debug("嵌入模型未初始化，正在获取默认嵌入提供商。")
+            current_settings = get_settings() # 获取当前配置
+            active_embedding_key = current_settings.default_embedding_provider
+            try:
+                self.embedding_model = ModelProviderFactory.get_embedding_provider(active_embedding_key)
+                logger.info(f"成功获取嵌入模型: {active_embedding_key}")
+            except Exception as e:
+                logger.error(f"获取嵌入模型失败: {e}", exc_info=True)
+                raise
 
         # 生成新文档的嵌入
         new_texts = [doc.get("page_content", "") for doc in documents]
-        new_embeddings = np.array(self.embedding_model.embed_documents(texts=new_texts), dtype=np.float32)
+        logger.debug(f"正在为 {len(new_texts)} 个文档生成嵌入。")
+        try:
+            new_embeddings = np.array(self.embedding_model.embed_documents(texts=new_texts), dtype=np.float32)
+            logger.debug("嵌入生成完成。")
+        except Exception as e:
+            logger.error(f"生成文档嵌入失败: {e}", exc_info=True)
+            raise
 
         # 合并新旧文档和嵌入
         self.documents.extend(documents)
@@ -74,10 +108,12 @@ class FaissStore(VectorStoreBase):
             self.embeddings = new_embeddings
         else:
             self.embeddings = np.vstack((self.embeddings, new_embeddings))
+        logger.info(f"当前文档总数: {len(self.documents)}, 嵌入总数: {len(self.embeddings) if self.embeddings is not None else 0}")
 
         # 更新BM25和FAISS索引
         self._initialize_bm25()
         self._initialize_faiss_index()
+        logger.info("文档添加和索引更新完成。")
 
     def search(self, query: str, top_k: int = 5, search_type: str = "semantic") -> List[Dict[str, Any]]:
         """
@@ -97,7 +133,8 @@ class FaissStore(VectorStoreBase):
                 return []
             
             if self.embedding_model is None:
-                active_embedding_key = settings.default_embedding_provider
+                current_settings = get_settings() # 获取当前配置
+                active_embedding_key = current_settings.default_embedding_provider
                 self.embedding_model = ModelProviderFactory.get_embedding_provider(active_embedding_key)
             
             query_embedding = np.array(self.embedding_model.embed_documents([query])[0], dtype=np.float32).reshape(1, -1)
@@ -179,6 +216,7 @@ class FaissStore(VectorStoreBase):
             嵌入模型实例。
         """
         if self.embedding_model is None:
-            active_embedding_key = settings.default_embedding_provider
+            current_settings = get_settings() # 获取当前配置
+            active_embedding_key = current_settings.default_embedding_provider
             self.embedding_model = ModelProviderFactory.get_embedding_provider(active_embedding_key)
         return self.embedding_model

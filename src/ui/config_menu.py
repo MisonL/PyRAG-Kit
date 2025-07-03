@@ -4,13 +4,16 @@ from rich.console import Console
 from rich.panel import Panel
 from typing import Dict, Any, Tuple
 
-from ..utils.config import settings, RetrievalMethod
+from ..utils.config import get_settings, RetrievalMethod # 导入 get_settings 函数
 from .display_utils import display_chat_config
+from ..utils.log_manager import get_module_logger # 导入日志管理器
 
+logger = get_module_logger(__name__) # 获取当前模块的日志器
 console = Console()
 
 def edit_retrieval_params(chat_config: Dict[str, Any]) -> None:
     """编辑检索相关参数。"""
+    logger.info("进入检索参数编辑菜单。")
     while True:
         current_method = chat_config['retrieval_method'].value
         current_top_k = chat_config['top_k']
@@ -31,6 +34,7 @@ def edit_retrieval_params(chat_config: Dict[str, Any]) -> None:
         ).ask()
 
         if choice == "back" or choice is None:
+            logger.info("退出检索参数编辑菜单。")
             break
 
         if choice == "method":
@@ -46,6 +50,7 @@ def edit_retrieval_params(chat_config: Dict[str, Any]) -> None:
             if new_method:
                 chat_config['retrieval_method'] = RetrievalMethod(new_method)
                 console.print(f"[green]检索模式已更新为: {new_method}[/green]")
+                logger.info(f"检索模式已更新为: {new_method}")
 
         elif choice == "top_k":
             new_top_k = questionary.text(
@@ -56,6 +61,7 @@ def edit_retrieval_params(chat_config: Dict[str, Any]) -> None:
             if new_top_k:
                 chat_config['top_k'] = int(new_top_k)
                 console.print(f"[green]Top K 已更新为: {new_top_k}[/green]")
+                logger.info(f"Top K 已更新为: {new_top_k}")
 
         elif choice == "rerank":
             new_rerank = questionary.confirm(
@@ -65,10 +71,12 @@ def edit_retrieval_params(chat_config: Dict[str, Any]) -> None:
             if new_rerank is not None:
                 chat_config['rerank_enabled'] = new_rerank
                 console.print(f"[green]Rerank已更新为: {'启用' if new_rerank else '禁用'}[/green]")
+                logger.info(f"Rerank已更新为: {'启用' if new_rerank else '禁用'}")
         
         elif choice == "weights":
             if chat_config['retrieval_method'] != RetrievalMethod.HYBRID_SEARCH:
                 console.print("[yellow]警告: 权重调整仅在 '混合检索' 模式下生效。[/yellow]")
+                logger.warning("尝试调整权重，但当前检索模式不是混合检索。")
             
             def is_float_between_0_and_1(text):
                 try:
@@ -89,11 +97,13 @@ def edit_retrieval_params(chat_config: Dict[str, Any]) -> None:
                 chat_config['vector_weight'] = new_vector_weight
                 chat_config['keyword_weight'] = round(new_keyword_weight, 2)
                 console.print(f"[green]混合搜索权重已更新为 -> 向量: {chat_config['vector_weight']}, 关键词: {chat_config['keyword_weight']}[/green]")
+                logger.info(f"混合搜索权重已更新为 -> 向量: {chat_config['vector_weight']}, 关键词: {chat_config['keyword_weight']}")
     # 检索参数的更改不需要重载任何模型
     return None
 
 def edit_model_params(chat_config: Dict[str, Any]) -> bool:
     """编辑模型相关参数。"""
+    logger.info("进入模型参数编辑菜单。")
     llm_changed = False
     while True:
         current_llm = chat_config['active_llm_configuration']
@@ -111,6 +121,7 @@ def edit_model_params(chat_config: Dict[str, Any]) -> bool:
         ).ask()
 
         if choice == "back" or choice is None:
+            logger.info("退出模型参数编辑菜单。")
             break
 
         if choice == "llm":
@@ -123,6 +134,7 @@ def edit_model_params(chat_config: Dict[str, Any]) -> bool:
             if new_llm and new_llm != current_llm:
                 chat_config['active_llm_configuration'] = new_llm
                 console.print(f"[green]LLM配置已切换为: {new_llm}[/green]")
+                logger.info(f"LLM配置已切换为: {new_llm}")
                 llm_changed = True
 
         elif choice == "rerank":
@@ -135,6 +147,7 @@ def edit_model_params(chat_config: Dict[str, Any]) -> bool:
             if new_rerank:
                 chat_config['active_rerank_configuration'] = new_rerank
                 console.print(f"[green]Rerank已切换为: {new_rerank}[/green]")
+                logger.info(f"Rerank已切换为: {new_rerank}")
                 # Rerank模型是按需加载的，所以不需要标记状态
 
     return llm_changed
@@ -144,6 +157,7 @@ def launch_config_editor(chat_config: Dict[str, Any]) -> Tuple[bool, Dict[str, A
     启动交互式配置编辑器。
     返回一个元组 (llm_needs_reload, updated_config)
     """
+    logger.info("启动配置编辑器。")
     console.print(Panel("进入配置模式...", title="[yellow]配置编辑器[/yellow]", border_style="yellow"))
     
     llm_needs_reload = False
@@ -163,17 +177,23 @@ def launch_config_editor(chat_config: Dict[str, Any]) -> Tuple[bool, Dict[str, A
 
         if choice == "exit" or choice is None:
             console.print(Panel("配置完成，返回聊天。", title="[yellow]配置编辑器[/yellow]", border_style="yellow"))
+            logger.info("配置编辑器退出，保存并返回聊天。")
             break
         
         if "1." in choice:
+            logger.debug("用户选择调整检索参数。")
             # 检索参数的更改不会触发重载
             edit_retrieval_params(chat_config)
         elif "2." in choice:
+            logger.debug("用户选择切换模型。")
             # 如果LLM发生变化，标记需要重载
             if edit_model_params(chat_config):
                 llm_needs_reload = True
         elif "3." in choice:
+            logger.debug("用户选择查看当前完整配置。")
             display_chat_config(console, chat_config)
             questionary.press_any_key_to_continue("按任意键返回主菜单...").ask()
+            logger.debug("用户已查看配置并返回。")
 
+    logger.info(f"配置编辑器完成，LLM需要重载: {llm_needs_reload}")
     return llm_needs_reload, chat_config

@@ -8,10 +8,6 @@ import pandas as pd
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Generator
 import copy # 导入 copy 模块
-import os # 保持 os 导入，因为 ChatLogger 仍然需要
-import pickle # 保持 pickle 导入，因为 ChatLogger 仍然需要
-import pandas as pd # 保持 pandas 导入，因为 ChatLogger 仍然需要
-from datetime import datetime # 保持 datetime 导入，因为 ChatLogger 仍然需要
 
 from rich.console import Console
 from rich.panel import Panel
@@ -25,69 +21,52 @@ from prompt_toolkit.formatted_text import HTML
 # 使用相对导入
 from ..providers.factory import ModelProviderFactory
 from ..providers.__base__.model_provider import LargeLanguageModel
-from ..utils.config import settings, RetrievalMethod # 导入 RetrievalMethod
+from ..utils.config import get_settings, RetrievalMethod # 导入 get_settings 函数和 RetrievalMethod
 from ..ui.config_menu import launch_config_editor
 from ..ui.display_utils import display_chat_config
-from ..retrieval.retriever import retrieve_documents # 移除 VectorStore
-from ..retrieval.vdb.base import VectorStoreBase # 导入 VectorStoreBase
-from ..retrieval.vdb.factory import VectorStoreFactory # 导入 VectorStoreFactory
+from ..retrieval.retriever import retrieve_documents
+from ..retrieval.vdb.base import VectorStoreBase
+from ..retrieval.vdb.factory import VectorStoreFactory
+from ..utils.log_manager import get_chat_logger # 导入新的日志管理器
 
 # =================================================================
-# 2. 日志记录器 (LOGGER)
-# =================================================================
-class ChatLogger:
-    def __init__(self):
-        self.log_dir = settings.log_path
-        if not os.path.exists(self.log_dir):
-            os.makedirs(self.log_dir)
-        self.log_file = os.path.join(self.log_dir, f"chat_log_{datetime.now().strftime('%Y-%m-%d')}.xlsx")
-        self.log_data = []
-
-    def log(self, query: str, intent: str, context: str, response: str):
-        self.log_data.append({
-            "Timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            "UserQuery": query,
-            "DetectedIntent": intent,
-            "RetrievedContext": context,
-            "LLMResponse": response
-        })
-        df = pd.DataFrame(self.log_data)
-        df.to_excel(self.log_file, index=False, engine='openpyxl')
-
-# =================================================================
-# 3. 聊天机器人核心 (CHATBOT CORE)
+# 2. 聊天机器人核心 (CHATBOT CORE)
 # =================================================================
 class Chatbot:
     def __init__(self, console: Console):
         self.console = console
-        self.vector_store: Optional[VectorStoreBase] = None # 更改类型提示
+        self.vector_store: Optional[VectorStoreBase] = None
         self.llm_model: Optional[LargeLanguageModel] = None
-        self.logger = ChatLogger()
-        # 初始化聊天配置
+        self.logger = get_chat_logger() # 使用新的日志管理器
+        
+        # 在初始化时获取一次配置，并存储在实例变量中
+        current_settings = get_settings()
         self.chat_config = {
-            "retrieval_method": settings.chat_retrieval_method,
-            "vector_weight": settings.chat_vector_weight,
-            "keyword_weight": settings.chat_keyword_weight,
-            "rerank_enabled": settings.chat_rerank_enabled,
-            "top_k": settings.chat_top_k,
-            "score_threshold": settings.chat_score_threshold,
-            "active_llm_configuration": settings.default_llm_provider,
-            "active_rerank_configuration": settings.default_rerank_provider,
-            "llm_configurations": copy.deepcopy(settings.llm_configurations),
-            "rerank_configurations": copy.deepcopy(settings.rerank_configurations),
-            "chat_temperature": settings.chat_temperature,
+            "retrieval_method": current_settings.chat_retrieval_method,
+            "vector_weight": current_settings.chat_vector_weight,
+            "keyword_weight": current_settings.chat_keyword_weight,
+            "rerank_enabled": current_settings.chat_rerank_enabled,
+            "top_k": current_settings.chat_top_k,
+            "score_threshold": current_settings.chat_score_threshold,
+            "active_llm_configuration": current_settings.default_llm_provider,
+            "active_rerank_configuration": current_settings.default_rerank_provider,
+            "llm_configurations": copy.deepcopy(current_settings.llm_configurations),
+            "rerank_configurations": copy.deepcopy(current_settings.rerank_configurations),
+            "chat_temperature": current_settings.chat_temperature,
         }
-        self._initialize_vector_store() # 新增初始化向量存储的方法
-        self.reload_llm() # 初始加载
+        self._initialize_vector_store()
+        self.reload_llm()
 
     def _initialize_vector_store(self):
         """初始化向量存储，并尝试加载现有知识库。"""
         self.vector_store = VectorStoreFactory.get_default_vector_store()
         try:
-            self.vector_store.load(settings.pkl_path)
-            self.console.print(f"[green]知识库 '[cyan]{os.path.basename(settings.pkl_path)}[/cyan]' 已加载。[/green]")
+            current_settings = get_settings() # 再次获取最新配置
+            self.vector_store.load(current_settings.pkl_path)
+            self.console.print(f"[green]知识库 '[cyan]{os.path.basename(current_settings.pkl_path)}[/cyan]' 已加载。[/green]")
         except FileNotFoundError:
-            self.console.print(f"[bold red]警告：知识库文件 '{settings.pkl_path}' 未找到。请先运行向量化脚本。[/bold red]")
+            current_settings = get_settings() # 再次获取最新配置
+            self.console.print(f"[bold red]警告：知识库文件 '{current_settings.pkl_path}' 未找到。请先运行向量化脚本。[/bold red]")
         except Exception as e:
             self.console.print(f"[bold red]加载知识库时出错: {e}[/bold red]")
 
@@ -180,7 +159,7 @@ class Chatbot:
                 full_response += chunk
                 yield chunk
             
-            self.logger.log(user_input, intent, context_for_log, full_response)
+            self.logger.info(f"UserQuery: {user_input}\nDetectedIntent: {intent}\nRetrievedContext: {context_for_log}\nLLMResponse: {full_response}")
 
         return response_generator_with_logging()
 

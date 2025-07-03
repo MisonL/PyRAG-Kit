@@ -4,7 +4,7 @@ from typing import List, cast
 import requests
 
 from src.providers.__base__.model_provider import RerankModel
-from src.utils.config import settings
+from src.utils.config import get_settings # 导入 get_settings 函数
 
 
 class SiliconflowRerankProvider(RerankModel):
@@ -14,8 +14,9 @@ class SiliconflowRerankProvider(RerankModel):
 
     def __init__(self, model_name: str):
         self._model_name = model_name
-        self._api_key = settings.siliconflow_api_key
-        self._base_url = settings.siliconflow_base_url
+        current_settings = get_settings() # 获取当前配置
+        self._api_key = current_settings.siliconflow_api_key
+        self._base_url = current_settings.siliconflow_base_url
         
         if not self._api_key:
             raise ValueError("错误：SiliconFlow Rerank 提供商需要 API 密钥。")

@@ -1,5 +1,10 @@
+# 本文件包含部分从 Dify 项目移植的代码。
+# 原始来源: https://github.com/langgenius/dify
+# 遵循修改后的 Apache License 2.0 许可证。详情请参阅项目根目录下的 DIFY_LICENSE 文件。
+
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any
+from typing import List
+from src.models.document import Document
 
 class BaseCleaner(ABC):
     """
@@ -8,15 +13,15 @@ class BaseCleaner(ABC):
     """
 
     @abstractmethod
-    def clean(self, documents: List[Dict[str, Any]], **kwargs) -> List[Dict[str, Any]]:
+    def clean(self, documents: List[Document], **kwargs) -> List[Document]:
         """
         对文档列表中的文本内容进行清洗。
 
         Args:
-            documents (List[Dict[str, Any]]): 待清洗的文档列表，每个文档字典至少包含 'content' 键。
+            documents (List[Document]): 待清洗的文档对象列表。
             **kwargs: 额外的参数，用于控制清洗行为。
 
         Returns:
-            List[Dict[str, Any]]: 清洗后的文档列表，每个文档字典至少包含 'content' 键。
+            List[Document]: 清洗后的文档对象列表。
         """
         pass

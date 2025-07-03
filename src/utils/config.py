@@ -66,7 +66,7 @@ class Settings(BaseSettings):
     grok_base_url: str = "https://api.x.ai/v1"
 
     # --- [GENERAL] ---
-    log_level: str = "INFO" # 新增 log_level 字段
+    log_level: str = "WARNING" # 新增 log_level 字段，默认级别调整为 WARNING
     cache_path: str = ".cache" # 新增 cache_path 字段
     log_path: str = "data/logs"
     log_retention_days: int = 15
@@ -293,17 +293,16 @@ def get_settings() -> Settings:
     """
     return Settings()
 
-# 导出 settings 实例，供其他模块直接导入
-# 注意: 为了避免在导入时立即加载配置，通常更好的做法是
-# 只导出 get_settings 函数，然后在需要的地方调用它。
-settings = get_settings()
+# 导出 get_settings 函数，供其他模块在需要时调用
+# 这样可以确保在测试中能够灵活地替换或模拟配置
+# settings = get_settings() # 移除直接导出 settings 实例
 
 # =================================================================
 # 4. 向后兼容层 (BACKWARD COMPATIBILITY LAYER)
 # =================================================================
 # 目标: 最小化对现有代码的侵入性。
 # 策略: 保持旧的配置变量，但使其从新的settings实例派生。
-# 后续重构中，应逐步淘汰这些变量，直接使用 `settings` 对象。
+# 后续重构中，应逐步淘汰这些变量，直接使用 `get_settings()` 对象。
 
 def get_backward_compatible_configs() -> Dict[str, Any]:
     """

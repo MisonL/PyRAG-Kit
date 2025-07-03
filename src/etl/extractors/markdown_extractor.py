@@ -1,41 +1,30 @@
-import os
-from typing import List, Dict, Any
+# 本文件包含部分从 Dify 项目移植的代码。
+# 原始来源: https://github.com/langgenius/dify
+# 遵循修改后的 Apache License 2.0 许可证。详情请参阅项目根目录下的 DIFY_LICENSE 文件。
+
+from typing import List
 from .base import BaseExtractor
+from src.models.document import Document
 
 class MarkdownExtractor(BaseExtractor):
     """
     Markdown 文档内容抽取器。
-    从 Markdown 文件中抽取原始文本内容。
+    在ETL流水线中，此阶段主要起验证和传递作用，
+    因为内容已在创建Document对象时从文件中读取。
     """
 
-    def extract(self, source: str, **kwargs) -> List[Dict[str, Any]]:
+    def extract(self, document: Document, **kwargs) -> List[Document]:
         """
-        从 Markdown 文件中抽取文本内容。
+        从代表源文件的 Document 对象中“抽取”内容。
+        对于Markdown，主要是将单个文档对象放入列表中，以符合流水线格式。
 
         Args:
-            source (str): Markdown 文件的路径。
+            document (Document): 包含源文件内容的文档对象。
             **kwargs: 额外的参数（目前未使用）。
 
         Returns:
-            List[Dict[str, Any]]: 包含抽取出的文档内容的列表。
-                                  每个文档字典包含 'content' 和 'metadata'。
-        Raises:
-            FileNotFoundError: 如果文件路径不存在。
-            IOError: 如果读取文件时发生错误。
+            List[Document]: 包含单个文档对象的列表。
         """
-        if not os.path.exists(source):
-            raise FileNotFoundError(f"文件未找到: {source}")
-
-        try:
-            with open(source, 'r', encoding='utf-8') as f:
-                content = f.read()
-            
-            # 提取文件名作为元数据
-            file_name = os.path.basename(source)
-            
-            return [{
-                "content": content,
-                "metadata": {"source": file_name, "file_path": source}
-            }]
-        except Exception as e:
-            raise IOError(f"读取文件 {source} 时发生错误: {e}")
+        # 由于内容已在外部读取并封装到 Document 对象中，
+        # 此处的 "extract" 只是按约定返回一个列表。
+        return [document]

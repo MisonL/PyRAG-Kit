@@ -1,5 +1,10 @@
+# 本文件包含部分从 Dify 项目移植的代码。
+# 原始来源: https://github.com/langgenius/dify
+# 遵循修改后的 Apache License 2.0 许可证。详情请参阅项目根目录下的 DIFY_LICENSE 文件。
+
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any
+from typing import List
+from src.models.document import Document
 
 class BaseSplitter(ABC):
     """
@@ -8,17 +13,15 @@ class BaseSplitter(ABC):
     """
 
     @abstractmethod
-    def split(self, documents: List[Dict[str, Any]], **kwargs) -> List[Dict[str, Any]]:
+    def split(self, documents: List[Document], **kwargs) -> List[Document]:
         """
         将文档列表中的文本内容分割成更小的块。
 
         Args:
-            documents (List[Dict[str, Any]]): 待分割的文档列表，每个文档字典至少包含 'content' 键。
+            documents (List[Document]): 待分割的文档对象列表。
             **kwargs: 额外的参数，用于控制分割行为，如 chunk_size, chunk_overlap, separators等。
 
         Returns:
-            List[Dict[str, Any]]: 分割后的文本块列表，每个块是一个字典，
-                                  至少包含 'content' 键（文本块内容）。
-                                  可以包含 'metadata' 键（文本块元数据，如来源、页码等）。
+            List[Document]: 分割后的文档块列表。
         """
         pass

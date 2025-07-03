@@ -1,7 +1,11 @@
+# 本文件包含部分从 Dify 项目移植的代码。
+# 原始来源: https://github.com/langgenius/dify
+# 遵循修改后的 Apache License 2.0 许可证。详情请参阅项目根目录下的 DIFY_LICENSE 文件。
+
 from typing import Any
 from .base import VectorStoreBase
 from .faiss_store import FaissStore
-from ...utils.config import settings
+from ...utils.config import get_settings # 导入 get_settings 函数
 
 class VectorStoreFactory:
     """
@@ -37,6 +41,7 @@ class VectorStoreFactory:
         Returns:
             VectorStoreBase 的实例。
         """
-        default_store_type = settings.default_vector_store
-        default_file_path = settings.pkl_path
+        current_settings = get_settings() # 获取当前配置
+        default_store_type = current_settings.default_vector_store
+        default_file_path = current_settings.pkl_path
         return VectorStoreFactory.get_vector_store(default_store_type, default_file_path)

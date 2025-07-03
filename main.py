@@ -15,9 +15,9 @@ from prompt_toolkit.formatted_text import HTML
 # 导入 cleanup 模块以注册 atexit 钩子
 import src.utils.cleanup
 # 从新的配置模块导入 settings 实例
-from src.utils.config import settings
-# 导入日志清理函数
-from src.utils.log_manager import cleanup_old_logs
+from src.utils.config import get_settings
+# 导入日志管理器，以便调用其清理函数
+import src.utils.log_manager
 # 导入UI工具
 from src.ui.display_utils import CONSOLE_WIDTH
 
@@ -92,10 +92,10 @@ def initialize_dependencies():
     console.print("[dim]正在初始化依赖项...[/dim]")
     
     # 1. 执行日志清理
-    cleanup_old_logs()
+    src.utils.log_manager.cleanup_old_logs()
     
     # 2. 使用从 settings 实例获取的缓存目录
-    cache_dir = settings.cache_path
+    cache_dir = get_settings().cache_path
     if not os.path.exists(cache_dir):
         os.makedirs(cache_dir)
     

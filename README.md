@@ -22,7 +22,8 @@
 - **🚀 高级检索策略**: 支持向量检索、全文检索和混合检索，并通过 Rerank 模型二次精排，提升答案相关性。
 - **⚙️ 动态交互配置**: 运行时通过 `/config` 命令打开交互式菜单，动态切换LLM、调整检索策略、修改权重等。
 - **📄 流式响应**: 客服回答采用打字机流式输出，提升用户交互体验。
-- **📊 Excel日志**: 自动将每一次对话的详细信息记录到 Excel 文件中，便于审计和分析。
+- **📊 统一日志系统**: 采用标准 `logging` 模块，将程序运行和聊天对话的详细信息统一记录到文件和控制台，便于审计、分析和调试。
+- **✅ 单元测试**: 为核心模块（如模型提供商工厂、向量存储工厂、ETL流水线）编写了全面的单元测试，确保代码质量和功能稳定性。
 - **🧹 智能缓存与清理**: 自动处理知识库向量化，并在程序退出时清理缓存，保持项目整洁。
 
 ## 📸 程序截图
@@ -47,8 +48,11 @@
 │   ├── providers/       # 所有模型提供商的实现
 │   ├── retrieval/       # 检索逻辑
 │   ├── ui/              # 用户界面 (菜单、显示工具)
-│   └── utils/           # 辅助工具 (配置、清理)
-├── tests/               # (预留) 自动化测试
+│   └── utils/           # 辅助工具 (配置、清理、日志管理)
+├── tests/               # 自动化测试
+│   ├── etl/             # ETL流水线测试
+│   ├── providers/       # 模型提供商测试
+│   └── retrieval/       # 检索模块测试
 ├── main.py              # 程序主入口
 ├── config.ini.example   # 配置文件模板
 ├── .gitignore           # Git忽略文件配置
@@ -174,11 +178,35 @@ python main.py
 **常用命令:**
 -   输入 `/config` 可以随时打开动态配置菜单。
 -   输入 `/quit` 或 `exit` 可以退出聊天。
+-   详细日志请查看 `data/logs/` 目录下的文件。
 
 ---
 
 <div align="center">
 
-*作者: Mison* · *联系邮箱: 1360962086@qq.com*
+## ⚖️ 许可证声明
+
+本项目移植了部分 [Dify](https://github.com/langgenius/dify) 的核心逻辑。Dify 采用的是 [Apache License 2.0](http://www.apache.org/licenses/LICENSE-2.0) 的修改版本，并附加了特定的商业使用条件（例如多租户服务和前端 LOGO/版权限制）。
+
+因此，本项目在使用 Dify 源码的部分，也需遵循 Dify 的原始许可证及其附加条件。详细许可证内容请参阅项目根目录下的 [`DIFY_LICENSE`](DIFY_LICENSE) 文件。
+
+在遵守 Dify 许可证的前提下，本项目其余部分采用 [MIT License](https://opensource.org/licenses/MIT) 进行许可。
+
+### Dify 移植代码文件
+
+以下文件包含或受 Dify 核心逻辑启发：
+
+*   `src/etl/pipeline.py`
+*   `src/etl/cleaners/base.py`
+*   `src/etl/cleaners/basic_cleaner.py`
+*   `src/etl/extractors/base.py`
+*   `src/etl/extractors/markdown_extractor.py`
+*   `src/etl/splitters/base.py`
+*   `src/etl/splitters/recursive_text_splitter.py`
+*   `src/retrieval/retriever.py`
+*   `src/retrieval/vdb/base.py`
+*   `src/retrieval/vdb/factory.py`
+*   `src/retrieval/vdb/faiss_store.py`
+*   `src/models/document.py`
 
 </div>
