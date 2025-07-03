@@ -22,7 +22,7 @@ import src.utils.log_manager
 from src.ui.display_utils import CONSOLE_WIDTH
 
 console = Console()
-VERSION = "1.1.0" # 程序版本
+VERSION = "1.2.0" # 程序版本
 
 # =================================================================
 # 应用程序界面 (APP UI)
