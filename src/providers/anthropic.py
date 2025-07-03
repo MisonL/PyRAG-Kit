@@ -4,7 +4,7 @@ from typing import Any, Dict, Generator, List
 import anthropic
 
 from src.providers.__base__.model_provider import LargeLanguageModel
-from src.utils.config import API_CONFIG
+from src.utils.config import settings
 
 
 class AnthropicProvider(LargeLanguageModel):
@@ -14,7 +14,7 @@ class AnthropicProvider(LargeLanguageModel):
 
     def __init__(self, model_name: str):
         self._model_name = model_name
-        api_key = API_CONFIG.get("ANTHROPIC_API_KEY")
+        api_key = settings.anthropic_api_key
         if not api_key:
             raise ValueError("Anthropic配置不完整：缺少 ANTHROPIC_API_KEY。")
         self._client = anthropic.Anthropic(api_key=api_key)

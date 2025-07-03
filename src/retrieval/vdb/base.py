@@ -19,14 +19,15 @@ class VectorStoreBase(ABC):
         pass
 
     @abstractmethod
-    def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    def search(self, query: str, top_k: int = 5, search_type: str = "semantic") -> List[Dict[str, Any]]:
         """
         在向量存储中搜索与查询最相关的文档。
-        
+
         Args:
             query: 搜索查询字符串。
             top_k: 返回最相关文档的数量。
-            
+            search_type: 搜索类型，可以是 'semantic'（向量检索）或 'keyword'（全文检索）。
+
         Returns:
             包含相关文档内容和元数据的字典列表。
         """

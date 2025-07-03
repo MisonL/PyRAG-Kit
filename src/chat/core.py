@@ -7,6 +7,7 @@ import pickle
 import pandas as pd
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Generator
+import copy # 导入 copy 模块
 import os # 保持 os 导入，因为 ChatLogger 仍然需要
 import pickle # 保持 pickle 导入，因为 ChatLogger 仍然需要
 import pandas as pd # 保持 pandas 导入，因为 ChatLogger 仍然需要
@@ -24,7 +25,7 @@ from prompt_toolkit.formatted_text import HTML
 # 使用相对导入
 from ..providers.factory import ModelProviderFactory
 from ..providers.__base__.model_provider import LargeLanguageModel
-from ..utils.config import settings, LOG_PATH # 移除 CHAT_CONFIG, KB_CONFIG, PKL_PATH
+from ..utils.config import settings, RetrievalMethod # 导入 RetrievalMethod
 from ..ui.config_menu import launch_config_editor
 from ..ui.display_utils import display_chat_config
 from ..retrieval.retriever import retrieve_documents # 移除 VectorStore
@@ -36,7 +37,7 @@ from ..retrieval.vdb.factory import VectorStoreFactory # 导入 VectorStoreFacto
 # =================================================================
 class ChatLogger:
     def __init__(self):
-        self.log_dir = LOG_PATH
+        self.log_dir = settings.log_path
         if not os.path.exists(self.log_dir):
             os.makedirs(self.log_dir)
         self.log_file = os.path.join(self.log_dir, f"chat_log_{datetime.now().strftime('%Y-%m-%d')}.xlsx")
@@ -62,6 +63,20 @@ class Chatbot:
         self.vector_store: Optional[VectorStoreBase] = None # 更改类型提示
         self.llm_model: Optional[LargeLanguageModel] = None
         self.logger = ChatLogger()
+        # 初始化聊天配置
+        self.chat_config = {
+            "retrieval_method": settings.chat_retrieval_method,
+            "vector_weight": settings.chat_vector_weight,
+            "keyword_weight": settings.chat_keyword_weight,
+            "rerank_enabled": settings.chat_rerank_enabled,
+            "top_k": settings.chat_top_k,
+            "score_threshold": settings.chat_score_threshold,
+            "active_llm_configuration": settings.default_llm_provider,
+            "active_rerank_configuration": settings.default_rerank_provider,
+            "llm_configurations": copy.deepcopy(settings.llm_configurations),
+            "rerank_configurations": copy.deepcopy(settings.rerank_configurations),
+            "chat_temperature": settings.chat_temperature,
+        }
         self._initialize_vector_store() # 新增初始化向量存储的方法
         self.reload_llm() # 初始加载
 
@@ -79,7 +94,7 @@ class Chatbot:
     def reload_llm(self) -> bool:
         """重新加载或初始化LLM模型。"""
         try:
-            active_llm_key = settings.default_llm_provider
+            active_llm_key = self.chat_config["active_llm_configuration"]
             self.console.print(f"[dim]正在加载LLM: [bold cyan]{active_llm_key}[/bold cyan]...[/dim]")
             self.llm_model = ModelProviderFactory.get_llm_provider(active_llm_key)
             if self.llm_model:
@@ -92,20 +107,39 @@ class Chatbot:
             return False
 
     def _identify_intent(self, user_query: str) -> str:
-        if not self.llm_model: return "未知意图"
+        if not self.llm_model: return user_query # 如果LLM未加载，直接返回原始查询
         prompt = f"你是一个意图识别助手。请根据用户的问题，判断其意图。\n用户问题: {user_query}\n请直接输出用户意图的简短描述。"
         try:
             # 使用invoke并设置stream=False来获取完整结果
-            response_generator = self.llm_model.invoke(prompt=prompt, stream=False)
-            return "".join(list(response_generator))
+            response_generator = self.llm_model.invoke(
+                prompt=prompt,
+                stream=False,
+                temperature=self.chat_config['chat_temperature']
+            )
+            response = "".join(list(response_generator)).strip()
+            # 如果模型返回空或非常短的响应，可能表示不确定，直接返回原始查询
+            if not response or len(response) < 4:
+                 return user_query
+            return response
         except Exception as e:
             self.console.print(f"[red]意图识别时出错: {e}[/red]")
-            return "未知意图"
+            return user_query # 出错时返回原始查询
 
     def _retrieve_knowledge(self, query: str) -> List[Dict[str, Any]]:
         if not self.vector_store: return []
-        self.console.print(f"[dim]正在使用 '[yellow]{settings.chat_retrieval_method.value}[/yellow]' 模式检索...[/dim]")
-        return retrieve_documents(query, self.vector_store, self.console)
+        self.console.print(f"[dim]正在使用 '[yellow]{self.chat_config['retrieval_method'].value}[/yellow]' 模式检索...[/dim]")
+        return retrieve_documents(
+            query=query,
+            vector_store=self.vector_store,
+            console=self.console,
+            retrieval_method=self.chat_config['retrieval_method'],
+            top_k=self.chat_config['top_k'],
+            vector_weight=self.chat_config['vector_weight'],
+            keyword_weight=self.chat_config['keyword_weight'],
+            rerank_enabled=self.chat_config['rerank_enabled'],
+            active_rerank_configuration=self.chat_config['active_rerank_configuration'],
+            score_threshold=self.chat_config['score_threshold']
+        )
 
     def _generate_answer_stream(self, user_query: str, intent: str, retrieved_docs: List[Dict[str, Any]]) -> "Generator[str, None, None]":
         if not self.llm_model:
@@ -121,7 +155,11 @@ class Chatbot:
         
         try:
             # 使用新的invoke方法并确保以流式传输
-            yield from self.llm_model.invoke(prompt=prompt, stream=True)
+            yield from self.llm_model.invoke(
+                prompt=prompt,
+                stream=True,
+                temperature=self.chat_config['chat_temperature']
+            )
         except Exception as e:
             self.console.print(f"[red]LLM 生成最终回答时出错: {e}[/red]")
             yield "抱歉，我在生成回答时遇到了一些问题。"
@@ -181,8 +219,8 @@ def start_chat_session():
     bot = Chatbot(console)
     
     if bot.llm_model:
-        display_chat_config(console)
-        console.print(f"我是你的智能客服（由 [bold green]{settings.default_llm_provider}[/bold green] 支持），请输入问题（输入'[bold]/quit[/bold]'或'[bold]/config[/bold]'）：")
+        display_chat_config(console, bot.chat_config)
+        console.print(f"我是你的智能客服（由 [bold green]{bot.chat_config['active_llm_configuration']}[/bold green] 支持），请输入问题（输入'[bold]/quit[/bold]'或'[bold]/config[/bold]'）：")
         
         while True:
             try:
@@ -193,12 +231,15 @@ def start_chat_session():
                     break
                 
                 if user_query.lower() == '/config':
-                    llm_needs_reload, _ = launch_config_editor()
+                    # 使用新的配置编辑器接口
+                    from ..ui.config_menu import launch_config_editor
+                    llm_needs_reload, updated_config = launch_config_editor(bot.chat_config)
+                    bot.chat_config = updated_config  # 更新配置
                     if llm_needs_reload:
                         console.print("[yellow]检测到LLM配置变更，正在重载模型...[/yellow]")
                         bot.reload_llm()
-                    display_chat_config(console)
-                    console.print(f"我是你的智能客服（由 [bold green]{settings.default_llm_provider}[/bold green] 支持），请输入问题（输入'[bold]/quit[/bold]'或'[bold]/config[/bold]'）：")
+                    display_chat_config(console, bot.chat_config)  # 使用新的配置显示
+                    console.print(f"我是你的智能客服（由 [bold green]{bot.chat_config['active_llm_configuration']}[/bold green] 支持），请输入问题（输入'[bold]/quit[/bold]'或'[bold]/config[/bold]'）：")
                     continue
 
                 answer_stream = bot.chat(user_query)

@@ -79,86 +79,71 @@ class FaissStore(VectorStoreBase):
         self._initialize_bm25()
         self._initialize_faiss_index()
 
-    def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    def search(self, query: str, top_k: int = 5, search_type: str = "semantic") -> List[Dict[str, Any]]:
         """
         在向量存储中搜索与查询最相关的文档。
-        结合语义搜索和BM25搜索，并根据配置进行混合或单一检索。
-        
+        根据 search_type 参数执行语义搜索或关键字搜索。
+
         Args:
             query: 搜索查询字符串。
             top_k: 返回最相关文档的数量。
-            
+            search_type: 搜索类型 ('semantic' 或 'keyword')。
+
         Returns:
             包含相关文档内容和元数据的字典列表。
         """
-        retrieval_method = settings.chat_retrieval_method
-        score_threshold = settings.chat_score_threshold
-        
-        semantic_results = []
-        if self.embeddings is not None and len(self.embeddings) > 0 and self.faiss_index is not None:
+        if search_type == "semantic":
+            if self.embeddings is None or len(self.embeddings) == 0 or self.faiss_index is None:
+                return []
+            
             if self.embedding_model is None:
                 active_embedding_key = settings.default_embedding_provider
                 self.embedding_model = ModelProviderFactory.get_embedding_provider(active_embedding_key)
             
             query_embedding = np.array(self.embedding_model.embed_documents([query])[0], dtype=np.float32).reshape(1, -1)
             
-            # FAISS 搜索
-            # 确保 self.faiss_index 不为 None 且 query_embedding 是有效的 numpy 数组
-            if self.faiss_index is not None and isinstance(query_embedding, np.ndarray):
-                distances, indices = self.faiss_index.search(query_embedding, top_k * 2) # type: ignore # 检索更多以供过滤
-            else:
-                distances, indices = np.array([[]]), np.array([[]]) # 如果条件不满足，返回空数组
-            
-            similarities = 1 - (distances[0] / np.max(distances[0])) if distances.size > 0 and np.max(distances[0]) != 0 else np.zeros_like(distances[0]) # 归一化距离为相似度
-            
-            semantic_results = []
-            for i, idx in enumerate(indices[0]):
-                if idx == -1: continue # 跳过无效索引
-                if similarities.size > i and similarities[i] >= score_threshold: # 确保索引有效
-                    doc = copy.deepcopy(self.documents[idx])
-                    doc["semantic_score"] = similarities[i]
-                    semantic_results.append(doc)
-            semantic_results = sorted(semantic_results, key=lambda x: x.get("semantic_score", 0), reverse=True)[:top_k]
+            if self.faiss_index is None or not isinstance(query_embedding, np.ndarray):
+                 return []
 
-        full_text_results = []
-        if self.bm25_index:
+            distances, indices = self.faiss_index.search(query_embedding, top_k) # type: ignore
+            
+            # L2 距离转换为相似度分数 (0-1范围)
+            # 一个简单的转换方法是 1 / (1 + distance)
+            similarities = 1.0 / (1.0 + distances[0])
+
+            results = []
+            for i, idx in enumerate(indices[0]):
+                if idx == -1: continue
+                doc = copy.deepcopy(self.documents[idx])
+                doc["score"] = similarities[i] # 使用 'score' 作为通用分数键
+                results.append(doc)
+            return sorted(results, key=lambda x: x.get("score", 0), reverse=True)
+
+        elif search_type == "keyword":
+            if not self.bm25_index:
+                return []
+            
             tokenized_query = list(jieba.cut(query))
             doc_scores = self.bm25_index.get_scores(tokenized_query)
-            top_indices = np.argsort(doc_scores)[-top_k:][::-1]
-            full_text_results = [
-                {**copy.deepcopy(self.documents[i]), "keyword_score": doc_scores[i]}
-                for i in top_indices if doc_scores[i] > 0
-            ][:top_k]
-
-        # 合并和重排逻辑 (与 retriever.py 中的 HybridReranker 类似)
-        if retrieval_method == RetrievalMethod.HYBRID_SEARCH: # 使用导入的 RetrievalMethod
-            all_docs = {doc["metadata"]["source"] + doc["page_content"]: doc for doc in semantic_results}
-            for doc in full_text_results:
-                key = doc["metadata"]["source"] + doc["page_content"]
-                if key in all_docs: all_docs[key].update(doc)
-                else: all_docs[key] = doc
             
-            # 归一化BM25分数
-            documents_to_rerank = list(all_docs.values())
-            keyword_scores = [doc.get("keyword_score", 0) for doc in documents_to_rerank]
-            max_keyword_score = max(keyword_scores) if keyword_scores else 1
-            normalized_keyword_scores = [s / max_keyword_score for s in keyword_scores]
+            # 获取所有分数大于0的文档的索引和分数
+            top_indices = np.argsort(doc_scores)[::-1]
             
-            # 归一化语义分数
-            semantic_scores = [doc.get("semantic_score", 0) for doc in documents_to_rerank]
-            max_semantic_score = max(semantic_scores) if semantic_scores else 1
-            normalized_semantic_scores = [s / max_semantic_score for s in semantic_scores]
+            results = []
+            for i in top_indices:
+                if doc_scores[i] > 0:
+                    doc = copy.deepcopy(self.documents[i])
+                    doc["score"] = doc_scores[i] # 使用 'score' 作为通用分数键
+                    results.append(doc)
+                else:
+                    # 由于分数是排序的，一旦遇到非正数就可以停止
+                    break
             
-            for i, doc in enumerate(documents_to_rerank):
-                doc["score"] = (settings.chat_vector_weight * normalized_semantic_scores[i] +
-                                settings.chat_keyword_weight * normalized_keyword_scores[i])
-            ranked_results = sorted(documents_to_rerank, key=lambda x: x["score"], reverse=True)
-        elif retrieval_method == RetrievalMethod.SEMANTIC_SEARCH: # 使用导入的 RetrievalMethod
-            ranked_results = sorted(semantic_results, key=lambda x: x.get("semantic_score", 0), reverse=True)
-        else: # FULL_TEXT_SEARCH
-            ranked_results = sorted(full_text_results, key=lambda x: x.get("keyword_score", 0), reverse=True)
-
-        return ranked_results[:top_k]
+            # 在返回之前按分数排序并取 top_k
+            return sorted(results, key=lambda x: x.get("score", 0), reverse=True)[:top_k]
+        
+        else:
+            raise ValueError(f"不支持的搜索类型: {search_type}")
 
     def save(self, path: str):
         """

@@ -7,7 +7,7 @@ from src.providers.__base__.model_provider import (
     LargeLanguageModel,
     TextEmbeddingModel,
 )
-from src.utils.config import API_CONFIG
+from src.utils.config import settings
 
 
 class OpenAIProvider(LargeLanguageModel, TextEmbeddingModel):
@@ -17,8 +17,8 @@ class OpenAIProvider(LargeLanguageModel, TextEmbeddingModel):
 
     def __init__(self, model_name: str):
         self._model_name = model_name
-        api_key = API_CONFIG.get("OPENAI_API_KEY")
-        base_url = API_CONFIG.get("OPENAI_API_BASE")
+        api_key = settings.openai_api_key
+        base_url = settings.openai_api_base
 
         if not api_key:
             raise ValueError("OpenAI配置不完整：缺少 OPENAI_API_KEY。")

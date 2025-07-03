@@ -3,9 +3,7 @@
 # 1. 导入 (IMPORTS)
 # =================================================================
 import os
-import re
 import sys
-import numpy as np
 import pickle
 from typing import Any, Optional, List, Dict
 
@@ -14,8 +12,6 @@ from typing import Any, Optional, List, Dict
 # 这样我们就可以从 src 目录导入模块
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pydantic import BaseModel, Field
-from abc import ABC, abstractmethod
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -27,81 +23,33 @@ from src.providers.factory import ModelProviderFactory
 from src.retrieval.vdb.base import VectorStoreBase # 导入 VectorStoreBase
 from src.retrieval.vdb.factory import VectorStoreFactory # 导入 VectorStoreFactory
 from src.ui.display_utils import CONSOLE_WIDTH, get_relative_path
+from src.etl.pipeline import PipelineManager # 导入 PipelineManager
 
 # =================================================================
-# 2. 文本处理 (TEXT PROCESSING)
-# =================================================================
-class Document(BaseModel):
-    page_content: str
-    metadata: dict = Field(default_factory=dict)
-
-class TextSplitter(ABC):
-    def __init__(self, chunk_size: int = 4000, chunk_overlap: int = 200, **kwargs: Any):
-        self._chunk_size = chunk_size
-        self._chunk_overlap = chunk_overlap
-
-    @abstractmethod
-    def split_text(self, text: str) -> List[str]:
-        raise NotImplementedError
-
-class EnhanceRecursiveCharacterTextSplitter(TextSplitter):
-    def __init__(self, separators: Optional[List[str]] = None, **kwargs: Any):
-        super().__init__(**kwargs)
-        self._separators = separators or ["\n\n", "\n", " ", ""]
-
-    def split_text(self, text: str) -> list[str]:
-        final_chunks = []
-        separator = self._separators[-1]
-        for _s in self._separators:
-            if _s == "":
-                separator = _s
-                break
-            if re.search(_s, text):
-                separator = _s
-                break
-        
-        splits = re.split(f'({separator})', text)
-        _good_splits = [s for s in splits if s]
-        
-        _merger = ""
-        for s in _good_splits:
-            if len(_merger) + len(s) < self._chunk_size:
-                _merger += s
-            else:
-                final_chunks.append(_merger)
-                _merger = s
-        final_chunks.append(_merger)
-        return [chunk for chunk in final_chunks if chunk and chunk.strip()]
-
-# =================================================================
-# 3. 知识库核心 (KNOWLEDGE BASE CORE)
+# 2. 知识库核心 (KNOWLEDGE BASE CORE)
 # =================================================================
 def process_documents(vector_store: VectorStoreBase): # 更改类型提示
     console = Console()
     kb_dir = settings.knowledge_base_path # 使用 settings
-    all_texts = []
-    all_metadatas = []
-    console.print("[bold]开始处理文档...[/bold]")
+    
+    # 获取所有Markdown文件路径
+    markdown_files = []
     for filename in os.listdir(kb_dir):
         if filename.endswith(".md"):
-            file_path = os.path.join(kb_dir, filename)
-            console.print(f"  [cyan]正在读取文件:[/cyan] {filename}")
-            with open(file_path, "r", encoding="utf-8") as f:
-                content = f.read()
-                text_splitter = EnhanceRecursiveCharacterTextSplitter(
-                    chunk_size=settings.kb_chunk_size, # 使用 settings
-                    chunk_overlap=settings.kb_chunk_overlap, # 使用 settings
-                    separators=settings.kb_splitter_separators # 使用 settings
-                )
-                chunks = text_splitter.split_text(content)
-                for chunk in chunks:
-                    all_texts.append(chunk)
-                    all_metadatas.append({"source": filename})
+            markdown_files.append(os.path.join(kb_dir, filename))
 
-    console.print(f"  [green]总共生成 [bold]{len(all_texts)}[/bold] 个文本块。[/green]")
+    if not markdown_files:
+        console.print(f"[bold red]错误: 知识库目录 '{kb_dir}' 中未找到Markdown文档。[/bold red]")
+        sys.exit(1)
+
+    console.print("[bold]开始通过ETL流水线处理文档...[/bold]")
+    pipeline_manager = PipelineManager()
+    final_chunks = pipeline_manager.process_documents(markdown_files)
+
+    console.print(f"  [green]总共生成 [bold]{len(final_chunks)}[/bold] 个文本块。[/green]")
     
     # 将文档内容和元数据存入 VectorStore 实例
-    documents_to_embed = [{"page_content": text, "metadata": meta} for text, meta in zip(all_texts, all_metadatas)]
+    documents_to_embed = [{"page_content": chunk["content"], "metadata": chunk["metadata"]} for chunk in final_chunks]
     vector_store.add_documents(documents_to_embed) # 调用 add_documents 方法
 
     console.print("  [bold]开始生成文本嵌入...[/bold]")
@@ -145,7 +93,9 @@ def display_config_and_confirm():
     table.add_row("输出文件路径", f"[bold cyan]{get_relative_path(settings.pkl_path)}[/bold cyan]")
     table.add_row("文本切分块大小 (Chunk Size)", f"[bold magenta]{settings.kb_chunk_size}[/bold magenta]")
     table.add_row("文本切分重叠量 (Overlap)", f"[bold magenta]{settings.kb_chunk_overlap}[/bold magenta]")
-    table.add_row("切分分隔符 (Separators)", f"[bold bright_white]{settings.kb_splitter_separators}[/bold bright_white]")
+    # 将分隔符列表转换为更易读的字符串
+    separators_str = ", ".join([f"'{s}'" for s in settings.kb_splitter_separators])
+    table.add_row("切分分隔符 (Separators)", f"[bold bright_white]{separators_str}[/bold bright_white]")
     table.add_section()
 
     # --- 模型与API配置 ---
@@ -188,10 +138,11 @@ def main():
     console = Console()
     display_config_and_confirm()
     
-    kb_dir = settings.knowledge_base_path # 使用 settings
-    if not os.path.exists(kb_dir) or not any(f.endswith('.md') for f in os.listdir(kb_dir)):
-         console.print(f"[bold red]错误: 知识库目录 '{kb_dir}' 不存在或为空。请先添加Markdown文档。[/bold red]")
-         sys.exit(1)
+    # 知识库目录检查已移至 process_documents 内部
+    # kb_dir = settings.knowledge_base_path 
+    # if not os.path.exists(kb_dir) or not any(f.endswith('.md') for f in os.listdir(kb_dir)):
+    #      console.print(f"[bold red]错误: 知识库目录 '{kb_dir}' 不存在或为空。请先添加Markdown文档。[/bold red]")
+    #      sys.exit(1)
 
     vector_store = VectorStoreFactory.get_default_vector_store() # 通过工厂获取实例
     process_documents(vector_store)

@@ -4,7 +4,7 @@ import glob
 import atexit
 import shutil
 from rich.console import Console
-from .config import CACHE_PATH
+from .config import settings
 
 console = Console()
 
@@ -14,7 +14,8 @@ def cleanup_temp_files():
     """
     console.print("\n[dim]执行退出前清理任务...[/dim]")
     
-    cache_dir = CACHE_PATH
+    # 从 settings 对象获取缓存路径
+    cache_dir = settings.cache_path
     
     if os.path.exists(cache_dir):
         try:

@@ -45,13 +45,13 @@ class RerankModel(ABC):
     """Rerank模型抽象基类"""
 
     @abstractmethod
-    def rerank(self, query: str, documents: List[str], top_n: int) -> List[int]:
+    def rerank(self, query: str, documents: List[str], top_n: int) -> tuple[list[int], list[float]]:
         """
         对文档列表进行重排序。
 
         :param query: 查询语句。
         :param documents: 待排序的文档列表。
         :param top_n: 需要返回的重排后文档数量。
-        :return: 排序后的文档索引列表。
+        :return: 一个元组，包含 (排序后的文档索引列表, 对应的相关度分数列表)。
         """
         pass

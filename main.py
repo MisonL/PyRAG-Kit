@@ -14,8 +14,8 @@ from prompt_toolkit.formatted_text import HTML
 # --- 绝对导入 ---
 # 导入 cleanup 模块以注册 atexit 钩子
 import src.utils.cleanup
-# 从 config 模块直接导入 CACHE_PATH
-from src.utils.config import CACHE_PATH
+# 从新的配置模块导入 settings 实例
+from src.utils.config import settings
 # 导入日志清理函数
 from src.utils.log_manager import cleanup_old_logs
 # 导入UI工具
@@ -94,8 +94,8 @@ def initialize_dependencies():
     # 1. 执行日志清理
     cleanup_old_logs()
     
-    # 2. 使用从配置中导入的缓存目录
-    cache_dir = CACHE_PATH
+    # 2. 使用从 settings 实例获取的缓存目录
+    cache_dir = settings.cache_path
     if not os.path.exists(cache_dir):
         os.makedirs(cache_dir)
     

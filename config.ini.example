@@ -32,12 +32,17 @@ LM_STUDIO_BASE_URL = http://localhost:1234/v1
 VOLC_BASE_URL = https://maas-api.ml-platform-cn-beijing.volces.com
 GROK_BASE_URL = https://api.x.ai/v1
 
+[GENERAL]
+# 通用配置
+LOG_LEVEL = INFO # 日志级别 (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+CACHE_PATH = .cache # 缓存文件存放目录
+LOG_PATH = data/logs # 程序运行日志的存放目录
+LOG_RETENTION_DAYS = 15 # 日志文件的最长保留天数（例如，15天）
+
 [PATHS]
 # 路径配置
 KNOWLEDGE_BASE_PATH = knowledge_base # 存放原始知识库文档的目录
 PKL_PATH = data/employee_kb.pkl # 处理和向量化后的知识库数据存储路径 (pickle文件)
-LOG_PATH = data/logs # 程序运行日志的存放目录
-LOG_RETENTION_DAYS = 15 # 日志文件的最长保留天数（例如，15天）
 
 [KNOWLEDGE_BASE]
 # 知识库构建与文本处理相关的配置
@@ -56,6 +61,7 @@ KB_EMBEDDING_BATCH_SIZE = 32 # 向量化处理时，每批处理的文本数量 
 DEFAULT_LLM_PROVIDER = google # 程序启动时默认加载的LLM提供商 (必须是下面LLM_CONFIGURATIONS中定义的key)
 DEFAULT_EMBEDDING_PROVIDER = google # 构建知识库时默认使用的向量化模型 (必须是下面EMBEDDING_CONFIGURATIONS中定义的key)
 DEFAULT_RERANK_PROVIDER = siliconflow # 默认使用的Rerank模型 (必须是下面RERANK_CONFIGURATIONS中定义的key)
+DEFAULT_VECTOR_STORE = faiss # 默认使用的向量数据库 (目前仅支持 faiss)
 
 [CHAT]
 # 聊天机器人核心功能配置
@@ -65,6 +71,7 @@ CHAT_KEYWORD_WEIGHT = 0.7 # 混合搜索中，关键词搜索结果的权重 (�
 CHAT_RERANK_ENABLED = False # 是否启用Rerank精排模型对检索结果进行二次排序
 CHAT_TOP_K = 5 # 检索返回的最相关文档数量
 CHAT_SCORE_THRESHOLD = 0.4 # 向量搜索的得分阈值，低于此分数的文档将被过滤
+CHAT_TEMPERATURE = 0.7 # LLM生成回答时的温度系数 (0.0-1.0之间，越高越有创意)
 
 [MODEL_CONFIGURATIONS]
 # 模型配置 (JSON格式)
@@ -72,7 +79,8 @@ CHAT_SCORE_THRESHOLD = 0.4 # 向量搜索的得分阈值，低于此分数的文
 # "key" (如 "google", "openai-gpt4o") 是您在程序中选择模型时使用的名称。
 # "provider" 必须与 `src/providers/` 目录下的模型提供商实现相对应。
 # "model_name" 是传递给API的实际模型名称。
-EMBEDDING_CONFIGURATIONS = 
+# 注意: 在.ini文件中，值可以跨越多行，只要后续行以空格或制表符开头即可。
+EMBEDDING_CONFIGURATIONS =
 	{
 	    "google": {"provider": "google", "model_name": "models/text-embedding-004"},
 	    "openai": {"provider": "openai", "model_name": "text-embedding-3-large"},
@@ -82,14 +90,14 @@ EMBEDDING_CONFIGURATIONS =
 	    "siliconflow": {"provider": "siliconflow", "model_name": "BAAI/bge-m3"}
 	}
 
-RERANK_CONFIGURATIONS = 
+RERANK_CONFIGURATIONS =
 	{
 	    "siliconflow": {"provider": "siliconflow", "model_name": "BAAI/bge-reranker-v2-m3"},
 	    "jina": {"provider": "jina", "model_name": "jina-reranker-v2-base-multilingual"},
 	    "qwen": {"provider": "qwen", "model_name": "Qwen/Qwen3-Reranker-4B"}
 	}
 
-LLM_CONFIGURATIONS = 
+LLM_CONFIGURATIONS =
 	{
 	    "google": {"provider": "google", "model_name": "gemini-2.5-flash"},
 	    "google-pro": {"provider": "google", "model_name": "gemini-2.5-pro"},

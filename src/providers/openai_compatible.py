@@ -7,7 +7,7 @@ from src.providers.__base__.model_provider import (
     LargeLanguageModel,
     TextEmbeddingModel,
 )
-from src.utils.config import API_CONFIG
+from src.utils.config import settings
 
 
 class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
@@ -19,11 +19,12 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         self._model_name = model_name
         self._provider = provider
 
-        api_key_name = f"{provider.upper()}_API_KEY"
-        base_url_name = f"{provider.upper()}_BASE_URL"
+        # 从 settings 对象动态获取配置
+        api_key_name = f"{provider.lower()}_api_key"
+        base_url_name = f"{provider.lower()}_base_url"
 
-        api_key = API_CONFIG.get(api_key_name)
-        base_url = API_CONFIG.get(base_url_name)
+        api_key = getattr(settings, api_key_name, None)
+        base_url = getattr(settings, base_url_name, None)
 
         # 特殊处理ollama和lm-studio，它们通常不需要key
         if provider in ["ollama", "lm-studio"] and not api_key:

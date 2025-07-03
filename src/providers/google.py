@@ -9,11 +9,11 @@ from src.providers.__base__.model_provider import (
     LargeLanguageModel,
     TextEmbeddingModel,
 )
-from src.utils.config import API_CONFIG
+from src.utils.config import settings
 
 # 初始化Google API
-if API_CONFIG.get("GOOGLE_API_KEY"):
-    configure(api_key=API_CONFIG["GOOGLE_API_KEY"])
+if settings.google_api_key:
+    configure(api_key=settings.google_api_key)
 
 
 class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
