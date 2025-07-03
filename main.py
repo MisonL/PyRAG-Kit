@@ -45,14 +45,38 @@ def display_banner():
     banner_text = fig.renderText('PyRAG-Kit')
     
     # 定义渐变色 (左蓝右红)
-    blue = (0, 0, 255)
-    red = (255, 0, 0)
-    
-    gradient_banner = create_gradient(banner_text, blue, red)
-    console.print(gradient_banner)
-    
-    # 计算 banner 的宽度以对齐面板
-    banner_width = max(len(line) for line in banner_text.split('\n'))
+    blue_rgb = (0, 0, 255)
+    red_rgb = (255, 0, 0)
+
+    lines = banner_text.splitlines()
+    banner_width = max(len(l) for l in lines) if lines else CONSOLE_WIDTH
+
+    # 准备署名文本，使用Dify官方的黑(白)蓝配色并增加括号
+    attribution_text = Text("inspired by [", style="white")
+    attribution_text.append("d", style="bold white")
+    attribution_text.append("if", style="bold bright_blue")
+    attribution_text.append("y", style="bold white")
+    attribution_text.append("]", style="white")
+
+    # 逐行打印，以便对特定行进行特殊处理
+    for i, line in enumerate(lines):
+        # 如果是倒数第二行，添加署名
+        if i == len(lines) - 2:
+            line_content = line.rstrip()
+            gradient_part = create_gradient(line_content, blue_rgb, red_rgb)
+            
+            # 计算填充，确保署名在右下角对齐
+            padding_size = banner_width - len(line_content) - len(attribution_text)
+            if padding_size < 1:
+                padding_size = 1
+            
+            padding = Text(" " * padding_size)
+            
+            # 组合并打印该行
+            console.print(gradient_part + padding + attribution_text)
+        else:
+            # 其他行正常打印渐变效果
+            console.print(create_gradient(line, blue_rgb, red_rgb))
     
     # 构建包含丰富链接和信息的欢迎面板
     welcome_text = Text(justify="center")

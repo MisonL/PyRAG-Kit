@@ -26,6 +26,12 @@
 - **✅ 单元测试**: 为核心模块（如模型提供商工厂、向量存储工厂、ETL流水线）编写了全面的单元测试，确保代码质量和功能稳定性。
 - **🧹 智能缓存与清理**: 自动处理知识库向量化，并在程序退出时清理缓存，保持项目整洁。
 
+## 📚 使用文档
+
+为了帮助您更好地理解和使用本项目，我们提供了一套完整的在线文档，涵盖了从快速上手到二次开发的所有内容。
+
+**[➡️ 点击这里，查看完整用户指南](./docs/user_guide/introduction.md)**
+
 ## 📸 程序截图
 
 ![Main Screenshot](imgs/main.jpg)
@@ -182,7 +188,7 @@ python main.py
 
 ---
 
-<div align="center">
+---
 
 ## ⚖️ 许可证声明
 
@@ -196,17 +202,15 @@ python main.py
 
 以下文件包含或受 Dify 核心逻辑启发：
 
-*   `src/etl/pipeline.py`
-*   `src/etl/cleaners/base.py`
-*   `src/etl/cleaners/basic_cleaner.py`
-*   `src/etl/extractors/base.py`
-*   `src/etl/extractors/markdown_extractor.py`
-*   `src/etl/splitters/base.py`
-*   `src/etl/splitters/recursive_text_splitter.py`
-*   `src/retrieval/retriever.py`
-*   `src/retrieval/vdb/base.py`
-*   `src/retrieval/vdb/factory.py`
-*   `src/retrieval/vdb/faiss_store.py`
-*   `src/models/document.py`
-
-</div>
+*   [`src/etl/pipeline.py`](src/etl/pipeline.py)
+*   [`src/etl/cleaners/base.py`](src/etl/cleaners/base.py)
+*   [`src/etl/cleaners/basic_cleaner.py`](src/etl/cleaners/basic_cleaner.py)
+*   [`src/etl/extractors/base.py`](src/etl/extractors/base.py)
+*   [`src/etl/extractors/markdown_extractor.py`](src/etl/extractors/markdown_extractor.py)
+*   [`src/etl/splitters/base.py`](src/etl/splitters/base.py)
+*   [`src/etl/splitters/recursive_text_splitter.py`](src/etl/splitters/recursive_text_splitter.py)
+*   [`src/retrieval/retriever.py`](src/retrieval/retriever.py)
+*   [`src/retrieval/vdb/base.py`](src/retrieval/vdb/base.py)
+*   [`src/retrieval/vdb/factory.py`](src/retrieval/vdb/factory.py)
+*   [`src/retrieval/vdb/faiss_store.py`](src/retrieval/vdb/faiss_store.py)
+*   [`src/models/document.py`](src/models/document.py)
