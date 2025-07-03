@@ -37,8 +37,28 @@ class FaissStore(VectorStoreBase):
         self.embeddings: Optional[np.ndarray] = None
         self.bm25_index: Optional[BM25Okapi] = None
         self.faiss_index: Optional[faiss.IndexFlatL2] = None
-        self.embedding_model = None # 在加载或添加文档时设置
-        logger.info(f"FaissStore 初始化完成，文件路径: {file_path if file_path else '未指定'}")
+        
+        # 在初始化时就获取嵌入模型
+        try:
+            current_settings = get_settings()
+            active_embedding_key = current_settings.default_embedding_provider
+            self.embedding_model = ModelProviderFactory.get_embedding_provider(active_embedding_key)
+            logger.info(f"FaissStore 初始化时成功获取嵌入模型: {active_embedding_key}")
+        except Exception as e:
+            logger.error(f"FaissStore 初始化时获取嵌入模型失败: {e}", exc_info=True)
+            self.embedding_model = None
+
+        if self.file_path and os.path.exists(self.file_path):
+            logger.info(f"找到向量存储文件，正在从 {self.file_path} 加载...")
+            try:
+                self.load(self.file_path)
+                logger.info("向量存储加载成功。")
+            except Exception as e:
+                logger.error(f"从 {self.file_path} 加载向量存储失败: {e}", exc_info=True)
+        else:
+            logger.info("未提供或未找到向量存储文件，FaissStore 为空实例。")
+        
+        logger.info(f"FaissStore 初始化完成。")
     
     def _initialize_bm25(self):
         """在加载文档或添加新文档后初始化/更新BM25索引。"""
@@ -129,17 +149,13 @@ class FaissStore(VectorStoreBase):
             包含相关文档内容和元数据的字典列表。
         """
         if search_type == "semantic":
-            if self.embeddings is None or len(self.embeddings) == 0 or self.faiss_index is None:
+            if self.embeddings is None or len(self.embeddings) == 0 or self.faiss_index is None or self.embedding_model is None:
+                logger.warning("语义搜索无法执行：嵌入、FAISS索引或嵌入模型未初始化。")
                 return []
-            
-            if self.embedding_model is None:
-                current_settings = get_settings() # 获取当前配置
-                active_embedding_key = current_settings.default_embedding_provider
-                self.embedding_model = ModelProviderFactory.get_embedding_provider(active_embedding_key)
             
             query_embedding = np.array(self.embedding_model.embed_documents([query])[0], dtype=np.float32).reshape(1, -1)
             
-            if self.faiss_index is None or not isinstance(query_embedding, np.ndarray):
+            if not isinstance(query_embedding, np.ndarray):
                  return []
 
             distances, indices = self.faiss_index.search(query_embedding, top_k) # type: ignore

@@ -100,8 +100,9 @@ def display_menu():
     menu_content = (
         "请选择要执行的操作:\n"
         "[bold cyan]1.[/bold cyan] 知识库文档向量化处理\n"
-        "[bold cyan]2.[/bold cyan] 启动聊天机器人会话\n"
-        "[bold cyan]3.[/bold cyan] 退出程序"
+        "[bold cyan]2.[/bold cyan] 召回测试\n"
+        "[bold cyan]3.[/bold cyan] 启动聊天机器人会话\n"
+        "[bold cyan]4.[/bold cyan] 退出程序"
     )
     console.print(Panel(menu_content, title="[bold yellow]主菜单[/bold yellow]", border_style="green", expand=False, highlight=True))
 
@@ -142,7 +143,7 @@ def main():
         display_menu()
         try:
             # 使用 prompt_toolkit 替代 console.input，并优化样式
-            choice = prompt(HTML('<skyblue><b>请输入选项 (1-3): </b></skyblue>'))
+            choice = prompt(HTML('<skyblue><b>请输入选项 (1-4): </b></skyblue>'))
             if choice == '1':
                 console.print(Panel("[bold green]开始执行知识库文档向量化处理...[/bold green]", border_style="green", width=CONSOLE_WIDTH))
                 # 延迟加载和执行
@@ -150,16 +151,22 @@ def main():
                 run_embedding_process()
                 console.print(Panel("[bold green]向量化处理完成。[/bold green]", border_style="green", width=CONSOLE_WIDTH))
             elif choice == '2':
+                console.print(Panel("[bold green]开始执行召回测试...[/bold green]", border_style="green", width=CONSOLE_WIDTH))
+                # 延迟加载和执行
+                from src.retrieval_test.core import run_retrieval_test
+                run_retrieval_test()
+                console.print(Panel("[bold green]召回测试完成。[/bold green]", border_style="green", width=CONSOLE_WIDTH))
+            elif choice == '3':
                 console.print(Panel("[bold green]启动聊天机器人会话...[/bold green]", border_style="green", width=CONSOLE_WIDTH))
                 # 延迟加载和执行
                 from src.chat.core import start_chat_session
                 start_chat_session()
                 console.print(Panel("[bold green]聊天会话结束。[/bold green]", border_style="green", width=CONSOLE_WIDTH))
-            elif choice == '3':
+            elif choice == '4':
                 console.print("[bold]正在退出程序... 再见！[/bold]")
                 sys.exit(0)
             else:
-                console.print("[bold red]无效的选项，请输入 1, 2, 或 3。[/bold red]")
+                console.print("[bold red]无效的选项，请输入 1, 2, 3, 或 4。[/bold red]")
         except (KeyboardInterrupt, EOFError):
             console.print("\n[bold yellow]检测到中断信号，正在退出程序... 再见！[/bold yellow]")
             sys.exit(0)
