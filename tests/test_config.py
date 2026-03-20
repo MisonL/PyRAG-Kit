@@ -60,6 +60,16 @@ def test_settings_model_validation():
         Settings(chat_retrieval_method="UNKNOWN_METHOD")  # type: ignore[arg-type]
 
 
+def test_settings_splitter_separators_empty_string_falls_back_to_default():
+    settings = Settings(kb_splitter_separators="")
+    assert settings.kb_splitter_separators == ["###"]
+
+
+def test_settings_splitter_separators_blank_csv_falls_back_to_default():
+    settings = Settings(kb_splitter_separators=" , ")
+    assert settings.kb_splitter_separators == ["###"]
+
+
 def test_settings_defaults():
     settings = get_settings()
 

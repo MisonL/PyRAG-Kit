@@ -78,7 +78,7 @@ class JinaProvider(RerankModel):
             return indices, scores
         except Exception as e:
             logger.error(f"Jina Rerank ({self._model_name}) 出错: {e}", exc_info=True)
-            return list(range(len(documents))), [0.0] * len(documents)
+            raise
 
     @retry(
         stop=stop_after_attempt(3),
@@ -108,4 +108,4 @@ class JinaProvider(RerankModel):
             return indices, scores
         except Exception as e:
             logger.error(f"Jina Rerank ({self._model_name}) 异步出错: {e}", exc_info=True)
-            return list(range(len(documents))), [0.0] * len(documents)
+            raise

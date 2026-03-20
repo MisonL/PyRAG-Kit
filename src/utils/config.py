@@ -197,10 +197,14 @@ class Settings(BaseSettings):
         如果分隔符是字符串，则按逗号分割成列表。
         如果输入值为空（None或空字符串），或者分割后为空列表，则使用字段的默认值。
         """
-        # 通过访问类的模型字段来安全地获取默认值
-        default_value = cls.model_fields['kb_splitter_separators'].default
-        if default_value is None:
-            default_value = [] # 以防万一没有设置默认值
+        field_info = cls.model_fields["kb_splitter_separators"]
+        default_factory = field_info.default_factory
+        if default_factory is not None:
+            default_value = default_factory()
+        else:
+            default_value = field_info.default
+            if default_value is None:
+                default_value = []
 
         # 如果输入为空（来自 .env 或环境变量的空字符串），则回退到默认值
         if v is None or v == '':

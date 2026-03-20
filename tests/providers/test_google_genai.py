@@ -1,5 +1,6 @@
 import pytest
 from unittest.mock import MagicMock, patch
+import src.providers.google as google_module
 from src.providers.google import GoogleProvider
 
 @pytest.fixture(autouse=True)
@@ -7,13 +8,13 @@ def mock_settings(monkeypatch):
     """强制模拟 settings 并在环境中设置 key"""
     mock_settings_instance = MagicMock()
     mock_settings_instance.google_api_key = "fake_key"
-    monkeypatch.setattr("src.providers.google.get_settings", lambda: mock_settings_instance)
+    monkeypatch.setattr(google_module, "get_settings", lambda: mock_settings_instance)
     monkeypatch.setenv("GOOGLE_API_KEY", "fake_key")
     return mock_settings_instance
 
 @pytest.fixture
 def mock_genai_client():
-    with patch('src.providers.google.genai.Client') as mock_client_class:
+    with patch.object(google_module.genai, "Client") as mock_client_class:
         mock_client = MagicMock()
         mock_client_class.return_value = mock_client
         yield mock_client

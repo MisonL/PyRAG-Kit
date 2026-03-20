@@ -74,7 +74,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             logger.info(f"Google LLM ({self._model_name}) 调用完成，耗时: {duration:.2f}s")
         except Exception as e:
             logger.error(f"Google LLM ({self._model_name}) 出错: {e}", exc_info=True)
-            yield f"抱歉，Google LLM 遇到错误: {str(e)}"
+            raise
 
     @retry(
         stop=stop_after_attempt(3),
@@ -111,7 +111,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             logger.info(f"Google LLM ({self._model_name}) 异步调用完成，耗时: {duration:.2f}s")
         except Exception as e:
             logger.error(f"Google LLM ({self._model_name}) 异步出错: {e}", exc_info=True)
-            yield f"抱歉，Google LLM 异步处理遇到错误: {str(e)}"
+            raise
 
     @retry(
         stop=stop_after_attempt(3),
@@ -137,7 +137,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             return embeddings
         except Exception as e:
             logger.error(f"Google Embedding ({self._model_name}) 出错: {e}", exc_info=True)
-            return [[] for _ in texts]
+            raise
 
     @retry(
         stop=stop_after_attempt(3),
@@ -163,4 +163,4 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             return embeddings
         except Exception as e:
             logger.error(f"Google Embedding ({self._model_name}) 异步出错: {e}", exc_info=True)
-            return [[] for _ in texts]
+            raise

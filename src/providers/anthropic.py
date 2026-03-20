@@ -82,7 +82,7 @@ class AnthropicProvider(LargeLanguageModel):
             logger.info(f"Anthropic LLM ({self._model_name}) 调用完成，耗时: {duration:.2f}s")
         except Exception as e:
             logger.error(f"Anthropic LLM ({self._model_name}) 出错: {e}", exc_info=True)
-            yield f"抱歉，Anthropic 遇到错误: {str(e)}"
+            raise
 
     @retry(
         stop=stop_after_attempt(3),
@@ -126,4 +126,4 @@ class AnthropicProvider(LargeLanguageModel):
             logger.info(f"Anthropic LLM ({self._model_name}) 异步调用完成，耗时: {duration:.2f}s")
         except Exception as e:
             logger.error(f"Anthropic LLM ({self._model_name}) 异步出错: {e}", exc_info=True)
-            yield f"抱歉，Anthropic 异步处理遇到错误: {str(e)}"
+            raise

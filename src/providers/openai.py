@@ -84,7 +84,7 @@ class OpenAIProvider(LargeLanguageModel, TextEmbeddingModel):
             logger.info(f"OpenAI LLM ({self._model_name}) 调用完成，耗时: {duration:.2f}s")
         except Exception as e:
             logger.error(f"OpenAI LLM ({self._model_name}) 出错: {e}", exc_info=True)
-            yield f"抱歉，OpenAI 遇到错误: {str(e)}"
+            raise
 
     @retry(
         stop=stop_after_attempt(3),
@@ -126,7 +126,7 @@ class OpenAIProvider(LargeLanguageModel, TextEmbeddingModel):
             logger.info(f"OpenAI LLM ({self._model_name}) 异步调用完成，耗时: {duration:.2f}s")
         except Exception as e:
             logger.error(f"OpenAI LLM ({self._model_name}) 异步出错: {e}", exc_info=True)
-            yield f"抱歉，OpenAI 异步处理遇到错误: {str(e)}"
+            raise
 
     @retry(
         stop=stop_after_attempt(3),
@@ -148,7 +148,7 @@ class OpenAIProvider(LargeLanguageModel, TextEmbeddingModel):
             return embeddings
         except Exception as e:
             logger.error(f"OpenAI Embedding ({self._model_name}) 出错: {e}", exc_info=True)
-            return [[] for _ in texts]
+            raise
 
     @retry(
         stop=stop_after_attempt(3),
@@ -170,4 +170,4 @@ class OpenAIProvider(LargeLanguageModel, TextEmbeddingModel):
             return embeddings
         except Exception as e:
             logger.error(f"OpenAI Embedding ({self._model_name}) 异步出错: {e}", exc_info=True)
-            return [[] for _ in texts]
+            raise

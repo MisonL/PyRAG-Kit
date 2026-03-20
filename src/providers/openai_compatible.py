@@ -92,7 +92,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             logger.info(f"{self._provider} LLM ({self._model_name}) 调用完成，耗时: {duration:.2f}s")
         except Exception as e:
             logger.error(f"{self._provider} LLM ({self._model_name}) 出错: {e}", exc_info=True)
-            yield f"抱歉，提供商 {self._provider} 遇到错误: {str(e)}"
+            raise
 
     async def ainvoke(
         self,
@@ -128,7 +128,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             logger.info(f"{self._provider} LLM ({self._model_name}) 异步调用完成，耗时: {duration:.2f}s")
         except Exception as e:
             logger.error(f"{self._provider} LLM ({self._model_name}) 异步出错: {e}", exc_info=True)
-            yield f"抱歉，提供商 {self._provider} 异步处理遇到错误: {str(e)}"
+            raise
 
     @retry(
         stop=stop_after_attempt(3),
@@ -150,7 +150,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             return embeddings
         except Exception as e:
             logger.error(f"{self._provider} 嵌入 ({self._model_name}) 出错: {e}", exc_info=True)
-            return [[] for _ in texts]
+            raise
 
     async def aembed_documents(self, texts: List[str]) -> List[List[float]]:
         """异步向量化文档。"""
@@ -166,4 +166,4 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             return embeddings
         except Exception as e:
             logger.error(f"{self._provider} 嵌入 ({self._model_name}) 异步出错: {e}", exc_info=True)
-            return [[] for _ in texts]
+            raise

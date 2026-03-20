@@ -1,7 +1,7 @@
 import time
 from typing import Any, AsyncGenerator, Dict, Generator, List, Optional
 
-from volcengine.ark import Ark, AsyncArk
+from volcenginesdkarkruntime import Ark, AsyncArk
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from src.providers.__base__.model_provider import (
@@ -82,7 +82,7 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             logger.info(f"火山引擎 LLM ({self._model_name}) 调用完成，耗时: {duration:.2f}s")
         except Exception as e:
             logger.error(f"火山引擎 LLM ({self._model_name}) 出错: {e}", exc_info=True)
-            yield f"抱歉，火山引擎遇到错误: {str(e)}"
+            raise
 
     @retry(
         stop=stop_after_attempt(3),
@@ -124,7 +124,7 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             logger.info(f"火山引擎 LLM ({self._model_name}) 异步调用完成，耗时: {duration:.2f}s")
         except Exception as e:
             logger.error(f"火山引擎 LLM ({self._model_name}) 异步出错: {e}", exc_info=True)
-            yield f"抱歉，火山引擎异步处理遇到错误: {str(e)}"
+            raise
 
     @retry(
         stop=stop_after_attempt(3),
@@ -147,7 +147,7 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             return embeddings
         except Exception as e:
             logger.error(f"火山引擎嵌入 ({self._model_name}) 出错: {e}", exc_info=True)
-            return [[] for _ in texts]
+            raise
 
     @retry(
         stop=stop_after_attempt(3),
@@ -169,4 +169,4 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             return embeddings
         except Exception as e:
             logger.error(f"火山引擎嵌入 ({self._model_name}) 异步出错: {e}", exc_info=True)
-            return [[] for _ in texts]
+            raise
