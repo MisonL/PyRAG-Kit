@@ -39,6 +39,13 @@ HIDDEN_IMPORTS = [
     "src.providers.jina",
     "src.providers.siliconflow_rerank",
 ]
+EXCLUDED_MODULES = [
+    "pandas",
+    "scipy",
+    "sklearn",
+    "pytest",
+    "_pytest",
+]
 
 
 def load_version() -> str:
@@ -93,6 +100,8 @@ def run_pyinstaller() -> None:
     ]
     for hidden_import in HIDDEN_IMPORTS:
         command.extend(["--hidden-import", hidden_import])
+    for excluded_module in EXCLUDED_MODULES:
+        command.extend(["--exclude-module", excluded_module])
     command.append("main.py")
     subprocess.run(command, cwd=PROJECT_ROOT, check=True)
 
