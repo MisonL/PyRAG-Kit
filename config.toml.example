@@ -1,0 +1,267 @@
+# =================================================================
+# 本地知识库AI聊天机器人 - 主配置文件 (config.toml.example)
+# =================================================================
+# 使用方法:
+# 1. 将此文件复制并重命名为 config.toml
+# 2. 非密钥类配置放在这里
+# 3. 密钥类配置请放在 .env
+# 4. 修改后需要重启程序
+# =================================================================
+
+# OpenAI 兼容接口的默认 Base URL
+openai_api_base = "https://api.openai.com/v1"
+# SiliconFlow 的 Base URL
+siliconflow_base_url = "https://api.siliconflow.cn/v1"
+# Qwen 官方接口的 Base URL
+qwen_base_url = "https://dashscope.aliyuncs.com/api/v1"
+# DeepSeek 的 Base URL
+deepseek_base_url = "https://api.deepseek.com"
+# Ollama 的 Base URL
+ollama_base_url = "http://localhost:11434/v1"
+# LM Studio 的 Base URL
+lm_studio_base_url = "http://localhost:1234/v1"
+# 火山引擎的 Base URL
+volc_base_url = "https://maas-api.ml-platform-cn-beijing.volces.com"
+# Grok 的 Base URL
+grok_base_url = "https://api.x.ai/v1"
+
+# 日志级别
+log_level = "WARNING"
+# 缓存目录
+cache_path = ".cache"
+# 日志输出目录
+log_path = "data/logs"
+# 日志保留天数
+log_retention_days = 15
+
+# 原始知识库目录
+knowledge_base_path = "knowledge_base"
+# 向量化结果持久化路径
+pkl_path = "data/employee_kb.pkl"
+
+# 是否在清洗阶段折叠连续空白字符
+kb_replace_whitespace = false
+# 是否移除多余空格
+kb_remove_spaces = false
+# 是否移除 URL 和邮箱
+kb_remove_urls = false
+# 是否启用 QA 分段模式
+kb_use_qa_segmentation = false
+# 文本分割符列表
+kb_splitter_separators = ["###"]
+# 文本主分片大小
+kb_chunk_size = 1500
+# 文本主分片重叠大小
+kb_chunk_overlap = 150
+# 子分片大小
+kb_child_chunk_size = 300
+# 子分片重叠大小
+kb_child_chunk_overlap = 30
+# 每批嵌入的文本数量
+kb_embedding_batch_size = 32
+
+# 默认 LLM 提供商键
+default_llm_provider = "google"
+# 默认 Embedding 提供商键
+default_embedding_provider = "google"
+# 默认 Rerank 提供商键
+default_rerank_provider = "siliconflow"
+# 默认向量存储实现
+default_vector_store = "faiss"
+
+# 默认检索方式
+chat_retrieval_method = "HYBRID_SEARCH"
+# 混合检索中文本向量权重
+chat_vector_weight = 0.3
+# 混合检索中关键词权重
+chat_keyword_weight = 0.7
+# 混合检索融合策略
+hybrid_fusion_strategy = "rrf"
+# 检索候选过量招募倍率
+retrieval_candidate_multiplier = 3
+# 是否启用 Rerank 二次排序
+chat_rerank_enabled = false
+# 检索返回的 Top-K 数量
+chat_top_k = 5
+# 检索得分阈值
+chat_score_threshold = 0.4
+# LLM 输出温度
+chat_temperature = 0.7
+
+# --- 向量化模型配置 ---
+# google 向量化模型
+[embedding_configurations.google]
+# 提供商实现标识
+provider = "google"
+# API 实际模型名
+model_name = "models/text-embedding-004"
+
+# openai 向量化模型
+[embedding_configurations.openai]
+# 提供商实现标识
+provider = "openai"
+# API 实际模型名
+model_name = "text-embedding-3-large"
+
+# qwen 向量化模型
+[embedding_configurations.qwen]
+# 提供商实现标识
+provider = "qwen"
+# API 实际模型名
+model_name = "text-embedding-v4"
+
+# volcengine 向量化模型
+[embedding_configurations.volcengine]
+# 提供商实现标识
+provider = "volcengine"
+# API 实际模型名
+model_name = "bge-large-zh"
+
+# ollama 向量化模型
+[embedding_configurations.ollama]
+# 提供商实现标识
+provider = "ollama"
+# API 实际模型名
+model_name = "mxbai-embed-large"
+
+# siliconflow 向量化模型
+[embedding_configurations.siliconflow]
+# 提供商实现标识
+provider = "siliconflow"
+# API 实际模型名
+model_name = "BAAI/bge-m3"
+
+# --- Rerank 模型配置 ---
+# siliconflow rerank 模型
+[rerank_configurations.siliconflow]
+# 提供商实现标识
+provider = "siliconflow"
+# API 实际模型名
+model_name = "BAAI/bge-reranker-v2-m3"
+
+# jina rerank 模型
+[rerank_configurations.jina]
+# 提供商实现标识
+provider = "jina"
+# API 实际模型名
+model_name = "jina-reranker-v2-base-multilingual"
+
+# qwen rerank 模型
+[rerank_configurations.qwen]
+# 提供商实现标识
+provider = "qwen"
+# API 实际模型名
+model_name = "Qwen/Qwen3-Reranker-4B"
+
+# --- LLM 配置 ---
+# google 聊天模型
+[llm_configurations.google]
+# 提供商实现标识
+provider = "google"
+# API 实际模型名
+model_name = "gemini-2.5-flash"
+
+# google-pro 聊天模型
+[llm_configurations.google-pro]
+# 提供商实现标识
+provider = "google"
+# API 实际模型名
+model_name = "gemini-2.5-pro"
+
+# openai-gpt4o 聊天模型
+[llm_configurations.openai-gpt4o]
+# 提供商实现标识
+provider = "openai"
+# API 实际模型名
+model_name = "gpt-4o"
+
+# openai-gpt3.5 聊天模型
+[llm_configurations."openai-gpt3.5"]
+# 提供商实现标识
+provider = "openai"
+# API 实际模型名
+model_name = "gpt-3.5-turbo"
+
+# qwen-max 聊天模型
+[llm_configurations.qwen-max]
+# 提供商实现标识
+provider = "qwen"
+# API 实际模型名
+model_name = "qwen-max"
+
+# qwen-plus 聊天模型
+[llm_configurations.qwen-plus]
+# 提供商实现标识
+provider = "qwen"
+# API 实际模型名
+model_name = "qwen-plus"
+
+# volc-doubao-pro-32k 聊天模型
+[llm_configurations.volc-doubao-pro-32k]
+# 提供商实现标识
+provider = "volcengine"
+# API 实际模型名
+model_name = "doubao-pro-32k"
+
+# sf-qwen2-7b 聊天模型
+[llm_configurations.sf-qwen2-7b]
+# 提供商实现标识
+provider = "siliconflow"
+# API 实际模型名
+model_name = "Qwen/Qwen2-7B-Instruct"
+
+# sf-llama3-8b 聊天模型
+[llm_configurations.sf-llama3-8b]
+# 提供商实现标识
+provider = "siliconflow"
+# API 实际模型名
+model_name = "meta-llama/Meta-Llama-3-8B-Instruct"
+
+# ollama-llama3 聊天模型
+[llm_configurations.ollama-llama3]
+# 提供商实现标识
+provider = "ollama"
+# API 实际模型名
+model_name = "llama3"
+
+# ollama-gemma 聊天模型
+[llm_configurations.ollama-gemma]
+# 提供商实现标识
+provider = "ollama"
+# API 实际模型名
+model_name = "gemma"
+
+# lm-studio 聊天模型
+[llm_configurations.lm-studio]
+# 提供商实现标识
+provider = "lm-studio"
+# API 实际模型名
+model_name = "local-model/gguf-model-name"
+
+# deepseek-chat 聊天模型
+[llm_configurations.deepseek-chat]
+# 提供商实现标识
+provider = "deepseek"
+# API 实际模型名
+model_name = "deepseek-chat"
+
+# deepseek-v2 聊天模型
+[llm_configurations.deepseek-v2]
+# 提供商实现标识
+provider = "deepseek"
+# API 实际模型名
+model_name = "deepseek-v2"
+
+# grok-llama3-70b 聊天模型
+[llm_configurations.grok-llama3-70b]
+# 提供商实现标识
+provider = "grok"
+# API 实际模型名
+model_name = "llama3-70b-8192"
+
+# anthropic-sonnet-3.5 聊天模型
+[llm_configurations."anthropic-sonnet-3.5"]
+# 提供商实现标识
+provider = "anthropic"
+# API 实际模型名
+model_name = "claude-3-5-sonnet-20240620"

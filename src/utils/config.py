@@ -1,10 +1,8 @@
 # -*- coding: utf-8 -*-
-import configparser
-import json
-import re
+import functools
+import tomllib
 from enum import Enum
 from pathlib import Path
-import functools
 from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field, field_validator, ValidationError
@@ -18,7 +16,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict, PydanticBaseSett
 # 项目根目录
 ROOT_DIR = Path(__file__).parent.parent.parent
 # 配置文件路径
-CONFIG_PATH = ROOT_DIR / 'config.ini'
+CONFIG_TOML_PATH = ROOT_DIR / 'config.toml'
 
 class RetrievalMethod(str, Enum):
     """定义知识库检索的策略枚举。"""
@@ -40,7 +38,7 @@ class ModelDetail(BaseModel):
 class Settings(BaseSettings):
     """
     定义整个应用的配置，使用Pydantic进行类型校验和分层加载。
-    加载顺序: 环境变量 > .env 文件 > config.ini 文件 > 模型中定义的默认值。
+    加载顺序: 环境变量 > .env 文件 > config.toml 文件 > 模型中定义的默认值。
     """
     # --- [API_KEYS] ---
     anthropic_api_key: Optional[str] = None
@@ -80,7 +78,7 @@ class Settings(BaseSettings):
     kb_remove_spaces: bool = False
     kb_remove_urls: bool = False
     kb_use_qa_segmentation: bool = False
-    kb_splitter_separators: List[str] = Field(default=["###"])
+    kb_splitter_separators: List[str] = Field(default_factory=lambda: ["###"])
     kb_chunk_size: int = 1500
     kb_chunk_overlap: int = 150
     kb_child_chunk_size: int = 300
@@ -124,7 +122,7 @@ class Settings(BaseSettings):
         "siliconflow": ModelDetail(provider="siliconflow", model_name="deepseek-ai/DeepSeek-V2-Chat"),
         "openai": ModelDetail(provider="openai", model_name="gpt-4o"),
         "ollama": ModelDetail(provider="ollama", model_name="llama3"),
-        "lm_studio": ModelDetail(provider="lm_studio", model_name="LM-Studio-Community/Meta-Llama-3-8B-Instruct-GGUF"),
+        "lm-studio": ModelDetail(provider="lm-studio", model_name="LM-Studio-Community/Meta-Llama-3-8B-Instruct-GGUF"),
     })
 
     # --- [VALIDATORS] ---
@@ -236,20 +234,12 @@ class Settings(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> Tuple[PydanticBaseSettingsSource, ...]:
-        """
-        自定义配置加载源，加入对 config.ini 的支持。
-        加载顺序:
-        1. init_settings: 初始化时传入的参数
-        2. env_settings: 环境变量
-        3. dotenv_settings: .env 文件
-        4. IniConfigSettingsSource: config.ini 文件
-        5. file_secret_settings: Docker secrets
-        """
+        """自定义配置加载源，保留环境变量、.env 和 config.toml 三层来源。"""
         return (
             init_settings,
             env_settings,
             dotenv_settings,
-            IniConfigSettingsSource(settings_cls),
+            TomlConfigSettingsSource(settings_cls),
             file_secret_settings,
         )
 
@@ -261,41 +251,115 @@ class Settings(BaseSettings):
         protected_namespaces=(),
     )
 
-def load_ini_config() -> Dict[str, Any]:
+def load_toml_config() -> Dict[str, Any]:
     """
-    从全局 CONFIG_PATH 路径加载 .ini 文件配置，并将其扁平化为单个字典。
+    从全局 CONFIG_TOML_PATH 路径加载 config.toml 文件配置。
     """
-    if not CONFIG_PATH.exists():
+    if not CONFIG_TOML_PATH.exists():
         return {}
 
-    parser = configparser.ConfigParser()
-    parser.read(CONFIG_PATH, encoding='utf-8')
+    with CONFIG_TOML_PATH.open("rb") as f:
+        raw_config = tomllib.load(f)
+
+    def normalize_mapping(value: Any, preserve_keys: set[str] | None = None) -> Any:
+        if not isinstance(value, dict):
+            return value
+
+        preserved = preserve_keys or set()
+        normalized: Dict[str, Any] = {}
+        for raw_key, raw_value in value.items():
+            key = str(raw_key).lower()
+            if key in preserved and isinstance(raw_value, dict):
+                normalized[key] = {
+                    str(item_key): normalize_mapping(item_value)
+                    for item_key, item_value in raw_value.items()
+                }
+                continue
+
+            if isinstance(raw_value, dict):
+                normalized[key] = {
+                    str(item_key).lower(): normalize_mapping(item_value)
+                    for item_key, item_value in raw_value.items()
+                }
+                continue
+
+            if isinstance(raw_value, list):
+                normalized[key] = [normalize_mapping(item) for item in raw_value]
+                continue
+
+            normalized[key] = raw_value
+        return normalized
+
+    raw_config = normalize_mapping(
+        raw_config,
+        preserve_keys={"embedding_configurations", "rerank_configurations", "llm_configurations"},
+    )
 
     flat_config: Dict[str, Any] = {}
-    json_keys = {'embedding_configurations', 'rerank_configurations', 'llm_configurations'}
+    scalar_keys = {
+        "anthropic_api_key",
+        "google_api_key",
+        "siliconflow_api_key",
+        "openai_api_key",
+        "qwen_api_key",
+        "volc_access_key",
+        "volc_secret_key",
+        "jina_api_key",
+        "deepseek_api_key",
+        "grok_api_key",
+        "lm_studio_api_key",
+        "openai_api_base",
+        "siliconflow_base_url",
+        "qwen_base_url",
+        "deepseek_base_url",
+        "ollama_base_url",
+        "lm_studio_base_url",
+        "volc_base_url",
+        "grok_base_url",
+        "log_level",
+        "cache_path",
+        "log_path",
+        "log_retention_days",
+        "knowledge_base_path",
+        "pkl_path",
+        "kb_replace_whitespace",
+        "kb_remove_spaces",
+        "kb_remove_urls",
+        "kb_use_qa_segmentation",
+        "kb_splitter_separators",
+        "kb_chunk_size",
+        "kb_chunk_overlap",
+        "kb_child_chunk_size",
+        "kb_child_chunk_overlap",
+        "kb_embedding_batch_size",
+        "default_llm_provider",
+        "default_embedding_provider",
+        "default_rerank_provider",
+        "default_vector_store",
+        "chat_retrieval_method",
+        "chat_vector_weight",
+        "chat_keyword_weight",
+        "hybrid_fusion_strategy",
+        "retrieval_candidate_multiplier",
+        "chat_rerank_enabled",
+        "chat_top_k",
+        "chat_score_threshold",
+        "chat_temperature",
+    }
 
-    for section in parser.sections():
-        for key, value in parser.items(section):
-            # 移除可能存在的行内注释
-            value = re.sub(r'\s*([#;]).*$', '', value).strip()
-            # 移除值两端的单引号和双引号
-            value = value.strip('\'"')
+    for key in scalar_keys:
+        if key in raw_config:
+            flat_config[key] = raw_config[key]
 
-            if key in json_keys:
-                if value:
-                    try:
-                        flat_config[key] = json.loads(value)
-                    except (json.JSONDecodeError, TypeError):
-                        flat_config[key] = {}
-                else:
-                    flat_config[key] = {}
-            else:
-                flat_config[key] = value
+    for config_key in ("embedding_configurations", "rerank_configurations", "llm_configurations"):
+        if config_key in raw_config:
+            flat_config[config_key] = raw_config[config_key]
+
     return flat_config
 
-class IniConfigSettingsSource(PydanticBaseSettingsSource):
+class TomlConfigSettingsSource(PydanticBaseSettingsSource):
     """
-    一个 pydantic-settings 的自定义源，用于从 config.ini 文件加载配置。
+    一个 pydantic-settings 的自定义源，用于从 config.toml 文件加载配置。
     """
     def get_field_value(
         self, field: FieldInfo, field_name: str
@@ -305,11 +369,11 @@ class IniConfigSettingsSource(PydanticBaseSettingsSource):
 
     def __call__(self) -> dict[str, Any]:
         """
-        在被调用时加载并返回 .ini 配置。
+        在被调用时加载并返回 TOML 配置。
         这确保了加载操作发生在 get_settings() 被调用时，
         此时 monkeypatch 已经生效。
         """
-        return load_ini_config()
+        return load_toml_config()
 
 # =================================================================
 # 3. 实例化并导出 (INSTANTIATE & EXPORT)
