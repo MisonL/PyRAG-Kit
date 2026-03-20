@@ -39,12 +39,12 @@ jobs:
         uses: actions/checkout@v6.0.2
 
       - name: Setup Python
-        uses: actions/setup-python@v7.0.0
+        uses: actions/setup-python@v6.2.0
         with:
           python-version: "3.11"
 
       - name: Setup uv
-        uses: astral-sh/setup-uv@v8.0.1
+        uses: astral-sh/setup-uv@v7.6.0
 
       - name: Sync dependencies
         run: uv sync --group dev
@@ -53,7 +53,7 @@ jobs:
         run: uv run python scripts/build_binary_release.py --target "${{ matrix.target }}" --validate
 
       - name: Upload release artifact
-        uses: actions/upload-artifact@v7.6.0
+        uses: actions/upload-artifact@v7.0.0
         with:
           name: ${{ matrix.target }}
           path: |
@@ -77,7 +77,7 @@ jobs:
           path: release_artifacts
 
       - name: Setup Python
-        uses: actions/setup-python@v7.0.0
+        uses: actions/setup-python@v6.2.0
         with:
           python-version: "3.11"
 
