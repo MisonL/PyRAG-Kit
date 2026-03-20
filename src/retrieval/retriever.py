@@ -9,8 +9,6 @@
 import copy
 from typing import Any, Callable, Dict, List, Optional
 
-import jieba
-import numpy as np
 from rich.console import Console
 
 # 使用相对导入来引用同一 src 目录下的模块
@@ -90,6 +88,7 @@ class HybridReranker:
 
         scored_documents = [copy.deepcopy(doc) for doc in documents]
         for doc in scored_documents:
+            # RRF 只依赖 hybrid merge 后注入的 rank 字段；非 hybrid 路径不会进入这里。
             semantic_rank = int(doc.get("semantic_rank") or 0)
             keyword_rank = int(doc.get("keyword_rank") or 0)
             semantic_rrf = 1.0 / (self.rrf_k + semantic_rank) if semantic_rank > 0 else 0.0
@@ -191,6 +190,12 @@ def _deduplicate_parent_documents(documents: List[Dict[str, Any]]) -> List[Dict[
     return list(deduplicated.values())
 
 
+def _should_apply_score_threshold(retrieval_method: RetrievalMethod, fusion_strategy: str) -> bool:
+    if retrieval_method == RetrievalMethod.HYBRID_SEARCH and fusion_strategy.strip().lower() == "rrf":
+        return False
+    return True
+
+
 def retrieve_documents(
     query: str,
     vector_store: VectorStoreBase,
@@ -223,7 +228,8 @@ def retrieve_documents(
     else: 
         ranked_results = vector_store.search(query, effective_top_k, search_type="keyword")
 
-    ranked_results = [doc for doc in ranked_results if doc.get("score", 0) >= score_threshold]
+    if _should_apply_score_threshold(retrieval_method, fusion_strategy):
+        ranked_results = [doc for doc in ranked_results if doc.get("score", 0) >= score_threshold]
     ranked_results = _promote_parent_context(ranked_results, parent_content_resolver)
     ranked_results = _deduplicate_parent_documents(ranked_results)
 
@@ -280,7 +286,8 @@ async def aretrieve_documents(
     else:
         ranked_results = await vector_store.asearch(query, effective_top_k, search_type="keyword")
 
-    ranked_results = [doc for doc in ranked_results if doc.get("score", 0) >= score_threshold]
+    if _should_apply_score_threshold(retrieval_method, fusion_strategy):
+        ranked_results = [doc for doc in ranked_results if doc.get("score", 0) >= score_threshold]
     ranked_results = _promote_parent_context(ranked_results, parent_content_resolver)
     ranked_results = _deduplicate_parent_documents(ranked_results)
 
