@@ -53,7 +53,7 @@
 
 ---
 
-## 🚀 快速开始
+## 快速开始
 
 ### 1. 环境初始化
 
@@ -69,16 +69,21 @@ uv sync
 
 ### 2. 配置与认证
 
-PyRAG-Kit 采用分层配置策略（环境变量 > .env > config.ini）。
+PyRAG-Kit 采用分层配置策略（环境变量 > .env > config.toml）。
 
 ```bash
-# 从模板创建配置文件
-cp config.ini.example config.ini
+# 从模板创建主配置文件和密钥文件
+cp config.toml.example config.toml
+cp .env.example .env
 ```
 
-编辑 `config.ini`：
-1. 在 `[API_KEYS]` 中填入对应的服务 Key。
-2. 在 `[MODEL_CONFIGURATIONS]` 中通过 JSON 定义模型方案。
+编辑 `config.toml`：
+1. 在根级字段中调整默认路径、检索参数和 base url。
+2. 在 `[llm_configurations]`、`[embedding_configurations]`、`[rerank_configurations]` 下使用 TOML 表定义模型。
+
+编辑 `.env`：
+1. 只填写 API Key 等敏感信息。
+2. 不要把非密钥配置写入 `.env`。
 
 ### 3. 运行系统
 
