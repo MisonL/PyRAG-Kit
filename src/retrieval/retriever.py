@@ -7,7 +7,7 @@
 # 1. 导入 (IMPORTS)
 # =================================================================
 import copy
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 import jieba
 import numpy as np
@@ -21,14 +21,25 @@ from ..utils.log_manager import get_module_logger  # 导入日志管理器
 
 logger = get_module_logger(__name__)  # 获取当前模块的日志器
 
+DEFAULT_RRF_K = 60.0
+
 # =================================================================
 # 2. 检索逻辑 (RETRIEVAL LOGIC)
 # =================================================================
 class HybridReranker:
-    def __init__(self, vector_weight: float, keyword_weight: float):
+    def __init__(self, vector_weight: float, keyword_weight: float, fusion_strategy: str = "rrf", rrf_k: float = DEFAULT_RRF_K):
         self.vector_weight = vector_weight
         self.keyword_weight = keyword_weight
-        logger.debug(f"初始化混合重排器，向量权重: {vector_weight}, 关键词权重: {keyword_weight}")
+        self.fusion_strategy = fusion_strategy.strip().lower()
+        self.rrf_k = rrf_k
+        if self.fusion_strategy not in {"rrf", "weighted"}:
+            raise ValueError(f"不支持的混合检索融合策略: {fusion_strategy}")
+        logger.debug(
+            "初始化混合重排器，向量权重: %s, 关键词权重: %s, 策略: %s",
+            vector_weight,
+            keyword_weight,
+            self.fusion_strategy,
+        )
 
     @staticmethod
     def _normalize_scores(scores: List[float]) -> List[float]:
@@ -43,13 +54,7 @@ class HybridReranker:
         score_range = max_score - min_score
         return [max(0.0, min(1.0, (score - min_score) / score_range)) for score in scores]
 
-    def rerank(self, documents: List[Dict]) -> List[Dict]:
-        if not documents:
-            logger.info("没有文档可供重排，返回空列表。")
-            return []
-
-        logger.debug(f"开始混合重排，文档数量: {len(documents)}")
-
+    def _weighted_rerank(self, documents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         total_weight = self.vector_weight + self.keyword_weight
         if total_weight <= 0:
             normalized_vector_weight = 0.0
@@ -72,7 +77,36 @@ class HybridReranker:
                 + normalized_keyword_weight * normalized_keyword_scores[index]
             )
 
-        ranked_docs = sorted(scored_documents, key=lambda x: x["score"], reverse=True)
+        return sorted(scored_documents, key=lambda x: x["score"], reverse=True)
+
+    def _rrf_rerank(self, documents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        total_weight = self.vector_weight + self.keyword_weight
+        if total_weight <= 0:
+            normalized_vector_weight = 0.0
+            normalized_keyword_weight = 0.0
+        else:
+            normalized_vector_weight = self.vector_weight / total_weight
+            normalized_keyword_weight = self.keyword_weight / total_weight
+
+        scored_documents = [copy.deepcopy(doc) for doc in documents]
+        for doc in scored_documents:
+            semantic_rank = int(doc.get("semantic_rank") or 0)
+            keyword_rank = int(doc.get("keyword_rank") or 0)
+            semantic_rrf = 1.0 / (self.rrf_k + semantic_rank) if semantic_rank > 0 else 0.0
+            keyword_rrf = 1.0 / (self.rrf_k + keyword_rank) if keyword_rank > 0 else 0.0
+            doc["score"] = normalized_vector_weight * semantic_rrf + normalized_keyword_weight * keyword_rrf
+        return sorted(scored_documents, key=lambda x: x["score"], reverse=True)
+
+    def rerank(self, documents: List[Dict]) -> List[Dict]:
+        if not documents:
+            logger.info("没有文档可供重排，返回空列表。")
+            return []
+
+        logger.debug(f"开始混合重排，文档数量: {len(documents)}")
+        if self.fusion_strategy == "weighted":
+            ranked_docs = self._weighted_rerank(documents)
+        else:
+            ranked_docs = self._rrf_rerank(documents)
         logger.debug(f"混合重排完成，返回 {len(ranked_docs)} 个文档。")
         return ranked_docs
 
@@ -96,21 +130,24 @@ def _document_key(document: Dict[str, Any]) -> str:
 def _merge_hybrid_results(semantic_results: List[Dict[str, Any]], keyword_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     merged_results: Dict[str, Dict[str, Any]] = {}
 
-    for doc in semantic_results:
+    for rank, doc in enumerate(semantic_results, start=1):
         merged_doc = copy.deepcopy(doc)
         merged_doc["semantic_score"] = float(merged_doc.get("score", 0) or 0)
+        merged_doc["semantic_rank"] = rank
         merged_doc["keyword_score"] = float(merged_doc.get("keyword_score", 0) or 0)
         merged_results[_document_key(merged_doc)] = merged_doc
 
-    for doc in keyword_results:
+    for rank, doc in enumerate(keyword_results, start=1):
         key = _document_key(doc)
         keyword_score = float(doc.get("score", 0) or 0)
         if key in merged_results:
             merged_results[key]["keyword_score"] = keyword_score
+            merged_results[key]["keyword_rank"] = rank
         else:
             merged_doc = copy.deepcopy(doc)
             merged_doc["semantic_score"] = float(merged_doc.get("semantic_score", 0) or 0)
             merged_doc["keyword_score"] = keyword_score
+            merged_doc["keyword_rank"] = rank
             merged_results[key] = merged_doc
 
     for doc in merged_results.values():
@@ -120,12 +157,17 @@ def _merge_hybrid_results(semantic_results: List[Dict[str, Any]], keyword_result
     return list(merged_results.values())
 
 
-def _promote_parent_context(documents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _promote_parent_context(
+    documents: List[Dict[str, Any]],
+    parent_content_resolver: Optional[Callable[[str | None], Optional[str]]] = None,
+) -> List[Dict[str, Any]]:
     promoted_documents: List[Dict[str, Any]] = []
     for doc in documents:
         promoted_doc = copy.deepcopy(doc)
         metadata = promoted_doc.get("metadata") or {}
         parent_content = metadata.get("parent_content")
+        if not parent_content and parent_content_resolver:
+            parent_content = parent_content_resolver(metadata.get("parent_id"))
         if parent_content:
             metadata.setdefault("matched_chunk_content", promoted_doc.get("page_content", ""))
             promoted_doc["page_content"] = parent_content
@@ -160,25 +202,29 @@ def retrieve_documents(
     rerank_enabled: bool,
     active_rerank_configuration: str,
     score_threshold: float,
+    fusion_strategy: str = "rrf",
+    candidate_multiplier: int = 3,
 ) -> List[Dict]:
     logger.info(f"开始同步检索: '{query[:20]}...', 方法: {retrieval_method.value}")
 
     ranked_results: List[Dict] = []
+    effective_top_k = max(1, top_k) * max(1, candidate_multiplier)
+    parent_content_resolver = getattr(vector_store, "resolve_parent_content", None)
 
     if retrieval_method == RetrievalMethod.HYBRID_SEARCH:
-        semantic_results = vector_store.search(query, top_k, search_type="semantic")
-        keyword_results = vector_store.search(query, top_k, search_type="keyword")
+        semantic_results = vector_store.search(query, effective_top_k, search_type="semantic")
+        keyword_results = vector_store.search(query, effective_top_k, search_type="keyword")
 
-        reranker = HybridReranker(vector_weight, keyword_weight)
+        reranker = HybridReranker(vector_weight, keyword_weight, fusion_strategy=fusion_strategy)
         ranked_results = reranker.rerank(_merge_hybrid_results(semantic_results, keyword_results))
 
     elif retrieval_method == RetrievalMethod.SEMANTIC_SEARCH:
-        ranked_results = vector_store.search(query, top_k, search_type="semantic")
+        ranked_results = vector_store.search(query, effective_top_k, search_type="semantic")
     else: 
-        ranked_results = vector_store.search(query, top_k, search_type="keyword")
+        ranked_results = vector_store.search(query, effective_top_k, search_type="keyword")
 
     ranked_results = [doc for doc in ranked_results if doc.get("score", 0) >= score_threshold]
-    ranked_results = _promote_parent_context(ranked_results)
+    ranked_results = _promote_parent_context(ranked_results, parent_content_resolver)
     ranked_results = _deduplicate_parent_documents(ranked_results)
 
     if rerank_enabled and ranked_results:
@@ -210,28 +256,32 @@ async def aretrieve_documents(
     rerank_enabled: bool,
     active_rerank_configuration: str,
     score_threshold: float,
+    fusion_strategy: str = "rrf",
+    candidate_multiplier: int = 3,
 ) -> List[Dict]:
     """异步检索文档 (CSE Sensor)。"""
     import asyncio
     logger.info(f"开始异步检索: '{query[:20]}...', 方法: {retrieval_method.value}")
 
     ranked_results: List[Dict] = []
+    effective_top_k = max(1, top_k) * max(1, candidate_multiplier)
+    parent_content_resolver = getattr(vector_store, "resolve_parent_content", None)
 
     if retrieval_method == RetrievalMethod.HYBRID_SEARCH:
-        semantic_task = vector_store.asearch(query, top_k, search_type="semantic")
-        keyword_task = vector_store.asearch(query, top_k, search_type="keyword")
+        semantic_task = vector_store.asearch(query, effective_top_k, search_type="semantic")
+        keyword_task = vector_store.asearch(query, effective_top_k, search_type="keyword")
         semantic_results, keyword_results = await asyncio.gather(semantic_task, keyword_task)
 
-        reranker = HybridReranker(vector_weight, keyword_weight)
+        reranker = HybridReranker(vector_weight, keyword_weight, fusion_strategy=fusion_strategy)
         ranked_results = reranker.rerank(_merge_hybrid_results(semantic_results, keyword_results))
 
     elif retrieval_method == RetrievalMethod.SEMANTIC_SEARCH:
-        ranked_results = await vector_store.asearch(query, top_k, search_type="semantic")
+        ranked_results = await vector_store.asearch(query, effective_top_k, search_type="semantic")
     else:
-        ranked_results = await vector_store.asearch(query, top_k, search_type="keyword")
+        ranked_results = await vector_store.asearch(query, effective_top_k, search_type="keyword")
 
     ranked_results = [doc for doc in ranked_results if doc.get("score", 0) >= score_threshold]
-    ranked_results = _promote_parent_context(ranked_results)
+    ranked_results = _promote_parent_context(ranked_results, parent_content_resolver)
     ranked_results = _deduplicate_parent_documents(ranked_results)
 
     if rerank_enabled and ranked_results:

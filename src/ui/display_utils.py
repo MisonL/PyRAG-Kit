@@ -41,6 +41,8 @@ def display_chat_config(console: Console, chat_config: Dict[str, Any]):
     chat_table.add_column(style="bold white")
     chat_table.add_row("检索策略:", chat_config['retrieval_method'].value)
     chat_table.add_row("混合搜索权重 (向量/关键词):", f"{chat_config['vector_weight']} / {chat_config['keyword_weight']}")
+    chat_table.add_row("混合融合策略:", chat_config['hybrid_fusion_strategy'].upper())
+    chat_table.add_row("候选过量招募倍率:", str(chat_config['retrieval_candidate_multiplier']))
     chat_table.add_row("Rerank重排:", "[bold green]启用[/bold green]" if chat_config['rerank_enabled'] else "[bold red]禁用[/bold red]")
     if chat_config['rerank_enabled']:
         active_rerank = chat_config['active_rerank_configuration']

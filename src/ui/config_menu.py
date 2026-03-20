@@ -19,6 +19,8 @@ def edit_retrieval_params(chat_config: Dict[str, Any]) -> None:
         current_top_k = chat_config['top_k']
         current_rerank = "启用" if chat_config['rerank_enabled'] else "禁用"
         current_weights = f"向量: {chat_config['vector_weight']} / 关键词: {chat_config['keyword_weight']}"
+        current_fusion_strategy = chat_config['hybrid_fusion_strategy'].upper()
+        current_candidate_multiplier = chat_config['retrieval_candidate_multiplier']
 
         choice = questionary.select(
             "选择要调整的检索参数:",
@@ -27,6 +29,8 @@ def edit_retrieval_params(chat_config: Dict[str, Any]) -> None:
                 questionary.Choice(f"2. 检索数量 Top K (当前: {current_top_k})", value="top_k"),
                 questionary.Choice(f"3. Rerank重排 (当前: {current_rerank})", value="rerank"),
                 questionary.Choice(f"4. 混合搜索权重 (当前: {current_weights})", value="weights"),
+                questionary.Choice(f"5. 混合融合策略 (当前: {current_fusion_strategy})", value="fusion"),
+                questionary.Choice(f"6. 候选过量招募倍率 (当前: {current_candidate_multiplier})", value="candidate_multiplier"),
                 questionary.Separator(),
                 questionary.Choice("返回主菜单", value="back")
             ],
@@ -98,6 +102,35 @@ def edit_retrieval_params(chat_config: Dict[str, Any]) -> None:
                 chat_config['keyword_weight'] = round(new_keyword_weight, 2)
                 console.print(f"[green]混合搜索权重已更新为 -> 向量: {chat_config['vector_weight']}, 关键词: {chat_config['keyword_weight']}[/green]")
                 logger.info(f"混合搜索权重已更新为 -> 向量: {chat_config['vector_weight']}, 关键词: {chat_config['keyword_weight']}")
+
+        elif choice == "fusion":
+            if chat_config['retrieval_method'] != RetrievalMethod.HYBRID_SEARCH:
+                console.print("[yellow]警告: 融合策略仅在 '混合检索' 模式下生效。[/yellow]")
+                logger.warning("尝试调整融合策略，但当前检索模式不是混合检索。")
+
+            new_strategy = questionary.select(
+                "选择新的混合融合策略:",
+                choices=[
+                    questionary.Choice("RRF (倒数排名融合)", value="rrf"),
+                    questionary.Choice("Weighted (分值加权)", value="weighted"),
+                ],
+                default=chat_config['hybrid_fusion_strategy'],
+            ).ask()
+            if new_strategy:
+                chat_config['hybrid_fusion_strategy'] = new_strategy
+                console.print(f"[green]混合融合策略已更新为: {new_strategy.upper()}[/green]")
+                logger.info(f"混合融合策略已更新为: {new_strategy.upper()}")
+
+        elif choice == "candidate_multiplier":
+            new_multiplier = questionary.text(
+                f"输入候选过量招募倍率 (当前: {current_candidate_multiplier}):",
+                validate=lambda text: text.isdigit() and int(text) >= 1,
+                default=str(current_candidate_multiplier),
+            ).ask()
+            if new_multiplier:
+                chat_config['retrieval_candidate_multiplier'] = int(new_multiplier)
+                console.print(f"[green]候选过量招募倍率已更新为: {new_multiplier}[/green]")
+                logger.info(f"候选过量招募倍率已更新为: {new_multiplier}")
     # 检索参数的更改不需要重载任何模型
     return None
 

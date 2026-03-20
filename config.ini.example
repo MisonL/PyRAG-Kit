@@ -54,6 +54,8 @@ KB_SPLITTER_SEPARATORS = ###
 # 文本分割器使用的分隔符。如果要使用多个，请用英文逗号隔开，例如: ###,---,===
 KB_CHUNK_SIZE = 1500 # 文本切块的最大长度 (单位：字符)
 KB_CHUNK_OVERLAP = 150 # 文本切块之间的重叠长度 (单位：字符)
+KB_CHILD_CHUNK_SIZE = 300 # 层级分片时子分段的最大长度 (单位：字符)
+KB_CHILD_CHUNK_OVERLAP = 30 # 层级分片时子分段的重叠长度 (单位：字符)
 KB_EMBEDDING_BATCH_SIZE = 32 # 向量化处理时，每批处理的文本数量 (可根据显存或API限制调整)
 
 [BEHAVIOR]
@@ -68,6 +70,8 @@ DEFAULT_VECTOR_STORE = faiss # 默认使用的向量数据库 (目前仅支持 f
 CHAT_RETRIEVAL_METHOD = HYBRID_SEARCH # 检索方法。可选值: SEMANTIC_SEARCH (或 "向量检索"), FULL_TEXT_SEARCH (或 "全文检索"), HYBRID_SEARCH (或 "混合检索")
 CHAT_VECTOR_WEIGHT = 0.3 # 混合搜索中，向量搜索结果的权重 (与关键词权重相加建议为1)
 CHAT_KEYWORD_WEIGHT = 0.7 # 混合搜索中，关键词搜索结果的权重 (与向量权重相加建议为1)
+HYBRID_FUSION_STRATEGY = rrf # 混合搜索融合策略。可选值: rrf, weighted
+RETRIEVAL_CANDIDATE_MULTIPLIER = 3 # 检索候选过量招募倍率。实际搜索 top_k = CHAT_TOP_K * 倍率
 CHAT_RERANK_ENABLED = False # 是否启用Rerank精排模型对检索结果进行二次排序
 CHAT_TOP_K = 5 # 检索返回的最相关文档数量
 CHAT_SCORE_THRESHOLD = 0.4 # 向量搜索的得分阈值，低于此分数的文档将被过滤

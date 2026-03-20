@@ -83,6 +83,8 @@ class Settings(BaseSettings):
     kb_splitter_separators: List[str] = Field(default=["###"])
     kb_chunk_size: int = 1500
     kb_chunk_overlap: int = 150
+    kb_child_chunk_size: int = 300
+    kb_child_chunk_overlap: int = 30
     kb_embedding_batch_size: int = 32
 
     # --- [BEHAVIOR] ---
@@ -95,6 +97,8 @@ class Settings(BaseSettings):
     chat_retrieval_method: RetrievalMethod = RetrievalMethod.HYBRID_SEARCH
     chat_vector_weight: float = 0.3
     chat_keyword_weight: float = 0.7
+    hybrid_fusion_strategy: str = "rrf"
+    retrieval_candidate_multiplier: int = 3
     chat_rerank_enabled: bool = False
     chat_top_k: int = 5
     chat_score_threshold: float = 0.4
@@ -144,6 +148,32 @@ class Settings(BaseSettings):
 
         if not (0.0 <= value <= 1.0):
             raise ValueError(f"聊天温度必须在 0.0 到 1.0 之间，但得到 {value}。")
+        return value
+
+    @field_validator('hybrid_fusion_strategy', mode='before')
+    @classmethod
+    def validate_hybrid_fusion_strategy(cls, v: Any) -> str:
+        """验证混合检索融合策略。"""
+        if not isinstance(v, str):
+            raise ValueError("混合检索融合策略必须是字符串。")
+
+        normalized = v.strip().lower()
+        valid_strategies = {"rrf", "weighted"}
+        if normalized not in valid_strategies:
+            raise ValueError(f"无效的混合检索融合策略: {v}. 必须是 {', '.join(sorted(valid_strategies))}。")
+        return normalized
+
+    @field_validator('retrieval_candidate_multiplier', mode='before')
+    @classmethod
+    def validate_retrieval_candidate_multiplier(cls, v: Any) -> int:
+        """验证检索候选过量招募倍率。"""
+        try:
+            value = int(v)
+        except (ValueError, TypeError):
+            raise ValueError(f"无法将检索候选倍率 '{v}' 转换为整数。")
+
+        if value < 1:
+            raise ValueError(f"检索候选倍率必须大于等于 1，但得到 {value}。")
         return value
 
     @field_validator('kb_splitter_separators', mode='before')
@@ -325,6 +355,8 @@ def get_backward_compatible_configs() -> Dict[str, Any]:
         "text_splitter_separators": current_settings.kb_splitter_separators,
         "chunk_size": current_settings.kb_chunk_size,
         "chunk_overlap": current_settings.kb_chunk_overlap,
+        "child_chunk_size": current_settings.kb_child_chunk_size,
+        "child_chunk_overlap": current_settings.kb_child_chunk_overlap,
         "use_qa_segmentation": current_settings.kb_use_qa_segmentation,
         "embedding_configurations": current_settings.embedding_configurations,
         "active_embedding_configuration": current_settings.default_embedding_provider,
@@ -339,6 +371,8 @@ def get_backward_compatible_configs() -> Dict[str, Any]:
         "retrieval_method": current_settings.chat_retrieval_method,
         "vector_weight": current_settings.chat_vector_weight,
         "keyword_weight": current_settings.chat_keyword_weight,
+        "hybrid_fusion_strategy": current_settings.hybrid_fusion_strategy,
+        "retrieval_candidate_multiplier": current_settings.retrieval_candidate_multiplier,
         "rerank_enabled": current_settings.chat_rerank_enabled,
         "top_k": current_settings.chat_top_k,
         "score_threshold": current_settings.chat_score_threshold,

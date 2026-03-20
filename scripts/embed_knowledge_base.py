@@ -58,6 +58,8 @@ async def process_documents_async(vector_store: VectorStoreBase, splitter_struct
             content = f.read()
         doc = Document(content=content, metadata={'source': file_path})
         chunks = pipeline.process(doc)
+        if splitter_structure_mode == "hierarchical" and hasattr(pipeline.splitter, "parent_documents"):
+            vector_store.register_parent_documents(getattr(pipeline.splitter, "parent_documents", {}))
         final_chunks.extend(chunks)
         logger.debug(f"文件 '{get_relative_path(file_path)}' 生成 {len(chunks)} 个文本块。")
  
@@ -109,6 +111,8 @@ def display_config_and_confirm(splitter_structure_mode: str):
     table.add_row("索引模式", f"[bold magenta]{splitter_structure_mode}[/bold magenta]")
     table.add_row("文本切分块大小", f"[bold magenta]{current_settings.kb_chunk_size}[/bold magenta]")
     table.add_row("切分重叠量", f"[bold magenta]{current_settings.kb_chunk_overlap}[/bold magenta]")
+    table.add_row("子分段块大小", f"[bold magenta]{current_settings.kb_child_chunk_size}[/bold magenta]")
+    table.add_row("子分段重叠量", f"[bold magenta]{current_settings.kb_child_chunk_overlap}[/bold magenta]")
     
     table.add_section()
     table.add_row("[bold green]模型与API配置[/bold green]", "")

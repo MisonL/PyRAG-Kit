@@ -45,6 +45,8 @@ class Chatbot:
             "retrieval_method": current_settings.chat_retrieval_method,
             "vector_weight": current_settings.chat_vector_weight,
             "keyword_weight": current_settings.chat_keyword_weight,
+            "hybrid_fusion_strategy": current_settings.hybrid_fusion_strategy,
+            "retrieval_candidate_multiplier": current_settings.retrieval_candidate_multiplier,
             "rerank_enabled": current_settings.chat_rerank_enabled,
             "top_k": current_settings.chat_top_k,
             "score_threshold": current_settings.chat_score_threshold,
@@ -108,7 +110,9 @@ class Chatbot:
             keyword_weight=self.chat_config['keyword_weight'],
             rerank_enabled=self.chat_config['rerank_enabled'],
             active_rerank_configuration=self.chat_config['active_rerank_configuration'],
-            score_threshold=self.chat_config['score_threshold']
+            score_threshold=self.chat_config['score_threshold'],
+            fusion_strategy=self.chat_config['hybrid_fusion_strategy'],
+            candidate_multiplier=self.chat_config['retrieval_candidate_multiplier'],
         )
 
     async def chat_async(self, user_input: str) -> "AsyncGenerator[str, None]":

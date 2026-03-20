@@ -39,6 +39,7 @@ class FaissStore(VectorStoreBase):
         self.embeddings: Optional[np.ndarray] = None
         self.bm25_index: Optional[BM25Okapi] = None
         self.faiss_index: Optional[faiss.IndexFlatL2] = None
+        self.parent_documents: Dict[str, Dict[str, Any]] = {}
         self._tokenized_docs_cache: List[List[str]] = [] # 缓存分词结果以优化 BM25
         self.lock = asyncio.Lock() # 并发锁，确保写入安全
         
@@ -68,6 +69,40 @@ class FaissStore(VectorStoreBase):
         
         self.faiss_index.add(new_embeddings)
         logger.debug(f"索引增量更新完成，当前总量: {len(self.documents)}")
+
+    @staticmethod
+    def _normalize_parent_document(parent_document: Any) -> Dict[str, Any]:
+        if isinstance(parent_document, dict):
+            parent_content = parent_document.get("content", "")
+            parent_metadata = parent_document.get("metadata") or {}
+            return {
+                "content": parent_content,
+                "metadata": parent_metadata,
+            }
+        if isinstance(parent_document, str):
+            return {"content": parent_document, "metadata": {}}
+        return {"content": "", "metadata": {}}
+
+    def register_parent_documents(self, parent_documents: Dict[str, Dict[str, Any]]):
+        """注册父分段侧车数据。"""
+        if not parent_documents:
+            return
+
+        for parent_id, parent_document in parent_documents.items():
+            normalized = self._normalize_parent_document(parent_document)
+            if normalized["content"]:
+                self.parent_documents[str(parent_id)] = normalized
+
+    def resolve_parent_content(self, parent_id: str | None) -> str | None:
+        if not parent_id:
+            return None
+
+        parent_document = self.parent_documents.get(str(parent_id))
+        if not parent_document:
+            return None
+
+        content = parent_document.get("content")
+        return content if isinstance(content, str) and content else None
 
     def add_documents(self, documents: List[Dict[str, Any]]):
         """同步添加文档。"""
@@ -213,7 +248,34 @@ class FaissStore(VectorStoreBase):
 
     def save(self, path: str):
         with open(path, "wb") as f:
-            pickle.dump({"documents": self.documents, "embeddings": self.embeddings}, f)
+            pickle.dump(
+                {
+                    "documents": self.documents,
+                    "embeddings": self.embeddings,
+                    "parent_documents": self.parent_documents,
+                },
+                f,
+            )
+
+    def _normalize_loaded_documents(self):
+        normalized_parent_documents: Dict[str, Dict[str, Any]] = dict(self.parent_documents)
+
+        for document in self.documents:
+            metadata = document.get("metadata") or {}
+            parent_id = metadata.get("parent_id")
+            parent_content = metadata.pop("parent_content", None)
+            if parent_id and parent_content and parent_id not in normalized_parent_documents:
+                normalized_parent_documents[str(parent_id)] = {
+                    "content": parent_content,
+                    "metadata": {
+                        key: value
+                        for key, value in metadata.items()
+                        if key not in {"chunk_id", "doc_id", "parent_id", "parent_chunk_index"}
+                    },
+                }
+            document["metadata"] = metadata
+
+        self.parent_documents = normalized_parent_documents
 
     def load(self, path: str):
         if not os.path.exists(path):
@@ -222,6 +284,9 @@ class FaissStore(VectorStoreBase):
             data = pickle.load(f)
             self.documents = data.get("documents", [])
             self.embeddings = data.get("embeddings", None)
+            self.parent_documents = data.get("parent_documents", {})
+
+        self._normalize_loaded_documents()
         
         # 重新初始化索引和缓存
         if self.documents:

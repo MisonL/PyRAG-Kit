@@ -45,3 +45,11 @@ class VectorStoreBase(ABC):
     def get_embedding_model(self) -> Any:
         """获取嵌入模型。"""
         pass
+
+    def register_parent_documents(self, parent_documents: Dict[str, Dict[str, Any]]):
+        """注册父分段侧车数据。"""
+        return None
+
+    def resolve_parent_content(self, parent_id: str | None) -> str | None:
+        """根据父分段 ID 解析父内容。"""
+        return None

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import copy
+import re
 import uuid
 from typing import Callable, List, Optional
 
@@ -30,8 +30,8 @@ class RecursiveTextSplitter(BaseSplitter):
         structure_mode: str = "standard",
         parent_chunk_size: Optional[int] = None,
         parent_chunk_overlap: Optional[int] = None,
-        child_chunk_size: int = DEFAULT_CHILD_CHUNK_SIZE,
-        child_chunk_overlap: int = DEFAULT_CHILD_CHUNK_OVERLAP,
+        child_chunk_size: Optional[int] = None,
+        child_chunk_overlap: Optional[int] = None,
     ):
         """
         初始化 RecursiveTextSplitter。
@@ -48,6 +48,7 @@ class RecursiveTextSplitter(BaseSplitter):
         self.parent_chunk_overlap = parent_chunk_overlap
         self.child_chunk_size = child_chunk_size
         self.child_chunk_overlap = child_chunk_overlap
+        self.parent_documents: dict[str, dict[str, object]] = {}
         self._encoder = tiktoken.get_encoding(encoding_name)
         logger.info(
             "初始化 RecursiveTextSplitter，模式: %s, 结构模式: %s, 编码: %s",
@@ -84,8 +85,12 @@ class RecursiveTextSplitter(BaseSplitter):
         """构建子分片器。"""
         current_settings = get_settings()
         return RecursiveCharacterTextSplitter(
-            chunk_size=self.child_chunk_size,
-            chunk_overlap=self.child_chunk_overlap,
+            chunk_size=self.child_chunk_size if self.child_chunk_size is not None else current_settings.kb_child_chunk_size,
+            chunk_overlap=(
+                self.child_chunk_overlap
+                if self.child_chunk_overlap is not None
+                else current_settings.kb_child_chunk_overlap
+            ),
             separators=current_settings.kb_splitter_separators,
             length_function=self._get_length_function(),
             is_separator_regex=False,
@@ -94,9 +99,7 @@ class RecursiveTextSplitter(BaseSplitter):
     @staticmethod
     def _strip_leading_punctuation(text: str) -> str:
         """去掉分片开头的句号类标点。"""
-        if text.startswith(".") or text.startswith("。"):
-            return text[1:].strip()
-        return text.strip()
+        return re.sub(r"^[\s.。]+", "", text).strip()
 
     def _split_standard_documents(self, documents: List[Document]) -> List[Document]:
         """标准单层分片。"""
@@ -129,6 +132,7 @@ class RecursiveTextSplitter(BaseSplitter):
         """层级分片：先切父块，再切子块。"""
         all_chunks: List[Document] = []
         child_splitter = self._build_child_splitter()
+        self.parent_documents = {}
 
         for doc in documents:
             logger.debug(f"正在层级分割文档: {doc.metadata.get('source', '未知来源')}")
@@ -141,6 +145,13 @@ class RecursiveTextSplitter(BaseSplitter):
                     continue
 
                 parent_id = uuid.uuid4().hex
+                self.parent_documents[parent_id] = {
+                    "content": parent_content,
+                    "metadata": {
+                        **parent_doc.metadata.copy(),
+                        "parent_chunk_index": parent_index,
+                    },
+                }
                 child_documents = child_splitter.create_documents([parent_content], metadatas=[parent_doc.metadata])
 
                 for child_index, child_doc in enumerate(child_documents):
@@ -155,9 +166,7 @@ class RecursiveTextSplitter(BaseSplitter):
                     child_metadata["chunk_index"] = child_index
                     child_metadata["parent_id"] = parent_id
                     child_metadata["parent_chunk_index"] = parent_index
-                    child_metadata["parent_content"] = parent_content
                     child_metadata["token_count"] = len(self._encoder.encode(child_content))
-                    child_metadata["parent_token_count"] = len(self._encoder.encode(parent_content))
                     all_chunks.append(Document(content=child_content, metadata=child_metadata))
                     doc_chunk_count += 1
 
@@ -177,6 +186,7 @@ class RecursiveTextSplitter(BaseSplitter):
 
         # 实时同步最新配置
         self._init_splitter()
+        self.parent_documents = {}
 
         if self.structure_mode == "hierarchical":
             all_chunks = self.split_hierarchical(documents)
