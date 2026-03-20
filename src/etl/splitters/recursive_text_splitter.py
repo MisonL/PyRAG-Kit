@@ -1,88 +1,84 @@
-# 本文件包含部分从 Dify 项目移植的代码。
-# 原始来源: https://github.com/langgenius/dify
-# 遵循修改后的 Apache License 2.0 许可证。详情请参阅项目根目录下的 DIFY_LICENSE 文件。
+# -*- coding: utf-8 -*-
+from typing import List, Optional, Callable
+import tiktoken
 
-from typing import List, Optional
 from .base import BaseSplitter
 from src.models.document import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from src.utils.config import get_settings # 导入 get_settings 函数
-from src.utils.log_manager import get_module_logger # 导入日志管理器
+from src.utils.config import get_settings
+from src.utils.log_manager import get_module_logger
 
-logger = get_module_logger(__name__) # 获取当前模块的日志器
+logger = get_module_logger(__name__)
 
 class RecursiveTextSplitter(BaseSplitter):
     """
     递归文本分割器。
-    使用 LangChain 的 RecursiveCharacterTextSplitter 将文本分割成块。
+    使用 LangChain 的 RecursiveCharacterTextSplitter。
+    支持基于字符长度或基于 Token 数量的分割。
     """
 
-    def __init__(self):
+    def __init__(self, mode: str = "token", encoding_name: str = "cl100k_base"):
         """
         初始化 RecursiveTextSplitter。
-        参数从全局配置 get_settings() 中读取。
+        
+        Args:
+            mode (str): 分割模式，可选 "char" 或 "token"。
+            encoding_name (str): tiktoken 编码名称。
         """
-        logger.info("初始化 RecursiveTextSplitter。")
-        current_settings = get_settings() # 获取当前配置
+        self.mode = mode
+        self._encoder = tiktoken.get_encoding(encoding_name)
+        logger.info(f"初始化 RecursiveTextSplitter，模式: {mode}, 编码: {encoding_name}")
+        self._init_splitter()
+
+    def _get_length_function(self) -> Callable[[str], int]:
+        """根据模式返回长度计算函数。"""
+        if self.mode == "token":
+            return lambda x: len(self._encoder.encode(x))
+        return len
+
+    def _init_splitter(self):
+        """根据当前配置初始化内部分割器。"""
+        current_settings = get_settings()
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=current_settings.kb_chunk_size,
             chunk_overlap=current_settings.kb_chunk_overlap,
             separators=current_settings.kb_splitter_separators,
-            length_function=len,
+            length_function=self._get_length_function(),
             is_separator_regex=False
         )
-        logger.info(f"文本分割器配置: chunk_size={current_settings.kb_chunk_size}, chunk_overlap={current_settings.kb_chunk_overlap}, separators={current_settings.kb_splitter_separators}")
+        logger.info(f"文本分割器已就绪: chunk_size={current_settings.kb_chunk_size}, mode={self.mode}")
 
     def split(self, documents: List[Document], **kwargs) -> List[Document]:
         """
         将文档列表中的文本内容分割成更小的块。
-
-        Args:
-            documents (List[Document]): 待分割的文档对象列表。
-            **kwargs: 额外的参数（目前未使用）。
-
-        Returns:
-            List[Document]: 分割后的文档块列表。
         """
         logger.info(f"开始分割 {len(documents)} 个文档。")
-        all_chunks: List[Document] = []
         
-        # 获取最新的配置并重新初始化 text_splitter
-        current_settings = get_settings() # 获取当前配置
-        current_chunk_size = current_settings.kb_chunk_size
-        current_chunk_overlap = current_settings.kb_chunk_overlap
-        current_separators = current_settings.kb_splitter_separators
-
-        # 每次都重新初始化分割器，以确保使用最新的配置
-        logger.info("正在根据最新配置重新初始化文本分割器。")
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=current_chunk_size,
-            chunk_overlap=current_chunk_overlap,
-            separators=current_separators,
-            length_function=len,
-            is_separator_regex=False
-        )
-        logger.info(f"文本分割器重新配置: chunk_size={current_chunk_size}, chunk_overlap={current_chunk_overlap}, separators={current_separators}")
-
+        # 实时同步最新配置
+        self._init_splitter()
+        
+        all_chunks: List[Document] = []
         for doc in documents:
             logger.debug(f"正在分割文档: {doc.metadata.get('source', '未知来源')}")
-            # 使用 LangChain 的分割器进行分割
-            # langchain 的 create_documents 返回它自己的 Document 类型
+            
+            # 使用 LangChain 分割器
             langchain_chunks = self.text_splitter.create_documents(
                 [doc.content],
                 metadatas=[doc.metadata]
             )
             
             for i, chunk in enumerate(langchain_chunks):
-                # 将 langchain 的 Document 转换回我们自己的 Document 模型
                 chunk_metadata = chunk.metadata.copy()
-                chunk_metadata["chunk_index"] = i # 添加块索引
+                chunk_metadata["chunk_index"] = i
+                # 计算并记录本块的 token 数量
+                chunk_metadata["token_count"] = len(self._encoder.encode(chunk.page_content))
                 
                 all_chunks.append(Document(
                     content=chunk.page_content,
                     metadata=chunk_metadata
                 ))
+            
             logger.debug(f"文档 '{doc.metadata.get('source', '未知来源')}' 分割完成，生成 {len(langchain_chunks)} 个块。")
         
-        logger.info(f"所有文档分割完成，总共生成 {len(all_chunks)} 个文本块。")
+        logger.info(f"分割任务完成，总计生成 {len(all_chunks)} 个文本块 (模式: {self.mode})。")
         return all_chunks
