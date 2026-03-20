@@ -149,15 +149,16 @@ def executable_path(bundle_root: Path) -> Path:
 
 def validate_bundle(bundle_root: Path) -> None:
     executable = executable_path(bundle_root)
-    subprocess.run(
-        [str(executable)],
+    result = subprocess.run(
+        [str(executable), "--smoke-test"],
         cwd=bundle_root,
-        input="4\n",
         text=True,
         capture_output=True,
         check=True,
         timeout=30,
     )
+    if "smoke test ok" not in result.stdout:
+        raise RuntimeError("发布包自检输出不符合预期。")
 
 
 def main() -> None:

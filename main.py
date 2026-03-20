@@ -17,7 +17,7 @@ os.environ.setdefault("PROMPT_TOOLKIT_NO_CPR", "1")
 # 导入 cleanup 模块以注册 atexit 钩子
 import src.utils.cleanup
 # 从新的配置模块导入 settings 实例
-from src.utils.config import get_settings
+from src.utils.config import get_settings, resolve_app_root
 # 导入日志管理器，以便调用其清理函数
 import src.utils.log_manager
 # 导入UI工具
@@ -137,6 +137,24 @@ def initialize_dependencies():
 
     console.print("[dim]依赖项初始化完成。[/dim]")
 
+def run_smoke_test() -> int:
+    """执行非交互式启动自检。"""
+    settings = get_settings()
+    console.print(f"PyRAG-Kit {VERSION} smoke test ok")
+    console.print(f"app_root={resolve_app_root()}")
+    console.print(f"log_path={settings.log_path}")
+    return 0
+
+
+def run_cli(argv: list[str] | None = None) -> int:
+    """解析启动参数并执行对应入口。"""
+    args = list(sys.argv[1:] if argv is None else argv)
+    if "--smoke-test" in args:
+        return run_smoke_test()
+    main()
+    return 0
+
+
 def main():
     """程序主入口，提供交互式菜单并实现延迟加载。"""
     display_banner()
@@ -177,4 +195,4 @@ def main():
             console.print("[bold red]请检查错误信息并重试。[/bold red]")
 
 if __name__ == "__main__":
-    main()
+    sys.exit(run_cli())
