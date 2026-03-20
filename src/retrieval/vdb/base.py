@@ -46,6 +46,26 @@ class VectorStoreBase(ABC):
         """获取嵌入模型。"""
         pass
 
+    def upsert_embeddings(self, documents: List[Dict[str, Any]], embeddings: Any):
+        """根据外部已生成的向量写入文档。默认未实现。"""
+        raise NotImplementedError("当前向量存储未实现 upsert_embeddings。")
+
+    def semantic_search(self, query_embedding: Any, top_k: int = 5) -> List[Dict[str, Any]]:
+        """使用查询向量执行语义检索。默认未实现。"""
+        raise NotImplementedError("当前向量存储未实现 semantic_search。")
+
+    def keyword_search(self, query_text: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """使用原始文本执行关键词检索。默认退回 search。"""
+        return self.search(query_text, top_k=top_k, search_type="keyword")
+
+    def save_snapshot(self, snapshot_dir: str):
+        """将当前状态保存为快照。默认未实现。"""
+        raise NotImplementedError("当前向量存储未实现 save_snapshot。")
+
+    def load_snapshot(self, snapshot_dir: str):
+        """从快照目录加载状态。默认未实现。"""
+        raise NotImplementedError("当前向量存储未实现 load_snapshot。")
+
     def register_parent_documents(self, parent_documents: Dict[str, Dict[str, Any]]):
         """注册父分段侧车数据。"""
         return None

@@ -81,6 +81,27 @@ def test_start_chat_session_async_can_open_config(monkeypatch):
     assert len(config_calls) == 1
 
 
+def test_start_chat_session_async_skips_empty_input(monkeypatch):
+    chat_calls = []
+
+    class EmptySafeChatbot(FakeChatbot):
+        async def chat_async(self, user_input):
+            chat_calls.append(user_input)
+            if False:
+                yield ""
+
+    monkeypatch.setattr("src.chat.core.Chatbot", EmptySafeChatbot)
+    monkeypatch.setattr(
+        "src.chat.core.PromptSession",
+        lambda: FakePromptSession(["", "   ", "/quit"]),
+    )
+    monkeypatch.setattr("src.chat.core.display_chat_config", lambda *_args, **_kwargs: None)
+
+    asyncio.run(start_chat_session_async())
+
+    assert chat_calls == []
+
+
 def test_chat_async_retrieves_with_intent():
     retrieval_queries = []
 

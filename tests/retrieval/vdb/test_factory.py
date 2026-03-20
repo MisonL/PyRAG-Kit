@@ -40,11 +40,29 @@ class MockFaissStore(VectorStoreBase):
         return MagicMock() # 返回一个模拟的嵌入模型
 
 @pytest.fixture(scope="function", autouse=True)
-def patch_settings(monkeypatch):
+def patch_settings(monkeypatch, tmp_path):
     """模拟全局设置对象"""
     mock_settings_instance = MagicMock(spec=Settings)
     mock_settings_instance.default_vector_store = "faiss"
-    mock_settings_instance.pkl_path = "/mock/path/to/faiss_store.pkl"
+    mock_settings_instance.pkl_path = str(tmp_path / "faiss_store.pkl")
+    mock_settings_instance.snapshot_root = str(tmp_path / "kb")
+    mock_settings_instance.knowledge_base_path = str(tmp_path / "knowledge_base")
+    mock_settings_instance.cache_path = str(tmp_path / "cache")
+    mock_settings_instance.log_path = str(tmp_path / "logs")
+    mock_settings_instance.default_llm_provider = "google"
+    mock_settings_instance.default_embedding_provider = "local-hash"
+    mock_settings_instance.default_rerank_provider = "siliconflow"
+    mock_settings_instance.llm_configurations = {}
+    mock_settings_instance.embedding_configurations = {
+        "local-hash": MagicMock(model_name="local-hash-256"),
+    }
+    mock_settings_instance.rerank_configurations = {}
+    mock_settings_instance.chat_temperature = 0.7
+    mock_settings_instance.kb_embedding_batch_size = 32
+    mock_settings_instance.kb_chunk_size = 1500
+    mock_settings_instance.kb_chunk_overlap = 150
+    mock_settings_instance.kb_child_chunk_size = 300
+    mock_settings_instance.kb_child_chunk_overlap = 30
 
     with patch('src.utils.config.get_settings', return_value=mock_settings_instance):
         # 清除 VectorStoreFactory 及其依赖模块的缓存
@@ -93,7 +111,7 @@ def test_get_default_vector_store_success():
     """测试成功获取默认向量存储实例"""
     store = VectorStoreFactory.get_default_vector_store()
     assert isinstance(store, MockFaissStore)
-    assert store.file_path == "/mock/path/to/faiss_store.pkl"
+    assert store.file_path is None
 
 
 def test_get_default_vector_store_without_loading_existing():

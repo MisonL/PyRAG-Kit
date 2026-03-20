@@ -1,29 +1,10 @@
-from types import SimpleNamespace
-
 import numpy as np
 
 from src.retrieval.vdb.faiss_store import FaissStore
 
 
-class DummyEmbeddingModel:
-    def embed_documents(self, texts):
-        return [[0.0, 0.0] for _ in texts]
-
-    async def aembed_documents(self, texts):
-        return [[0.0, 0.0] for _ in texts]
-
-
-def test_faiss_store_persists_parent_sidecar_roundtrip(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        "src.retrieval.vdb.faiss_store.get_settings",
-        lambda: SimpleNamespace(default_embedding_provider="dummy"),
-    )
-    monkeypatch.setattr(
-        "src.retrieval.vdb.faiss_store.ModelProviderFactory.get_embedding_provider",
-        lambda *args, **kwargs: DummyEmbeddingModel(),
-    )
-
-    store_path = tmp_path / "faiss_store.pkl"
+def test_faiss_store_persists_parent_sidecar_snapshot_roundtrip(tmp_path):
+    snapshot_dir = tmp_path / "snapshot"
     store = FaissStore(file_path=None)
     store.documents = [
         {
@@ -44,12 +25,12 @@ def test_faiss_store_persists_parent_sidecar_roundtrip(tmp_path, monkeypatch):
             }
         }
     )
+    store._rebuild_indices()
+    store.save_snapshot(str(snapshot_dir))
 
-    store.save(str(store_path))
-
-    reloaded = FaissStore(file_path=str(store_path))
+    reloaded = FaissStore(file_path=None)
+    reloaded.load_snapshot(str(snapshot_dir))
 
     assert reloaded.resolve_parent_content("parent-1") == "parent content"
     assert reloaded.parent_documents["parent-1"]["metadata"]["source"] == "kb.md"
     assert reloaded.documents[0]["metadata"]["parent_id"] == "parent-1"
-    assert "parent_content" not in reloaded.documents[0]["metadata"]

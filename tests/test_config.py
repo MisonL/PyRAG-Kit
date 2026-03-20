@@ -67,6 +67,7 @@ def test_settings_defaults():
     assert settings.chat_top_k == 5
     assert settings.chat_retrieval_method == RetrievalMethod.HYBRID_SEARCH
     assert settings.knowledge_base_path.endswith("knowledge_base")
+    assert settings.snapshot_root.endswith("data/kb")
     assert settings.hybrid_fusion_strategy == "rrf"
     assert settings.retrieval_candidate_multiplier == 3
     assert settings.kb_child_chunk_size == 300

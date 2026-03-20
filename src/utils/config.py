@@ -72,6 +72,7 @@ class Settings(BaseSettings):
     # --- [PATHS] ---
     knowledge_base_path: str = "knowledge_base"
     pkl_path: str = "data/employee_kb.pkl"
+    snapshot_root: str = "data/kb"
 
     # --- [KNOWLEDGE_BASE] ---
     kb_replace_whitespace: bool = False
@@ -216,7 +217,7 @@ class Settings(BaseSettings):
         # 如果已经是枚举成员或无法转换，则让默认验证器处理
         return v
 
-    @field_validator('knowledge_base_path', 'pkl_path', 'log_path', 'cache_path', mode='before')
+    @field_validator('knowledge_base_path', 'pkl_path', 'snapshot_root', 'log_path', 'cache_path', mode='before')
     @classmethod
     def resolve_path(cls, v: str) -> str:
         """将相对路径解析为绝对路径。"""
@@ -324,6 +325,7 @@ def load_toml_config() -> Dict[str, Any]:
         "log_retention_days",
         "knowledge_base_path",
         "pkl_path",
+        "snapshot_root",
         "kb_replace_whitespace",
         "kb_remove_spaces",
         "kb_remove_urls",

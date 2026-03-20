@@ -1,194 +1,164 @@
 # -*- coding: utf-8 -*-
-# =================================================================
-# 1. 导入 (IMPORTS)
-# =================================================================
+import asyncio
 import os
-import pickle
-import pandas as pd
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Generator
-import copy # 导入 copy 模块
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
-from rich.console import Console
-from rich.panel import Panel
-from rich.table import Table
-from rich.style import Style
-from rich.text import Text
-from rich.live import Live
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import HTML
-
-import asyncio
+from rich.console import Console
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
 
 os.environ.setdefault("PROMPT_TOOLKIT_NO_CPR", "1")
-# 使用相对导入
+
 from ..providers.factory import ModelProviderFactory
-from ..providers.__base__.model_provider import LargeLanguageModel
-from ..utils.config import get_settings, RetrievalMethod
-from ..ui.config_menu import launch_config_editor
-from ..ui.display_utils import display_chat_config
-from ..retrieval.retriever import aretrieve_documents  # 使用异步检索
 from ..retrieval.vdb.base import VectorStoreBase
 from ..retrieval.vdb.factory import VectorStoreFactory
+from ..runtime.contracts import RunConfig, SessionConfig, build_run_config, build_session_config
+from ..services.chat_service import ChatService
+from ..services.embedding_service import EmbeddingService
+from ..services.retrieval_service import RetrievalService
+from ..ui.config_menu import launch_config_editor
+from ..ui.display_utils import display_chat_config, get_relative_path
+from ..utils.config import get_settings
 from ..utils.log_manager import get_chat_logger
 
-# =================================================================
-# 2. 聊天机器人核心 (CHATBOT CORE)
-# =================================================================
+
 class Chatbot:
     def __init__(self, console: Console):
         self.console = console
+        self.run_config: RunConfig = build_run_config(get_settings())
+        self.session_config: SessionConfig = build_session_config(get_settings())
         self.vector_store: Optional[VectorStoreBase] = None
-        self.llm_model: Optional[LargeLanguageModel] = None
+        self.retrieval_service: Optional[RetrievalService] = None
+        self.llm_model = None
+        self.chat_service: Optional[ChatService] = None
         self.logger = get_chat_logger()
-        
-        current_settings = get_settings()
-        self.chat_config = {
-            "retrieval_method": current_settings.chat_retrieval_method,
-            "vector_weight": current_settings.chat_vector_weight,
-            "keyword_weight": current_settings.chat_keyword_weight,
-            "hybrid_fusion_strategy": current_settings.hybrid_fusion_strategy,
-            "retrieval_candidate_multiplier": current_settings.retrieval_candidate_multiplier,
-            "rerank_enabled": current_settings.chat_rerank_enabled,
-            "top_k": current_settings.chat_top_k,
-            "score_threshold": current_settings.chat_score_threshold,
-            "active_llm_configuration": current_settings.default_llm_provider,
-            "active_rerank_configuration": current_settings.default_rerank_provider,
-            "llm_configurations": copy.deepcopy(current_settings.llm_configurations),
-            "rerank_configurations": copy.deepcopy(current_settings.rerank_configurations),
-            "chat_temperature": current_settings.chat_temperature,
-        }
+
         self._initialize_vector_store()
         self.reload_llm()
 
+    @property
+    def chat_config(self) -> SessionConfig:
+        return self.session_config
+
+    @chat_config.setter
+    def chat_config(self, value: SessionConfig | Dict[str, Any]):
+        if isinstance(value, SessionConfig):
+            self.session_config = value
+            return
+        if not hasattr(self, "session_config"):
+            self.session_config = build_session_config(get_settings())
+        for key, item in value.items():
+            self.session_config[key] = item
+
     def _initialize_vector_store(self):
         self.vector_store = VectorStoreFactory.get_default_vector_store()
-        try:
-            current_settings = get_settings()
-            self.vector_store.load(current_settings.pkl_path)
-            self.console.print(f"[green]知识库 '{os.path.basename(current_settings.pkl_path)}' 加载成功。[/green]")
-        except FileNotFoundError:
-            self.console.print(f"[bold red]警告：知识库未找到。请运行向量化脚本。[/bold red]")
-        except Exception as e:
-            self.console.print(f"[bold red]加载知识库出错: {e}[/bold red]")
+        self.retrieval_service = RetrievalService(
+            vector_store=self.vector_store,
+            embedding_service=EmbeddingService(self.run_config),
+        )
+        self.console.print("[green]知识快照加载成功。[/green]")
 
     def reload_llm(self) -> bool:
         try:
-            active_llm_key = self.chat_config["active_llm_configuration"]
-            self.llm_model = ModelProviderFactory.get_llm_provider(active_llm_key)
-            return True if self.llm_model else False
-        except Exception as e:
-            self.console.print(f"[bold red]重载LLM出错: {e}[/bold red]")
+            llm_key = self.session_config.active_llm_configuration
+            self.llm_model = ModelProviderFactory.get_llm_provider(llm_key)
+            if self.retrieval_service is None:
+                raise RuntimeError("检索服务尚未初始化。")
+            self.chat_service = ChatService(self.llm_model, self.retrieval_service)
+            return True
+        except Exception as exc:
+            self.console.print(f"[bold red]重载 LLM 出错: {exc}[/bold red]")
             return False
 
     async def _identify_intent_async(self, user_query: str) -> str:
-        """异步意图识别。"""
-        if not self.llm_model: return user_query
-        prompt = f"你是一个意图识别助手。判断用户意图。\n用户问题: {user_query}\n直接输出意图简述。"
-        try:
-            # 异步调用 invoke
-            response = ""
-            async for chunk in self.llm_model.ainvoke(
-                prompt=prompt,
-                stream=False,
-                temperature=0.1
-            ):
-                response += chunk
-            return response.strip() or user_query
-        except Exception as e:
-            self.logger.error(f"异步意图识别失败: {e}")
+        if getattr(self, "chat_service", None) is None:
             return user_query
+        return await self.chat_service.identify_intent(user_query)
 
     async def _retrieve_knowledge_async(self, retrieval_query: str) -> List[Dict[str, Any]]:
-        """异步知识检索。"""
-        if not self.vector_store: return []
-        return await aretrieve_documents(
-            query=retrieval_query,
-            vector_store=self.vector_store,
-            console=self.console,
-            retrieval_method=self.chat_config['retrieval_method'],
-            top_k=self.chat_config['top_k'],
-            vector_weight=self.chat_config['vector_weight'],
-            keyword_weight=self.chat_config['keyword_weight'],
-            rerank_enabled=self.chat_config['rerank_enabled'],
-            active_rerank_configuration=self.chat_config['active_rerank_configuration'],
-            score_threshold=self.chat_config['score_threshold'],
-            fusion_strategy=self.chat_config['hybrid_fusion_strategy'],
-            candidate_multiplier=self.chat_config['retrieval_candidate_multiplier'],
-        )
+        if getattr(self, "retrieval_service", None) is None:
+            return []
+        return await self.retrieval_service.retrieve(retrieval_query, self.session_config, console=self.console)
 
-    async def chat_async(self, user_input: str) -> "AsyncGenerator[str, None]":
-        """核心异步聊天流。"""
-        # 1. 意图识别
+    async def chat_async(self, user_input: str) -> AsyncGenerator[str, None]:
         intent = await self._identify_intent_async(user_input)
-        self.console.print(f"  [bold]意图:[/bold] [yellow]{intent}[/yellow]")
-        
-        # 2. 检索
         retrieved_docs = await self._retrieve_knowledge_async(intent)
+        self.console.print(f"  [bold]意图:[/bold] [yellow]{intent}[/yellow]")
         self._display_retrieved_docs(retrieved_docs)
-        
-        # 3. 构造 Prompt
-        context_str = "\n".join([f"来源: {doc['metadata']['source']}\n内容: {doc.get('page_content', '')}" for doc in retrieved_docs])
-        if context_str:
-            prompt = f"你是一个智能客服。根据知识回答。\n意图: {intent}\n问题: {user_input}\n知识:\n{context_str}\n回答要简洁。"
-        else:
-            prompt = f"你是一个智能客服。用户问题: {user_input}\n没找到相关知识。请礼貌告知。"
 
-        # 4. 异步流式生成
         full_response = ""
-        context_summary = "\n".join([f"[{doc['metadata']['source']}]" for doc in retrieved_docs])
-        
         try:
-            async for chunk in self.llm_model.ainvoke(
-                prompt=prompt,
-                stream=True,
-                temperature=self.chat_config['chat_temperature']
-            ):
-                full_response += chunk
-                yield chunk
-            
-            # 记录日志
-            self.logger.info(f"Query: {user_input} | Intent: {intent} | Docs: {len(retrieved_docs)}\nResponse: {full_response}")
-        except Exception as e:
-            self.console.print(f"[red]LLM 异步生成出错: {e}[/red]")
+            if getattr(self, "chat_service", None) is not None:
+                async for chunk in self.chat_service.generate_reply(
+                    user_input=user_input,
+                    intent=intent,
+                    documents=retrieved_docs,
+                    session_config=self.session_config,
+                ):
+                    full_response += chunk
+                    yield chunk
+            else:
+                prompt = (
+                    f"你是一个智能客服。用户问题: {user_input}\n"
+                    f"意图: {intent}\n"
+                    f"知识: {retrieved_docs}\n回答要简洁。"
+                )
+                async for chunk in self.llm_model.ainvoke(
+                    prompt=prompt,
+                    stream=True,
+                    temperature=self.session_config["chat_temperature"],
+                ):
+                    full_response += chunk
+                    yield chunk
+            self.logger.info(
+                "Query: %s | Intent: %s | Docs: %s\nResponse: %s",
+                user_input,
+                intent,
+                len(retrieved_docs),
+                full_response,
+            )
+        except Exception as exc:
+            self.console.print(f"[red]LLM 异步生成出错: {exc}[/red]")
             yield "抱歉，生成回复时遇到错误。"
 
-    def _display_retrieved_docs(self, docs: List[Dict]):
+    def _display_retrieved_docs(self, docs: List[Dict[str, Any]]):
         if not docs:
             self.console.print("[yellow]无相关文档。[/yellow]")
             return
-        
+
         table = Table(title="[bold cyan]检索详情[/bold cyan]", show_header=True)
         table.add_column("来源", style="cyan")
         table.add_column("预览", style="white")
         table.add_column("得分", style="bold")
         for doc in docs:
             preview = doc.get("page_content", "")[:60].replace("\n", " ") + "..."
-            table.add_row(doc["metadata"]["source"], preview, f"{doc.get('score', 0):.4f}")
+            source = get_relative_path(doc.get("metadata", {}).get("source", "N/A"))
+            table.add_row(source, preview, f"{doc.get('score', 0):.4f}")
         self.console.print(table)
 
-# =================================================================
-# 4. 主函数 (MAIN)
-# =================================================================
+
 async def start_chat_session_async():
-    """启动异步交互式聊天。"""
     console = Console()
     bot = Chatbot(console)
     session = PromptSession()
-    
+
     if bot.llm_model:
         display_chat_config(console, bot.chat_config)
         console.print(f"客服已就绪 ([bold green]{bot.chat_config['active_llm_configuration']}[/bold green])")
-        
+
         while True:
             try:
-                user_query = await session.prompt_async(
-                    HTML('<skyblue><b>你: </b></skyblue>')
-                )
-                if user_query.lower() == '/quit':
+                user_query = await session.prompt_async(HTML('<skyblue><b>你: </b></skyblue>'))
+                if not user_query.strip():
+                    continue
+                if user_query.lower() == "/quit":
                     break
-                
-                if user_query.lower() == '/config':
+
+                if user_query.lower() == "/config":
                     llm_needs_reload, updated_config = await asyncio.to_thread(
                         launch_config_editor,
                         bot.chat_config,
@@ -201,21 +171,21 @@ async def start_chat_session_async():
 
                 response_panel = Panel("", title="客服", border_style="green")
                 full_response = ""
-
                 with Live(response_panel, console=console, refresh_per_second=10) as live:
                     async for chunk in bot.chat_async(user_query):
                         full_response += chunk
                         live.update(Panel(Text(full_response), title="客服", border_style="green"))
-            
+
             except (KeyboardInterrupt, EOFError):
                 break
         console.print("[yellow]感谢使用，再见！[/yellow]")
     else:
         console.print("[red]模型初始化失败。[/red]")
 
+
 def start_chat_session():
-    """入口包装。"""
     asyncio.run(start_chat_session_async())
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     start_chat_session()
