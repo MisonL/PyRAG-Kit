@@ -10,7 +10,7 @@
 
 - `uv sync`：根据 `pyproject.toml` 安装依赖并创建本地环境。
 - `uv run main.py`：启动应用程序。
-- `uv run python -m scripts.embed_knowledge_base`：重建知识库向量化缓存。
+- `uv run python -m scripts.embed_knowledge_base`：重建知识库快照。
 - `uv run pytest`：运行完整测试套件。
 - `uv run pytest tests/test_config.py`：在迭代特定更改时运行单个测试文件。
 
