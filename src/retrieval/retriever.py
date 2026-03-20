@@ -71,83 +71,116 @@ def retrieve_documents(
     active_rerank_configuration: str,
     score_threshold: float,
 ) -> List[Dict]:
-    logger.info(f"开始检索文档，查询: '{query}', 检索方法: {retrieval_method.value}, top_k: {top_k}")
+    logger.info(f"开始同步检索: '{query[:20]}...', 方法: {retrieval_method.value}")
     
-    ranked_results: List[Dict] = [] # 明确类型
+    ranked_results: List[Dict] = []
     
     if retrieval_method == RetrievalMethod.HYBRID_SEARCH:
-        logger.info("执行混合搜索。")
         semantic_results = vector_store.search(query, top_k, search_type="semantic")
         keyword_results = vector_store.search(query, top_k, search_type="keyword")
         
-        logger.debug(f"语义搜索结果数量: {len(semantic_results)}, 关键词搜索结果数量: {len(keyword_results)}")
-
-        # 合并并去重
         all_docs_map = {doc['metadata']['source'] + str(doc['metadata'].get('page', '')): doc for doc in semantic_results}
         for doc in keyword_results:
             key = doc['metadata']['source'] + str(doc['metadata'].get('page', ''))
             if key in all_docs_map:
-                # 如果文档已存在，更新其关键词分数
                 all_docs_map[key]['keyword_score'] = doc.get('score', 0)
-                logger.debug(f"合并文档: {key}，更新关键词分数。")
             else:
-                # 如果文档不存在，添加新文档
                 all_docs_map[key] = doc
-                logger.debug(f"合并文档: {key}，添加新文档。")
 
-        # 为文档分配分数
         for doc in all_docs_map.values():
             doc['semantic_score'] = doc.get('score', 0) if 'semantic_score' not in doc else doc['semantic_score']
             doc['keyword_score'] = doc.get('score', 0) if 'keyword_score' not in doc else doc['keyword_score']
 
         reranker = HybridReranker(vector_weight, keyword_weight)
         ranked_results = reranker.rerank(list(all_docs_map.values()))
-        logger.info(f"混合搜索完成，初始重排文档数量: {len(ranked_results)}")
 
     elif retrieval_method == RetrievalMethod.SEMANTIC_SEARCH:
-        logger.info("执行语义搜索。")
         ranked_results = vector_store.search(query, top_k, search_type="semantic")
-        logger.info(f"语义搜索完成，文档数量: {len(ranked_results)}")
-    else: # FULL_TEXT_SEARCH
-        logger.info("执行关键词搜索。")
+    else: 
         ranked_results = vector_store.search(query, top_k, search_type="keyword")
-        logger.info(f"关键词搜索完成，文档数量: {len(ranked_results)}")
 
-    # 应用分数阈值过滤
-    initial_count = len(ranked_results)
     ranked_results = [doc for doc in ranked_results if doc.get("score", 0) >= score_threshold]
-    if len(ranked_results) < initial_count:
-        logger.info(f"应用分数阈值 {score_threshold} 后，过滤掉 {initial_count - len(ranked_results)} 个文档。")
 
-    # 使用外部Reranker（如果启用）
-    if rerank_enabled:
-        logger.info(f"外部Rerank已启用，正在使用 '{active_rerank_configuration}' 进行重排。")
+    if rerank_enabled and ranked_results:
         rerank_provider = ModelProviderFactory.get_rerank_provider(active_rerank_configuration)
-        if rerank_provider and ranked_results:
-            console.print(f"[dim]正在使用 '{active_rerank_configuration}' 进行重排...[/dim]")
+        if rerank_provider:
             docs_to_rerank = [doc.get("page_content", "") for doc in ranked_results]
-            
             try:
                 reranked_indices, reranked_scores = rerank_provider.rerank(query, docs_to_rerank, top_n=top_k)
-                
-                # 根据索引和分数重新构建文档列表
                 reranked_docs = []
                 for i, score in zip(reranked_indices, reranked_scores):
                     if i < len(ranked_results):
                         doc = ranked_results[i]
-                        doc['score'] = score # 更新为 reranker 的分数
+                        doc['score'] = score
                         reranked_docs.append(doc)
-                
-                # 按新的分数排序
                 ranked_results = sorted(reranked_docs, key=lambda x: x['score'], reverse=True)
-                logger.info(f"外部重排完成，返回 {len(ranked_results)} 个文档。")
-
             except Exception as e:
-                logger.error(f"Rerank提供商出错: {e}", exc_info=True) # 记录详细异常信息
-                console.print(f"[bold red]Rerank提供商出错: {e}[/bold red]")
+                logger.error(f"同步 Rerank 出错: {e}")
+
+    return ranked_results[:top_k]
+
+async def aretrieve_documents(
+    query: str,
+    vector_store: VectorStoreBase,
+    console: Console,
+    retrieval_method: RetrievalMethod,
+    top_k: int,
+    vector_weight: float,
+    keyword_weight: float,
+    rerank_enabled: bool,
+    active_rerank_configuration: str,
+    score_threshold: float,
+) -> List[Dict]:
+    """异步检索文档 (CSE Sensor)。"""
+    import asyncio
+    logger.info(f"开始异步检索: '{query[:20]}...', 方法: {retrieval_method.value}")
+    
+    ranked_results: List[Dict] = []
+    
+    if retrieval_method == RetrievalMethod.HYBRID_SEARCH:
+        semantic_task = vector_store.asearch(query, top_k, search_type="semantic")
+        keyword_task = vector_store.asearch(query, top_k, search_type="keyword")
+        semantic_results, keyword_results = await asyncio.gather(semantic_task, keyword_task)
+        
+        all_docs_map = {doc['metadata']['source'] + str(doc['metadata'].get('page', '')): doc for doc in semantic_results}
+        for doc in keyword_results:
+            key = doc['metadata']['source'] + str(doc['metadata'].get('page', ''))
+            if key in all_docs_map:
+                all_docs_map[key]['keyword_score'] = doc.get('score', 0)
+            else:
+                all_docs_map[key] = doc
+
+        for doc in all_docs_map.values():
+            doc['semantic_score'] = doc.get('score', 0) if 'semantic_score' not in doc else doc['semantic_score']
+            doc['keyword_score'] = doc.get('score', 0) if 'keyword_score' not in doc else doc['keyword_score']
+
+        reranker = HybridReranker(vector_weight, keyword_weight)
+        ranked_results = reranker.rerank(list(all_docs_map.values()))
+
+    elif retrieval_method == RetrievalMethod.SEMANTIC_SEARCH:
+        ranked_results = await vector_store.asearch(query, top_k, search_type="semantic")
     else:
-        logger.info("外部Rerank未启用。")
+        ranked_results = await vector_store.asearch(query, top_k, search_type="keyword")
+
+    ranked_results = [doc for doc in ranked_results if doc.get("score", 0) >= score_threshold]
+
+    if rerank_enabled and ranked_results:
+        rerank_provider = ModelProviderFactory.get_rerank_provider(active_rerank_configuration)
+        if rerank_provider:
+            docs_to_rerank = [doc.get("page_content", "") for doc in ranked_results]
+            try:
+                reranked_indices, reranked_scores = await rerank_provider.arerank(query, docs_to_rerank, top_n=top_k)
+                reranked_docs = []
+                for i, score in zip(reranked_indices, reranked_scores):
+                    if i < len(ranked_results):
+                        doc = ranked_results[i]
+                        doc['score'] = score
+                        reranked_docs.append(doc)
+                ranked_results = sorted(reranked_docs, key=lambda x: x['score'], reverse=True)
+                logger.info(f"外部异步重排完成，获取到 {len(ranked_results)} 个结果。")
+            except Exception as e:
+                logger.error(f"异步 Rerank 出错 (降级到原始评分): {e}")
 
     final_results = ranked_results[:top_k]
-    logger.info(f"检索过程完成，最终返回 {len(final_results)} 个文档。")
+    logger.info(f"异步检索流程结束，返回 {len(final_results)} 条记录。")
     return final_results
