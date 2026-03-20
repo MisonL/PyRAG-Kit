@@ -4,7 +4,7 @@ import os
 import pytest
 from pydantic import ValidationError
 
-from src.utils.config import RetrievalMethod, Settings, get_settings
+from src.utils.config import RetrievalMethod, Settings, get_settings, resolve_app_root
 
 
 MOCK_TOML_CONTENT = """
@@ -172,3 +172,24 @@ def test_settings_path_resolution(monkeypatch):
 
     assert os.path.isabs(settings.knowledge_base_path)
     assert settings.knowledge_base_path.endswith("my_kb")
+
+
+def test_resolve_app_root_source_mode(monkeypatch, tmp_path):
+    monkeypatch.setattr("src.utils.config.sys", type("FakeSys", (), {"frozen": False, "executable": ""})())
+    monkeypatch.setattr("src.utils.config.__file__", str(tmp_path / "src" / "utils" / "config.py"))
+
+    root = resolve_app_root()
+
+    assert root == tmp_path
+
+
+def test_resolve_app_root_frozen_mode(monkeypatch, tmp_path):
+    executable = tmp_path / "PyRAG-Kit" / "PyRAG-Kit"
+    monkeypatch.setattr(
+        "src.utils.config.sys",
+        type("FakeSys", (), {"frozen": True, "executable": str(executable)})(),
+    )
+
+    root = resolve_app_root()
+
+    assert root == executable.parent

@@ -47,6 +47,7 @@ venv.bak
 /data/logs/
 /data/kb/
 *.pkl
+/release_artifacts/
 
 # 知识库文档
 /knowledge_base/

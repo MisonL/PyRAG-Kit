@@ -117,6 +117,25 @@ data/kb/ACTIVE_SNAPSHOT
 data/kb/<snapshot_id>/
 ```
 
+## 二进制发布
+
+仓库内置了基于 PyInstaller 的 GitHub Release 打包链路，发布标签推送后会自动构建以下平台产物：
+
+- `windows-x64`
+- `macos-x64`
+- `macos-arm64`
+- `linux-x64`
+- `linux-arm64`
+
+本地手动打包示例：
+
+```bash
+uv sync --group dev
+uv run python scripts/build_binary_release.py --target macos-x64 --validate
+```
+
+发布工作流定义在 [`.github/workflows/release.yml`](/Volumes/Work/code/PyRAG-kit/.github/workflows/release.yml)，发布说明会从 [CHANGELOG.md](/Volumes/Work/code/PyRAG-kit/CHANGELOG.md) 的对应版本节自动提取。
+
 ---
 
 ## 📖 开发者文档

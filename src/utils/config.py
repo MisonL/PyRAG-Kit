@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import functools
+import sys
 import tomllib
 from enum import Enum
 from pathlib import Path
@@ -14,7 +15,19 @@ from pydantic_settings import BaseSettings, SettingsConfigDict, PydanticBaseSett
 # =================================================================
 
 # 项目根目录
-ROOT_DIR = Path(__file__).parent.parent.parent
+def resolve_app_root() -> Path:
+    """
+    返回应用根目录。
+
+    - 源码运行时使用仓库根目录。
+    - PyInstaller 冻结运行时使用可执行文件所在目录。
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent.parent
+
+
+ROOT_DIR = resolve_app_root()
 # 配置文件路径
 CONFIG_TOML_PATH = ROOT_DIR / 'config.toml'
 
