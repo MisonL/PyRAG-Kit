@@ -8,6 +8,7 @@ import jieba
 import copy
 import pickle
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from rank_bm25 import BM25Okapi
 
@@ -26,6 +27,8 @@ from ...providers.factory import ModelProviderFactory
 from ...utils.log_manager import get_module_logger
 
 logger = get_module_logger(__name__)
+
+jieba.setLogLevel(jieba.logging.ERROR)
 
 class FaissStore(VectorStoreBase):
     """
@@ -58,7 +61,7 @@ class FaissStore(VectorStoreBase):
     def _update_indices(self, new_documents: List[Dict], new_embeddings: np.ndarray):
         """增量更新索引逻辑。"""
         # 1. 更新 BM25 缓存与索引
-        new_tokens = [list(jieba.cut(doc.get("page_content", ""))) for doc in new_documents]
+        new_tokens = [list(jieba.cut(self._build_index_text(doc))) for doc in new_documents]
         self._tokenized_docs_cache.extend(new_tokens)
         self.bm25_index = BM25Okapi(self._tokenized_docs_cache)
         
@@ -82,6 +85,19 @@ class FaissStore(VectorStoreBase):
         if isinstance(parent_document, str):
             return {"content": parent_document, "metadata": {}}
         return {"content": "", "metadata": {}}
+
+    @staticmethod
+    def _build_index_text(document: Dict[str, Any]) -> str:
+        metadata = document.get("metadata") or {}
+        source = metadata.get("source", "")
+        source_hint = ""
+        if isinstance(source, str) and source:
+            source_hint = Path(source).stem.replace("_", " ").replace("-", " ")
+
+        page_content = document.get("page_content", "") or ""
+        if source_hint and source_hint not in page_content:
+            return f"{source_hint}\n{page_content}"
+        return page_content
 
     def register_parent_documents(self, parent_documents: Dict[str, Dict[str, Any]]):
         """注册父分段侧车数据。"""
@@ -111,7 +127,7 @@ class FaissStore(VectorStoreBase):
         logger.info(f"正在同步添加 {len(documents)} 个文档到 FaissStore。")
         start_total = time.perf_counter()
 
-        new_texts = [doc.get("page_content", "") for doc in documents]
+        new_texts = [self._build_index_text(doc) for doc in documents]
         model = self.get_embedding_model()
         new_embeddings = np.array(model.embed_documents(texts=new_texts), dtype=np.float32)
 
@@ -133,7 +149,7 @@ class FaissStore(VectorStoreBase):
             logger.info(f"正在异步添加 {len(documents)} 个文档 (已加锁)。")
             start_total = time.perf_counter()
 
-            new_texts = [doc.get("page_content", "") for doc in documents]
+            new_texts = [self._build_index_text(doc) for doc in documents]
             model = self.get_embedding_model()
             embeddings_list = await model.aembed_documents(texts=new_texts)
             new_embeddings = np.array(embeddings_list, dtype=np.float32)
@@ -290,7 +306,7 @@ class FaissStore(VectorStoreBase):
         
         # 重新初始化索引和缓存
         if self.documents:
-            self._tokenized_docs_cache = [list(jieba.cut(doc.get("page_content", ""))) for doc in self.documents]
+            self._tokenized_docs_cache = [list(jieba.cut(self._build_index_text(doc))) for doc in self.documents]
             self.bm25_index = BM25Okapi(self._tokenized_docs_cache)
         
         if self.embeddings is not None and len(self.embeddings) > 0:

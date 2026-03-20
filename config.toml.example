@@ -63,7 +63,7 @@ kb_embedding_batch_size = 32
 # 默认 LLM 提供商键
 default_llm_provider = "google"
 # 默认 Embedding 提供商键
-default_embedding_provider = "google"
+default_embedding_provider = "local-hash"
 # 默认 Rerank 提供商键
 default_rerank_provider = "siliconflow"
 # 默认向量存储实现
@@ -89,6 +89,13 @@ chat_score_threshold = 0.4
 chat_temperature = 0.7
 
 # --- 向量化模型配置 ---
+# local-hash 离线向量化模型
+[embedding_configurations.local-hash]
+# 提供商实现标识
+provider = "local-hash"
+# 本地哈希向量模型名，后缀数字表示维度
+model_name = "local-hash-256"
+
 # google 向量化模型
 [embedding_configurations.google]
 # 提供商实现标识
@@ -174,6 +181,13 @@ model_name = "gemini-2.5-pro"
 provider = "openai"
 # API 实际模型名
 model_name = "gpt-4o"
+
+# iflow-qwen3-max 聊天模型
+[llm_configurations.iflow-qwen3-max]
+# 提供商实现标识
+provider = "openai"
+# API 实际模型名
+model_name = "qwen3-max"
 
 # openai-gpt3.5 聊天模型
 [llm_configurations."openai-gpt3.5"]

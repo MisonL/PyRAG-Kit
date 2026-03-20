@@ -10,7 +10,7 @@ from src.retrieval.vdb.faiss_store import FaissStore # 导入 FaissStore
 
 # Mock FaissStore 类
 class MockFaissStore(VectorStoreBase):
-    def __init__(self, file_path: str):
+    def __init__(self, file_path: str | None):
         self.file_path = file_path
         self.documents = []
         self.embeddings = None
@@ -65,7 +65,7 @@ def patch_settings(monkeypatch):
         from src.retrieval.vdb.factory import VectorStoreFactory as ReloadedVectorStoreFactory
         
         # 直接模拟 VectorStoreFactory.get_vector_store 方法
-        def mock_get_vector_store(store_type: str, file_path: str) -> VectorStoreBase:
+        def mock_get_vector_store(store_type: str, file_path: str | None = None) -> VectorStoreBase:
             if store_type.lower() == "faiss":
                 return MockFaissStore(file_path=file_path)
             else:
@@ -94,3 +94,10 @@ def test_get_default_vector_store_success():
     store = VectorStoreFactory.get_default_vector_store()
     assert isinstance(store, MockFaissStore)
     assert store.file_path == "/mock/path/to/faiss_store.pkl"
+
+
+def test_get_default_vector_store_without_loading_existing():
+    """测试获取空白向量存储实例，不加载现有索引文件。"""
+    store = VectorStoreFactory.get_default_vector_store(load_existing=False)
+    assert isinstance(store, MockFaissStore)
+    assert store.file_path is None

@@ -1,10 +1,13 @@
 import asyncio
+import os
 from typing import Dict, List
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from prompt_toolkit import prompt
+from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import HTML
+
+os.environ.setdefault("PROMPT_TOOLKIT_NO_CPR", "1")
 
 from ..utils.config import get_settings
 from ..retrieval.vdb.factory import VectorStoreFactory
@@ -43,6 +46,7 @@ def display_results(query: str, documents: List[Dict]):
 async def run_retrieval_test_async():
     """异步执行召回测试。"""
     console.print(Panel("进入异步召回测试模式。输入 '/quit' 退出。", border_style="yellow"))
+    session = PromptSession()
     
     excel_logger = None
     try:
@@ -59,7 +63,9 @@ async def run_retrieval_test_async():
 
     while True:
         try:
-            query = prompt(HTML('<deepskyblue><b>测试查询: </b></deepskyblue>'))
+            query = await session.prompt_async(
+                HTML('<deepskyblue><b>测试查询: </b></deepskyblue>')
+            )
             if query.lower() == '/quit':
                 break
             if not query: continue

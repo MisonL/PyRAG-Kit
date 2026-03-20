@@ -71,6 +71,9 @@ def test_settings_defaults():
     assert settings.retrieval_candidate_multiplier == 3
     assert settings.kb_child_chunk_size == 300
     assert settings.kb_child_chunk_overlap == 30
+    assert settings.default_embedding_provider == "local-hash"
+    assert settings.embedding_configurations["local-hash"].model_name == "local-hash-256"
+    assert settings.llm_configurations["iflow-qwen3-max"].model_name == "qwen3-max"
 
 
 def test_settings_from_toml(tmp_path):

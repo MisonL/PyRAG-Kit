@@ -14,7 +14,7 @@ class VectorStoreFactory:
     """
 
     @staticmethod
-    def get_vector_store(store_type: str, file_path: str) -> VectorStoreBase:
+    def get_vector_store(store_type: str, file_path: str | None = None) -> VectorStoreBase:
         """
         根据指定的存储类型获取向量存储实例。
         
@@ -34,7 +34,7 @@ class VectorStoreFactory:
             raise ValueError(f"不支持的向量存储类型: {store_type}")
 
     @staticmethod
-    def get_default_vector_store() -> VectorStoreBase:
+    def get_default_vector_store(load_existing: bool = True) -> VectorStoreBase:
         """
         获取默认配置的向量存储实例。
         
@@ -43,5 +43,5 @@ class VectorStoreFactory:
         """
         current_settings = get_settings() # 获取当前配置
         default_store_type = current_settings.default_vector_store
-        default_file_path = current_settings.pkl_path
+        default_file_path = current_settings.pkl_path if load_existing else None
         return VectorStoreFactory.get_vector_store(default_store_type, default_file_path)

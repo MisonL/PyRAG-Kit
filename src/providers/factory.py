@@ -27,6 +27,7 @@ class ModelProviderFactory:
         "lm-studio": {"module": "src.providers.lm_studio", "class": "LMStudioProvider"},
         "deepseek": {"module": "src.providers.deepseek", "class": "DeepSeekProvider"},
         "grok": {"module": "src.providers.grok", "class": "GrokProvider"},
+        "local-hash": {"module": "src.providers.local_hash", "class": "LocalHashEmbeddingProvider"},
         
         # Rerank Providers
         "jina": {"module": "src.providers.jina", "class": "JinaProvider"},

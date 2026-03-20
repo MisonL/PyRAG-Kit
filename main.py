@@ -11,6 +11,8 @@ from typing import Tuple
 from prompt_toolkit import prompt
 from prompt_toolkit.formatted_text import HTML
 
+os.environ.setdefault("PROMPT_TOOLKIT_NO_CPR", "1")
+
 # --- 绝对导入 ---
 # 导入 cleanup 模块以注册 atexit 钩子
 import src.utils.cleanup

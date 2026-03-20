@@ -9,6 +9,10 @@ import sys
 from typing import Optional
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -123,12 +127,15 @@ def display_config_and_confirm(splitter_structure_mode: str):
     table.add_row("激活嵌入提供商", f"[bold green]{active_embedding_key}[/bold green] ([dim]{provider}[/dim])")
     table.add_row("模型名称", f"[bold bright_white]{embedding_model_details.model_name}[/bold bright_white]")
 
-    key_field_name = f"{provider.lower()}_api_key"
-    api_key_value = getattr(current_settings, key_field_name, None)
-    table.add_row(f"API Key ({key_field_name.upper()})", mask_api_key(api_key_value))
+    if provider == "local-hash":
+        table.add_row("API Key", "[dim]本地模型，无需设置[/dim]")
+    else:
+        key_field_name = f"{provider.lower()}_api_key"
+        api_key_value = getattr(current_settings, key_field_name, None)
+        table.add_row(f"API Key ({key_field_name.upper()})", mask_api_key(api_key_value))
 
     console.print(table)
-    console.print("[yellow]配置信息来源于 config.ini, .env 或环境变量。[/yellow]")
+    console.print("[yellow]配置信息来源于 config.toml, .env 或环境变量。[/yellow]")
     
     choice = console.input("是否使用以上配置继续？ (y/n): ").lower()
     if choice not in ['y', 'yes']:
@@ -140,7 +147,7 @@ async def main_async(splitter_structure_mode: str):
     logger.info("脚本开始执行 (Async)。")
     display_config_and_confirm(splitter_structure_mode)
     
-    vector_store = VectorStoreFactory.get_default_vector_store()
+    vector_store = VectorStoreFactory.get_default_vector_store(load_existing=False)
     await process_documents_async(vector_store, splitter_structure_mode)
     console.print("\n[bold green]知识库异步嵌入完成。[/bold green]")
     logger.info("知识库嵌入脚本执行完成。")

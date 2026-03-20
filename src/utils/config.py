@@ -87,7 +87,7 @@ class Settings(BaseSettings):
 
     # --- [BEHAVIOR] ---
     default_llm_provider: str = "google"
-    default_embedding_provider: str = "google"
+    default_embedding_provider: str = "local-hash"
     default_rerank_provider: str = "siliconflow"
     default_vector_store: str = "faiss" # 新增向量存储默认提供商
 
@@ -104,6 +104,7 @@ class Settings(BaseSettings):
 
     # --- [MODEL_CONFIGURATIONS] ---
     embedding_configurations: Dict[str, ModelDetail] = Field(default_factory=lambda: {
+        "local-hash": ModelDetail(provider="local-hash", model_name="local-hash-256"),
         "google": ModelDetail(provider="google", model_name="embedding-001"),
         "jina": ModelDetail(provider="jina", model_name="jina-embeddings-v2-base-zh"),
         "siliconflow": ModelDetail(provider="siliconflow", model_name="alibaba/bge-large-zh-v1.5"),
@@ -121,6 +122,7 @@ class Settings(BaseSettings):
         "volcengine": ModelDetail(provider="volcengine", model_name="Doubao-pro-32k"),
         "siliconflow": ModelDetail(provider="siliconflow", model_name="deepseek-ai/DeepSeek-V2-Chat"),
         "openai": ModelDetail(provider="openai", model_name="gpt-4o"),
+        "iflow-qwen3-max": ModelDetail(provider="openai", model_name="qwen3-max"),
         "ollama": ModelDetail(provider="ollama", model_name="llama3"),
         "lm-studio": ModelDetail(provider="lm-studio", model_name="LM-Studio-Community/Meta-Llama-3-8B-Instruct-GGUF"),
     })

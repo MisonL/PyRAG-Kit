@@ -15,10 +15,12 @@ from rich.table import Table
 from rich.style import Style
 from rich.text import Text
 from rich.live import Live
-from prompt_toolkit import prompt
+from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import HTML
 
 import asyncio
+
+os.environ.setdefault("PROMPT_TOOLKIT_NO_CPR", "1")
 # 使用相对导入
 from ..providers.factory import ModelProviderFactory
 from ..providers.__base__.model_provider import LargeLanguageModel
@@ -94,14 +96,14 @@ class Chatbot:
                 response += chunk
             return response.strip() or user_query
         except Exception as e:
-            logger.error(f"异步意图识别失败: {e}")
+            self.logger.error(f"异步意图识别失败: {e}")
             return user_query
 
-    async def _retrieve_knowledge_async(self, query: str) -> List[Dict[str, Any]]:
+    async def _retrieve_knowledge_async(self, retrieval_query: str) -> List[Dict[str, Any]]:
         """异步知识检索。"""
         if not self.vector_store: return []
         return await aretrieve_documents(
-            query=query,
+            query=retrieval_query,
             vector_store=self.vector_store,
             console=self.console,
             retrieval_method=self.chat_config['retrieval_method'],
@@ -122,7 +124,7 @@ class Chatbot:
         self.console.print(f"  [bold]意图:[/bold] [yellow]{intent}[/yellow]")
         
         # 2. 检索
-        retrieved_docs = await self._retrieve_knowledge_async(user_input)
+        retrieved_docs = await self._retrieve_knowledge_async(intent)
         self._display_retrieved_docs(retrieved_docs)
         
         # 3. 构造 Prompt
@@ -172,6 +174,7 @@ async def start_chat_session_async():
     """启动异步交互式聊天。"""
     console = Console()
     bot = Chatbot(console)
+    session = PromptSession()
     
     if bot.llm_model:
         display_chat_config(console, bot.chat_config)
@@ -179,15 +182,17 @@ async def start_chat_session_async():
         
         while True:
             try:
-                # prompt_toolkit prompt 是阻塞的，但在简单的 CLI 中通常可以接受
-                # 如果追求极致，可以使用异步版本的 prompt
-                user_query = prompt(HTML('<skyblue><b>你: </b></skyblue>'))
+                user_query = await session.prompt_async(
+                    HTML('<skyblue><b>你: </b></skyblue>')
+                )
                 if user_query.lower() == '/quit':
                     break
                 
                 if user_query.lower() == '/config':
-                    from ..ui.config_menu import launch_config_editor
-                    llm_needs_reload, updated_config = launch_config_editor(bot.chat_config)
+                    llm_needs_reload, updated_config = await asyncio.to_thread(
+                        launch_config_editor,
+                        bot.chat_config,
+                    )
                     bot.chat_config = updated_config
                     if llm_needs_reload:
                         bot.reload_llm()
