@@ -1,217 +1,115 @@
 <div align="center">
+<img src="imgs/logo.jpg" alt="PyRAG-Kit Logo" width="200"/>
 
-![Logo](imgs/logo.jpg)
+# PyRAG-Kit
+
+**轻量级、面向架构验证的 Dify 核心逻辑 Python 实现**
+
+[![Python Version](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
+[![License: Hybrid](https://img.shields.io/badge/License-Hybrid-yellow.svg)](DIFY_LICENSE)
+[![Dependency Manager: UV](https://img.shields.io/badge/UV-Fast%20&%20Reliable-green)](https://github.com/astral-sh/uv)
 
 </div>
-
-<div align="center">
-
-[![Python Version](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://www.python.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Author: Mison](https://img.shields.io/badge/Author-Mison-brightgreen)](mailto:1360962086@qq.com)
-
-</div>
-
-> **PyRAG-Kit** 是一个 **Dify 核心逻辑的 Python 实现**，旨在提供一个轻量级的本地化工具，用于快速验证和理解 Dify 的知识库核心工作流程，包括文档的**向量化、分段处理**以及**混合检索**策略。
 
 ---
 
-## ✨ 核心功能
+## 📌 项目定位
 
-- **🔌 多模型支持**: 无缝集成多种主流和本地大语言模型，包括 Google Gemini, OpenAI GPT, Anthropic Claude, 阿里云通义千问, 豆包, DeepSeek, Grok, 以及通过 Ollama 或 LM Studio 运行的本地模型。
-- **🚀 高级检索策略**: 支持向量检索、全文检索和混合检索，并通过 Rerank 模型二次精排，提升答案相关性。
-- **⚙️ 动态交互配置**: 运行时通过 `/config` 命令打开交互式菜单，动态切换LLM、调整检索策略、修改权重等。
-- **📄 流式响应**: 客服回答采用打字机流式输出，提升用户交互体验。
-- **📊 统一日志系统**: 采用标准 `logging` 模块，将程序运行和聊天对话的详细信息统一记录到文件和控制台，便于审计、分析和调试。
-- **✅ 单元测试**: 为核心模块（如模型提供商工厂、向量存储工厂、ETL流水线）编写了全面的单元测试，确保代码质量和功能稳定性。
-- **🧹 智能缓存与清理**: 自动处理知识库向量化，并在程序退出时清理缓存，保持项目整洁。
+**PyRAG-Kit** 是对 [Dify](https://github.com/langgenius/dify) 核心 RAG (Retrieval-Augmented Generation) 逻辑的深度剖析与 Python 原生实现。本项目并非 Dify 的简单克隆，而是旨在提供一个**高透明度、高性能且可快速迭代的本地化实验场**，用于验证和研究：
 
-## 📚 使用文档
+- **全链路异步流水线**: 从文档 ETL 到混合检索及 LLM 生成的全过程异步化。
+- **高维索引平衡**: 哈希/向量检索与传统关键词检索的混合策略及加权融合。
+- **Provider 解耦架构**: 针对主流模型供应商（Google, OpenAI, Anthropic 等）的标准化抽象与容错处理。
+- **工程化最佳实践**: 采用 `uv` 环境管理、CSE 性能传感器及 `tenacity` 指数退避重试机制。
 
-为了帮助您更好地理解和使用本项目，我们提供了一套完整的在线文档，涵盖了从快速上手到二次开发的所有内容。
+---
 
-**[➡️ 点击这里，查看完整用户指南](./docs/user_guide/introduction.md)**
+## ✨ 核心能力
 
-## 📸 程序截图
+- **🏗️ 异步 RAG 架构**: 基于 `asyncio` 构建的非阻塞检索流水线，支持高并发处理与流式响应输出。
+- **🔌 模块化扩展 (`ProviderFactory`)**: 无缝集成 Google Gemini (采用最新 `google-genai` SDK)、OpenAI GPT-4o、Anthropic Claude 3.5、DeepSeek 以及国产闭源/开源模型（豆包、通义千问等）。
+- **🚀 混合检索策略 (Hybrid Search)**: 深度复现 Dify 混合检索逻辑，支持语义向量检索、全文检索（BM25）及其加权分值融合。
+- **🎯 语义精排 (Rerank)**: 支持集成 Jina AI、SiliconFlow 等 Rerank 模型，对海量召回结果进行二次精排，解决 RAG 系统中的“召回精度不足”问题。
+- **⚙️ 交互式配置控制**: 通过 `/config` 命令在运行时动态调整全局参数，包括检索 Top-K、权重配比及重试策略。
+- **🧪 架构级验证工具**: 内置 `AGENTS.md` 指导原则与全面的 `pytest` 测试套件，确保每一行核心逻辑的可重复性验证。
 
-![Main Screenshot](imgs/main.jpg)
+---
 
+## 📂 目录结构
 
-## 📂 项目结构
-
-项目采用了现代化的目录结构，将源代码、数据、脚本和文档清晰地分离开来。
-
-```
+```text
 .
-├── data/                # 生成的数据 (被 .gitignore 忽略)
-│   ├── employee_kb.pkl  # 知识库向量文件
-│   └── logs/            # 聊天日志
-├── knowledge_base/      # 存放你的原始知识库 .md 文件
-├── scripts/             # 独立脚本
-│   └── embed_knowledge_base.py # 知识库向量化脚本
-├── src/                 # 核心源代码
-│   ├── chat/            # 聊天核心逻辑
-│   ├── providers/       # 所有模型提供商的实现
-│   ├── retrieval/       # 检索逻辑
-│   ├── ui/              # 用户界面 (菜单、显示工具)
-│   └── utils/           # 辅助工具 (配置、清理、日志管理)
-├── tests/               # 自动化测试
-│   ├── etl/             # ETL流水线测试
-│   ├── providers/       # 模型提供商测试
-│   └── retrieval/       # 检索模块测试
-├── main.py              # 程序主入口
-├── config.ini.example   # 配置文件模板
-├── .gitignore           # Git忽略文件配置
-├── README.md            # 就是你正在看的这个文件
-└── requirements.txt     # Python依赖项
+├── src/
+│   ├── chat/           # 会话控制中心：响应流管理与 RAG 循环逻辑
+│   ├── providers/      # 供应商适配层：标准化 SDK 调用与异常隔离
+│   ├── retrieval/      # 检索引擎：向量存储与混合搜索算法
+│   ├── etl/            # 数据管道：文档结构化、清洗与分块向量化
+│   ├── ui/             # 交互界面：动态配置菜单与 Rich 渲染
+│   └── utils/          # 基础设施：强类型配置 (Pydantic) 与日志系统
+├── scripts/            # 工具脚本：大规模知识库离线构建
+├── tests/              # 验证矩阵：覆盖核心组件的单元测试
+└── data/               # 持久化层：向量索引文件与审计日志
 ```
 
-## 🚀 安装与运行
+---
 
-### 1. 克隆项目
+## 🚀 快速开始
+
+### 1. 环境初始化
+
+本项目推荐使用 [uv](https://github.com/astral-sh/uv) 进行高性能依赖管理。
 
 ```bash
 git clone https://github.com/MisonL/PyRAG-Kit.git
 cd PyRAG-Kit
-```
 
-### 2. 安装依赖
-
-项目使用 `uv` 管理依赖，这比传统的 `pip` 更快且更可靠。
-
-```bash
-# 同步依赖并创建虚拟环境
+# 同步依赖并初始化虚拟环境 (Python 3.11+)
 uv sync
 ```
 
-### 3. 配置指南
+### 2. 配置与认证
 
-本项目采用了一套灵活的分层配置系统。您可以根据自己的喜好和使用场景，选择以下任何一种或多种方式进行配置。
+PyRAG-Kit 采用分层配置策略（环境变量 > .env > config.ini）。
 
-**配置加载优先级:**
+```bash
+# 从模板创建配置文件
+cp config.ini.example config.ini
+```
 
-系统会按照以下顺序寻找配置项，排在前面的方式会覆盖排在后面的：
+编辑 `config.ini`：
+1. 在 `[API_KEYS]` 中填入对应的服务 Key。
+2. 在 `[MODEL_CONFIGURATIONS]` 中通过 JSON 定义模型方案。
 
-1.  **环境变量** (最高优先级)
-2.  **`.env` 文件** (位于项目根目录)
-3.  **`config.ini` 文件** (位于项目根目录)
-4.  **代码中的默认值** (最低优先级)
+### 3. 运行系统
 
----
-
-#### **方式一: `config.ini` 文件 (推荐用于本地开发)**
-
-这是最直观的配置方式。
-
-1.  **创建配置文件**:
-    ```bash
-    cp config.ini.example config.ini
-    ```
-
-2.  **编辑 `config.ini`**:
-    打开 `config.ini` 文件，根据您的需求修改。文件内有详细的中文注释说明每个配置项的作用。
-    ```ini
-    # config.ini
-
-    [API_KEYS]
-    # 填入你希望使用的模型的API Key
-    GOOGLE_API_KEY = "AIzaSy..."
-    # ...
-
-    [BEHAVIOR]
-    # 默认使用的LLM提供商
-    DEFAULT_LLM_PROVIDER = google
-    # ...
-    ```
-
----
-
-#### **方式二: `.env` 文件 (推荐用于隔离敏感信息)**
-
-您可以将敏感信息（如API密钥）或需要频繁更改的配置放在 `.env` 文件中，这个文件通常不提交到版本控制系统。
-
-1.  在项目根目录创建一个名为 `.env` 的文件。
-
-2.  在文件中以 `KEY=VALUE` 的格式添加配置项。注意，这里的键名需要与 `config.ini` 中的键名保持一致，但不需要段落 `[SECTION]`。
-    ```dotenv
-    # .env
-    # 这里的配置会覆盖 config.ini 中的同名配置
-
-    OPENAI_API_KEY="sk-your-real-openai-key"
-    DEFAULT_LLM_PROVIDER="openai-gpt4o"
-    LOG_LEVEL="DEBUG"
-    ```
-
----
-
-#### **方式三: 环境变量 (推荐用于生产部署)**
-
-在服务器或 Docker 环境中部署时，使用环境变量是最标准、最安全的方式。
-
--   在 Linux 或 macOS 系统中:
-    ```bash
-    export OPENAI_API_KEY="sk-your-real-openai-key"
-    export DEFAULT_LLM_PROVIDER="openai-gpt4o"
-    python main.py
-    ```
--   在 Windows (PowerShell) 中:
-    ```powershell
-    $env:OPENAI_API_KEY="sk-your-real-openai-key"
-    $env:DEFAULT_LLM_PROVIDER="openai-gpt4o"
-    python main.py
-    ```
-
-> **总结**:
-> - **本地开发**: 直接修改 `config.ini` 最方便。
-> - **团队协作**: 使用 `config.ini` 作为基础配置，个人使用 `.env` 文件覆盖部分配置（并将 `.env` 加入 `.gitignore`）。
-> - **服务器部署**: 使用环境变量来管理所有配置，特别是密钥。
-
-### 4. 准备知识库
-
-将你的 `.md` 格式的知识库文档放入 `knowledge_base` 文件夹中。
-
-### 5. 运行程序
-
-使用 `uv run` 直接运行主程序，它会自动处理虚拟环境。
+1. 将原始 Markdown 文件放入 `knowledge_base/`。
+2. 启动主程序，系统将自动按需构建/更新向量索引：
 
 ```bash
 uv run main.py
 ```
 
-**程序会自动完成以下工作:**
-1.  **检查知识库**: 如果 `knowledge_base` 目录中有新的或更新的文档，程序会自动进行向量化并更新 `data/employee_kb.pkl` 文件。
-2.  **启动聊天**: 直接进入交互式聊天会话。
+---
 
-**常用命令:**
--   输入 `/config` 可以随时打开动态配置菜单。
--   输入 `/quit` 或 `exit` 可以退出聊天。
--   详细日志请查看 `data/logs/` 目录下的文件。
+## 📖 开发者文档
+
+- [用户指南](./docs/user_guide/introduction.md)
+- [核心概念](./docs/user_guide/core-concepts.md)
+- [开发者指南](./docs/developer_docs/developer-guide.md)
+- [重构路线图](./docs/developer_docs/REFACTORING_PLAN.md)
 
 ---
 
+## ⚖️ 商业许可与源代码声明
+
+**PyRAG-Kit 包含 Dify 核心逻辑的衍生实现。**
+
+- **Dify 移植板块**: 本项目在 `src/etl/` 和 `src/retrieval/` 等目录中使用了 Dify 核心代码。这些部分遵循 [Dify Modified Apache License 2.0](DIFY_LICENSE)。禁止通过此部分代码构建多租户商业服务，且必须保留原始作者版权。
+- **项目框架层**: 本项目自身的工程化架构、Provider 适配层及测试链路采用 [MIT 许可证](LICENSE)。
+
+详细移植列表与版权说明请参阅 [`AGENTS.md`](AGENTS.md)。
+
 ---
-
-## ⚖️ 许可证声明
-
-本项目移植了部分 [Dify](https://github.com/langgenius/dify) 的核心逻辑。Dify 采用的是 [Apache License 2.0](http://www.apache.org/licenses/LICENSE-2.0) 的修改版本，并附加了特定的商业使用条件（例如多租户服务和前端 LOGO/版权限制）。
-
-因此，本项目在使用 Dify 源码的部分，也需遵循 Dify 的原始许可证及其附加条件。详细许可证内容请参阅项目根目录下的 [`DIFY_LICENSE`](DIFY_LICENSE) 文件。
-
-在遵守 Dify 许可证的前提下，本项目其余部分采用 [MIT License](https://opensource.org/licenses/MIT) 进行许可。
-
-### Dify 移植代码文件
-
-以下文件包含或受 Dify 核心逻辑启发：
-
-*   [`src/etl/pipeline.py`](src/etl/pipeline.py)
-*   [`src/etl/cleaners/base.py`](src/etl/cleaners/base.py)
-*   [`src/etl/cleaners/basic_cleaner.py`](src/etl/cleaners/basic_cleaner.py)
-*   [`src/etl/extractors/base.py`](src/etl/extractors/base.py)
-*   [`src/etl/extractors/markdown_extractor.py`](src/etl/extractors/markdown_extractor.py)
-*   [`src/etl/splitters/base.py`](src/etl/splitters/base.py)
-*   [`src/etl/splitters/recursive_text_splitter.py`](src/etl/splitters/recursive_text_splitter.py)
-*   [`src/retrieval/retriever.py`](src/retrieval/retriever.py)
-*   [`src/retrieval/vdb/base.py`](src/retrieval/vdb/base.py)
-*   [`src/retrieval/vdb/factory.py`](src/retrieval/vdb/factory.py)
-*   [`src/retrieval/vdb/faiss_store.py`](src/retrieval/vdb/faiss_store.py)
-*   [`src/models/document.py`](src/models/document.py)
+<div align="center">
+Created by Mison @ 2025 | 基于 Dify 核心架构的本地化演进
+</div>

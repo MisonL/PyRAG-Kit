@@ -2,8 +2,11 @@
 # =================================================================
 # 1. 导入 (IMPORTS)
 # =================================================================
+import argparse
 import asyncio
-from typing import Any, Optional, List, Dict
+import os
+import sys
+from typing import Optional
 from pathlib import Path
 
 from rich.console import Console
@@ -26,7 +29,7 @@ logger = get_module_logger(__name__)
 # =================================================================
 # 2. 知识库核心 (KNOWLEDGE BASE CORE)
 # =================================================================
-async def process_documents_async(vector_store: VectorStoreBase):
+async def process_documents_async(vector_store: VectorStoreBase, splitter_structure_mode: str):
     console = Console()
     logger.info("开始异步处理知识库文档。")
     current_settings = get_settings()
@@ -45,7 +48,7 @@ async def process_documents_async(vector_store: VectorStoreBase):
     logger.info(f"找到 {len(markdown_files)} 个Markdown文档。")
     
     # 实例化 Pipeline
-    pipeline = Pipeline.from_file_path(Path(markdown_files[0]))
+    pipeline = Pipeline.from_file_path(Path(markdown_files[0]), splitter_structure_mode=splitter_structure_mode)
     
     final_chunks = []
     # 这里处理文档内容读取可以保持同步，或者使用 aiofiles
@@ -77,7 +80,7 @@ async def process_documents_async(vector_store: VectorStoreBase):
 # =================================================================
 # 4. 辅助与主函数 (HELPERS & MAIN)
 # =================================================================
-def display_config_and_confirm():
+def display_config_and_confirm(splitter_structure_mode: str):
     """以美观的表格形式显示全面的配置信息，并请求用户确认。"""
     console = Console()
     logger.info("正在显示配置显示。")
@@ -103,6 +106,7 @@ def display_config_and_confirm():
     table.add_row("[bold green]知识库配置[/bold green]", "")
     table.add_row("知识库目录", f"[bold cyan]{get_relative_path(current_settings.knowledge_base_path)}[/bold cyan]")
     table.add_row("输出文件路径", f"[bold cyan]{get_relative_path(current_settings.pkl_path)}[/bold cyan]")
+    table.add_row("索引模式", f"[bold magenta]{splitter_structure_mode}[/bold magenta]")
     table.add_row("文本切分块大小", f"[bold magenta]{current_settings.kb_chunk_size}[/bold magenta]")
     table.add_row("切分重叠量", f"[bold magenta]{current_settings.kb_chunk_overlap}[/bold magenta]")
     
@@ -127,20 +131,32 @@ def display_config_and_confirm():
         console.print("[bold red]操作取消。[/bold red]")
         sys.exit(0)
 
-async def main_async():
+async def main_async(splitter_structure_mode: str):
     console = Console()
     logger.info("脚本开始执行 (Async)。")
-    display_config_and_confirm()
+    display_config_and_confirm(splitter_structure_mode)
     
     vector_store = VectorStoreFactory.get_default_vector_store()
-    await process_documents_async(vector_store)
+    await process_documents_async(vector_store, splitter_structure_mode)
     console.print("\n[bold green]知识库异步嵌入完成。[/bold green]")
     logger.info("知识库嵌入脚本执行完成。")
+
+def parse_args():
+    """解析命令行参数。"""
+    parser = argparse.ArgumentParser(description="将知识库文档向量化并保存到本地存储。")
+    parser.add_argument(
+        "--mode",
+        choices=["standard", "hierarchical"],
+        default="standard",
+        help="索引模式。standard 为单层分片，hierarchical 为父子分片。",
+    )
+    return parser.parse_args()
 
 def main():
     """同步入口包装。"""
     try:
-        asyncio.run(main_async())
+        args = parse_args()
+        asyncio.run(main_async(args.mode))
     except KeyboardInterrupt:
         pass
 

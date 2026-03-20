@@ -2,7 +2,7 @@
 # 原始来源: https://github.com/langgenius/dify
 # 遵循修改后的 Apache License 2.0 许可证。详情请参阅项目根目录下的 DIFY_LICENSE 文件。
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Dict, Any
 
 class Document(BaseModel):
@@ -11,7 +11,7 @@ class Document(BaseModel):
     用于在ETL流水线和检索过程中传递文本内容及其相关元数据。
     """
     content: str
-    metadata: Dict[str, Any] = {}
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
     def __str__(self):
         """返回文档内容的字符串表示，方便调试。"""

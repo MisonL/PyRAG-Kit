@@ -41,14 +41,14 @@ class Pipeline:
         logger.info("ETL Pipeline 初始化完成。")
 
     @classmethod
-    def from_file_path(cls, file_path: Path) -> "Pipeline":
+    def from_file_path(cls, file_path: Path, splitter_structure_mode: str = "standard") -> "Pipeline":
         """
         根据文件路径创建并初始化 Pipeline 实例。
         """
         logger.info(f"正在从文件路径 '{file_path}' 创建 ETL Pipeline。")
         extractor_instance: BaseExtractor = MarkdownExtractor()
         cleaner_instance: BaseCleaner = BasicCleaner()
-        splitter_instance: BaseSplitter = RecursiveTextSplitter()
+        splitter_instance: BaseSplitter = RecursiveTextSplitter(structure_mode=splitter_structure_mode)
         
         return cls(
             extractor=extractor_instance,
