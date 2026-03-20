@@ -77,10 +77,11 @@ cd PyRAG-Kit
 
 ### 2. 安装依赖
 
-项目使用 `requirements.txt` 管理依赖。
+项目使用 `uv` 管理依赖，这比传统的 `pip` 更快且更可靠。
 
 ```bash
-pip install -r requirements.txt
+# 同步依赖并创建虚拟环境
+uv sync
 ```
 
 ### 3. 配置指南
@@ -171,10 +172,10 @@ pip install -r requirements.txt
 
 ### 5. 运行程序
 
-直接从项目根目录运行主程序文件即可。
+使用 `uv run` 直接运行主程序，它会自动处理虚拟环境。
 
 ```bash
-python main.py
+uv run main.py
 ```
 
 **程序会自动完成以下工作:**

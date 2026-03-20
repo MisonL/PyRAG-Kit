@@ -58,6 +58,8 @@ def test_full_etl_pipeline_for_markdown(mock_markdown_document):
     try:
         # 从模拟的文件路径初始化 Pipeline
         pipeline = Pipeline.from_file_path(Path(mock_markdown_document.metadata['source']))
+        # 强制设置 splitter 模式为 'char' 以支持旧测试逻辑 (50字符)
+        pipeline.splitter = RecursiveTextSplitter(mode="char")
 
         # 执行处理流程
         processed_docs = pipeline.process(mock_markdown_document)
@@ -125,7 +127,7 @@ def test_recursive_text_splitter():
         current_settings.kb_chunk_overlap = test_chunk_overlap
         current_settings.kb_splitter_separators = test_separators
 
-        splitter = RecursiveTextSplitter() # 实例化时会读取 settings
+        splitter = RecursiveTextSplitter(mode="char") # 实例化时强制用 char 模式
         
         # 使用一个更长的文本来测试分割和重叠
         # 调整文本内容，使其在 chunk_size=20, chunk_overlap=5 的情况下能被分割成两部分

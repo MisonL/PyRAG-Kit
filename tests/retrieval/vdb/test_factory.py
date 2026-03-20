@@ -19,7 +19,12 @@ class MockFaissStore(VectorStoreBase):
         self.documents.extend(documents)
 
     def search(self, query: str, top_k: int = 5, search_type: str = "semantic") -> List[dict[str, Any]]:
-        """模拟搜索，返回假数据"""
+        return [{"page_content": f"mock_doc_{i}", "metadata": {"source": "mock"}} for i in range(top_k)]
+
+    async def aadd_documents(self, documents: List[dict[str, Any]]):
+        self.documents.extend(documents)
+
+    async def asearch(self, query: str, top_k: int = 5, search_type: str = "semantic") -> List[dict[str, Any]]:
         return [{"page_content": f"mock_doc_{i}", "metadata": {"source": "mock"}} for i in range(top_k)]
 
     def save(self, path: str):

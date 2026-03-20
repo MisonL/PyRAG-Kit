@@ -1,6 +1,6 @@
 import pytest
 from unittest.mock import MagicMock, patch
-from typing import Any, Generator, List
+from typing import Any, Generator, List, AsyncGenerator
 import sys # 导入 sys 模块
 
 from src.utils.config import Settings, get_settings
@@ -21,6 +21,13 @@ class MockLLMProvider(LargeLanguageModel):
         else:
             yield f"Mock LLM response for {self.model_name}"
 
+    async def ainvoke(self, prompt: str, system_prompt: str | None = "You are a helpful assistant.", tools: List[dict[str, Any]] | None = None, stream: bool = True, temperature: float = 0.7) -> AsyncGenerator[str, None]:
+        """模拟异步 LLM 聊天响应"""
+        if stream:
+            yield f"Mock Async LLM stream response for {self.model_name}"
+        else:
+            yield f"Mock Async LLM response for {self.model_name}"
+
 class MockEmbeddingProvider(TextEmbeddingModel):
     def __init__(self, model_name: str):
         self.model_name = model_name
@@ -33,12 +40,22 @@ class MockEmbeddingProvider(TextEmbeddingModel):
         """模拟查询嵌入"""
         return [0.2] * 10
 
+    async def aembed_documents(self, texts: list[str]) -> list[list[float]]:
+        """模拟异步文档嵌入"""
+        return [[0.1] * 10 for _ in texts]
+
 class MockRerankProvider(RerankModel):
     def __init__(self, model_name: str):
         self.model_name = model_name
 
     def rerank(self, query: str, documents: list[str], top_n: int) -> tuple[list[int], list[float]]:
         """模拟重排，返回原始顺序和递减的分数"""
+        indices = list(range(len(documents)))
+        scores = [1.0 - i * 0.1 for i in range(len(documents))]
+        return indices[:top_n], scores[:top_n]
+
+    async def arerank(self, query: str, documents: list[str], top_n: int) -> tuple[list[int], list[float]]:
+        """模拟异步重排"""
         indices = list(range(len(documents)))
         scores = [1.0 - i * 0.1 for i in range(len(documents))]
         return indices[:top_n], scores[:top_n]
