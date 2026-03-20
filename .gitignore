@@ -19,6 +19,7 @@ __pycache__/
 *instance/
 # 虚拟环境
 /.env*
+!/.env.example
 .venv
 env/
 venv/

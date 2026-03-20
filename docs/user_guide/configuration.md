@@ -6,6 +6,7 @@ PyRAG-Kit 采用分层配置：环境变量 > `.env` > `config.toml` > 代码默
 
 - `config.toml.example` 是版本库内模板文件。
 - `config.toml` 只放非密钥配置，例如 base url、路径、检索参数和模型映射；该文件仅用于本地环境，默认不纳入版本控制。
+- `.env.example` 是版本库内的密钥模板文件，可复制为本地 `.env`。
 - `.env` 只放 API Key 和本机临时覆盖项。
 - 环境变量优先级最高，适合容器和生产环境。
 
@@ -37,6 +38,10 @@ model_name = "gemini-2.5-flash"
 ## 使用 `.env`
 
 `.env` 适合存放敏感信息，例如：
+
+```bash
+cp .env.example .env
+```
 
 ```dotenv
 OPENAI_API_KEY="sk-xxxxxxxxxxxxxxxxxxxx"
