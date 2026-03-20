@@ -135,6 +135,7 @@ uv run python scripts/build_binary_release.py --target macos-x64 --validate
 ```
 
 发布工作流定义在 [`.github/workflows/release.yml`](/Volumes/Work/code/PyRAG-kit/.github/workflows/release.yml)，发布说明会从 [CHANGELOG.md](/Volumes/Work/code/PyRAG-kit/CHANGELOG.md) 的对应版本节自动提取。
+二进制包内默认只包含空的 `knowledge_base/` 占位目录，使用时请自行放入 Markdown 源文档后再构建知识快照。
 
 ---
 

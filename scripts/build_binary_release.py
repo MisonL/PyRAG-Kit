@@ -24,7 +24,6 @@ PACKAGE_FILES = [
     "config.toml.example",
     ".env.example",
 ]
-PACKAGE_DIRS = ["knowledge_base"]
 HIDDEN_IMPORTS = [
     "src.providers.google",
     "src.providers.openai",
@@ -107,10 +106,26 @@ def stage_bundle(target: str, version: str) -> Path:
     shutil.copytree(app_source, app_target)
     for relative_file in PACKAGE_FILES:
         shutil.copy2(PROJECT_ROOT / relative_file, bundle_root / relative_file)
-    for relative_dir in PACKAGE_DIRS:
-        shutil.copytree(PROJECT_ROOT / relative_dir, bundle_root / relative_dir)
+    prepare_runtime_layout(bundle_root)
 
     return bundle_root
+
+
+def prepare_runtime_layout(bundle_root: Path) -> None:
+    knowledge_base_dir = bundle_root / "knowledge_base"
+    data_kb_dir = bundle_root / "data" / "kb"
+    data_logs_dir = bundle_root / "data" / "logs"
+
+    knowledge_base_dir.mkdir(parents=True, exist_ok=True)
+    data_kb_dir.mkdir(parents=True, exist_ok=True)
+    data_logs_dir.mkdir(parents=True, exist_ok=True)
+
+    placeholder = knowledge_base_dir / "README.md"
+    placeholder.write_text(
+        "# 知识库目录\n\n"
+        "请将您的 Markdown 知识库文档放入当前目录，然后再执行知识库构建。\n",
+        encoding="utf-8",
+    )
 
 
 def archive_bundle(bundle_root: Path, target: str) -> Path:
