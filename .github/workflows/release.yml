@@ -56,7 +56,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: release_artifacts/*
+          path: |
+            release_artifacts/*.zip
+            release_artifacts/*.tar.gz
           if-no-files-found: error
 
   publish:
@@ -101,7 +103,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
-          mapfile -t files < <(find release_artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" \) | sort)
+          mapfile -t files < <(find release_artifacts -maxdepth 2 -type f \( -name "PyRAG-Kit-*.zip" -o -name "PyRAG-Kit-*.tar.gz" \) | sort)
           if [ "${#files[@]}" -eq 0 ]; then
             echo "未找到发布产物。" >&2
             exit 1
