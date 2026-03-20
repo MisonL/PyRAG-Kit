@@ -4,7 +4,8 @@ PyRAG-Kit 采用分层配置：环境变量 > `.env` > `config.toml` > 代码默
 
 ## 配置原则
 
-- `config.toml` 只放非密钥配置，例如 base url、路径、检索参数和模型映射。
+- `config.toml.example` 是版本库内模板文件。
+- `config.toml` 只放非密钥配置，例如 base url、路径、检索参数和模型映射；该文件仅用于本地环境，默认不纳入版本控制。
 - `.env` 只放 API Key 和本机临时覆盖项。
 - 环境变量优先级最高，适合容器和生产环境。
 
@@ -21,6 +22,7 @@ cp config.toml.example config.toml
 ```toml
 log_level = "WARNING"
 knowledge_base_path = "knowledge_base"
+default_embedding_provider = "local-hash"
 chat_top_k = 5
 chat_score_threshold = 0.4
 
@@ -30,6 +32,7 @@ model_name = "gemini-2.5-flash"
 ```
 
 3. 修改后重启程序。
+4. 默认情况下，知识库向量化会写入 `pkl_path` 指定的文件，当前默认值是 `data/employee_kb.pkl`。
 
 ## 使用 `.env`
 
@@ -41,6 +44,14 @@ GOOGLE_API_KEY="AIza..."
 ```
 
 `.env` 中的同名键会覆盖 `config.toml`。
+
+如果您使用 OpenAI 兼容渠道，可以这样配置：
+
+```dotenv
+OPENAI_API_KEY="sk-..."
+OPENAI_API_BASE="https://apis.iflow.cn/v1"
+DEFAULT_LLM_PROVIDER="iflow-qwen3-max"
+```
 
 ## 主要字段
 
@@ -91,3 +102,15 @@ model_name = "gpt-4o"
 - `llm_configurations`: 聊天模型
 - `embedding_configurations`: 向量化模型
 - `rerank_configurations`: 精排模型
+
+### 默认本地向量化
+
+当前默认嵌入模型是 `local-hash`：
+
+```toml
+[embedding_configurations.local-hash]
+provider = "local-hash"
+model_name = "local-hash-256"
+```
+
+它用于本地可复现验证，不依赖外部 Embedding API。

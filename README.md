@@ -30,6 +30,7 @@
 - **🔌 模块化扩展 (`ProviderFactory`)**: 无缝集成 Google Gemini (采用最新 `google-genai` SDK)、OpenAI GPT-4o、Anthropic Claude 3.5、DeepSeek 以及国产闭源/开源模型（豆包、通义千问等）。
 - **🚀 混合检索策略 (Hybrid Search)**: 深度复现 Dify 混合检索逻辑，支持语义向量检索、全文检索（BM25）及其加权分值融合。
 - **🎯 语义精排 (Rerank)**: 支持集成 Jina AI、SiliconFlow 等 Rerank 模型，对海量召回结果进行二次精排，解决 RAG 系统中的“召回精度不足”问题。
+- **🧱 本地可复现默认链路**: 默认使用 `local-hash` 嵌入模型，本地无需额外 Embedding API 即可完成知识库构建、召回测试和聊天验证。
 - **⚙️ 交互式配置控制**: 通过 `/config` 命令在运行时动态调整全局参数，包括检索 Top-K、权重配比及重试策略。
 - **🧪 架构级验证工具**: 内置 `AGENTS.md` 指导原则与全面的 `pytest` 测试套件，确保每一行核心逻辑的可重复性验证。
 
@@ -69,13 +70,17 @@ uv sync
 
 ### 2. 配置与认证
 
-PyRAG-Kit 采用分层配置策略（环境变量 > .env > config.toml）。
+PyRAG-Kit 采用分层配置策略（环境变量 > `.env` > `config.toml` > 代码默认值）。
 
 ```bash
-# 从模板创建主配置文件和密钥文件
+# 从模板创建本地主配置文件和密钥文件
 cp config.toml.example config.toml
 cp .env.example .env
 ```
+
+说明：
+1. `config.toml.example` 会纳入版本控制，`config.toml` 仅作本地配置，不应提交。
+2. 默认嵌入模型是 `local-hash`，首次向量化不需要额外的 Embedding API Key。
 
 编辑 `config.toml`：
 1. 在根级字段中调整默认路径、检索参数和 base url。
@@ -83,15 +88,32 @@ cp .env.example .env
 
 编辑 `.env`：
 1. 只填写 API Key 等敏感信息。
-2. 不要把非密钥配置写入 `.env`。
+2. 如需使用 OpenAI 兼容渠道，可覆盖 `OPENAI_API_BASE` 和 `DEFAULT_LLM_PROVIDER`。
 
 ### 3. 运行系统
 
 1. 将原始 Markdown 文件放入 `knowledge_base/`。
-2. 启动主程序，系统将自动按需构建/更新向量索引：
+2. 启动主程序：
 
 ```bash
 uv run main.py
+```
+
+3. 在主菜单中按需执行：
+   - `1`：重建知识库向量缓存
+   - `2`：执行召回测试
+   - `3`：启动聊天会话
+
+也可以直接重建知识库：
+
+```bash
+uv run python -m scripts.embed_knowledge_base --mode standard
+```
+
+默认向量缓存输出到：
+
+```text
+data/employee_kb.pkl
 ```
 
 ---

@@ -1,6 +1,6 @@
 # 快速上手
 
-本指南将引导您完成 PyRAG-Kit 的环境准备、安装和首次运行。
+本指南将引导您完成 PyRAG-Kit 的环境准备、配置和首次运行。
 
 ## 1. 环境要求
 
@@ -46,9 +46,9 @@ uv sync
 
 > **注意**: 如果该文件夹为空，程序在启动时会提示您添加知识库文件。
 
-## 5. 配置 API 密钥
+## 5. 准备配置文件
 
-在运行程序之前，您至少需要配置一个大语言模型 (LLM) 的 API 密钥。详细的配置方法请参阅 [配置指南](./configuration.md)。
+在运行程序之前，请先准备本地配置。详细说明请参阅 [配置指南](./configuration.md)。
 
 最快捷的方式是编辑 `config.toml` 和 `.env` 文件：
 
@@ -57,24 +57,37 @@ uv sync
     cp config.toml.example config.toml
     cp .env.example .env
     ```
-2.  打开 `.env` 文件，填入您所拥有模型的 API Key。例如，如果您有 Google Gemini 的 Key：
+2.  `config.toml.example` 会纳入版本控制，`config.toml` 仅用于本地环境，默认不应提交。
+3.  默认嵌入模型是 `local-hash`，知识库向量化不依赖外部 Embedding API。
+4.  打开 `.env` 文件，填入您要使用的聊天模型 API Key。例如，如果您使用 OpenAI 兼容渠道：
     ```dotenv
-    GOOGLE_API_KEY="AIzaSy..."
+    OPENAI_API_KEY="sk-..."
+    OPENAI_API_BASE="https://apis.iflow.cn/v1"
+    DEFAULT_LLM_PROVIDER="iflow-qwen3-max"
     ```
-3.  如需调整默认路径、base url 或检索参数，请编辑 `config.toml`。
+5.  如需调整默认路径、base url 或检索参数，请编辑 `config.toml`。
 
 ## 6. 运行程序
 
 完成以上步骤后，您就可以启动程序了。
 
 ```bash
-python main.py
+uv run main.py
 ```
 
-程序首次运行时，会自动执行以下操作：
+程序启动后会进入主菜单，您可以按需执行：
 
-*   **知识库向量化**: 检查 `knowledge_base` 目录中的文档，如果发现有新的或已修改的文档，它将处理这些文档，生成向量并保存在 `data/` 目录下。这个过程可能需要一些时间，具体取决于您的文档大小和计算机性能。
-*   **启动聊天界面**: 向量化完成后，程序将进入交互式聊天模式，您可以开始提问。
+*   **1. 知识库文档向量化处理**: 处理 `knowledge_base/` 目录中的 Markdown 文件，并生成本地向量缓存。
+*   **2. 召回测试**: 针对当前知识库运行检索验证。
+*   **3. 启动聊天机器人会话**: 加载本地向量缓存并进入对话界面。
+
+如需直接重建知识库，也可以执行：
+
+```bash
+uv run python -m scripts.embed_knowledge_base --mode standard
+```
+
+默认输出文件位于 `data/employee_kb.pkl`。
 
 **常用命令:**
 
