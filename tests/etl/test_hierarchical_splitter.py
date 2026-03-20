@@ -34,6 +34,9 @@ def test_hierarchical_splitter_builds_parent_child_metadata(monkeypatch):
     assert len({chunk.metadata["chunk_id"] for chunk in chunks}) == len(chunks)
     assert len({chunk.metadata["parent_id"] for chunk in chunks}) < len(chunks)
     assert all(chunk.metadata["source"] == "knowledge_base/sample.md" for chunk in chunks)
-    assert all("parent_content" in chunk.metadata for chunk in chunks)
+    assert all("parent_content" not in chunk.metadata for chunk in chunks)
     assert all("parent_chunk_index" in chunk.metadata for chunk in chunks)
-    assert any(chunk.content != chunk.metadata["parent_content"] for chunk in chunks)
+    assert splitter.parent_documents
+    parent_content = next(iter(splitter.parent_documents.values()))["content"]
+    assert isinstance(parent_content, str) and parent_content
+    assert any(chunk.content != parent_content for chunk in chunks)
