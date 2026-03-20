@@ -3,6 +3,12 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
 *build/
 *develop-eggs/
 *dist/
@@ -35,9 +41,11 @@ venv.bak
 
 # macOS
 .DS_Store
+.ipynb_checkpoints/
 
 # 生成的数据和日志
 /data/logs/
+/data/kb/
 *.pkl
 
 # 知识库文档

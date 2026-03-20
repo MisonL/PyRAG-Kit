@@ -36,8 +36,10 @@ log_retention_days = 15
 
 # 原始知识库目录
 knowledge_base_path = "knowledge_base"
-# 向量化结果持久化路径
+# 旧版 pkl 知识库路径，仅用于一次性迁移或重建参考
 pkl_path = "data/employee_kb.pkl"
+# 知识快照根目录，新的活动索引默认保存在这里
+snapshot_root = "data/kb"
 
 # 是否在清洗阶段折叠连续空白字符
 kb_replace_whitespace = false
