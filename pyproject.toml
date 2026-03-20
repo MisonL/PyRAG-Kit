@@ -1,0 +1,40 @@
+[project]
+name = "pyrag-kit"
+version = "0.1.0"
+description = "A lightweight Python implementation of Dify core RAG logic"
+readme = "README.md"
+authors = [{ name = "Mison", email = "1360962086@qq.com" }]
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.86.0",
+    "faiss-cpu>=1.13.2",
+    "google-genai>=1.68.0",
+    "httpx>=0.28.1",
+    "jieba>=0.42.1",
+    "langchain>=1.2.13",
+    "langchain-community>=0.4.1",
+    "langchain-core>=1.2.20",
+    "langchain-text-splitters>=1.1.1",
+    "numpy>=2.4.3",
+    "openai>=2.29.0",
+    "openpyxl>=3.1.5",
+    "pandas>=3.0.1",
+    "prompt-toolkit>=3.0.52",
+    "pydantic>=2.12.5",
+    "pydantic-settings>=2.13.1",
+    "pyfiglet>=1.0.4",
+    "questionary>=2.1.1",
+    "rank-bm25>=0.2.2",
+    "requests>=2.32.5",
+    "rich>=14.3.3",
+    "scikit-learn>=1.8.0",
+    "tenacity>=9.1.4",
+    "tiktoken>=0.12.0",
+    "volcengine-python-sdk[ark]>=5.0.18",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
