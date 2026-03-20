@@ -77,9 +77,9 @@ uv run main.py
 
 程序启动后会进入主菜单，您可以按需执行：
 
-*   **1. 知识库文档向量化处理**: 处理 `knowledge_base/` 目录中的 Markdown 文件，并生成本地向量缓存。
+*   **1. 知识库文档向量化处理**: 处理 `knowledge_base/` 目录中的 Markdown 文件，并生成新的本地知识快照。
 *   **2. 召回测试**: 针对当前知识库运行检索验证。
-*   **3. 启动聊天机器人会话**: 加载本地向量缓存并进入对话界面。
+*   **3. 启动聊天机器人会话**: 加载当前活动知识快照并进入对话界面。
 
 如需直接重建知识库，也可以执行：
 
@@ -87,7 +87,7 @@ uv run main.py
 uv run python -m scripts.embed_knowledge_base --mode standard
 ```
 
-默认输出文件位于 `data/employee_kb.pkl`。
+默认输出位于 `data/kb/<snapshot_id>/`，活动快照指针写入 `data/kb/ACTIVE_SNAPSHOT`。
 
 **常用命令:**
 

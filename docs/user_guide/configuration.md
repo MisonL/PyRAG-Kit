@@ -33,7 +33,7 @@ model_name = "gemini-2.5-flash"
 ```
 
 3. 修改后重启程序。
-4. 默认情况下，知识库向量化会写入 `pkl_path` 指定的文件，当前默认值是 `data/employee_kb.pkl`。
+4. 默认情况下，知识库构建会在 `snapshot_root` 下生成一个新的快照目录，并更新 `ACTIVE_SNAPSHOT` 指针。`pkl_path` 仅保留为旧格式迁移入口。
 
 ## 使用 `.env`
 
@@ -68,6 +68,7 @@ DEFAULT_LLM_PROVIDER="iflow-qwen3-max"
 
 - `knowledge_base_path`
 - `pkl_path`
+- `snapshot_root`
 - `log_path`
 - `cache_path`
 - `log_level`

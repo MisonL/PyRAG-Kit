@@ -19,7 +19,7 @@
 
 ### 2.1 知识库文档向量化处理
 
-该菜单项会处理 `knowledge_base/` 目录中的 Markdown 文件，并把向量缓存写入 `data/employee_kb.pkl`。
+该菜单项会处理 `knowledge_base/` 目录中的 Markdown 文件，生成新的知识快照，并把活动快照指针更新到最新构建结果。
 
 如果您只想单独执行这一步，也可以运行：
 
@@ -35,7 +35,7 @@ uv run python -m scripts.embed_knowledge_base --mode standard
 
 ### 2.3 聊天会话
 
-选择该项后，程序会加载本地知识库缓存并进入聊天界面。
+选择该项后，程序会加载当前活动知识快照并进入聊天界面。
 
 程序会执行以下步骤：
 

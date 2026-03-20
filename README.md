@@ -100,7 +100,7 @@ uv run main.py
 ```
 
 3. 在主菜单中按需执行：
-   - `1`：重建知识库向量缓存
+   - `1`：重建知识快照
    - `2`：执行召回测试
    - `3`：启动聊天会话
 
@@ -110,10 +110,11 @@ uv run main.py
 uv run python -m scripts.embed_knowledge_base --mode standard
 ```
 
-默认向量缓存输出到：
+默认会生成一个新的知识快照目录，并更新活动快照指针：
 
 ```text
-data/employee_kb.pkl
+data/kb/ACTIVE_SNAPSHOT
+data/kb/<snapshot_id>/
 ```
 
 ---
