@@ -18,16 +18,17 @@ from rich.live import Live
 from prompt_toolkit import prompt
 from prompt_toolkit.formatted_text import HTML
 
+import asyncio
 # 使用相对导入
 from ..providers.factory import ModelProviderFactory
 from ..providers.__base__.model_provider import LargeLanguageModel
-from ..utils.config import get_settings, RetrievalMethod # 导入 get_settings 函数和 RetrievalMethod
+from ..utils.config import get_settings, RetrievalMethod
 from ..ui.config_menu import launch_config_editor
 from ..ui.display_utils import display_chat_config
-from ..retrieval.retriever import retrieve_documents
+from ..retrieval.retriever import aretrieve_documents  # 使用异步检索
 from ..retrieval.vdb.base import VectorStoreBase
 from ..retrieval.vdb.factory import VectorStoreFactory
-from ..utils.log_manager import get_chat_logger # 导入新的日志管理器
+from ..utils.log_manager import get_chat_logger
 
 # =================================================================
 # 2. 聊天机器人核心 (CHATBOT CORE)
@@ -37,9 +38,8 @@ class Chatbot:
         self.console = console
         self.vector_store: Optional[VectorStoreBase] = None
         self.llm_model: Optional[LargeLanguageModel] = None
-        self.logger = get_chat_logger() # 使用新的日志管理器
+        self.logger = get_chat_logger()
         
-        # 在初始化时获取一次配置，并存储在实例变量中
         current_settings = get_settings()
         self.chat_config = {
             "retrieval_method": current_settings.chat_retrieval_method,
@@ -58,56 +58,47 @@ class Chatbot:
         self.reload_llm()
 
     def _initialize_vector_store(self):
-        """初始化向量存储，并尝试加载现有知识库。"""
         self.vector_store = VectorStoreFactory.get_default_vector_store()
         try:
-            current_settings = get_settings() # 再次获取最新配置
+            current_settings = get_settings()
             self.vector_store.load(current_settings.pkl_path)
-            self.console.print(f"[green]知识库 '[cyan]{os.path.basename(current_settings.pkl_path)}[/cyan]' 已加载。[/green]")
+            self.console.print(f"[green]知识库 '{os.path.basename(current_settings.pkl_path)}' 加载成功。[/green]")
         except FileNotFoundError:
-            current_settings = get_settings() # 再次获取最新配置
-            self.console.print(f"[bold red]警告：知识库文件 '{current_settings.pkl_path}' 未找到。请先运行向量化脚本。[/bold red]")
+            self.console.print(f"[bold red]警告：知识库未找到。请运行向量化脚本。[/bold red]")
         except Exception as e:
-            self.console.print(f"[bold red]加载知识库时出错: {e}[/bold red]")
+            self.console.print(f"[bold red]加载知识库出错: {e}[/bold red]")
 
     def reload_llm(self) -> bool:
-        """重新加载或初始化LLM模型。"""
         try:
             active_llm_key = self.chat_config["active_llm_configuration"]
-            self.console.print(f"[dim]正在加载LLM: [bold cyan]{active_llm_key}[/bold cyan]...[/dim]")
             self.llm_model = ModelProviderFactory.get_llm_provider(active_llm_key)
-            if self.llm_model:
-                self.console.print(f"[green]LLM [bold cyan]{active_llm_key}[/bold cyan] 加载成功。[/green]")
-                return True
-            return False
+            return True if self.llm_model else False
         except Exception as e:
-            self.console.print(f"[bold red]初始化LLM时出错: {e}[/bold red]")
-            self.llm_model = None
+            self.console.print(f"[bold red]重载LLM出错: {e}[/bold red]")
             return False
 
-    def _identify_intent(self, user_query: str) -> str:
-        if not self.llm_model: return user_query # 如果LLM未加载，直接返回原始查询
-        prompt = f"你是一个意图识别助手。请根据用户的问题，判断其意图。\n用户问题: {user_query}\n请直接输出用户意图的简短描述。"
+    async def _identify_intent_async(self, user_query: str) -> str:
+        """异步意图识别。"""
+        if not self.llm_model: return user_query
+        prompt = f"你是一个意图识别助手。判断用户意图。\n用户问题: {user_query}\n直接输出意图简述。"
         try:
-            # 使用invoke并设置stream=False来获取完整结果
-            response_generator = self.llm_model.invoke(
+            # 异步调用 invoke
+            response = ""
+            async for chunk in self.llm_model.ainvoke(
                 prompt=prompt,
                 stream=False,
-                temperature=self.chat_config['chat_temperature']
-            )
-            response = "".join(list(response_generator)).strip()
-            # 如果模型返回空或非常短的响应，可能表示不确定，直接返回原始查询
-            if not response or len(response) < 4:
-                 return user_query
-            return response
+                temperature=0.1
+            ):
+                response += chunk
+            return response.strip() or user_query
         except Exception as e:
-            self.console.print(f"[red]意图识别时出错: {e}[/red]")
-            return user_query # 出错时返回原始查询
+            logger.error(f"异步意图识别失败: {e}")
+            return user_query
 
-    def _retrieve_knowledge(self, query: str) -> List[Dict[str, Any]]:
+    async def _retrieve_knowledge_async(self, query: str) -> List[Dict[str, Any]]:
+        """异步知识检索。"""
         if not self.vector_store: return []
-        self.console.print(f"[dim]正在使用 '[yellow]{self.chat_config['retrieval_method'].value}[/yellow]' 模式检索...[/dim]")
-        return retrieve_documents(
+        return await aretrieve_documents(
             query=query,
             vector_store=self.vector_store,
             console=self.console,
@@ -120,122 +111,105 @@ class Chatbot:
             score_threshold=self.chat_config['score_threshold']
         )
 
-    def _generate_answer_stream(self, user_query: str, intent: str, retrieved_docs: List[Dict[str, Any]]) -> "Generator[str, None, None]":
-        if not self.llm_model:
-            yield "抱歉，我现在无法回答问题。"
-            return
-
-        context_str = "\n".join([f"来源: {doc['metadata']['source']}\n内容: {doc.get('page_content', '')}" for doc in retrieved_docs])
+    async def chat_async(self, user_input: str) -> "AsyncGenerator[str, None]":
+        """核心异步聊天流。"""
+        # 1. 意图识别
+        intent = await self._identify_intent_async(user_input)
+        self.console.print(f"  [bold]意图:[/bold] [yellow]{intent}[/yellow]")
         
+        # 2. 检索
+        retrieved_docs = await self._retrieve_knowledge_async(user_input)
+        self._display_retrieved_docs(retrieved_docs)
+        
+        # 3. 构造 Prompt
+        context_str = "\n".join([f"来源: {doc['metadata']['source']}\n内容: {doc.get('page_content', '')}" for doc in retrieved_docs])
         if context_str:
-            prompt = f"你是一个智能客服助手。请根据以下信息回答用户的问题。\n用户意图: {intent}\n用户问题: {user_query}\n相关知识:\n---\n{context_str}\n---\n请根据提供的相关知识，简洁明了地回答用户的问题。如果相关知识不足以回答问题，请礼貌地告知用户。"
+            prompt = f"你是一个智能客服。根据知识回答。\n意图: {intent}\n问题: {user_input}\n知识:\n{context_str}\n回答要简洁。"
         else:
-            prompt = f"你是一个智能客服助手。用户问题: {user_query}\n用户意图: {intent}\n没有找到相关知识。请礼貌地告知用户无法回答，并建议他们提供更多信息或尝试其他问题。"
+            prompt = f"你是一个智能客服。用户问题: {user_input}\n没找到相关知识。请礼貌告知。"
+
+        # 4. 异步流式生成
+        full_response = ""
+        context_summary = "\n".join([f"[{doc['metadata']['source']}]" for doc in retrieved_docs])
         
         try:
-            # 使用新的invoke方法并确保以流式传输
-            yield from self.llm_model.invoke(
+            async for chunk in self.llm_model.ainvoke(
                 prompt=prompt,
                 stream=True,
                 temperature=self.chat_config['chat_temperature']
-            )
-        except Exception as e:
-            self.console.print(f"[red]LLM 生成最终回答时出错: {e}[/red]")
-            yield "抱歉，我在生成回答时遇到了一些问题。"
-
-    def chat(self, user_input: str) -> "Generator[str, None, None]":
-        intent = self._identify_intent(user_input)
-        self.console.print(f"  [bold]识别到的意图:[/bold] [yellow]{intent}[/yellow]")
-        
-        retrieved_docs = self._retrieve_knowledge(user_input)
-        self._display_retrieved_docs(retrieved_docs)
-        
-        context_for_log = "\n".join([f"[{doc['metadata']['source']}]" for doc in retrieved_docs])
-        
-        def response_generator_with_logging():
-            full_response = ""
-            answer_stream = self._generate_answer_stream(user_input, intent, retrieved_docs)
-            for chunk in answer_stream:
+            ):
                 full_response += chunk
                 yield chunk
             
-            self.logger.info(f"UserQuery: {user_input}\nDetectedIntent: {intent}\nRetrievedContext: {context_for_log}\nLLMResponse: {full_response}")
-
-        return response_generator_with_logging()
+            # 记录日志
+            self.logger.info(f"Query: {user_input} | Intent: {intent} | Docs: {len(retrieved_docs)}\nResponse: {full_response}")
+        except Exception as e:
+            self.console.print(f"[red]LLM 异步生成出错: {e}[/red]")
+            yield "抱歉，生成回复时遇到错误。"
 
     def _display_retrieved_docs(self, docs: List[Dict]):
         if not docs:
-            self.console.print("[yellow]未检索到相关文档。[/yellow]")
+            self.console.print("[yellow]无相关文档。[/yellow]")
             return
         
-        table = Table(title="[bold cyan]检索到的相关文档[/bold cyan]", show_header=True, header_style="bold magenta")
-        table.add_column("来源", style="cyan", no_wrap=True)
-        table.add_column("内容预览", style="white")
-        table.add_column("相关度", style="bold")
-
-        max_score = max(doc.get("score", 0) for doc in docs) if docs else 1
-        
+        table = Table(title="[bold cyan]检索详情[/bold cyan]", show_header=True)
+        table.add_column("来源", style="cyan")
+        table.add_column("预览", style="white")
+        table.add_column("得分", style="bold")
         for doc in docs:
-            score = doc.get("score", 0)
-            normalized_score = score / max_score
-            
-            red = int(255 * (1 - normalized_score))
-            blue = int(255 * normalized_score)
-            color_style = Style(color=f"rgb({red},80,{blue})")
-            
-            preview = doc.get("page_content", "")[:100].replace("\n", " ") + "..."
-            table.add_row(doc["metadata"]["source"], preview, Text(f"{score:.4f}", style=color_style))
-        
+            preview = doc.get("page_content", "")[:60].replace("\n", " ") + "..."
+            table.add_row(doc["metadata"]["source"], preview, f"{doc.get('score', 0):.4f}")
         self.console.print(table)
 
 # =================================================================
 # 4. 主函数 (MAIN)
 # =================================================================
-def start_chat_session():
-    """启动交互式聊天会话。"""
+async def start_chat_session_async():
+    """启动异步交互式聊天。"""
     console = Console()
-    
     bot = Chatbot(console)
     
     if bot.llm_model:
         display_chat_config(console, bot.chat_config)
-        console.print(f"我是你的智能客服（由 [bold green]{bot.chat_config['active_llm_configuration']}[/bold green] 支持），请输入问题（输入'[bold]/quit[/bold]'或'[bold]/config[/bold]'）：")
+        console.print(f"客服已就绪 ([bold green]{bot.chat_config['active_llm_configuration']}[/bold green])")
         
         while True:
             try:
-                # 使用 prompt_toolkit 替代 console.input，并优化样式
+                # prompt_toolkit prompt 是阻塞的，但在简单的 CLI 中通常可以接受
+                # 如果追求极致，可以使用异步版本的 prompt
                 user_query = prompt(HTML('<skyblue><b>你: </b></skyblue>'))
                 if user_query.lower() == '/quit':
-                    console.print("[bold yellow]再见！[/bold yellow]")
                     break
                 
                 if user_query.lower() == '/config':
-                    # 使用新的配置编辑器接口
                     from ..ui.config_menu import launch_config_editor
                     llm_needs_reload, updated_config = launch_config_editor(bot.chat_config)
-                    bot.chat_config = updated_config  # 更新配置
+                    bot.chat_config = updated_config
                     if llm_needs_reload:
-                        console.print("[yellow]检测到LLM配置变更，正在重载模型...[/yellow]")
                         bot.reload_llm()
-                    display_chat_config(console, bot.chat_config)  # 使用新的配置显示
-                    console.print(f"我是你的智能客服（由 [bold green]{bot.chat_config['active_llm_configuration']}[/bold green] 支持），请输入问题（输入'[bold]/quit[/bold]'或'[bold]/config[/bold]'）：")
+                    display_chat_config(console, bot.chat_config)
                     continue
 
-                answer_stream = bot.chat(user_query)
-                
-                response_panel = Panel("", title="[bold green]客服[/bold green]", border_style="green", highlight=True)
+                response_panel = Panel("", title="客服", border_style="green")
                 full_response = ""
 
-                with Live(response_panel, console=console, refresh_per_second=10, vertical_overflow="visible") as live:
-                    for chunk in answer_stream:
+                with Live(response_panel, console=console, refresh_per_second=10) as live:
+                    async for chunk in bot.chat_async(user_query):
                         full_response += chunk
-                        live.update(Panel(Text(full_response), title="[bold green]客服[/bold green]", border_style="green", highlight=True))
+                        live.update(Panel(Text(full_response), title="客服", border_style="green"))
             
             except (KeyboardInterrupt, EOFError):
-                console.print("\n[bold yellow]再见！[/bold yellow]")
                 break
+        console.print("[yellow]感谢使用，再见！[/yellow]")
     else:
-        console.print("[bold red]错误：LLM模型未能成功初始化，程序无法启动。请检查配置和API密钥。[/bold red]")
+        console.print("[red]模型初始化失败。[/red]")
+
+def start_chat_session():
+    """入口包装。"""
+    asyncio.run(start_chat_session_async())
+
+if __name__ == '__main__':
+    start_chat_session()
 
 if __name__ == '__main__':
     start_chat_session()
