@@ -3,6 +3,8 @@ from types import SimpleNamespace
 
 from rich.console import Console
 
+from src.runtime.contracts import SessionConfig
+from src.utils.config import ModelDetail, RetrievalMethod
 from src.chat.core import Chatbot, start_chat_session_async
 
 
@@ -39,6 +41,9 @@ class FakeChatbot:
 
     def reload_llm(self):
         return True
+
+    def apply_config_update(self, updated_config, _llm_needs_reload):
+        self.chat_config = updated_config
 
     async def chat_async(self, _user_input):
         if False:
@@ -143,3 +148,113 @@ def test_chat_async_retrieves_with_intent():
 
     assert retrieval_queries == ["清除浏览器缓存的操作步骤"]
     assert chunks == ["回答"]
+
+
+def test_reload_llm_keeps_existing_model_on_failure(monkeypatch):
+    class OldModel:
+        async def ainvoke(self, *_args, **_kwargs):
+            if False:
+                yield ""
+
+    bot = object.__new__(Chatbot)
+    bot.console = Console()
+    bot.session_config = SimpleNamespace(active_llm_configuration="new-model")
+    bot.retrieval_service = object()
+    bot.llm_model = old_model = OldModel()
+    bot.chat_service = old_chat_service = object()
+
+    monkeypatch.setattr(
+        "src.chat.core.ModelProviderFactory.get_llm_provider",
+        lambda _llm_key: (_ for _ in ()).throw(RuntimeError("reload failed")),
+    )
+
+    assert bot.reload_llm() is False
+    assert bot.llm_model is old_model
+    assert bot.chat_service is old_chat_service
+
+
+def test_apply_config_update_reverts_llm_key_when_reload_fails(monkeypatch):
+    class DummySessionConfig:
+        def __init__(self, active_llm_configuration: str):
+            self.active_llm_configuration = active_llm_configuration
+
+        def __setitem__(self, key, value):
+            setattr(self, key, value)
+
+    messages = []
+    bot = object.__new__(Chatbot)
+    bot.console = SimpleNamespace(print=lambda message: messages.append(str(message)))
+    bot.session_config = DummySessionConfig(active_llm_configuration="old-model")
+    bot.llm_model = object()
+    bot.chat_service = object()
+    monkeypatch.setattr(bot, "reload_llm", lambda: False)
+
+    bot.apply_config_update({"active_llm_configuration": "new-model"}, llm_needs_reload=True)
+
+    assert bot.session_config.active_llm_configuration == "old-model"
+    assert any("LLM 切换失败" in message for message in messages)
+
+
+def test_start_chat_session_async_reverts_llm_after_editor_mutation(monkeypatch):
+    class RealishChatbot(FakeChatbot):
+        last_instance = None
+
+        def __init__(self, _console: Console):
+            RealishChatbot.last_instance = self
+            self.console = _console
+            self.llm_model = object()
+            self.session_config = SessionConfig(
+                retrieval_method=RetrievalMethod.HYBRID_SEARCH,
+                vector_weight=0.3,
+                keyword_weight=0.7,
+                hybrid_fusion_strategy="rrf",
+                retrieval_candidate_multiplier=3,
+                rerank_enabled=False,
+                top_k=5,
+                score_threshold=0.4,
+                active_llm_configuration="old-model",
+                active_rerank_configuration="siliconflow",
+                llm_configurations={"old-model": ModelDetail(provider="openai", model_name="qwen3-max")},
+                rerank_configurations={"siliconflow": ModelDetail(provider="siliconflow", model_name="rerank")},
+                chat_temperature=0.7,
+            )
+            self.chat_service = object()
+
+        @property
+        def chat_config(self):
+            return self.session_config
+
+        @chat_config.setter
+        def chat_config(self, value):
+            if isinstance(value, SessionConfig):
+                self.session_config = value
+                return
+            for key, item in value.items():
+                self.session_config[key] = item
+
+        def reload_llm(self):
+            return False
+
+        def apply_config_update(self, updated_config, llm_needs_reload):
+            return Chatbot.apply_config_update(self, updated_config, llm_needs_reload)
+
+    monkeypatch.setattr("src.chat.core.Chatbot", RealishChatbot)
+    monkeypatch.setattr(
+        "src.chat.core.PromptSession",
+        lambda: FakePromptSession(["/config", "/quit"]),
+    )
+    monkeypatch.setattr("src.chat.core.display_chat_config", lambda *_args, **_kwargs: None)
+
+    edited_configs = []
+
+    def fake_launch(chat_config):
+        edited_configs.append(chat_config)
+        chat_config["active_llm_configuration"] = "new-model"
+        return True, chat_config
+
+    monkeypatch.setattr("src.chat.core.launch_config_editor", fake_launch)
+
+    asyncio.run(start_chat_session_async())
+
+    assert edited_configs[0]["active_llm_configuration"] == "new-model"
+    assert RealishChatbot.last_instance.session_config.active_llm_configuration == "old-model"

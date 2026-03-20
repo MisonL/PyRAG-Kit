@@ -65,14 +65,26 @@ class Chatbot:
     def reload_llm(self) -> bool:
         try:
             llm_key = self.session_config.active_llm_configuration
-            self.llm_model = ModelProviderFactory.get_llm_provider(llm_key)
+            llm_model = ModelProviderFactory.get_llm_provider(llm_key)
             if self.retrieval_service is None:
                 raise RuntimeError("检索服务尚未初始化。")
-            self.chat_service = ChatService(self.llm_model, self.retrieval_service)
+            chat_service = ChatService(llm_model, self.retrieval_service)
+            self.llm_model = llm_model
+            self.chat_service = chat_service
             return True
         except Exception as exc:
             self.console.print(f"[bold red]重载 LLM 出错: {exc}[/bold red]")
             return False
+
+    def apply_config_update(self, updated_config: SessionConfig | Dict[str, Any], llm_needs_reload: bool) -> None:
+        previous_llm = self.session_config.active_llm_configuration
+        self.chat_config = updated_config
+        if not llm_needs_reload:
+            return
+        if self.reload_llm():
+            return
+        self.session_config.active_llm_configuration = previous_llm
+        self.console.print("[bold yellow]LLM 切换失败，已保留当前模型配置。[/bold yellow]")
 
     async def _identify_intent_async(self, user_query: str) -> str:
         if getattr(self, "chat_service", None) is None:
@@ -159,13 +171,16 @@ async def start_chat_session_async():
                     break
 
                 if user_query.lower() == "/config":
+                    editable_config = (
+                        bot.chat_config.to_dict()
+                        if isinstance(bot.chat_config, SessionConfig)
+                        else dict(bot.chat_config)
+                    )
                     llm_needs_reload, updated_config = await asyncio.to_thread(
                         launch_config_editor,
-                        bot.chat_config,
+                        editable_config,
                     )
-                    bot.chat_config = updated_config
-                    if llm_needs_reload:
-                        bot.reload_llm()
+                    bot.apply_config_update(updated_config, llm_needs_reload)
                     display_chat_config(console, bot.chat_config)
                     continue
 

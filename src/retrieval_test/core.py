@@ -78,6 +78,7 @@ async def run_retrieval_test_async():
         except (KeyboardInterrupt, EOFError):
             break
         except Exception as exc:
+            console.print(f"[red]召回测试出错: {exc}[/red]")
             logger.error("召回测试出错: %s", exc)
 
 
