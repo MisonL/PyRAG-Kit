@@ -1,61 +1,53 @@
-# -*- coding: utf-8 -*-
-import hashlib
-import hmac
-import json
 import time
-from typing import Any, Dict, Generator, List, cast
+from typing import Any, AsyncGenerator, Dict, Generator, List, Optional
 
-import requests
+from volcengine.ark import Ark, AsyncArk
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from src.providers.__base__.model_provider import (
     LargeLanguageModel,
     TextEmbeddingModel,
 )
-from src.utils.config import settings
+from src.utils.config import get_settings
+from src.utils.log_manager import get_module_logger
 
+logger = get_module_logger(__name__)
 
 class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
     """
-    火山引擎模型提供商，统一处理豆包LLM和Embedding。
+    火山引擎模型提供商 (豆包 Ark SDK)。
+    已注入 CSE 性能传感器与 tenacity 重试机制。
     """
 
     def __init__(self, model_name: str):
         self._model_name = model_name
-        self._access_key = settings.volc_access_key
-        self._secret_key = settings.volc_secret_key
-        self._base_url = str(settings.volc_base_url)
-
-        if not all([self._access_key, self._secret_key, self._base_url]):
-            raise ValueError("火山引擎配置不完整：缺少 VOLC_ACCESS_KEY, VOLC_SECRET_KEY, 或 VOLC_BASE_URL。")
-
-    def _sign_request(self, method: str, path: str, query: str, headers: Dict, body: bytes) -> Dict:
-        """为火山引擎API请求生成签名"""
-        secret_key = cast(str, self._secret_key) # 强制类型转换
-
-        canonical_request = f"{method}\n{path}\n{query}\n"
-        signed_headers = sorted([f"{k.lower()}:{v}" for k, v in headers.items()])
-        canonical_request += "\n".join(signed_headers) + "\n"
-        signed_headers_str = ";".join(sorted([k.lower() for k in headers.keys()]))
-        canonical_request += signed_headers_str + "\n"
-        payload_hash = hashlib.sha256(body).hexdigest()
-        canonical_request += payload_hash
-
-        current_time = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-        credential_scope = f"{time.strftime('%Y%m%d', time.gmtime())}/cn-beijing/ml_maas/request"
-        string_to_sign = f"HMAC-SHA256\n{current_time}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
+        settings = get_settings()
+        self._api_key = settings.volc_access_key # 映射为 ak/sk 或直接使用 api_key (Ark 支持 API Key)
+        # 注意：Ark SDK 推荐使用 API Key 模式，对应 volc_access_key
+        if not self._api_key:
+            logger.error("火山引擎 API Key (VOLC_ACCESS_KEY) 未设置。")
+            raise ValueError("VOLC_ACCESS_KEY is required for VolcengineProvider")
         
-        k_date = hmac.new(secret_key.encode('utf-8'), time.strftime('%Y%m%d', time.gmtime()).encode('utf-8'), hashlib.sha256).digest()
-        k_region = hmac.new(k_date, b'cn-beijing', hashlib.sha256).digest()
-        k_service = hmac.new(k_region, b'ml_maas', hashlib.sha256).digest()
-        k_signing = hmac.new(k_service, b'request', hashlib.sha256).digest()
-        
-        signature = hmac.new(k_signing, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
-        
-        auth_header = f"HMAC-SHA256 Credential={self._access_key}/{credential_scope}, SignedHeaders={signed_headers_str}, Signature={signature}"
-        headers['Authorization'] = auth_header
-        headers['X-Date'] = current_time
-        return headers
+        self._client: Optional[Ark] = None
+        self._aclient: Optional[AsyncArk] = None
+        logger.info(f"初始化 VolcengineProvider (Ark)，模型: {model_name}")
 
+    def _get_client(self) -> Ark:
+        if self._client is None:
+            self._client = Ark(api_key=self._api_key)
+        return self._client
+
+    def _get_aclient(self) -> AsyncArk:
+        if self._aclient is None:
+            self._aclient = AsyncArk(api_key=self._api_key)
+        return self._aclient
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type(Exception),
+        reraise=True
+    )
     def invoke(
         self,
         prompt: str,
@@ -64,48 +56,117 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         stream: bool = True,
         temperature: float = 0.7,
     ) -> Generator[str, None, None]:
-        """
-        调用火山引擎LLM（如豆包）。
-        API不支持流式响应，因此返回一个包含完整结果的生成器。
-        """
-        base_url = cast(str, self._base_url) # 强制类型转换
-        url = f"{base_url.rstrip('/')}/api/v1/chat/completions"
-        path = "/api/v1/chat/completions"
-        payload = {
-            "model": self._model_name,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": temperature,
-        }
-        body = json.dumps(payload).encode('utf-8')
-        headers = {'Host': base_url.replace('https://', '').split('/')[0], 'Content-Type': 'application/json'}
-        signed_headers = self._sign_request("POST", path, "", headers, body)
+        """同步调用火山引擎 LLM (CSE Sensor)。"""
+        logger.info(f"调用火山引擎 LLM ({self._model_name})，流式: {stream}")
+        client = self._get_client()
+        start_time = time.perf_counter()
         
         try:
-            response = requests.post(url, headers=signed_headers, data=body, timeout=30)
-            response.raise_for_status()
-            result = response.json()
-            content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-            yield content.strip()
+            messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}]
+            response = client.chat.completions.create(
+                model=self._model_name,
+                messages=messages,
+                temperature=temperature,
+                stream=stream
+            )
+            
+            if stream:
+                for chunk in response:
+                    if chunk.choices and chunk.choices[0].delta.content:
+                        yield chunk.choices[0].delta.content
+            else:
+                if response.choices and response.choices[0].message.content:
+                    yield response.choices[0].message.content
+            
+            duration = time.perf_counter() - start_time
+            logger.info(f"火山引擎 LLM ({self._model_name}) 调用完成，耗时: {duration:.2f}s")
         except Exception as e:
-            print(f"火山引擎 LLM ({self._model_name}) 生成内容时出错: {e}")
-            yield "抱歉，我在生成回答时遇到了一些问题。"
+            logger.error(f"火山引擎 LLM ({self._model_name}) 出错: {e}", exc_info=True)
+            yield f"抱歉，火山引擎遇到错误: {str(e)}"
 
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        """
-        使用火山引擎Embedding模型。
-        """
-        base_url = cast(str, self._base_url) # 强制类型转换
-        url = f"{base_url.rstrip('/')}/api/v1/embeddings"
-        path = "/api/v1/embeddings"
-        body = json.dumps({"model": self._model_name, "input": texts}).encode('utf-8')
-        headers = {'Host': base_url.replace('https://', '').split('/')[0], 'Content-Type': 'application/json'}
-        signed_headers = self._sign_request("POST", path, "", headers, body)
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type(Exception),
+        reraise=True
+    )
+    async def ainvoke(
+        self,
+        prompt: str,
+        system_prompt: str | None = "You are a helpful assistant.",
+        tools: List[Dict[str, Any]] | None = None,
+        stream: bool = True,
+        temperature: float = 0.7,
+    ) -> AsyncGenerator[str, None]:
+        """异步调用火山引擎 LLM (CSE Sensor)。"""
+        logger.info(f"异步调用 火山引擎 LLM ({self._model_name})，流式: {stream}")
+        aclient = self._get_aclient()
+        start_time = time.perf_counter()
         
         try:
-            response = requests.post(url, headers=signed_headers, data=body, timeout=30)
-            response.raise_for_status()
-            result = response.json()
-            return [item['embedding'] for item in result.get('data', [])]
+            messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}]
+            response = await aclient.chat.completions.create(
+                model=self._model_name,
+                messages=messages,
+                temperature=temperature,
+                stream=stream
+            )
+            
+            if stream:
+                async for chunk in response:
+                    if chunk.choices and chunk.choices[0].delta.content:
+                        yield chunk.choices[0].delta.content
+            else:
+                if response.choices and response.choices[0].message.content:
+                    yield response.choices[0].message.content
+            
+            duration = time.perf_counter() - start_time
+            logger.info(f"火山引擎 LLM ({self._model_name}) 异步调用完成，耗时: {duration:.2f}s")
         except Exception as e:
-            print(f"火山引擎嵌入时出错 ({self._model_name}): {e}")
+            logger.error(f"火山引擎 LLM ({self._model_name}) 异步出错: {e}", exc_info=True)
+            yield f"抱歉，火山引擎异步处理遇到错误: {str(e)}"
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type(Exception),
+        reraise=True
+    )
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """同步向量化文档。"""
+        logger.info(f"调用火山引擎嵌入 ({self._model_name})，数量: {len(texts)}")
+        client = self._get_client()
+        start_time = time.perf_counter()
+        
+        try:
+            # Ark SDK 嵌入调用
+            response = client.embeddings.create(input=texts, model=self._model_name)
+            embeddings = [item.embedding for item in response.data]
+            duration = time.perf_counter() - start_time
+            logger.info(f"火山引擎嵌入 ({self._model_name}) 完成，耗时: {duration:.2f}s")
+            return embeddings
+        except Exception as e:
+            logger.error(f"火山引擎嵌入 ({self._model_name}) 出错: {e}", exc_info=True)
+            return [[] for _ in texts]
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type(Exception),
+        reraise=True
+    )
+    async def aembed_documents(self, texts: List[str]) -> List[List[float]]:
+        """异步向量化文档。"""
+        logger.info(f"异步调用 火山引擎嵌入 ({self._model_name})，数量: {len(texts)}")
+        aclient = self._get_aclient()
+        start_time = time.perf_counter()
+        
+        try:
+            response = await aclient.embeddings.create(input=texts, model=self._model_name)
+            embeddings = [item.embedding for item in response.data]
+            duration = time.perf_counter() - start_time
+            logger.info(f"火山引擎嵌入 ({self._model_name}) 异步完成，耗时: {duration:.2f}s")
+            return embeddings
+        except Exception as e:
+            logger.error(f"火山引擎嵌入 ({self._model_name}) 异步出错: {e}", exc_info=True)
             return [[] for _ in texts]

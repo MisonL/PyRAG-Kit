@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Generator, List
-
-from typing import Any, Dict, Generator, List
+from typing import Any, AsyncGenerator, Dict, Generator, List, Tuple
 
 class LargeLanguageModel(ABC):
     """语言模型抽象基类"""
@@ -16,16 +14,19 @@ class LargeLanguageModel(ABC):
         stream: bool = True,
         temperature: float = 0.7,
     ) -> Generator[str, None, None]:
-        """
-        调用语言模型。
+        """同步调用语言模型。"""
+        pass
 
-        :param prompt: 用户输入。
-        :param system_prompt: 系统提示。
-        :param tools: 工具列表。
-        :param stream: 是否流式输出。
-        :param temperature: 温度参数。
-        :return: 一个生成器，用于流式输出结果。
-        """
+    @abstractmethod
+    async def ainvoke(
+        self,
+        prompt: str,
+        system_prompt: str | None = "You are a helpful assistant.",
+        tools: List[Dict[str, Any]] | None = None,
+        stream: bool = True,
+        temperature: float = 0.7,
+    ) -> AsyncGenerator[str, None]:
+        """异步调用语言模型。"""
         pass
 
 class TextEmbeddingModel(ABC):
@@ -33,25 +34,23 @@ class TextEmbeddingModel(ABC):
 
     @abstractmethod
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        """
-        将文档列表向量化。
+        """同步将文档列表向量化。"""
+        pass
 
-        :param texts: 文本列表。
-        :return: 向量列表。
-        """
+    @abstractmethod
+    async def aembed_documents(self, texts: List[str]) -> List[List[float]]:
+        """异步将文档列表向量化。"""
         pass
 
 class RerankModel(ABC):
     """Rerank模型抽象基类"""
 
     @abstractmethod
-    def rerank(self, query: str, documents: List[str], top_n: int) -> tuple[list[int], list[float]]:
-        """
-        对文档列表进行重排序。
+    def rerank(self, query: str, documents: List[str], top_n: int) -> Tuple[List[int], List[float]]:
+        """同步对文档列表进行重排序。"""
+        pass
 
-        :param query: 查询语句。
-        :param documents: 待排序的文档列表。
-        :param top_n: 需要返回的重排后文档数量。
-        :return: 一个元组，包含 (排序后的文档索引列表, 对应的相关度分数列表)。
-        """
+    @abstractmethod
+    async def arerank(self, query: str, documents: List[str], top_n: int) -> Tuple[List[int], List[float]]:
+        """异步对文档列表进行重排序。"""
         pass
