@@ -56,19 +56,31 @@ class AnthropicProvider(LargeLanguageModel):
         }
     )
 
+    # Anthropic 同时使用两种模型命名：``claude-<family>-<major>``（如
+    # ``claude-sonnet-4-6``）与 ``claude-<major>[-<minor>]-<family>``（如
+    # ``claude-3-5-sonnet-20240620``）。家族名不限于 opus/sonnet/haiku——
+    # 5 代引入了 ``claude-fable-5``、``claude-mythos-5`` 等新家族，因此家族段
+    # 按任意字母串匹配，避免新家族漏判采样控制字段的弃用契约。
     _MODEL_VERSION_RE = re.compile(
         r"claude[-_]"
         r"(?:"
-        r"(?:opus|sonnet|haiku)[-_](?P<family_major>\d+)"
+        r"(?P<family_name>[a-z]+)[-_](?P<family_major>\d+)"
         r"(?:[-_.](?P<family_minor>\d{1,2}))?"
         r"(?:[-_]\d{8})?"
         r"|"
         r"(?P<version_major>\d+)"
         r"(?:[-_.](?P<version_minor>\d{1,2}))?"
-        r"[-_](?:opus|sonnet|haiku)"
+        r"[-_](?:[a-z]+)"
         r"(?:[-_]\d{8})?"
         r")"
         r"(?=$|[-_.])",
+        re.IGNORECASE,
+    )
+
+    # 无版本号的现役家族名（如 ``claude-mythos-preview``）。这些是 5 代命名，
+    # 官方端点同样拒绝 legacy 采样控制字段。
+    _UNVERSIONED_MODERN_MODEL_RE = re.compile(
+        r"claude[-_](?:fable|mythos)(?:[-_][a-z0-9]+)*$",
         re.IGNORECASE,
     )
 
@@ -130,10 +142,18 @@ class AnthropicProvider(LargeLanguageModel):
 
     @classmethod
     def _sampling_controls_deprecated(cls, model_name: str) -> bool:
-        """识别 Claude 4.5+ 模型对采样控制字段的弃用契约。"""
-        match = cls._MODEL_VERSION_RE.search(str(model_name))
+        """识别 Claude 4.5+ 模型对采样控制字段的弃用契约。
+
+        4.7 起官方端点对非默认值直接返回 400，且 Python SDK v1.0+ 已从请求
+        签名移除 ``temperature``/``top_p``/``top_k``，透传会抛 ``TypeError``。
+        因此识别失败会让请求直接失败，必须覆盖全部命名形式。
+        """
+        name = str(model_name)
+        match = cls._MODEL_VERSION_RE.search(name)
         if match is None:
-            return False
+            # 无版本号的家族名（如 ``claude-mythos-preview``）出现在 5 代命名
+            # 中，按当前主力家族处理，避免把弃用字段透传给新模型。
+            return cls._UNVERSIONED_MODERN_MODEL_RE.search(name) is not None
         major = int(match.group("family_major") or match.group("version_major"))
         minor_value = match.group("family_minor") or match.group("version_minor")
         minor = int(minor_value) if minor_value is not None else 0

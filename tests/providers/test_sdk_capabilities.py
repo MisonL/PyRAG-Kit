@@ -5773,3 +5773,40 @@ def test_responses_input_still_requires_tool_call_id():
             ],
         )
 
+
+
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "claude-fable-5",
+        "claude-fable-5-1",
+        "claude-mythos-5",
+        "claude-mythos-5-1",
+        "claude-mythos-preview",
+    ],
+)
+def test_anthropic_sampling_deprecation_covers_new_family_names(model_name):
+    """5 代新增家族（fable/mythos）同样拒绝 legacy 采样控制字段。
+
+    Python SDK v1.0+ 已从请求签名移除 temperature/top_p/top_k，识别失败会让
+    请求直接抛 TypeError。家族名不能只匹配 opus/sonnet/haiku。
+    """
+    provider = object.__new__(AnthropicProvider)
+    provider._model_name = model_name
+    provider._options = {}
+
+    assert provider._sampling_controls_deprecated(model_name) is True
+
+
+@pytest.mark.parametrize(
+    "model_name",
+    ["claude-3-5-sonnet-20240620", "claude-3-haiku-20240307", "claude-2.1",
+     "claude-sonnet-4", "claude-opus-4"],
+)
+def test_anthropic_sampling_deprecation_keeps_legacy_models_permissive(model_name):
+    """4.5 之前的模型仍接受采样控制字段，不能被新家族规则误伤。"""
+    provider = object.__new__(AnthropicProvider)
+    provider._model_name = model_name
+    provider._options = {}
+
+    assert provider._sampling_controls_deprecated(model_name) is False
