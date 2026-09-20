@@ -1,14 +1,20 @@
-# -*- coding: utf-8 -*-
 import functools
 import sys
 import tomllib
+from collections.abc import Callable, Mapping
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, ClassVar, cast
 
-from pydantic import BaseModel, Field, field_validator, ValidationError
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 from pydantic.fields import FieldInfo
-from pydantic_settings import BaseSettings, SettingsConfigDict, PydanticBaseSettingsSource
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+)
+
+from src.utils.security import validate_secret_free_options
 
 # =================================================================
 # 1. 基础定义 (DEFINITIONS)
@@ -37,12 +43,84 @@ class RetrievalMethod(str, Enum):
     FULL_TEXT_SEARCH = "全文检索"
     HYBRID_SEARCH = "混合检索"
 
+
+class ModelProtocol(str, Enum):
+    """模型渠道使用的线协议。"""
+
+    CHAT_COMPLETIONS = "chat_completions"
+    RESPONSES = "responses"
+    MESSAGES = "messages"
+    GENERATE_CONTENT = "generate_content"
+    ARK = "ark"
+
+
 class ModelDetail(BaseModel):
     """定义单个模型配置的结构。"""
     provider: str
     model_name: str
+    protocol: ModelProtocol | None = None
+    options: dict[str, Any] = Field(default_factory=dict)
 
-    model_config = SettingsConfigDict(protected_namespaces=())
+    model_config = SettingsConfigDict(
+        protected_namespaces=(),
+        extra="forbid",
+    )
+
+    @field_validator("options", mode="before")
+    @classmethod
+    def validate_options(cls, value: Any, info: ValidationInfo) -> dict[str, Any]:
+        if value is None:
+            return {}
+        if not isinstance(value, Mapping):
+            raise ValueError("模型 options 必须是 TOML 表或字典。")
+        provider = str(info.data.get("provider", "")).strip().lower()
+        try:
+            if provider == "google" and "http_options" in value:
+                http_options = value["http_options"]
+                remaining = {
+                    key: nested
+                    for key, nested in value.items()
+                    if key != "http_options"
+                }
+                validated = validate_secret_free_options(remaining, "模型")
+                validated["http_options"] = validate_secret_free_options(
+                    {"http_options": http_options},
+                    "模型",
+                    allowed_containers={"http_options", "headers"},
+                )["http_options"]
+                return validated
+            return validate_secret_free_options(value, "模型")
+        except ValueError as exc:
+            raise ValueError(str(exc).replace("模型 options 不允许包含凭证或请求头/query 配置", "模型 options 不允许包含凭证或连接字段")) from exc
+
+    @field_validator("protocol", mode="before")
+    @classmethod
+    def normalize_protocol(cls, value: Any) -> ModelProtocol | None:
+        if value is None or value == "":
+            return None
+        if isinstance(value, ModelProtocol):
+            return value
+
+        normalized = str(value).strip().lower().replace("-", "_")
+        aliases = {
+            "chat": ModelProtocol.CHAT_COMPLETIONS,
+            "completion": ModelProtocol.CHAT_COMPLETIONS,
+            "chat_completion": ModelProtocol.CHAT_COMPLETIONS,
+            "chat_completions": ModelProtocol.CHAT_COMPLETIONS,
+            "response": ModelProtocol.RESPONSES,
+            "responses": ModelProtocol.RESPONSES,
+            "anthropic": ModelProtocol.MESSAGES,
+            "anthropic_messages": ModelProtocol.MESSAGES,
+            "gemini": ModelProtocol.GENERATE_CONTENT,
+            "generate": ModelProtocol.GENERATE_CONTENT,
+            "generate_content": ModelProtocol.GENERATE_CONTENT,
+        }
+        try:
+            alias = aliases.get(normalized)
+            return alias if alias is not None else ModelProtocol(normalized)
+        except ValueError as exc:
+            supported = ", ".join(protocol.value for protocol in ModelProtocol)
+            raise ValueError(f"不支持的模型协议: {value}。可选值: {supported}") from exc
 
 # =================================================================
 # 2. 主配置模型 (MAIN SETTINGS MODEL)
@@ -54,26 +132,68 @@ class Settings(BaseSettings):
     加载顺序: 环境变量 > .env 文件 > config.toml 文件 > 模型中定义的默认值。
     """
     # --- [API_KEYS] ---
-    anthropic_api_key: Optional[str] = None
-    google_api_key: Optional[str] = None
-    siliconflow_api_key: Optional[str] = None
-    openai_api_key: Optional[str] = None
-    qwen_api_key: Optional[str] = None
-    volc_access_key: Optional[str] = None
-    volc_secret_key: Optional[str] = None
-    jina_api_key: Optional[str] = None
-    deepseek_api_key: Optional[str] = None
-    grok_api_key: Optional[str] = None
-    lm_studio_api_key: Optional[str] = "lm-studio"
+    anthropic_api_key: str | None = Field(default=None, repr=False)
+    google_api_key: str | None = Field(default=None, repr=False)
+    gemini_api_key: str | None = Field(default=None, repr=False)
+    google_genai_use_vertexai: bool | None = Field(default=None)
+    google_genai_use_enterprise: bool | None = Field(default=None)
+    google_cloud_project: str | None = Field(default=None)
+    google_cloud_location: str | None = Field(default=None)
+    google_application_credentials: str | None = Field(default=None, repr=False)
+    siliconflow_api_key: str | None = Field(default=None, repr=False)
+    openai_api_key: str | None = Field(default=None, repr=False)
+    qwen_api_key: str | None = Field(default=None, repr=False)
+    ark_api_key: str | None = Field(default=None, repr=False)
+    volc_access_key: str | None = Field(default=None, repr=False)
+    volc_secret_key: str | None = Field(default=None, repr=False)
+    jina_api_key: str | None = Field(default=None, repr=False)
+    deepseek_api_key: str | None = Field(default=None, repr=False)
+    grok_api_key: str | None = Field(default=None, repr=False)
+    lm_studio_api_key: str | None = Field(default=None, repr=False)
+
+    _secret_fields: ClassVar[frozenset[str]] = frozenset(
+        {
+            "anthropic_api_key", "google_api_key", "siliconflow_api_key",
+            "gemini_api_key",
+            "google_application_credentials",
+            "openai_api_key", "qwen_api_key", "ark_api_key", "volc_access_key",
+            "volc_secret_key", "jina_api_key", "deepseek_api_key", "grok_api_key",
+            "lm_studio_api_key",
+        }
+    )
+
+    def _safe_dump_exclude(self, exclude: Any, include_secrets: bool) -> Any:
+        if include_secrets:
+            return exclude
+        secret_exclude = set(self._secret_fields)
+        if exclude is None:
+            return secret_exclude
+        if isinstance(exclude, Mapping):
+            return {**exclude, **{name: True for name in secret_exclude}}
+        return set(exclude) | secret_exclude
+
+    def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        include_secrets = bool(kwargs.pop("include_secrets", False))
+        exclude = self._safe_dump_exclude(kwargs.pop("exclude", None), include_secrets)
+        if exclude is not None:
+            kwargs["exclude"] = exclude
+        return super().model_dump(*args, **kwargs)
+
+    def model_dump_json(self, *args: Any, **kwargs: Any) -> str:
+        include_secrets = bool(kwargs.pop("include_secrets", False))
+        exclude = self._safe_dump_exclude(kwargs.pop("exclude", None), include_secrets)
+        if exclude is not None:
+            kwargs["exclude"] = exclude
+        return super().model_dump_json(*args, **kwargs)
 
     # --- [BASE_URLS] ---
     openai_api_base: str = "https://api.openai.com/v1"
     siliconflow_base_url: str = "https://api.siliconflow.cn/v1"
-    qwen_base_url: str = "https://dashscope.aliyuncs.com/api/v1"
+    qwen_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     deepseek_base_url: str = "https://api.deepseek.com"
     ollama_base_url: str = "http://localhost:11434/v1"
     lm_studio_base_url: str = "http://localhost:1234/v1"
-    volc_base_url: str = "https://maas-api.ml-platform-cn-beijing.volces.com"
+    volc_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
     grok_base_url: str = "https://api.x.ai/v1"
 
     # --- [GENERAL] ---
@@ -92,7 +212,7 @@ class Settings(BaseSettings):
     kb_remove_spaces: bool = False
     kb_remove_urls: bool = False
     kb_use_qa_segmentation: bool = False
-    kb_splitter_separators: List[str] = Field(default_factory=lambda: ["###"])
+    kb_splitter_separators: list[str] = Field(default_factory=lambda: ["###"])
     kb_chunk_size: int = 1500
     kb_chunk_overlap: int = 150
     kb_child_chunk_size: int = 300
@@ -117,17 +237,16 @@ class Settings(BaseSettings):
     chat_temperature: float = 0.7 # 将 chat_temperature 移到这里
 
     # --- [MODEL_CONFIGURATIONS] ---
-    embedding_configurations: Dict[str, ModelDetail] = Field(default_factory=lambda: {
+    embedding_configurations: dict[str, ModelDetail] = Field(default_factory=lambda: {
         "local-hash": ModelDetail(provider="local-hash", model_name="local-hash-256"),
         "google": ModelDetail(provider="google", model_name="embedding-001"),
-        "jina": ModelDetail(provider="jina", model_name="jina-embeddings-v2-base-zh"),
         "siliconflow": ModelDetail(provider="siliconflow", model_name="alibaba/bge-large-zh-v1.5"),
         "openai": ModelDetail(provider="openai", model_name="text-embedding-3-small"),
     })
-    rerank_configurations: Dict[str, ModelDetail] = Field(default_factory=lambda: {
+    rerank_configurations: dict[str, ModelDetail] = Field(default_factory=lambda: {
         "siliconflow": ModelDetail(provider="siliconflow", model_name="alibaba/bge-reranker-large"),
     })
-    llm_configurations: Dict[str, ModelDetail] = Field(default_factory=lambda: {
+    llm_configurations: dict[str, ModelDetail] = Field(default_factory=lambda: {
         "google": ModelDetail(provider="google", model_name="gemini-1.5-pro-latest"),
         "anthropic": ModelDetail(provider="anthropic", model_name="claude-3-opus-20240229"),
         "qwen": ModelDetail(provider="qwen", model_name="qwen-turbo"),
@@ -136,12 +255,25 @@ class Settings(BaseSettings):
         "volcengine": ModelDetail(provider="volcengine", model_name="Doubao-pro-32k"),
         "siliconflow": ModelDetail(provider="siliconflow", model_name="deepseek-ai/DeepSeek-V2-Chat"),
         "openai": ModelDetail(provider="openai", model_name="gpt-4o"),
-        "iflow-qwen3-max": ModelDetail(provider="openai", model_name="qwen3-max"),
         "ollama": ModelDetail(provider="ollama", model_name="llama3"),
         "lm-studio": ModelDetail(provider="lm-studio", model_name="LM-Studio-Community/Meta-Llama-3-8B-Instruct-GGUF"),
     })
 
     # --- [VALIDATORS] ---
+    @field_validator("chat_top_k")
+    @classmethod
+    def validate_chat_top_k(cls, value: int) -> int:
+        if isinstance(value, bool) or value < 1:
+            raise ValueError("chat_top_k 必须是大于等于 1 的整数。")
+        return value
+
+    @field_validator("chat_score_threshold")
+    @classmethod
+    def validate_chat_score_threshold(cls, value: float) -> float:
+        if isinstance(value, bool) or not 0 <= value <= 1:
+            raise ValueError("chat_score_threshold 必须在 0 到 1 之间。")
+        return value
+
     @field_validator('log_level', mode='before')
     @classmethod
     def validate_log_level(cls, v: str) -> str:
@@ -151,14 +283,33 @@ class Settings(BaseSettings):
             raise ValueError(f"无效的日志级别: {v}. 必须是 {', '.join(valid_levels)} 中的一个。")
         return v.upper()
 
+    @field_validator("embedding_configurations", "rerank_configurations")
+    @classmethod
+    def validate_non_llm_protocol(
+        cls,
+        value: dict[str, ModelDetail],
+        info: ValidationInfo,
+    ) -> dict[str, ModelDetail]:
+        """Embedding/Rerank 配置不允许携带 LLM 线协议。"""
+        invalid = sorted(
+            key for key, detail in value.items() if detail.protocol is not None
+        )
+        if invalid:
+            role = "Embedding" if info.field_name == "embedding_configurations" else "Rerank"
+            raise ValueError(
+                f"{role} 配置不支持 protocol；协议只能配置在 llm_configurations 中。"
+                f" 无效条目: {', '.join(invalid)}"
+            )
+        return value
+
     @field_validator('chat_temperature', mode='before')
     @classmethod
     def validate_chat_temperature(cls, v: Any) -> float:
         """验证聊天温度在 0.0 到 1.0 之间。"""
         try:
             value = float(v)
-        except (ValueError, TypeError):
-            raise ValueError(f"无法将聊天温度 '{v}' 转换为数字。")
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"无法将聊天温度 '{v}' 转换为数字。") from exc
 
         if not (0.0 <= value <= 1.0):
             raise ValueError(f"聊天温度必须在 0.0 到 1.0 之间，但得到 {value}。")
@@ -183,8 +334,8 @@ class Settings(BaseSettings):
         """验证检索候选过量招募倍率。"""
         try:
             value = int(v)
-        except (ValueError, TypeError):
-            raise ValueError(f"无法将检索候选倍率 '{v}' 转换为整数。")
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"无法将检索候选倍率 '{v}' 转换为整数。") from exc
 
         if value < 1:
             raise ValueError(f"检索候选倍率必须大于等于 1，但得到 {value}。")
@@ -192,7 +343,7 @@ class Settings(BaseSettings):
 
     @field_validator('kb_splitter_separators', mode='before')
     @classmethod
-    def split_separators(cls, v: Any) -> List[str]:
+    def split_separators(cls, v: Any) -> list[str]:
         """
         如果分隔符是字符串，则按逗号分割成列表。
         如果输入值为空（None或空字符串），或者分割后为空列表，则使用字段的默认值。
@@ -200,7 +351,7 @@ class Settings(BaseSettings):
         field_info = cls.model_fields["kb_splitter_separators"]
         default_factory = field_info.default_factory
         if default_factory is not None:
-            default_value = default_factory()
+            default_value = cast(Callable[[], Any], default_factory)()
         else:
             default_value = field_info.default
             if default_value is None:
@@ -253,7 +404,7 @@ class Settings(BaseSettings):
         env_settings: PydanticBaseSettingsSource,
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
-    ) -> Tuple[PydanticBaseSettingsSource, ...]:
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
         """自定义配置加载源，保留环境变量、.env 和 config.toml 三层来源。"""
         return (
             init_settings,
@@ -271,7 +422,7 @@ class Settings(BaseSettings):
         protected_namespaces=(),
     )
 
-def load_toml_config() -> Dict[str, Any]:
+def load_toml_config() -> dict[str, Any]:
     """
     从全局 CONFIG_TOML_PATH 路径加载 config.toml 文件配置。
     """
@@ -286,7 +437,7 @@ def load_toml_config() -> Dict[str, Any]:
             return value
 
         preserved = preserve_keys or set()
-        normalized: Dict[str, Any] = {}
+        normalized: dict[str, Any] = {}
         for raw_key, raw_value in value.items():
             key = str(raw_key).lower()
             if key in preserved and isinstance(raw_value, dict):
@@ -315,13 +466,21 @@ def load_toml_config() -> Dict[str, Any]:
         preserve_keys={"embedding_configurations", "rerank_configurations", "llm_configurations"},
     )
 
-    flat_config: Dict[str, Any] = {}
+    flat_config: dict[str, Any] = {}
     scalar_keys = {
         "anthropic_api_key",
         "google_api_key",
+        "gemini_api_key",
+        # Vertex/Enterprise endpoint selection and project routing are not
+        # credentials, so they may be supplied by config.toml as well as env.
+        "google_genai_use_vertexai",
+        "google_genai_use_enterprise",
+        "google_cloud_project",
+        "google_cloud_location",
         "siliconflow_api_key",
         "openai_api_key",
         "qwen_api_key",
+        "ark_api_key",
         "volc_access_key",
         "volc_secret_key",
         "jina_api_key",
@@ -400,7 +559,7 @@ class TomlConfigSettingsSource(PydanticBaseSettingsSource):
 # 3. 实例化并导出 (INSTANTIATE & EXPORT)
 # =================================================================
 
-@functools.lru_cache()
+@functools.lru_cache
 def get_settings() -> Settings:
     """
     获取 Settings 实例的单例。
@@ -419,7 +578,7 @@ def get_settings() -> Settings:
 # 策略: 保持旧的配置变量，但使其从新的settings实例派生。
 # 后续重构中，应逐步淘汰这些变量，直接使用 `get_settings()` 对象。
 
-def get_backward_compatible_configs() -> Dict[str, Any]:
+def get_backward_compatible_configs() -> dict[str, Any]:
     """
     获取向后兼容的配置字典。
     """
@@ -470,9 +629,11 @@ def get_backward_compatible_configs() -> Dict[str, Any]:
     API_CONFIG = {
         "ANTHROPIC_API_KEY": current_settings.anthropic_api_key,
         "GOOGLE_API_KEY": current_settings.google_api_key,
+        "GEMINI_API_KEY": current_settings.gemini_api_key,
         "SILICONFLOW_API_KEY": current_settings.siliconflow_api_key,
         "OPENAI_API_KEY": current_settings.openai_api_key,
         "QWEN_API_KEY": current_settings.qwen_api_key,
+        "ARK_API_KEY": current_settings.ark_api_key,
         "VOLC_ACCESS_KEY": current_settings.volc_access_key,
         "VOLC_SECRET_KEY": current_settings.volc_secret_key,
         "JINA_API_KEY": current_settings.jina_api_key,
