@@ -49,7 +49,9 @@ class JinaProvider(RerankModel):
             "query": query,
             "documents": documents,
             "model": self._model_name,
-            "top_n": top_n
+            "top_n": top_n,
+            # 默认请求返回文档内容；与 SiliconFlow Rerank 保持一致的不可覆盖字段。
+            "return_documents": True,
         }
         options = dict(self._options)
         options.pop("timeout", None)

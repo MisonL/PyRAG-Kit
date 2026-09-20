@@ -1,12 +1,13 @@
 import functools
 import sys
 import tomllib
+import warnings
 from collections.abc import Callable, Mapping
 from enum import Enum
 from pathlib import Path
 from typing import Any, ClassVar, cast
 
-from pydantic import BaseModel, Field, ValidationInfo, field_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 from pydantic.fields import FieldInfo
 from pydantic_settings import (
     BaseSettings,
@@ -327,6 +328,41 @@ class Settings(BaseSettings):
         if normalized not in valid_strategies:
             raise ValueError(f"无效的混合检索融合策略: {v}. 必须是 {', '.join(sorted(valid_strategies))}。")
         return normalized
+
+    @model_validator(mode="after")
+    def warn_retired_base_urls(self) -> "Settings":
+        """对已知失效的旧 base URL 发出显式升级警告。
+
+        1.4.0 把 Qwen 默认端点从 ``dashscope.aliyuncs.com/api/v1`` 换成
+        ``compatible-mode/v1``，并把火山默认域名从
+        ``maas-api.ml-platform-cn-beijing.volces.com`` 换成
+        ``ark.cn-beijing.volces.com/api/v3``。旧的 ``config.toml`` 会覆盖新默认值，
+        使请求在运行期收到 404/502。这里在配置加载时就明确提示如何修正，而不是让
+        用户从 404 反推原因；显式配置的自建或代理端点不受影响。
+
+        只警告不阻断：旧值是可修复的配置问题而非安全边界，直接失败会让仍在使用
+        旧配置的部署完全无法启动。
+        """
+        retired = {
+            "qwen_base_url": (
+                "https://dashscope.aliyuncs.com/api/v1",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            ),
+            "volc_base_url": (
+                "https://maas-api.ml-platform-cn-beijing.volces.com",
+                "https://ark.cn-beijing.volces.com/api/v3",
+            ),
+        }
+        for field_name, (old_url, new_url) in retired.items():
+            current = getattr(self, field_name, None)
+            if isinstance(current, str) and current.rstrip("/") == old_url:
+                warnings.warn(
+                    f"{field_name} 指向已失效的旧端点 {old_url}，"
+                    f"请改为 {new_url}（旧端点会返回 404）。",
+                    UserWarning,
+                    stacklevel=2,
+                )
+        return self
 
     @field_validator('retrieval_candidate_multiplier', mode='before')
     @classmethod

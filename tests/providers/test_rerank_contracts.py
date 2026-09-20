@@ -102,3 +102,24 @@ def test_siliconflow_rerank_rejects_return_documents_override():
 
     with pytest.raises(ValueError, match="return_documents"):
         provider._prepare_payload("query", ["document"], 1)
+
+
+def test_jina_rerank_rejects_return_documents_override():
+    """Jina 与 SiliconFlow 一样把 return_documents 固定为 True，不允许覆盖。"""
+    provider = object.__new__(JinaProvider)
+    provider._model_name = "rerank-model"
+    provider._options = {"return_documents": False}
+
+    with pytest.raises(ValueError, match="return_documents"):
+        provider._prepare_payload("query", ["document"], 1)
+
+
+def test_jina_rerank_requests_documents_by_default():
+    """未显式配置时也要请求返回文档，与 SiliconFlow 行为一致。"""
+    provider = object.__new__(JinaProvider)
+    provider._model_name = "rerank-model"
+    provider._options = {}
+
+    payload = provider._prepare_payload("query", ["document"], 1)
+
+    assert payload["return_documents"] is True

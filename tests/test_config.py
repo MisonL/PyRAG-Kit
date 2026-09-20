@@ -320,3 +320,41 @@ def test_resolve_app_root_frozen_mode(monkeypatch, tmp_path):
     root = resolve_app_root()
 
     assert root == executable.parent
+
+
+def test_settings_warns_on_retired_qwen_base_url():
+    """旧 Qwen 端点会 404，加载配置时必须给出显式升级提示。"""
+    with pytest.warns(UserWarning, match="qwen_base_url"):
+        Settings.model_validate(
+            {
+                "qwen_base_url": "https://dashscope.aliyuncs.com/api/v1",
+                "volc_base_url": "https://ark.cn-beijing.volces.com/api/v3",
+            }
+        )
+
+
+def test_settings_warns_on_retired_volc_base_url():
+    with pytest.warns(UserWarning, match="volc_base_url"):
+        Settings.model_validate(
+            {
+                "qwen_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "volc_base_url": "https://maas-api.ml-platform-cn-beijing.volces.com",
+            }
+        )
+
+
+def test_settings_accepts_current_and_custom_base_urls():
+    """新默认值以及自建/代理端点都不应触发升级警告。"""
+    import warnings as warnings_module
+
+    for qwen, volc in [
+        (
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "https://ark.cn-beijing.volces.com/api/v3",
+        ),
+        ("https://my-proxy.internal/v1", "https://my-proxy.internal/v3"),
+    ]:
+        with warnings_module.catch_warnings(record=True) as caught:
+            warnings_module.simplefilter("always")
+            Settings.model_validate({"qwen_base_url": qwen, "volc_base_url": volc})
+        assert not [w for w in caught if "base_url" in str(w.message)]

@@ -47,7 +47,7 @@ class KnowledgeBuildService:
             pending_embeddings: list[np.ndarray] = []
             pending_parent_documents: dict[str, dict[str, Any]] = {}
             for file_path in markdown_files:
-                chunks = self._process_file(pipeline, file_path, splitter_structure_mode)
+                chunks = self._process_file(pipeline, file_path)
                 if splitter_structure_mode == "hierarchical" and hasattr(pipeline.splitter, "parent_documents"):
                     parent_documents = getattr(pipeline.splitter, "parent_documents", {})
                     if isinstance(parent_documents, dict):
@@ -105,7 +105,7 @@ class KnowledgeBuildService:
                 except Exception:
                     logger.exception("清理临时知识快照失败: %s", temp_dir)
 
-    def _process_file(self, pipeline: Pipeline, file_path: Path, splitter_structure_mode: str) -> list[Document]:
+    def _process_file(self, pipeline: Pipeline, file_path: Path) -> list[Document]:
         logger.info("正在处理文件: %s", file_path)
         content = file_path.read_text(encoding="utf-8")
         document = Document(content=content, metadata={"source": str(file_path)})
