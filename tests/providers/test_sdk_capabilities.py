@@ -11,6 +11,9 @@ from src.providers.__base__.model_provider import (
     CompletionRequest,
     LargeLanguageModel,
     TextEmbeddingModel,
+    normalize_chat_messages,
+    normalize_messages,
+    normalize_responses_input,
 )
 from src.providers.anthropic import AnthropicProvider
 from src.providers.factory import ModelProviderFactory
@@ -5621,3 +5624,152 @@ def test_chat_completions_rejects_tool_call_without_function_name():
             ],
             stream=False,
         )
+
+
+def test_normalize_messages_accepts_id_less_tool_calls_for_non_chat_protocols():
+    """Google 这类协议必须接受无 id 的历史工具调用。
+
+    Gemini 的 ``FunctionCall.id`` 是可选字段且 SDK 默认 ``None``，其
+    ``_contents`` 明确允许无 id 的调用。公共的 ``normalize_messages`` 因此不能
+    强制要求 id，否则多轮工具调用会在到达 SDK 之前就被本地拒绝。
+    """
+    normalized = normalize_messages(
+        None,
+        None,
+        [
+            {"role": "user", "content": "北京天气"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": None, "type": "function", "name": "get_weather",
+                     "arguments": {"city": "BJ"}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "get_weather",
+             "name": "get_weather", "content": '{"t":20}'},
+        ],
+    )
+
+    tool_call = normalized[1]["tool_calls"][0]
+    assert "id" not in tool_call
+    assert tool_call["type"] == "function"
+    assert tool_call["function"] == {
+        "name": "get_weather",
+        "arguments": '{"city":"BJ"}',
+    }
+
+
+def test_google_multi_turn_replay_accepts_id_less_tool_calls():
+    """把上一轮无 id 的工具调用原样回填给 Google 必须成功。"""
+    contents = GoogleProvider._contents(
+        normalize_messages(
+            None,
+            None,
+            [
+                {"role": "user", "content": "北京天气"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"id": None, "type": "function", "name": "get_weather",
+                         "arguments": {"city": "BJ"}}
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "get_weather",
+                 "name": "get_weather", "content": '{"t":20}'},
+            ],
+        ),
+        None,
+        None,
+    )
+
+    function_call = next(
+        part.function_call
+        for content in contents
+        for part in content.parts
+        if part.function_call
+    )
+    assert function_call.name == "get_weather"
+
+
+def test_chat_tool_call_normalization_reads_input_alias():
+    """Responses/Anthropic 用 ``input`` 承载参数，回填时不能静默变空。"""
+    normalized = normalize_chat_messages(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "c1", "type": "custom_tool_call", "name": "n",
+                     "input": '{"a":1}'}
+                ],
+            }
+        ]
+    )
+
+    assert normalized[0]["tool_calls"] == [
+        {"id": "c1", "type": "function",
+         "function": {"name": "n", "arguments": '{"a":1}'}}
+    ]
+
+
+@pytest.mark.parametrize(
+    "tool_type",
+    ["function", "function_call", "custom_tool_call", "tool_call"],
+)
+def test_chat_tool_call_normalization_maps_type_to_function(tool_type):
+    """Chat Completions 只接受 ``type="function"``，其它来源取值都要映射。"""
+    normalized = normalize_chat_messages(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "x", "type": tool_type, "name": "n", "arguments": "{}"}
+                ],
+            }
+        ]
+    )
+
+    assert normalized[0]["tool_calls"][0]["type"] == "function"
+
+
+def test_chat_completions_still_requires_tool_call_id():
+    """Chat Completions 的严格校验不能被放宽，缺 id 必须显式报错。"""
+    with pytest.raises(ValueError, match="缺少 id/call_id"):
+        normalize_messages(
+            None,
+            None,
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"id": None, "type": "function", "name": "n",
+                         "arguments": "{}"}
+                    ],
+                }
+            ],
+            require_tool_call_ids=True,
+        )
+
+
+def test_responses_input_still_requires_tool_call_id():
+    """Responses 输入项需要 call_id，缺 id 仍要在请求前显式报错。"""
+    with pytest.raises(ValueError, match="缺少 id/call_id"):
+        normalize_responses_input(
+            None,
+            None,
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"id": None, "type": "function", "name": "n",
+                         "arguments": "{}"}
+                    ],
+                }
+            ],
+        )
+

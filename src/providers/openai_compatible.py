@@ -780,7 +780,14 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             extra_query,
             f"{getattr(self, '_provider', 'openai')} Chat Completions",
         )
-        normalized_messages = normalize_messages(prompt, system_prompt, messages)
+        # Chat Completions 要求 assistant 历史的每个 tool_call 都带 id；
+        # 这里显式校验，其它协议继续接受 Gemini 这类无 id 的历史。
+        normalized_messages = normalize_messages(
+            prompt,
+            system_prompt,
+            messages,
+            require_tool_call_ids=True,
+        )
 
         request: dict[str, Any] = {
             "model": self._model_name,

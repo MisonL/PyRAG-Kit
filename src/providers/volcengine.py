@@ -582,7 +582,17 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             extra_query,
             "Ark Chat Completions",
         )
-        request: dict[str, Any] = {"model": self._model_name, "messages": normalize_messages(prompt, system_prompt, messages), "stream": stream}
+        request: dict[str, Any] = {
+            "model": self._model_name,
+            # Ark Chat Completions 同样要求 assistant 历史的 tool_call 带 id。
+            "messages": normalize_messages(
+                prompt,
+                system_prompt,
+                messages,
+                require_tool_call_ids=True,
+            ),
+            "stream": stream,
+        }
         configured_options = self._request_options()
         self._validate_model_options(
             configured_options,

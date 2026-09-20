@@ -324,9 +324,14 @@ def merge_tool_call_fragment(
     return key, merged
 
 
+_CHAT_TOOL_CALL_TYPES = frozenset({"function"})
+
+
 def _chat_tool_call_item(
     tool_call: Mapping[str, Any],
     location: str,
+    *,
+    require_call_id: bool = False,
 ) -> dict[str, Any]:
     """将工具调用归一化为 OpenAI Chat Completions 的嵌套结构。
 
@@ -334,6 +339,11 @@ def _chat_tool_call_item(
     "arguments"}`` 形状，而 Chat Completions 要求 assistant 历史的
     ``tool_calls`` 使用 ``{"id", "type", "function": {"name", "arguments"}}``。
     两种输入都在这里统一，调用方可以把上一轮的 ``tool_calls`` 原样回填。
+
+    历史工具调用并不总是带 ``id``：Gemini 的 ``FunctionCall.id`` 是可选字段，
+    SDK 默认 ``None``，其 ``_contents`` 也允许无 id 的调用。因此默认只在调用方
+    确实提供 id 时保留该字段，不用本地错误打断本可发送的请求；只有确实要求
+    ``id`` 的协议（Chat Completions）才传入 ``require_call_id=True`` 显式校验。
     """
     if not isinstance(tool_call, Mapping):
         raise ValueError(f"{location} 必须是对象。")
@@ -350,25 +360,40 @@ def _chat_tool_call_item(
     arguments = function_values.get("arguments")
     if arguments is None:
         arguments = normalized.get("arguments")
+    if arguments is None:
+        # ``input`` 是 Responses ``custom_tool_call`` 与 Anthropic ``tool_use``
+        # 的参数别名，回退顺序与 Responses 适配保持一致。
+        arguments = normalized.get("input")
     # 复用统一助手：非字符串参数按 JSON 文本发送，None 保持空串，
     # 与 Responses 适配和流式工具调用使用同一套规则。
     arguments = normalize_tool_arguments(arguments)
 
     call_id = normalized.get("id") or normalized.get("call_id")
     if not isinstance(call_id, str) or not call_id.strip():
-        raise ValueError(f"{location} 缺少 id/call_id。")
+        if require_call_id:
+            raise ValueError(f"{location} 缺少 id/call_id。")
+        call_id = None
+
+    # Chat Completions 的 ``tool_calls[].type`` 只接受 ``function``；Responses 的
+    # ``function_call``/``custom_tool_call`` 与流式片段都要映射回该取值。
+    tool_type = normalized.get("type")
+    if not isinstance(tool_type, str) or tool_type not in _CHAT_TOOL_CALL_TYPES:
+        tool_type = "function"
 
     item: dict[str, Any] = {
-        "id": call_id,
-        "type": normalized.get("type") or "function",
+        "type": tool_type,
         "function": {"name": name, "arguments": arguments},
     }
+    if call_id is not None:
+        item["id"] = call_id
     return item
 
 
 def normalize_chat_messages(
     messages: Sequence[Mapping[str, Any]],
     location: str = "messages",
+    *,
+    require_tool_call_ids: bool = False,
 ) -> list[dict[str, Any]]:
     """归一化 Chat Completions 消息，转换工具调用并保留其它字段。"""
     normalized: list[dict[str, Any]] = []
@@ -384,7 +409,9 @@ def normalize_chat_messages(
                 raise ValueError(f"{location}[{index}].tool_calls 必须是序列。")
             item["tool_calls"] = [
                 _chat_tool_call_item(
-                    tool_call, f"{location}[{index}].tool_calls[{call_index}]"
+                    tool_call,
+                    f"{location}[{index}].tool_calls[{call_index}]",
+                    require_call_id=require_tool_call_ids,
                 )
                 for call_index, tool_call in enumerate(tool_calls)
             ]
@@ -396,12 +423,21 @@ def normalize_messages(
     prompt: str | None,
     system_prompt: str | None,
     messages: Sequence[Mapping[str, Any]] | None,
+    *,
+    require_tool_call_ids: bool = False,
 ) -> list[dict[str, Any]]:
-    """生成不修改调用方对象的标准消息列表。"""
+    """生成不修改调用方对象的标准消息列表。
+
+    ``require_tool_call_ids`` 只应由确实要求 assistant 历史工具调用带 ``id``
+    的协议（Chat Completions）开启；其它协议继续接受 Gemini 这类无 id 的历史。
+    """
     if messages is not None:
         if isinstance(messages, (str, bytes, bytearray)) or not isinstance(messages, Sequence):
             raise ValueError("messages 必须是消息对象序列。")
-        normalized = normalize_chat_messages(messages)
+        normalized = normalize_chat_messages(
+            messages,
+            require_tool_call_ids=require_tool_call_ids,
+        )
         if system_prompt and not any(message.get("role") == "system" for message in normalized):
             normalized.insert(0, {"role": "system", "content": system_prompt})
         return normalized
@@ -837,8 +873,16 @@ def normalize_responses_input(
     输入消息类型，必须分别变成 function_call 和 function_call_output。
     原生 Responses item 会保留，但其关键字段仍在边界处校验。``provider``
     为 ``ark``/``volcengine`` 时启用 Ark 独有的音视频内容块。
+
+    Responses 输入项要求每个 ``function_call`` 带 ``call_id``，因此这里强制
+    assistant 历史的工具调用提供 id；缺少关联 ID 会在请求前显式报错。
     """
-    normalized = normalize_messages(prompt, system_prompt, messages)
+    normalized = normalize_messages(
+        prompt,
+        system_prompt,
+        messages,
+        require_tool_call_ids=True,
+    )
     if messages is None and prompt is not None:
         return prompt
 
