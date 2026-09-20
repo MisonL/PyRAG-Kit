@@ -1,11 +1,18 @@
-# -*- coding: utf-8 -*-
 import logging
 import os
-import re # 导入 re 模块
+import re  # 导入 re 模块
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 
 from src.utils.config import get_settings
+from src.utils.security import redact_sensitive_text
+
+
+class RedactingFormatter(logging.Formatter):
+    """在格式化完整 traceback 后脱敏，避免异常链泄漏凭证。"""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return redact_sensitive_text(super().format(record))
 
 def get_chat_logger() -> logging.Logger:
     """
@@ -25,12 +32,12 @@ def get_chat_logger() -> logging.Logger:
 
         # 控制台处理器
         console_handler = logging.StreamHandler()
-        console_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        console_formatter = RedactingFormatter('%(asctime)s - %(levelname)s - %(message)s')
         console_handler.setFormatter(console_formatter)
         logger.addHandler(console_handler)
 
         # 文件处理器 (每天一个文件，最大 1MB，保留 5 个文件)
-        log_file_name = f"chat_log_{datetime.now().strftime('%Y-%m-%d')}.log"
+        log_file_name = f"chat_log_{datetime.now().astimezone().strftime('%Y-%m-%d')}.log"
         file_path = os.path.join(log_dir, log_file_name)
         file_handler = RotatingFileHandler(
             file_path,
@@ -38,7 +45,7 @@ def get_chat_logger() -> logging.Logger:
             backupCount=5,
             encoding='utf-8'
         )
-        file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        file_formatter = RedactingFormatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         file_handler.setFormatter(file_formatter)
         logger.addHandler(file_handler)
 
@@ -62,12 +69,12 @@ def get_module_logger(name: str) -> logging.Logger:
 
         # 控制台处理器
         console_handler = logging.StreamHandler()
-        console_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        console_formatter = RedactingFormatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         console_handler.setFormatter(console_formatter)
         logger.addHandler(console_handler)
 
         # 文件处理器 (每天一个文件，最大 1MB，保留 5 个文件)
-        log_file_name = f"app_log_{datetime.now().strftime('%Y-%m-%d')}.log"
+        log_file_name = f"app_log_{datetime.now().astimezone().strftime('%Y-%m-%d')}.log"
         file_path = os.path.join(log_dir, log_file_name)
         file_handler = RotatingFileHandler(
             file_path,
@@ -75,7 +82,7 @@ def get_module_logger(name: str) -> logging.Logger:
             backupCount=5,
             encoding='utf-8'
         )
-        file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
+        file_formatter = RedactingFormatter('%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
         file_handler.setFormatter(file_formatter)
         logger.addHandler(file_handler)
 
@@ -92,7 +99,7 @@ def cleanup_old_logs():
     if not os.path.exists(log_dir):
         return
 
-    now = datetime.now()
+    now = datetime.now().astimezone()
     
     # 获取所有日志文件
     log_files = [f for f in os.listdir(log_dir) if f.endswith(".log")]
@@ -104,7 +111,9 @@ def cleanup_old_logs():
             match = re.search(r'(\d{4}-\d{2}-\d{2})', filename)
             if match:
                 file_date_str = match.group(1)
-                file_date = datetime.strptime(file_date_str, '%Y-%m-%d')
+                file_date = datetime.strptime(file_date_str, '%Y-%m-%d').replace(
+                    tzinfo=now.tzinfo
+                )
                 
                 if (now - file_date).days > log_retention_days:
                     os.remove(file_path)
@@ -112,8 +121,10 @@ def cleanup_old_logs():
             else:
                 # 如果文件名不符合日期模式，也记录一下，但不删除
                 get_module_logger(__name__).warning(f"日志文件名不符合日期模式，跳过清理: {filename}")
-        except Exception as e:
-            get_module_logger(__name__).error(f"清理日志文件 {filename} 时出错: {e}", exc_info=True)
+        except Exception:  # noqa: BLE001 - cleanup continues independently per file
+            get_module_logger(__name__).exception(
+                "清理日志文件 %s 时出错", filename
+            )
 
 # 示例用法 (可选，用于测试)
 if __name__ == "__main__":
