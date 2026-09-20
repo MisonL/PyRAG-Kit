@@ -3,8 +3,9 @@
 # 遵循修改后的 Apache License 2.0 许可证。详情请参阅项目根目录下的 DIFY_LICENSE 文件。
 
 from abc import ABC, abstractmethod
-from typing import List
+
 from src.models.document import Document
+
 
 class BaseExtractor(ABC):
     """
@@ -13,7 +14,7 @@ class BaseExtractor(ABC):
     """
 
     @abstractmethod
-    def extract(self, document: Document, **kwargs) -> List[Document]:
+    def extract(self, document: Document, **kwargs) -> list[Document]:
         """
         从给定的 Document 对象中抽取内容。
         对于某些类型（如纯文本），可能只是原样返回。
@@ -26,4 +27,3 @@ class BaseExtractor(ABC):
         Returns:
             List[Document]: 抽取出的一个或多个文档对象列表。
         """
-        pass

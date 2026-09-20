@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import json
@@ -6,7 +5,7 @@ import shutil
 import tomllib
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 from src.runtime.contracts import KnowledgeSnapshotManifest, RunConfig
 
@@ -17,14 +16,14 @@ class SnapshotRepository:
         self.root = run_config.snapshot_root
         self.root.mkdir(parents=True, exist_ok=True)
 
-    def get_active_snapshot_id(self) -> Optional[str]:
+    def get_active_snapshot_id(self) -> str | None:
         marker = self.run_config.active_snapshot_marker
         if not marker.exists():
             return None
         snapshot_id = marker.read_text(encoding="utf-8").strip()
         return snapshot_id or None
 
-    def get_active_snapshot_dir(self) -> Optional[Path]:
+    def get_active_snapshot_dir(self) -> Path | None:
         snapshot_id = self.get_active_snapshot_id()
         if not snapshot_id:
             return None
@@ -37,6 +36,12 @@ class SnapshotRepository:
             shutil.rmtree(temp_dir)
         temp_dir.mkdir(parents=True, exist_ok=True)
         return temp_dir
+
+    def cleanup_temp_snapshot_dir(self, snapshot_id: str) -> None:
+        """删除指定构建任务的临时目录，不触碰正式快照。"""
+        temp_dir = self.root / f".tmp-{snapshot_id}"
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
 
     def finalize_snapshot(self, temp_dir: Path, snapshot_id: str) -> Path:
         final_dir = self.root / snapshot_id
@@ -64,13 +69,13 @@ class SnapshotRepository:
             data = tomllib.load(file)
         return KnowledgeSnapshotManifest.from_mapping(data)
 
-    def write_stats(self, snapshot_dir: Path, stats: Dict[str, Any]) -> None:
+    def write_stats(self, snapshot_dir: Path, stats: dict[str, Any]) -> None:
         (snapshot_dir / "stats.json").write_text(
             json.dumps(stats, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 
-    def load_stats(self, snapshot_dir: Path) -> Dict[str, Any]:
+    def load_stats(self, snapshot_dir: Path) -> dict[str, Any]:
         stats_path = snapshot_dir / "stats.json"
         if not stats_path.exists():
             return {}
@@ -89,7 +94,7 @@ class SnapshotRepository:
         if missing_files:
             raise FileNotFoundError(f"知识快照不完整，缺少文件: {', '.join(missing_files)}")
 
-    def load_active_manifest(self) -> Optional[KnowledgeSnapshotManifest]:
+    def load_active_manifest(self) -> KnowledgeSnapshotManifest | None:
         snapshot_dir = self.get_active_snapshot_dir()
         if snapshot_dir is None:
             return None

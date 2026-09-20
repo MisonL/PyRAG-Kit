@@ -1,7 +1,5 @@
-# -*- coding: utf-8 -*-
 import asyncio
 import os
-from typing import Dict, List
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import HTML
@@ -24,7 +22,7 @@ console = Console()
 logger = get_module_logger(__name__)
 
 
-def display_results(query: str, documents: List[Dict]):
+def display_results(query: str, documents: list[dict]):
     if not documents:
         console.print(Panel(f"对查询 “[bold yellow]{query}[/bold yellow]” 无结果。", border_style="red"))
         return
@@ -50,7 +48,7 @@ async def run_retrieval_test_async():
     excel_logger = None
     try:
         excel_logger = ExcelLogger()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - interactive setup reports all failures
         logger.error("ExcelLogger 初始化失败: %s", exc)
 
     try:
@@ -58,7 +56,7 @@ async def run_retrieval_test_async():
         session_config = build_session_config(get_settings())
         vector_store = VectorStoreFactory.get_default_vector_store()
         retrieval_service = RetrievalService(vector_store, EmbeddingService(run_config))
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - interactive setup reports all failures
         console.print(f"[red]数据库加载失败: {exc}[/red]")
         return
 
@@ -77,7 +75,7 @@ async def run_retrieval_test_async():
                 excel_logger.log_results(query, documents)
         except (KeyboardInterrupt, EOFError):
             break
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - interactive loop remains usable
             console.print(f"[red]召回测试出错: {exc}[/red]")
             logger.error("召回测试出错: %s", exc)
 

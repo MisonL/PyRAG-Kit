@@ -1,15 +1,15 @@
-# -*- coding: utf-8 -*-
 import re
 import uuid
-from typing import Callable, List, Optional
+from collections.abc import Callable
 
 import tiktoken
-
-from .base import BaseSplitter
-from src.models.document import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from src.models.document import Document
 from src.utils.config import get_settings
 from src.utils.log_manager import get_module_logger
+
+from .base import BaseSplitter
 
 logger = get_module_logger(__name__)
 
@@ -28,10 +28,10 @@ class RecursiveTextSplitter(BaseSplitter):
         mode: str = "token",
         encoding_name: str = "cl100k_base",
         structure_mode: str = "standard",
-        parent_chunk_size: Optional[int] = None,
-        parent_chunk_overlap: Optional[int] = None,
-        child_chunk_size: Optional[int] = None,
-        child_chunk_overlap: Optional[int] = None,
+        parent_chunk_size: int | None = None,
+        parent_chunk_overlap: int | None = None,
+        child_chunk_size: int | None = None,
+        child_chunk_overlap: int | None = None,
     ):
         """
         初始化 RecursiveTextSplitter。
@@ -101,9 +101,9 @@ class RecursiveTextSplitter(BaseSplitter):
         """去掉分片开头的句号类标点。"""
         return re.sub(r"^[\s.。]+", "", text).strip()
 
-    def _split_standard_documents(self, documents: List[Document]) -> List[Document]:
+    def _split_standard_documents(self, documents: list[Document]) -> list[Document]:
         """标准单层分片。"""
-        all_chunks: List[Document] = []
+        all_chunks: list[Document] = []
         for doc in documents:
             logger.debug(f"正在分割文档: {doc.metadata.get('source', '未知来源')}")
 
@@ -128,9 +128,9 @@ class RecursiveTextSplitter(BaseSplitter):
             )
         return all_chunks
 
-    def split_hierarchical(self, documents: List[Document]) -> List[Document]:
+    def split_hierarchical(self, documents: list[Document]) -> list[Document]:
         """层级分片：先切父块，再切子块。"""
-        all_chunks: List[Document] = []
+        all_chunks: list[Document] = []
         child_splitter = self._build_child_splitter()
         self.parent_documents = {}
 
@@ -178,7 +178,7 @@ class RecursiveTextSplitter(BaseSplitter):
 
         return all_chunks
 
-    def split(self, documents: List[Document], **kwargs) -> List[Document]:
+    def split(self, documents: list[Document], **kwargs) -> list[Document]:
         """
         将文档列表中的文本内容分割成更小的块。
         """

@@ -1,10 +1,10 @@
-# -*- coding: utf-8 -*-
-import os
 import json
+import os
 from datetime import datetime
-from typing import List, Dict, Any
-from openpyxl import Workbook
-from openpyxl.worksheet.worksheet import Worksheet
+from typing import Any
+
+from openpyxl import Workbook  # type: ignore[import-untyped]
+from openpyxl.worksheet.worksheet import Worksheet  # type: ignore[import-untyped]
 
 from ..utils.log_manager import get_module_logger
 
@@ -25,7 +25,7 @@ class ExcelLogger:
         os.makedirs(log_dir, exist_ok=True)
         
         # 生成带时间戳的唯一文件名
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
         self.filepath = os.path.join(log_dir, f"recall_test_log_{timestamp}.xlsx")
         
         # 创建一个新的 Excel 工作簿和工作表
@@ -53,7 +53,7 @@ class ExcelLogger:
         self.worksheet.append(headers)
         self.workbook.save(self.filepath)
 
-    def log_results(self, query: str, results: List[Dict[str, Any]]):
+    def log_results(self, query: str, results: list[dict[str, Any]]):
         """
         将单次查询的结果记录到 Excel 文件中。
 
@@ -61,8 +61,9 @@ class ExcelLogger:
             query (str):用户的查询。
             results (List[Dict[str, Any]]): 从检索器返回的文档列表。
         """
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
         
+        row: list[Any]
         if not results:
             # 如果没有结果，也记录一条信息
             row = [timestamp, query, "N/A", "N/A", "无结果", "N/A", "N/A", "N/A"]
@@ -100,5 +101,5 @@ class ExcelLogger:
         try:
             self.workbook.save(self.filepath)
             logger.debug(f"成功将查询 '{query}' 的 {len(results)} 条结果记录到 {self.filepath}")
-        except Exception as e:
-            logger.error(f"保存 Excel 日志文件失败: {e}", exc_info=True)
+        except Exception:
+            logger.exception("保存 Excel 日志文件失败")
