@@ -62,7 +62,7 @@ class AnthropicProvider(LargeLanguageModel):
     # 5 代引入了 ``claude-fable-5``、``claude-mythos-5`` 等新家族，因此家族段
     # 按任意字母串匹配，避免新家族漏判采样控制字段的弃用契约。
     _MODEL_VERSION_RE = re.compile(
-        r"claude[-_]"
+        r"(?<![a-z0-9])claude[-_]"
         r"(?:"
         r"(?P<family_name>[a-z]+)[-_](?P<family_major>\d+)"
         r"(?:[-_.](?P<family_minor>\d{1,2}))?"
@@ -80,7 +80,7 @@ class AnthropicProvider(LargeLanguageModel):
     # 无版本号的现役家族名（如 ``claude-mythos-preview``）。这些是 5 代命名，
     # 官方端点同样拒绝 legacy 采样控制字段。
     _UNVERSIONED_MODERN_MODEL_RE = re.compile(
-        r"claude[-_](?:fable|mythos)(?:[-_][a-z0-9]+)*$",
+        r"(?<![a-z0-9])claude[-_](?:fable|mythos)(?:[-_][a-z0-9]+)*$",
         re.IGNORECASE,
     )
 

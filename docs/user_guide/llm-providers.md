@@ -166,17 +166,17 @@ model_name = "gpt-5.6-sol"
 
 ## 如何添加新模型
 
-假设您想添加一个通过 SiliconFlow 平台提供的 `Qwen/Qwen2-57B-A14B-Instruct` 模型，可以按以下步骤操作：
+假设您想添加一个通过 SiliconFlow 平台提供的 `zai-org/GLM-5.3` 模型，可以按以下步骤操作：
 
 1.  **确保密钥已配置**: 在 `.env` 中填入 `SILICONFLOW_API_KEY`。
 2.  **编辑 `llm_configurations`**: 在 `config.toml` 中添加一个新的表：
 
     ```toml
-    [llm_configurations.sf-qwen2-57b]
+    [llm_configurations.sf-glm-5-3]
     provider = "siliconflow"
-    model_name = "Qwen/Qwen2-57B-A14B-Instruct"
+    model_name = "zai-org/GLM-5.3"
     ```
 
 3.  **重启程序**: 保存 `config.toml` 文件并重新启动 `uv run main.py`。
 
-现在，您就可以在 `/config` 菜单的“切换模型” -> “语言模型 (LLM)” 选项中看到并选择 `sf-qwen2-57b` 了。
+现在，您就可以在 `/config` 菜单的“切换模型” -> “语言模型 (LLM)” 选项中看到并选择 `sf-glm-5-3` 了。

@@ -241,14 +241,14 @@ provider = "siliconflow"
 model_name = "deepseek-ai/DeepSeek-V3.2"
 
 # ollama-llama3.1 聊天模型
-[llm_configurations.ollama-llama3]
+[llm_configurations.ollama-llama3-1]
 # 提供商实现标识
 provider = "ollama"
 # API 实际模型名
 model_name = "llama3.1"
 
 # ollama-gemma3 聊天模型
-[llm_configurations.ollama-gemma]
+[llm_configurations.ollama-gemma3]
 # 提供商实现标识
 provider = "ollama"
 # API 实际模型名

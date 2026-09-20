@@ -5810,3 +5810,16 @@ def test_anthropic_sampling_deprecation_keeps_legacy_models_permissive(model_nam
     provider._options = {}
 
     assert provider._sampling_controls_deprecated(model_name) is False
+
+
+@pytest.mark.parametrize(
+    "model_name",
+    ["notclaude-sonnet-4-6", "xclaude-opus-5", "myclaude-fable-5"],
+)
+def test_anthropic_version_parser_requires_a_word_boundary(model_name):
+    """``claude`` 必须是独立的名称段，不能被别的字符串前缀带出误判。"""
+    provider = object.__new__(AnthropicProvider)
+    provider._model_name = model_name
+    provider._options = {}
+
+    assert provider._sampling_controls_deprecated(model_name) is False
