@@ -1,12 +1,13 @@
-import pytest
-from unittest.mock import MagicMock, patch
-from typing import Any, List
 import sys
+from typing import Any
+from unittest.mock import MagicMock, patch
 
-from src.retrieval.vdb.factory import VectorStoreFactory
+import pytest
+
 from src.retrieval.vdb.base import VectorStoreBase
-from src.utils.config import Settings, get_settings # 导入 Settings 和 get_settings
-from src.retrieval.vdb.faiss_store import FaissStore # 导入 FaissStore
+from src.retrieval.vdb.factory import VectorStoreFactory
+from src.utils.config import Settings
+
 
 # Mock FaissStore 类
 class MockFaissStore(VectorStoreBase):
@@ -15,25 +16,23 @@ class MockFaissStore(VectorStoreBase):
         self.documents = []
         self.embeddings = None
 
-    def add_documents(self, documents: List[dict[str, Any]]):
+    def add_documents(self, documents: list[dict[str, Any]]):
         self.documents.extend(documents)
 
-    def search(self, query: str, top_k: int = 5, search_type: str = "semantic") -> List[dict[str, Any]]:
+    def search(self, query: str, top_k: int = 5, search_type: str = "semantic") -> list[dict[str, Any]]:
         return [{"page_content": f"mock_doc_{i}", "metadata": {"source": "mock"}} for i in range(top_k)]
 
-    async def aadd_documents(self, documents: List[dict[str, Any]]):
+    async def aadd_documents(self, documents: list[dict[str, Any]]):
         self.documents.extend(documents)
 
-    async def asearch(self, query: str, top_k: int = 5, search_type: str = "semantic") -> List[dict[str, Any]]:
+    async def asearch(self, query: str, top_k: int = 5, search_type: str = "semantic") -> list[dict[str, Any]]:
         return [{"page_content": f"mock_doc_{i}", "metadata": {"source": "mock"}} for i in range(top_k)]
 
     def save(self, path: str):
         """模拟保存操作"""
-        pass
 
     def load(self, path: str):
         """模拟加载操作"""
-        pass
 
     def get_embedding_model(self) -> Any:
         """模拟获取嵌入模型"""
@@ -80,7 +79,9 @@ def patch_settings(monkeypatch, tmp_path):
         # 重新导入 VectorStoreFactory，确保它加载的是最新的版本
         if 'src.retrieval.vdb.factory' in sys.modules:
             del sys.modules['src.retrieval.vdb.factory']
-        from src.retrieval.vdb.factory import VectorStoreFactory as ReloadedVectorStoreFactory
+        from src.retrieval.vdb.factory import (
+            VectorStoreFactory as ReloadedVectorStoreFactory,
+        )
         
         # 直接模拟 VectorStoreFactory.get_vector_store 方法
         def mock_get_vector_store(store_type: str, file_path: str | None = None) -> VectorStoreBase:

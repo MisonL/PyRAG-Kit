@@ -3,9 +3,60 @@ from types import SimpleNamespace
 
 from rich.console import Console
 
+from src.chat.core import Chatbot, _safe_exception_text, start_chat_session_async
 from src.runtime.contracts import SessionConfig
 from src.utils.config import ModelDetail, RetrievalMethod
-from src.chat.core import Chatbot, start_chat_session_async
+from src.utils.log_manager import RedactingFormatter
+
+
+def test_safe_exception_text_redacts_credentials():
+    text = _safe_exception_text(RuntimeError("Authorization: Bearer sk-secret-token"))
+    assert "sk-secret-token" not in text
+    assert "REDACTED" in text
+
+
+def test_safe_exception_text_redacts_json_credentials():
+    text = _safe_exception_text(RuntimeError('{"api_key": "secret-value"}'))
+    assert "secret-value" not in text
+    assert "REDACTED" in text
+
+
+def test_log_formatter_redacts_credentials_from_traceback():
+    import logging
+    import sys
+
+    try:
+        raise RuntimeError("Authorization: Bearer sk-secret-token")
+    except RuntimeError:
+        record = logging.LogRecord(
+            "chat_logger",
+            logging.ERROR,
+            __file__,
+            1,
+            "request failed",
+            (),
+            sys.exc_info(),
+        )
+
+    rendered = RedactingFormatter("%(message)s").format(record)
+    assert "sk-secret-token" not in rendered
+    assert "[REDACTED]" in rendered
+
+
+def test_chatbot_close_disposes_llm_and_retrieval_service():
+    llm = SimpleNamespace(close=lambda: setattr(llm, "closed", True), closed=False)
+    retrieval = SimpleNamespace(close=lambda: setattr(retrieval, "closed", True), closed=False)
+    bot = object.__new__(Chatbot)
+    bot.llm_model = llm
+    bot.chat_service = object()
+    bot.retrieval_service = retrieval
+
+    bot.close()
+
+    assert llm.closed is True
+    assert retrieval.closed is True
+    assert bot.llm_model is None
+    assert bot.retrieval_service is None
 
 
 class FakePromptSession:
@@ -20,7 +71,7 @@ class FakeChatbot:
     def __init__(self, _console: Console):
         self.llm_model = object()
         self.chat_config = {
-            "active_llm_configuration": "iflow-qwen3-max",
+            "active_llm_configuration": "openai",
             "active_rerank_configuration": "siliconflow",
             "retrieval_method": SimpleNamespace(value="混合检索"),
             "vector_weight": 0.3,
@@ -31,7 +82,7 @@ class FakeChatbot:
             "top_k": 5,
             "score_threshold": 0.4,
             "llm_configurations": {
-                "iflow-qwen3-max": SimpleNamespace(provider="openai", model_name="qwen3-max"),
+                "openai": SimpleNamespace(provider="openai", model_name="gpt-4o"),
             },
             "rerank_configurations": {
                 "siliconflow": SimpleNamespace(provider="siliconflow", model_name="rerank"),
@@ -109,6 +160,7 @@ def test_start_chat_session_async_skips_empty_input(monkeypatch):
 
 def test_chat_async_retrieves_with_intent():
     retrieval_queries = []
+    model_calls = []
 
     class DummyLogger:
         def info(self, *_args, **_kwargs):
@@ -118,7 +170,8 @@ def test_chat_async_retrieves_with_intent():
             return None
 
     class DummyLLM:
-        async def ainvoke(self, *_args, **_kwargs):
+        async def ainvoke(self, *_args, **kwargs):
+            model_calls.append(kwargs)
             yield "回答"
 
     async def fake_identify(self, _user_query):
@@ -148,6 +201,7 @@ def test_chat_async_retrieves_with_intent():
 
     assert retrieval_queries == ["清除浏览器缓存的操作步骤"]
     assert chunks == ["回答"]
+    assert "temperature" not in model_calls[0]
 
 
 def test_reload_llm_keeps_existing_model_on_failure(monkeypatch):
@@ -165,12 +219,56 @@ def test_reload_llm_keeps_existing_model_on_failure(monkeypatch):
 
     monkeypatch.setattr(
         "src.chat.core.ModelProviderFactory.get_llm_provider",
-        lambda _llm_key: (_ for _ in ()).throw(RuntimeError("reload failed")),
+        lambda _llm_key, _configurations=None: (_ for _ in ()).throw(RuntimeError("reload failed")),
     )
 
     assert bot.reload_llm() is False
     assert bot.llm_model is old_model
     assert bot.chat_service is old_chat_service
+
+
+def test_apply_config_update_async_keeps_runtime_on_chat_service_failure(monkeypatch):
+    class ClosableModel:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    old_model = ClosableModel()
+    new_model = ClosableModel()
+    old_chat_service = object()
+    messages = []
+
+    class DummySessionConfig:
+        active_llm_configuration = "new-model"
+
+        def __setitem__(self, key, value):
+            setattr(self, key, value)
+
+    bot = object.__new__(Chatbot)
+    bot.console = SimpleNamespace(print=lambda message: messages.append(str(message)))
+    bot.logger = SimpleNamespace(warning=lambda *_args, **_kwargs: None)
+    bot.session_config = DummySessionConfig()
+    bot.retrieval_service = object()
+    bot.llm_model = old_model
+    bot.chat_service = old_chat_service
+
+    monkeypatch.setattr(
+        "src.chat.core.ModelProviderFactory.get_llm_provider",
+        lambda *_args, **_kwargs: new_model,
+    )
+    monkeypatch.setattr(
+        "src.chat.core.ChatService",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("service init failed")),
+    )
+
+    asyncio.run(bot.apply_config_update_async({"active_llm_configuration": "new-model"}, True))
+
+    assert bot.llm_model is old_model
+    assert bot.chat_service is old_chat_service
+    assert new_model.closed is True
+    assert any("LLM 切换失败" in message for message in messages)
 
 
 def test_apply_config_update_reverts_llm_key_when_reload_fails(monkeypatch):
@@ -195,6 +293,42 @@ def test_apply_config_update_reverts_llm_key_when_reload_fails(monkeypatch):
     assert any("LLM 切换失败" in message for message in messages)
 
 
+def test_apply_config_update_restores_all_llm_configurations_on_reload_failure(monkeypatch):
+    old_detail = ModelDetail(provider="openai", model_name="old-model")
+    new_detail = ModelDetail(provider="qwen", model_name="new-model")
+    bot = object.__new__(Chatbot)
+    bot.console = SimpleNamespace(print=lambda _message: None)
+    bot.session_config = SessionConfig(
+        retrieval_method=RetrievalMethod.HYBRID_SEARCH,
+        vector_weight=0.3,
+        keyword_weight=0.7,
+        hybrid_fusion_strategy="rrf",
+        retrieval_candidate_multiplier=3,
+        rerank_enabled=False,
+        top_k=5,
+        score_threshold=0.4,
+        active_llm_configuration="old-model",
+        active_rerank_configuration="siliconflow",
+        llm_configurations={"old-model": old_detail},
+        rerank_configurations={},
+        chat_temperature=0.7,
+    )
+    bot.llm_model = object()
+    bot.chat_service = object()
+    monkeypatch.setattr(bot, "reload_llm", lambda: False)
+
+    bot.apply_config_update(
+        {
+            "active_llm_configuration": "new-model",
+            "llm_configurations": {"new-model": new_detail},
+        },
+        llm_needs_reload=True,
+    )
+
+    assert bot.session_config.active_llm_configuration == "old-model"
+    assert bot.session_config.llm_configurations == {"old-model": old_detail}
+
+
 def test_start_chat_session_async_reverts_llm_after_editor_mutation(monkeypatch):
     class RealishChatbot(FakeChatbot):
         last_instance = None
@@ -214,7 +348,7 @@ def test_start_chat_session_async_reverts_llm_after_editor_mutation(monkeypatch)
                 score_threshold=0.4,
                 active_llm_configuration="old-model",
                 active_rerank_configuration="siliconflow",
-                llm_configurations={"old-model": ModelDetail(provider="openai", model_name="qwen3-max")},
+                llm_configurations={"old-model": ModelDetail(provider="openai", model_name="gpt-4o")},
                 rerank_configurations={"siliconflow": ModelDetail(provider="siliconflow", model_name="rerank")},
                 chat_temperature=0.7,
             )

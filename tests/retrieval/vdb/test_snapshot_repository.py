@@ -39,3 +39,19 @@ def test_snapshot_repository_writes_and_loads_manifest(tmp_path, monkeypatch):
     assert loaded_manifest.snapshot_id == snapshot_id
     assert loaded_manifest.embedding_model == "local-hash-256"
     get_settings.cache_clear()
+
+
+def test_snapshot_repository_cleans_only_requested_temp_dir(tmp_path):
+    run_config = type("RunConfig", (), {"snapshot_root": tmp_path})()
+    repository = SnapshotRepository(run_config)
+    snapshot_id = "kb-cleanup"
+    temp_dir = repository.create_temp_snapshot_dir(snapshot_id)
+    (temp_dir / "partial.bin").write_bytes(b"partial")
+    final_dir = tmp_path / "kb-existing"
+    final_dir.mkdir()
+    (final_dir / "keep.bin").write_bytes(b"keep")
+
+    repository.cleanup_temp_snapshot_dir(snapshot_id)
+
+    assert not temp_dir.exists()
+    assert (final_dir / "keep.bin").exists()

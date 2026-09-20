@@ -1,11 +1,16 @@
-# -*- coding: utf-8 -*-
 import os
 
 import pytest
 from pydantic import ValidationError
 
-from src.utils.config import RetrievalMethod, Settings, get_settings, resolve_app_root
-
+from src.utils.config import (
+    ModelDetail,
+    ModelProtocol,
+    RetrievalMethod,
+    Settings,
+    get_settings,
+    resolve_app_root,
+)
 
 MOCK_TOML_CONTENT = """
 log_level = "INFO"
@@ -16,6 +21,10 @@ hybrid_fusion_strategy = "weighted"
 retrieval_candidate_multiplier = 4
 kb_child_chunk_size = 180
 kb_child_chunk_overlap = 18
+google_genai_use_vertexai = true
+gemini_api_key = "toml-gemini-key"
+google_cloud_project = "toml-project"
+google_cloud_location = "europe-west4"
 
 [embedding_configurations.google]
 provider = "google"
@@ -24,6 +33,8 @@ model_name = "toml-embedding-model"
 [llm_configurations.demo]
 provider = "openai"
 model_name = "demo-model"
+protocol = "responses"
+options = { top_p = 0.8, response_format = { type = "json_object" } }
 """
 
 
@@ -59,6 +70,12 @@ def test_settings_model_validation():
     with pytest.raises(ValidationError):
         Settings(chat_retrieval_method="UNKNOWN_METHOD")  # type: ignore[arg-type]
 
+    with pytest.raises(ValidationError, match="chat_top_k"):
+        Settings(chat_top_k=0)
+
+    with pytest.raises(ValidationError, match="chat_score_threshold"):
+        Settings(chat_score_threshold=1.1)
+
 
 def test_settings_splitter_separators_empty_string_falls_back_to_default():
     settings = Settings(kb_splitter_separators="")
@@ -84,7 +101,26 @@ def test_settings_defaults():
     assert settings.kb_child_chunk_overlap == 30
     assert settings.default_embedding_provider == "local-hash"
     assert settings.embedding_configurations["local-hash"].model_name == "local-hash-256"
-    assert settings.llm_configurations["iflow-qwen3-max"].model_name == "qwen3-max"
+    assert settings.llm_configurations["openai"].model_name == "gpt-4o"
+    assert settings.qwen_base_url.endswith("/compatible-mode/v1")
+    assert settings.volc_base_url.endswith("/api/v3")
+    assert "jina" not in settings.embedding_configurations
+
+
+def test_settings_dump_hides_credentials_by_default():
+    settings = Settings(openai_api_key="sk-test", lm_studio_api_key="local-secret")
+
+    assert "openai_api_key" not in settings.model_dump()
+    assert "lm_studio_api_key" not in settings.model_dump_json()
+    assert settings.model_dump(include_secrets=True)["openai_api_key"] == "sk-test"
+
+
+def test_settings_supports_gemini_api_key_alias_without_exposing_it_by_default():
+    settings = Settings(gemini_api_key="gemini-test")
+
+    assert settings.gemini_api_key == "gemini-test"
+    assert "gemini_api_key" not in settings.model_dump()
+    assert settings.model_dump(include_secrets=True)["gemini_api_key"] == "gemini-test"
 
 
 def test_settings_from_toml(tmp_path):
@@ -101,19 +137,100 @@ def test_settings_from_toml(tmp_path):
     assert settings.retrieval_candidate_multiplier == 4
     assert settings.kb_child_chunk_size == 180
     assert settings.kb_child_chunk_overlap == 18
+    assert settings.google_genai_use_vertexai is True
+    assert settings.gemini_api_key == "toml-gemini-key"
+    assert settings.google_cloud_project == "toml-project"
+    assert settings.google_cloud_location == "europe-west4"
     assert settings.embedding_configurations["google"].model_name == "toml-embedding-model"
     assert settings.llm_configurations["demo"].provider == "openai"
     assert settings.llm_configurations["demo"].model_name == "demo-model"
+    assert settings.llm_configurations["demo"].protocol == ModelProtocol.RESPONSES
+    assert settings.llm_configurations["demo"].options["top_p"] == 0.8
+
+
+def test_model_protocol_aliases_and_invalid_values():
+    assert ModelDetail(provider="openai", model_name="gpt-test", protocol="response").protocol == ModelProtocol.RESPONSES
+
+    with pytest.raises(ValidationError, match="不支持的模型协议"):
+        ModelDetail(provider="openai", model_name="gpt-test", protocol="unknown")
+
+
+@pytest.mark.parametrize("field_name", ["embedding_configurations", "rerank_configurations"])
+def test_settings_rejects_protocol_on_non_llm_configuration(field_name):
+    with pytest.raises(ValidationError, match="配置不支持 protocol"):
+        Settings(
+            **{
+                field_name: {
+                    "demo": {
+                        "provider": "openai",
+                        "model_name": "demo-model",
+                        "protocol": "responses",
+                    }
+                }
+            }
+        )
+
+
+@pytest.mark.parametrize("sensitive_key", [
+    "X-API-Key", "X-Auth-Token", "Authorization", "access_token", "api_key", "Bearer",
+])
+def test_model_options_reject_credentials_nested_in_headers_or_query(sensitive_key):
+    with pytest.raises(ValueError, match="凭证"):
+        ModelDetail(
+            provider="openai",
+            model_name="gpt-test",
+            options={"default_headers": {sensitive_key: "secret"}},
+        )
+
+    with pytest.raises(ValueError, match="凭证"):
+        ModelDetail(
+            provider="openai",
+            model_name="gpt-test",
+            options={"default_query": {sensitive_key: "secret"}},
+        )
+
+
+@pytest.mark.parametrize("container", [
+    "headers", "default_headers", "extra_headers",
+    "query", "default_query", "extra_query", "http_options", "header", "params",
+    "http_client", "httpx_client", "httpx_async_client", "aiohttp_client",
+])
+def test_model_options_reject_request_header_and_query_containers(container):
+    with pytest.raises(ValueError, match="凭证或连接字段"):
+        ModelDetail(
+            provider="openai",
+            model_name="gpt-test",
+            options={container: {"X-Trace-ID": "trace"}},
+        )
+
+
+@pytest.mark.parametrize("connection_key", ["base_url", "client_args", "async_client_args"])
+def test_model_options_reject_connection_overrides(connection_key):
+    with pytest.raises(ValueError, match="凭证或连接字段"):
+        ModelDetail(
+            provider="openai",
+            model_name="gpt-test",
+            options={connection_key: "https://proxy.invalid"},
+        )
 
 
 def test_settings_from_dotenv(tmp_path):
     dotenv_path = tmp_path / ".env"
-    dotenv_path.write_text('OPENAI_API_KEY="dotenv_key"\nCHAT_TOP_K=15', encoding="utf-8")
+    dotenv_path.write_text(
+        'OPENAI_API_KEY="dotenv_key"\nCHAT_TOP_K=15\n'
+        'GOOGLE_GENAI_USE_VERTEXAI=true\n'
+        'GOOGLE_CLOUD_PROJECT="dotenv-project"\n'
+        'GOOGLE_CLOUD_LOCATION="asia-east1"\n',
+        encoding="utf-8",
+    )
 
     settings = get_settings()
 
     assert settings.openai_api_key == "dotenv_key"
     assert settings.chat_top_k == 15
+    assert settings.google_genai_use_vertexai is True
+    assert settings.google_cloud_project == "dotenv-project"
+    assert settings.google_cloud_location == "asia-east1"
 
 
 def test_settings_from_env_vars(monkeypatch):
