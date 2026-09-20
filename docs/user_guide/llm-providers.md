@@ -15,8 +15,8 @@ PyRAG-Kit 的一个核心优势是其高度的灵活性和可扩展性，尤其�
 ### 云服务模型
 
 *   **Google**: 支持 Gemini 系列模型。
-*   **OpenAI**: 支持 GPT 系列模型，如 GPT-4o, GPT-3.5-Turbo。
-*   **Anthropic**: 支持 Claude 系列模型，如 Claude 3.5 Sonnet。
+*   **OpenAI**: 支持 GPT 系列模型，如 GPT-5.6 系列。
+*   **Anthropic**: 支持 Claude 系列模型，如 Claude Sonnet 4.6 与 Claude 5 系列。
 *   **阿里云 (Qwen)**: 支持通义千问系列模型。
 *   **火山引擎 (VolcEngine)**: 支持豆包 (Doubao) 系列模型。
 *   **深度求索 (DeepSeek)**: 支持 DeepSeek 系列模型。
@@ -26,7 +26,7 @@ PyRAG-Kit 的一个核心优势是其高度的灵活性和可扩展性，尤其�
 
 ### 本地化模型
 
-*   **Ollama**: 支持通过 Ollama 在本地运行的各种开源模型，如 Llama3, Gemma 等。
+*   **Ollama**: 支持通过 Ollama 在本地运行的各种开源模型，如 Llama 3.1、Gemma 3 等。
 *   **LM Studio**: 支持通过 LM Studio 在本地运行的 `gguf` 格式模型。
 
 ## 配置方法
