@@ -38,6 +38,8 @@
 - 新增 Provider 协议适配、SDK 能力、凭证边界、Rerank 契约与失败语义回归测试；测试总数增至 800。
 - 引入 Ruff、Bandit 与 MyPy 到开发依赖，并补齐对应配置。
 - 更新 `README.md`、`AGENTS.md` 与 `docs/`，同步协议选择、`options` 边界、原生资源入口和 Vertex ADC 配置口径。
+- 核对各渠道官方现状并刷新配置示例：Google Embedding 改用 `gemini-embedding-2`（`text-embedding-004` 已于 2026-01-14 退役），OpenAI 改用 `gpt-5.6-*`（`gpt-3.5-turbo` 于 2026-10-23 退役），Anthropic 改用 `claude-sonnet-4-6`（`claude-3-5-sonnet-20240620` 已于 2025-10-28 退役），DeepSeek 改用 `deepseek-v4-pro`/`deepseek-v4-flash`（`deepseek-chat` 已于 2026-07-24 退役），火山改用 `doubao-seed-2-0-lite-260428` 与 `doubao-embedding-vision-251215`（`doubao-pro-32k`、`bge-large-zh` 已不在方舟模型列表），Qwen 改用 `qwen3.8-max`/`qwen3.7-plus`，SiliconFlow 改用 `Qwen/Qwen3-8B`/`deepseek-ai/DeepSeek-V3.2`，Grok 改用 `grok-4.6`（`llama3-70b-8192` 实为 Groq 的 ID，不属于 xAI）。模型内置默认值同步更新。
+- 修复 Anthropic 采样字段弃用识别：家族名不再限定 `opus`/`sonnet`/`haiku`，覆盖 5 代新增的 `claude-fable-5`、`claude-mythos-5` 等命名；此前这些模型会被透传 `temperature`/`top_p`/`top_k`，而 Python SDK v1.0+ 已移除这些参数，请求会直接失败。
 
 ## [1.3.0] - 2026-03-20
 

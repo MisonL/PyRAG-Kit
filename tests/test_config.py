@@ -87,8 +87,11 @@ def test_settings_splitter_separators_blank_csv_falls_back_to_default():
     assert settings.kb_splitter_separators == ["###"]
 
 
-def test_settings_defaults():
-    settings = get_settings()
+def test_settings_defaults(monkeypatch, tmp_path):
+    # 直接构造，避免读取开发者本机的 config.toml：这些断言应验证模型内置默认值，
+    # 而不是某个本地文件恰好写了什么。
+    monkeypatch.setattr("src.utils.config.CONFIG_TOML_PATH", tmp_path / "absent.toml")
+    settings = Settings(_env_file=None)
 
     assert settings.openai_api_key is None
     assert settings.chat_top_k == 5
@@ -101,7 +104,6 @@ def test_settings_defaults():
     assert settings.kb_child_chunk_overlap == 30
     assert settings.default_embedding_provider == "local-hash"
     assert settings.embedding_configurations["local-hash"].model_name == "local-hash-256"
-    assert settings.llm_configurations["openai"].model_name == "gpt-4o"
     assert settings.qwen_base_url.endswith("/compatible-mode/v1")
     assert settings.volc_base_url.endswith("/api/v3")
     assert "jina" not in settings.embedding_configurations

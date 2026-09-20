@@ -70,7 +70,7 @@ OpenAI 兼容的 LLM 配置默认调用 Chat Completions。需要调用 Response
 ```toml
 [llm_configurations.openai-responses]
 provider = "openai"
-model_name = "gpt-5"
+model_name = "gpt-5.6-sol"
 protocol = "responses"
 ```
 
@@ -126,12 +126,12 @@ Embedding 文档和查询会区分任务类型：Google 使用 `RETRIEVAL_DOCUME
 ```toml
 [llm_configurations.google-pro]
 provider = "google"
-model_name = "gemini-1.5-pro-latest"
+model_name = "gemini-2.5-pro"
 ```
 
 *   **`your-custom-name`**: 您为这个模型配置起的名字。这个名字会显示在 `/config` 菜单中供您选择。例如，`google-pro`。
 *   **`provider`**: 指定使用哪个模型提供商的实现。这个值必须与 `src/providers/` 目录下的某个文件名（或工厂类中的标识符）相对应。例如，`google`。
-*   **`model_name`**: 要调用的实际模型名称/ID。这个值会直接传递给对应服务商的 API。例如，`gemini-1.5-pro-latest`。
+*   **`model_name`**: 要调用的实际模型名称/ID。这个值会直接传递给对应服务商的 API。例如，`gemini-2.5-pro`。
 *   **`protocol`**（仅 LLM 可选）: 指定渠道协议。OpenAI 兼容渠道和 Volcengine 可使用 `chat_completions`/`responses`（Volcengine 省略时为 Ark Chat）；Google、Anthropic 使用各自固定协议。Embedding 与 Rerank 配置不应填写此字段。
 
 ## 当前默认推荐组合
@@ -161,7 +161,7 @@ DEFAULT_LLM_PROVIDER="openai"
 ```toml
 [llm_configurations.openai]
 provider = "openai"
-model_name = "gpt-4o"
+model_name = "gpt-5.6-sol"
 ```
 
 ## 如何添加新模型

@@ -117,7 +117,7 @@ DEFAULT_LLM_PROVIDER="openai"
 ```toml
 [llm_configurations.demo]
 provider = "openai"
-model_name = "gpt-4o"
+model_name = "gpt-5.6-sol"
 ```
 
 - `llm_configurations`: 聊天模型

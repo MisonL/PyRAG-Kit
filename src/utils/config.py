@@ -248,14 +248,16 @@ class Settings(BaseSettings):
         "siliconflow": ModelDetail(provider="siliconflow", model_name="alibaba/bge-reranker-large"),
     })
     llm_configurations: dict[str, ModelDetail] = Field(default_factory=lambda: {
-        "google": ModelDetail(provider="google", model_name="gemini-1.5-pro-latest"),
-        "anthropic": ModelDetail(provider="anthropic", model_name="claude-3-opus-20240229"),
-        "qwen": ModelDetail(provider="qwen", model_name="qwen-turbo"),
-        "deepseek": ModelDetail(provider="deepseek", model_name="deepseek-chat"),
-        "grok": ModelDetail(provider="grok", model_name="grok-1"),
-        "volcengine": ModelDetail(provider="volcengine", model_name="Doubao-pro-32k"),
-        "siliconflow": ModelDetail(provider="siliconflow", model_name="deepseek-ai/DeepSeek-V2-Chat"),
-        "openai": ModelDetail(provider="openai", model_name="gpt-4o"),
+        # 默认条目只作为缺失配置时的兜底；模型名保持在写就时仍可用的现行 ID，
+        # 避免新用户照抄到已退役模型。
+        "google": ModelDetail(provider="google", model_name="gemini-2.5-flash"),
+        "anthropic": ModelDetail(provider="anthropic", model_name="claude-sonnet-4-6"),
+        "qwen": ModelDetail(provider="qwen", model_name="qwen3.8-max"),
+        "deepseek": ModelDetail(provider="deepseek", model_name="deepseek-v4-pro"),
+        "grok": ModelDetail(provider="grok", model_name="grok-4.6"),
+        "volcengine": ModelDetail(provider="volcengine", model_name="doubao-seed-2-0-lite-260428"),
+        "siliconflow": ModelDetail(provider="siliconflow", model_name="deepseek-ai/DeepSeek-V3.2"),
+        "openai": ModelDetail(provider="openai", model_name="gpt-5.6-sol"),
         "ollama": ModelDetail(provider="ollama", model_name="llama3"),
         "lm-studio": ModelDetail(provider="lm-studio", model_name="LM-Studio-Community/Meta-Llama-3-8B-Instruct-GGUF"),
     })

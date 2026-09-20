@@ -102,8 +102,8 @@ model_name = "local-hash-256"
 [embedding_configurations.google]
 # 提供商实现标识
 provider = "google"
-# API 实际模型名
-model_name = "models/text-embedding-004"
+# API 实际模型名（text-embedding-004 已于 2026-01-14 退役）
+model_name = "gemini-embedding-2"
 # 可选 SDK 参数：查询会自动使用 RETRIEVAL_QUERY，文档使用 RETRIEVAL_DOCUMENT
 # options = { output_dimensionality = 768 }
 
@@ -125,8 +125,8 @@ model_name = "text-embedding-v4"
 [embedding_configurations.volcengine]
 # 提供商实现标识
 provider = "volcengine"
-# API 实际模型名
-model_name = "bge-large-zh"
+# API 实际模型名（bge-large-zh 已不在方舟模型列表中，改用现役向量模型）
+model_name = "doubao-embedding-vision-251215"
 
 # ollama 向量化模型
 [embedding_configurations.ollama]
@@ -176,46 +176,46 @@ model_name = "gemini-2.5-pro"
 [llm_configurations.openai]
 # 提供商实现标识
 provider = "openai"
-# API 实际模型名
-model_name = "gpt-4o"
+# API 实际模型名（gpt-4o 各快照自 2026-10-23 起退役）
+model_name = "gpt-5.6-sol"
 
 # openai-responses Responses 协议示例
 # 仅当 Base URL 对应服务端实现了 /responses 时使用；省略 protocol 默认使用 Chat Completions。
 [llm_configurations.openai-responses]
 provider = "openai"
-model_name = "gpt-5"
+model_name = "gpt-5.6-sol"
 protocol = "responses"
 # 仅放非敏感 SDK 参数；API key、Base URL 必须放 .env/环境变量
 # 如果 Base URL 是代理、中转或自建网关，完成服务端验证后显式登记：
 # options = { server_verified_protocols = ["responses"], reasoning = { effort = "medium" }, store = true }
 
-# openai-gpt3.5 聊天模型
+# openai-gpt3.5 聊天模型（gpt-3.5-turbo 于 2026-10-23 退役，示例改用现行模型）
 [llm_configurations."openai-gpt3.5"]
 # 提供商实现标识
 provider = "openai"
 # API 实际模型名
-model_name = "gpt-3.5-turbo"
+model_name = "gpt-5.6-terra"
 
 # qwen-max 聊天模型
 [llm_configurations.qwen-max]
 # 提供商实现标识
 provider = "qwen"
-# API 实际模型名
-model_name = "qwen-max"
+# API 实际模型名（qwen-max 为旧版裸名，快照系列已陆续下线）
+model_name = "qwen3.8-max"
 
 # qwen-plus 聊天模型
 [llm_configurations.qwen-plus]
 # 提供商实现标识
 provider = "qwen"
 # API 实际模型名
-model_name = "qwen-plus"
+model_name = "qwen3.7-plus"
 
-# volc-doubao-pro-32k 聊天模型
+# volc-doubao 聊天模型（doubao-pro-32k 全部快照已退役）
 [llm_configurations.volc-doubao-pro-32k]
 # 提供商实现标识
 provider = "volcengine"
 # API 实际模型名
-model_name = "doubao-pro-32k"
+model_name = "doubao-seed-2-0-lite-260428"
 
 # Ark Responses 示例；只有目标 Ark 服务端支持 /responses 时启用
 # [llm_configurations.volc-responses]
@@ -225,19 +225,19 @@ model_name = "doubao-pro-32k"
 # 仅在目标 Ark Base URL 已实际验证 /responses 后保留此登记
 # options = { server_verified_protocols = ["responses"] }
 
-# sf-qwen2-7b 聊天模型
+# sf-qwen 聊天模型（Qwen2-7B-Instruct 已从 SiliconFlow 模型广场下线）
 [llm_configurations.sf-qwen2-7b]
 # 提供商实现标识
 provider = "siliconflow"
 # API 实际模型名
-model_name = "Qwen/Qwen2-7B-Instruct"
+model_name = "Qwen/Qwen3-8B"
 
-# sf-llama3-8b 聊天模型
+# sf-llama3-8b 聊天模型（meta-llama/* 已从 SiliconFlow 模型广场下线）
 [llm_configurations.sf-llama3-8b]
 # 提供商实现标识
 provider = "siliconflow"
 # API 实际模型名
-model_name = "meta-llama/Meta-Llama-3-8B-Instruct"
+model_name = "deepseek-ai/DeepSeek-V3.2"
 
 # ollama-llama3 聊天模型
 [llm_configurations.ollama-llama3]
@@ -260,30 +260,30 @@ provider = "lm-studio"
 # API 实际模型名
 model_name = "local-model/gguf-model-name"
 
-# deepseek-chat 聊天模型
+# deepseek 聊天模型（deepseek-chat 已于 2026-07-24 完全退役）
 [llm_configurations.deepseek-chat]
 # 提供商实现标识
 provider = "deepseek"
 # API 实际模型名
-model_name = "deepseek-chat"
+model_name = "deepseek-v4-pro"
 
-# deepseek-v2 聊天模型
+# deepseek-flash 聊天模型（deepseek-v2 从未作为官方 API ID 存在）
 [llm_configurations.deepseek-v2]
 # 提供商实现标识
 provider = "deepseek"
 # API 实际模型名
-model_name = "deepseek-v2"
+model_name = "deepseek-v4-flash"
 
-# grok-llama3-70b 聊天模型
+# grok 聊天模型（llama3-70b-8192 是 Groq 的 ID，xAI 只有 grok-* 系列）
 [llm_configurations.grok-llama3-70b]
 # 提供商实现标识
 provider = "grok"
 # API 实际模型名
-model_name = "llama3-70b-8192"
+model_name = "grok-4.6"
 
-# anthropic-sonnet-3.5 聊天模型
+# anthropic 聊天模型（claude-3-5-sonnet-20240620 已于 2025-10-28 退役）
 [llm_configurations."anthropic-sonnet-3.5"]
 # 提供商实现标识
 provider = "anthropic"
 # API 实际模型名
-model_name = "claude-3-5-sonnet-20240620"
+model_name = "claude-sonnet-4-6"
