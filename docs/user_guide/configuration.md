@@ -44,18 +44,33 @@ cp .env.example .env
 ```
 
 ```dotenv
-OPENAI_API_KEY="sk-xxxxxxxxxxxxxxxxxxxx"
+OPENAI_API_KEY="your-openai-api-key"
 GOOGLE_API_KEY="AIza..."
+# 也可使用 google-genai 官方别名；同时设置时 GOOGLE_API_KEY 优先
+# GEMINI_API_KEY="AIza..."
 ```
 
 `.env` 中的同名键会覆盖 `config.toml`。
+
+Google Vertex AI 使用 Application Default Credentials（ADC）时，不要把凭证对象或密钥内容写入 `config.toml`。
+请在运行环境中完成 `gcloud auth application-default login`，或设置服务账号文件路径，并显式选择 Vertex 模式：
+
+```dotenv
+GOOGLE_GENAI_USE_VERTEXAI="true"
+GOOGLE_CLOUD_PROJECT="your-project-id"
+GOOGLE_CLOUD_LOCATION="us-central1"
+# 可选：改用服务账号文件；文件本身不要提交到仓库
+GOOGLE_APPLICATION_CREDENTIALS="/absolute/path/service-account.json"
+```
+
+没有 `GOOGLE_API_KEY` 时，`GOOGLE_GENAI_USE_VERTEXAI=true` 会让 Provider 使用 Vertex ADC；`ModelDetail.options` 只接受非敏感参数，不能用来保存 `credentials`。
 
 如果您使用 OpenAI 兼容渠道，可以这样配置：
 
 ```dotenv
 OPENAI_API_KEY="sk-..."
-OPENAI_API_BASE="https://apis.iflow.cn/v1"
-DEFAULT_LLM_PROVIDER="iflow-qwen3-max"
+OPENAI_API_BASE="https://api.openai.com/v1"
+DEFAULT_LLM_PROVIDER="openai"
 ```
 
 ## 主要字段

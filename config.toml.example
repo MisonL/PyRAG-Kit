@@ -12,16 +12,16 @@
 openai_api_base = "https://api.openai.com/v1"
 # SiliconFlow 的 Base URL
 siliconflow_base_url = "https://api.siliconflow.cn/v1"
-# Qwen 官方接口的 Base URL
-qwen_base_url = "https://dashscope.aliyuncs.com/api/v1"
+# Qwen OpenAI 兼容接口的 Base URL
+qwen_base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 # DeepSeek 的 Base URL
 deepseek_base_url = "https://api.deepseek.com"
 # Ollama 的 Base URL
 ollama_base_url = "http://localhost:11434/v1"
 # LM Studio 的 Base URL
 lm_studio_base_url = "http://localhost:1234/v1"
-# 火山引擎的 Base URL
-volc_base_url = "https://maas-api.ml-platform-cn-beijing.volces.com"
+# 火山引擎 Ark API 的 Base URL
+volc_base_url = "https://ark.cn-beijing.volces.com/api/v3"
 # Grok 的 Base URL
 grok_base_url = "https://api.x.ai/v1"
 
@@ -104,6 +104,8 @@ model_name = "local-hash-256"
 provider = "google"
 # API 实际模型名
 model_name = "models/text-embedding-004"
+# 可选 SDK 参数：查询会自动使用 RETRIEVAL_QUERY，文档使用 RETRIEVAL_DOCUMENT
+# options = { output_dimensionality = 768 }
 
 # openai 向量化模型
 [embedding_configurations.openai]
@@ -155,13 +157,6 @@ provider = "jina"
 # API 实际模型名
 model_name = "jina-reranker-v2-base-multilingual"
 
-# qwen rerank 模型
-[rerank_configurations.qwen]
-# 提供商实现标识
-provider = "qwen"
-# API 实际模型名
-model_name = "Qwen/Qwen3-Reranker-4B"
-
 # --- LLM 配置 ---
 # google 聊天模型
 [llm_configurations.google]
@@ -177,19 +172,22 @@ provider = "google"
 # API 实际模型名
 model_name = "gemini-2.5-pro"
 
-# openai-gpt4o 聊天模型
-[llm_configurations.openai-gpt4o]
+# openai 聊天模型；与 .env.example 的 DEFAULT_LLM_PROVIDER=openai 对应
+[llm_configurations.openai]
 # 提供商实现标识
 provider = "openai"
 # API 实际模型名
 model_name = "gpt-4o"
 
-# iflow-qwen3-max 聊天模型
-[llm_configurations.iflow-qwen3-max]
-# 提供商实现标识
+# openai-responses Responses 协议示例
+# 仅当 Base URL 对应服务端实现了 /responses 时使用；省略 protocol 默认使用 Chat Completions。
+[llm_configurations.openai-responses]
 provider = "openai"
-# API 实际模型名
-model_name = "qwen3-max"
+model_name = "gpt-5"
+protocol = "responses"
+# 仅放非敏感 SDK 参数；API key、Base URL 必须放 .env/环境变量
+# 如果 Base URL 是代理、中转或自建网关，完成服务端验证后显式登记：
+# options = { server_verified_protocols = ["responses"], reasoning = { effort = "medium" }, store = true }
 
 # openai-gpt3.5 聊天模型
 [llm_configurations."openai-gpt3.5"]
@@ -218,6 +216,14 @@ model_name = "qwen-plus"
 provider = "volcengine"
 # API 实际模型名
 model_name = "doubao-pro-32k"
+
+# Ark Responses 示例；只有目标 Ark 服务端支持 /responses 时启用
+# [llm_configurations.volc-responses]
+# provider = "volcengine"
+# model_name = "doubao-seed-1-6-251015"
+# protocol = "responses"
+# 仅在目标 Ark Base URL 已实际验证 /responses 后保留此登记
+# options = { server_verified_protocols = ["responses"] }
 
 # sf-qwen2-7b 聊天模型
 [llm_configurations.sf-qwen2-7b]

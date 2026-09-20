@@ -2,6 +2,39 @@
 
 所有此项目的显著更改都将记录在此文件中。
 
+## [1.4.0] - 2026-09-20
+
+### Provider 与协议
+
+- 建立统一 Provider 工厂与抽象请求模型，补齐 LLM、Embedding、Rerank 的能力声明、配置校验、缓存与同步/异步生命周期管理。
+- 新增 `complete()`/`acomplete()` 高级调用入口，统一支持多轮消息、工具调用、结构化输出、多模态内容、usage 与结束原因；`invoke()`/`ainvoke()` 保留文本流兼容行为。
+- 支持 Chat Completions、Responses、Google Generate Content 和 Anthropic Messages 四类协议；OpenAI 兼容渠道与 Ark 可通过 `protocol = "responses"` 选择 Responses。
+- Responses 对非官方端点要求 `options.server_verified_protocols = ["responses"]` 显式登记；未登记时工厂、Provider 和资源 Facade 均在请求前拒绝，避免把本地 SDK 资源误发到未实现 `/responses` 的服务端。
+- 新增原生资源 Facade，显式暴露文件、批处理、缓存、向量库、token 计数、调优等 SDK 能力，不再把资源生命周期混入普通聊天请求。
+- 深度适配 Google GenAI、Anthropic、Volcengine Ark、Jina 与 SiliconFlow Rerank；OpenAI 兼容渠道复用 `openai` SDK，Jina 与 SiliconFlow Rerank 使用 HTTP JSON。
+- Embedding 区分文档与查询任务类型：Google 使用 `RETRIEVAL_DOCUMENT` 与 `RETRIEVAL_QUERY`。
+
+### 安全
+
+- 新增配置、请求与日志边界的凭证校验：模型级 `options` 与请求级扩展不得携带密钥、请求头、query 或 Base URL 覆盖，资源 Facade 的关键字与位置参数同样受检。
+- 日志与错误信息统一脱敏常见凭证表示（Bearer、API key、URL userinfo 与 query）。
+- 兼容渠道不再被当作官方 OpenAI 端点放行 SDK 专属资源；仅精确匹配 `https://api.openai.com/v1` 时按 SDK 契约放行。
+- 收紧失败语义：凭证、SDK 或远端调用失败时显式报错，不再以空 embedding、零分 rerank 或占位回答掩盖失败。
+
+### 移除与调整
+
+- 移除 Dify 上游子模块；`src/etl/`、`src/retrieval/` 等移植代码继续遵守 `DIFY_LICENSE` 并保留上游版权声明。
+- 移除 iFlow 渠道及其配置示例。
+- 移除 qwen rerank 配置示例；该渠道不提供 rerank 能力，调用时会显式报错。
+- 发布脚本新增目标环境校验，`--target` 与主机系统/架构不匹配时在清理构建产物前显式失败，不再生成错误架构的发布包。
+- Qwen Base URL 改为 OpenAI 兼容接口 `https://dashscope.aliyuncs.com/compatible-mode/v1`；Volcengine Base URL 改为 Ark API `https://ark.cn-beijing.volces.com/api/v3`。
+
+### 测试与文档
+
+- 新增 Provider 协议适配、SDK 能力、凭证边界、Rerank 契约与失败语义回归测试；测试总数增至 760。
+- 引入 Ruff、Bandit 与 MyPy 到开发依赖，并补齐对应配置。
+- 更新 `README.md`、`AGENTS.md` 与 `docs/`，同步协议选择、`options` 边界、原生资源入口和 Vertex ADC 配置口径。
+
 ## [1.3.0] - 2026-03-20
 
 ### 运行与配置
