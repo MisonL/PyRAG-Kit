@@ -8,6 +8,7 @@
 
 - 建立统一 Provider 工厂与抽象请求模型，补齐 LLM、Embedding、Rerank 的能力声明、配置校验、缓存与同步/异步生命周期管理。
 - 新增 `complete()`/`acomplete()` 高级调用入口，统一支持多轮消息、工具调用、结构化输出、多模态内容、usage 与结束原因；`invoke()`/`ainvoke()` 保留文本流兼容行为。
+- 修复多轮工具调用的历史归一化：共享的 `normalize_messages` 不再强制要求工具调用带 `id`，因为 Gemini 的 `FunctionCall.id` 是可选字段且 SDK 默认 `None`，否则把上一轮工具调用回填给 Google 会在请求发出前被本地拒绝；需要 `id` 的 Chat Completions 与 Responses 改为显式校验。同一处还修复了 `input` 参数别名被静默清空，以及 `function_call`/`custom_tool_call` 类型未映射为 `function` 的问题。
 - 支持 Chat Completions、Responses、Google Generate Content 和 Anthropic Messages 四类线协议；OpenAI 兼容渠道与 Ark 可通过 `protocol = "responses"` 选择 Responses，Ark 的 `ark` 取值是 Chat Completions 的别名。
 - Responses 对非官方端点要求 `options.server_verified_protocols = ["responses"]` 显式登记；未登记时工厂、Provider 和资源 Facade 均在请求前拒绝，避免把本地 SDK 资源误发到未实现 `/responses` 的服务端。
 - 新增原生资源 Facade，显式暴露文件、批处理、缓存、向量库、token 计数、调优等 SDK 能力，不再把资源生命周期混入普通聊天请求。
@@ -17,7 +18,9 @@
 ### 安全
 
 - 新增配置、请求与日志边界的凭证校验：模型级 `options` 与请求级扩展不得携带密钥、请求头、query 或 Base URL 覆盖，资源 Facade 的关键字与位置参数同样受检。
-- 日志与错误信息统一脱敏常见凭证表示（Bearer、API key、URL userinfo 与 query）。
+- 凭证键识别补齐火山引擎的 `ak`/`sk` 与 Azure 存储的 `account_key`；此前这些键可绕过请求覆盖校验，而 `api_key` 会被拒绝。
+- 日志与错误信息统一脱敏常见凭证表示（Bearer、API key、URL userinfo 与 query）；补齐 `ak=`/`sk=`/`account_key=` 形式。
+- 修复脱敏日志 formatter 的缓存泄漏：`logging.Formatter` 会把格式化后的 traceback 缓存在 `record.exc_text` 上供后续 handler 复用，先格式化后脱敏会让同一 logger 上的非脱敏 handler 输出原始凭证；现在脱敏结果会写回缓存。
 - 兼容渠道不再被当作官方 OpenAI 端点放行 SDK 专属资源；仅精确匹配 `https://api.openai.com/v1` 时按 SDK 契约放行。
 - 收紧失败语义：凭证、SDK 或远端调用失败时显式报错，不再以空 embedding、零分 rerank 或占位回答掩盖失败。
 
@@ -27,11 +30,12 @@
 - 移除 iFlow 渠道及其配置示例。
 - 移除 qwen rerank 配置示例；该渠道不提供 rerank 能力，调用时会显式报错。
 - 发布脚本新增目标环境校验，`--target` 与主机系统/架构不匹配时在清理构建产物前显式失败，不再生成错误架构的发布包。
-- Qwen Base URL 改为 OpenAI 兼容接口 `https://dashscope.aliyuncs.com/compatible-mode/v1`；Volcengine Base URL 改为 Ark API `https://ark.cn-beijing.volces.com/api/v3`。
+- Qwen Base URL 改为 OpenAI 兼容接口 `https://dashscope.aliyuncs.com/compatible-mode/v1`；Volcengine Base URL 改为 Ark API `https://ark.cn-beijing.volces.com/api/v3`。旧端点已失效，配置仍为旧值时会在加载时给出显式升级警告。
+- Jina Rerank 与 SiliconFlow Rerank 一致，`return_documents` 固定为 `True` 且不允许被 `options` 覆盖。
 
 ### 测试与文档
 
-- 新增 Provider 协议适配、SDK 能力、凭证边界、Rerank 契约与失败语义回归测试；测试总数增至 760。
+- 新增 Provider 协议适配、SDK 能力、凭证边界、Rerank 契约与失败语义回归测试；测试总数增至 800。
 - 引入 Ruff、Bandit 与 MyPy 到开发依赖，并补齐对应配置。
 - 更新 `README.md`、`AGENTS.md` 与 `docs/`，同步协议选择、`options` 边界、原生资源入口和 Vertex ADC 配置口径。
 
