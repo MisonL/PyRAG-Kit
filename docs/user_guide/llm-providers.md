@@ -92,6 +92,8 @@ Responses 请求会使用 `input`、`instructions` 和 `tools` 字段，并把�
 
 统一的高级调用入口是 Provider 的 `complete()`/`acomplete()`，支持 `messages`（多轮和多模态内容）、`tools`、`tool_choice`、`response_format`、`max_tokens`、`top_p`、`stop`、`seed` 和 `extra_body`。结果包含 `text`、`tool_calls`、`usage`、`finish_reason` 和原始 SDK 响应。旧版 `invoke()`/`ainvoke()` 仍只输出文本流，以保持聊天界面兼容。需要 reasoning、thinking、拒答或流式 usage 时使用 `stream_events()`/`astream_events()`。
 
+多轮工具调用的历史可以原样回填：请求边界会把扁平的 `{"id","type","name","arguments"}` 归一化为各协议需要的形状，并读取 Responses `custom_tool_call` 与 Anthropic `tool_use` 使用的 `input` 别名。各协议对关联 ID 的要求不同——Chat Completions 与 Responses 要求 `assistant.tool_calls` 带 `id`（缺少时在请求前显式报错），Google Gemini 不需要，其 `FunctionCall.id` 为可选且默认缺省，因此无 id 的 Google 工具调用可以正常回填。Provider 自己产出的 `tool_calls` 都带有协议所需的标识。
+
 非敏感供应商参数放在模型条目的 `options` 表中，工厂会拒绝 `api_key`、`access_key`、`secret_key`、`token`、`headers` 和 `base_url` 等字段：
 
 ```toml
