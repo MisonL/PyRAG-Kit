@@ -1,9 +1,11 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Any
+
+import numpy as np
 
 from src.etl.pipeline import Pipeline
 from src.models.document import Document
@@ -29,64 +31,86 @@ class KnowledgeBuildService:
         self.embedding_service = embedding_service
         self.snapshot_repository = snapshot_repository
 
-    async def build(self, splitter_structure_mode: str) -> Dict[str, object]:
+    async def build(self, splitter_structure_mode: str) -> dict[str, object]:
         markdown_files = sorted(self.run_config.knowledge_base_path.glob("*.md"))
         if not markdown_files:
             raise FileNotFoundError(f"知识库目录 '{self.run_config.knowledge_base_path}' 中未找到 Markdown 文件。")
 
         snapshot_id = self.snapshot_repository.generate_snapshot_id()
         temp_dir = self.snapshot_repository.create_temp_snapshot_dir(snapshot_id)
-        pipeline = Pipeline.from_file_path(markdown_files[0], splitter_structure_mode=splitter_structure_mode)
+        finalized = False
+        try:
+            pipeline = Pipeline.from_file_path(markdown_files[0], splitter_structure_mode=splitter_structure_mode)
 
-        chunk_count = 0
-        for file_path in markdown_files:
-            chunks = self._process_file(pipeline, file_path, splitter_structure_mode)
-            await self._persist_chunks(chunks)
-            chunk_count += len(chunks)
+            chunk_count = 0
+            pending_documents: list[dict[str, Any]] = []
+            pending_embeddings: list[np.ndarray] = []
+            pending_parent_documents: dict[str, dict[str, Any]] = {}
+            for file_path in markdown_files:
+                chunks = self._process_file(pipeline, file_path, splitter_structure_mode)
+                if splitter_structure_mode == "hierarchical" and hasattr(pipeline.splitter, "parent_documents"):
+                    parent_documents = getattr(pipeline.splitter, "parent_documents", {})
+                    if isinstance(parent_documents, dict):
+                        pending_parent_documents.update(parent_documents)
+                if chunks:
+                    documents = [
+                        {"page_content": chunk.content, "metadata": chunk.metadata}
+                        for chunk in chunks
+                    ]
+                    texts = [chunk.content for chunk in chunks]
+                    pending_documents.extend(documents)
+                    pending_embeddings.append(await self.embedding_service.embed_in_batches(texts))
+                chunk_count += len(chunks)
 
-        manifest = KnowledgeSnapshotManifest.create(
-            snapshot_id=snapshot_id,
-            store_type=self.run_config.default_vector_store,
-            embedding_provider=self.embedding_service.embedding_provider_key,
-            embedding_model=self.embedding_service.embedding_model_detail.model_name,
-            chunk_mode=splitter_structure_mode,
-            source_digest=self._compute_source_digest(markdown_files),
-            document_count=len(markdown_files),
-            chunk_count=chunk_count,
-        )
-        self.vector_store.save_snapshot(str(temp_dir))
-        self.snapshot_repository.write_manifest(temp_dir, manifest)
-        self.snapshot_repository.finalize_snapshot(temp_dir, snapshot_id)
-        final_dir = self.snapshot_repository.get_active_snapshot_dir()
-        if final_dir is None:
-            raise RuntimeError("活动知识快照切换失败。")
-        self.snapshot_repository.validate_snapshot_dir(final_dir)
-        return {
-            "snapshot_id": snapshot_id,
-            "snapshot_dir": str(final_dir),
-            "document_count": len(markdown_files),
-            "chunk_count": chunk_count,
-            "embedding_provider": self.embedding_service.embedding_provider_key,
-            "embedding_model": self.embedding_service.embedding_model_detail.model_name,
-            "chunk_mode": splitter_structure_mode,
-        }
+            if pending_documents:
+                embeddings = np.vstack(pending_embeddings)
+                if len(pending_documents) != len(embeddings):
+                    raise ValueError("知识快照中的文档数量与 embedding 数量不一致。")
+                self.vector_store.upsert_embeddings(pending_documents, embeddings)
+            if pending_parent_documents:
+                self.vector_store.register_parent_documents(pending_parent_documents)
 
-    def _process_file(self, pipeline: Pipeline, file_path: Path, splitter_structure_mode: str) -> List[Document]:
+            manifest = KnowledgeSnapshotManifest.create(
+                snapshot_id=snapshot_id,
+                store_type=self.run_config.default_vector_store,
+                embedding_provider=self.embedding_service.embedding_provider_key,
+                embedding_model=self.embedding_service.embedding_model_detail.model_name,
+                chunk_mode=splitter_structure_mode,
+                source_digest=self._compute_source_digest(markdown_files),
+                document_count=len(markdown_files),
+                chunk_count=chunk_count,
+            )
+            self.vector_store.save_snapshot(str(temp_dir))
+            self.snapshot_repository.write_manifest(temp_dir, manifest)
+            self.snapshot_repository.validate_snapshot_dir(temp_dir)
+            self.snapshot_repository.finalize_snapshot(temp_dir, snapshot_id)
+            final_dir = self.snapshot_repository.get_active_snapshot_dir()
+            if final_dir is None:
+                raise RuntimeError("活动知识快照切换失败。")
+            self.snapshot_repository.validate_snapshot_dir(final_dir)
+            finalized = True
+            return {
+                "snapshot_id": snapshot_id,
+                "snapshot_dir": str(final_dir),
+                "document_count": len(markdown_files),
+                "chunk_count": chunk_count,
+                "embedding_provider": self.embedding_service.embedding_provider_key,
+                "embedding_model": self.embedding_service.embedding_model_detail.model_name,
+                "chunk_mode": splitter_structure_mode,
+            }
+        finally:
+            if not finalized:
+                try:
+                    self.snapshot_repository.cleanup_temp_snapshot_dir(snapshot_id)
+                except Exception:
+                    logger.exception("清理临时知识快照失败: %s", temp_dir)
+
+    def _process_file(self, pipeline: Pipeline, file_path: Path, splitter_structure_mode: str) -> list[Document]:
         logger.info("正在处理文件: %s", file_path)
         content = file_path.read_text(encoding="utf-8")
         document = Document(content=content, metadata={"source": str(file_path)})
         chunks = pipeline.process(document)
-        if splitter_structure_mode == "hierarchical" and hasattr(pipeline.splitter, "parent_documents"):
-            self.vector_store.register_parent_documents(getattr(pipeline.splitter, "parent_documents", {}))
         return chunks
-
-    async def _persist_chunks(self, chunks: List[Document]) -> None:
-        if not chunks:
-            return
-        documents = [{"page_content": chunk.content, "metadata": chunk.metadata} for chunk in chunks]
-        texts = [doc["page_content"] for doc in documents]
-        embeddings = await self.embedding_service.embed_in_batches(texts)
-        self.vector_store.upsert_embeddings(documents, embeddings)
 
     @staticmethod
     def _compute_source_digest(markdown_files: Iterable[Path]) -> str:

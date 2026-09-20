@@ -1,35 +1,37 @@
-# -*- coding: utf-8 -*-
-import sys
 import os
-from io import StringIO
+import sys
 from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
+
+import pyfiglet
+from prompt_toolkit import prompt
+from prompt_toolkit.formatted_text import HTML
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
-import pyfiglet
-from typing import Tuple
-from prompt_toolkit import prompt
-from prompt_toolkit.formatted_text import HTML
 
 os.environ.setdefault("PROMPT_TOOLKIT_NO_CPR", "1")
 
 # --- 绝对导入 ---
 # 导入 cleanup 模块以注册 atexit 钩子
 import src.utils.cleanup
-# 从新的配置模块导入 settings 实例
-from src.utils.config import get_settings, resolve_app_root
+
 # 导入日志管理器，以便调用其清理函数
 import src.utils.log_manager
+
 # 导入UI工具
 from src.ui.display_utils import CONSOLE_WIDTH
 
+# 从新的配置模块导入 settings 实例
+from src.utils.config import get_settings, resolve_app_root
+
 console = Console()
-VERSION = "1.3.0" # 程序版本
+VERSION = "1.4.0" # 程序版本
 
 # =================================================================
 # 应用程序界面 (APP UI)
 # =================================================================
-def create_gradient(text: str, start_color: Tuple[int, int, int], end_color: Tuple[int, int, int]) -> Text:
+def create_gradient(text: str, start_color: tuple[int, int, int], end_color: tuple[int, int, int]) -> Text:
     """为文本创建从左到右的水平颜色渐变效果。"""
     text_obj = Text()
     total_length = len(text)
@@ -69,8 +71,7 @@ def display_banner():
             
             # 计算填充，确保署名在右下角对齐
             padding_size = banner_width - len(line_content) - len(attribution_text)
-            if padding_size < 1:
-                padding_size = 1
+            padding_size = max(padding_size, 1)
             
             padding = Text(" " * padding_size)
             
@@ -132,7 +133,7 @@ def initialize_dependencies():
         import jieba.posseg as pseg
         
         jieba.setLogLevel(jieba.logging.ERROR)
-        setattr(jieba.dt, 'tmp_dir', str(cache_dir))
+        jieba.dt.tmp_dir = str(cache_dir)
         list(pseg.cut(""))
 
     console.print("[dim]依赖项初始化完成。[/dim]")
@@ -190,7 +191,7 @@ def main():
         except (KeyboardInterrupt, EOFError):
             console.print("\n[bold yellow]检测到中断信号，正在退出程序... 再见！[/bold yellow]")
             sys.exit(0)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - top-level CLI boundary reports failures
             console.print(f"\n[bold red]程序运行期间发生错误:[/bold red] {e}")
             console.print("[bold red]请检查错误信息并重试。[/bold red]")
 

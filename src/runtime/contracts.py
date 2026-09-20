@@ -1,14 +1,13 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from collections.abc import Iterator, MutableMapping
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, Iterator, MutableMapping
+from typing import Any
 
 from src.utils.config import ModelDetail, RetrievalMethod, Settings
-
 
 SCHEMA_VERSION = "2"
 
@@ -24,9 +23,9 @@ class RunConfig:
     default_llm_provider: str
     default_embedding_provider: str
     default_rerank_provider: str
-    llm_configurations: Dict[str, ModelDetail]
-    embedding_configurations: Dict[str, ModelDetail]
-    rerank_configurations: Dict[str, ModelDetail]
+    llm_configurations: dict[str, ModelDetail]
+    embedding_configurations: dict[str, ModelDetail]
+    rerank_configurations: dict[str, ModelDetail]
     chat_temperature: float
     kb_embedding_batch_size: int
     kb_chunk_size: int
@@ -52,8 +51,8 @@ class SessionConfig(MutableMapping[str, Any]):
         score_threshold: float,
         active_llm_configuration: str,
         active_rerank_configuration: str,
-        llm_configurations: Dict[str, ModelDetail],
-        rerank_configurations: Dict[str, ModelDetail],
+        llm_configurations: dict[str, ModelDetail],
+        rerank_configurations: dict[str, ModelDetail],
         chat_temperature: float,
     ):
         self.retrieval_method = retrieval_method
@@ -85,7 +84,7 @@ class SessionConfig(MutableMapping[str, Any]):
     def __len__(self) -> int:
         return len(self.to_dict())
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "retrieval_method": self.retrieval_method,
             "vector_weight": self.vector_weight,
@@ -127,11 +126,11 @@ class KnowledgeSnapshotManifest:
         source_digest: str,
         document_count: int,
         chunk_count: int,
-    ) -> "KnowledgeSnapshotManifest":
+    ) -> KnowledgeSnapshotManifest:
         return cls(
             schema_version=SCHEMA_VERSION,
             snapshot_id=snapshot_id,
-            created_at=datetime.now(timezone.utc).isoformat(),
+            created_at=datetime.now(UTC).isoformat(),
             store_type=store_type,
             embedding_provider=embedding_provider,
             embedding_model=embedding_model,
@@ -159,7 +158,7 @@ class KnowledgeSnapshotManifest:
         )
 
     @classmethod
-    def from_mapping(cls, data: Dict[str, Any]) -> "KnowledgeSnapshotManifest":
+    def from_mapping(cls, data: dict[str, Any]) -> KnowledgeSnapshotManifest:
         return cls(
             schema_version=str(data["schema_version"]),
             snapshot_id=str(data["snapshot_id"]),
