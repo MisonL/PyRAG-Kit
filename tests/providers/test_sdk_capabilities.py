@@ -5545,3 +5545,79 @@ def test_async_embedding_query_default_works_for_legacy_provider():
             return [[float(len(texts[0]))]]
 
     assert asyncio.run(Embedding().aembed_query("abc")) == [3.0]
+
+
+def test_chat_completions_normalizes_flat_tool_calls_to_openai_shape():
+    """我们产出的扁平 tool_calls 必须能在回填时转换成 OpenAI 规范结构。
+
+    ``CompletionResult.tool_calls`` 使用扁平的 ``{"id","type","name",
+    "arguments"}`` 形状；OpenAI Chat Completions 要求 assistant 历史的
+    ``tool_calls`` 使用嵌套的 ``{"id","type","function":{"name",
+    "arguments"}}``。适配器必须在请求边界完成转换，否则多轮工具调用会
+    被服务端以 400 拒绝。
+    """
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "demo"
+    provider._provider = "openai"
+    provider._protocol = "chat_completions"
+    provider._options = {}
+
+    flat = {"id": "call-1", "type": "function", "name": "lookup",
+            "arguments": '{"id":1}'}
+    request = provider._build_chat_request(
+        messages=[
+            {"role": "user", "content": "查询"},
+            {"role": "assistant", "content": "", "tool_calls": [flat]},
+            {"role": "tool", "tool_call_id": "call-1", "content": "结果"},
+        ],
+        stream=False,
+    )
+
+    tool_calls = request["messages"][1]["tool_calls"]
+    assert tool_calls == [{
+        "id": "call-1",
+        "type": "function",
+        "function": {"name": "lookup", "arguments": '{"id":1}'},
+    }], "扁平 tool_calls 必须转换为 OpenAI 嵌套结构"
+
+
+def test_chat_completions_preserves_native_tool_calls():
+    """已经是 OpenAI 原生嵌套结构的历史必须原样保留。"""
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "demo"
+    provider._provider = "openai"
+    provider._protocol = "chat_completions"
+    provider._options = {}
+
+    native = {"id": "call-2", "type": "function",
+              "function": {"name": "lookup", "arguments": '{"id":2}'}}
+    request = provider._build_chat_request(
+        messages=[
+            {"role": "user", "content": "查询"},
+            {"role": "assistant", "content": "", "tool_calls": [native]},
+            {"role": "tool", "tool_call_id": "call-2", "content": "结果"},
+        ],
+        stream=False,
+    )
+
+    assert request["messages"][1]["tool_calls"] == [native]
+
+
+def test_chat_completions_rejects_tool_call_without_function_name():
+    """缺少函数名的工具调用必须显式报错，不能静默发出无效请求。"""
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "demo"
+    provider._provider = "openai"
+    provider._protocol = "chat_completions"
+    provider._options = {}
+
+    with pytest.raises(ValueError, match="函数名"):
+        provider._build_chat_request(
+            messages=[
+                {"role": "user", "content": "查询"},
+                {"role": "assistant", "content": "",
+                 "tool_calls": [{"id": "call-3", "type": "function",
+                                 "arguments": "{}"}]},
+            ],
+            stream=False,
+        )

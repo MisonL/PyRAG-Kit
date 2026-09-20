@@ -324,6 +324,74 @@ def merge_tool_call_fragment(
     return key, merged
 
 
+def _chat_tool_call_item(
+    tool_call: Mapping[str, Any],
+    location: str,
+) -> dict[str, Any]:
+    """将工具调用归一化为 OpenAI Chat Completions 的嵌套结构。
+
+    ``CompletionResult.tool_calls`` 使用扁平的 ``{"id", "type", "name",
+    "arguments"}`` 形状，而 Chat Completions 要求 assistant 历史的
+    ``tool_calls`` 使用 ``{"id", "type", "function": {"name", "arguments"}}``。
+    两种输入都在这里统一，调用方可以把上一轮的 ``tool_calls`` 原样回填。
+    """
+    if not isinstance(tool_call, Mapping):
+        raise ValueError(f"{location} 必须是对象。")
+    normalized = dict(tool_call)
+
+    function = normalized.get("function")
+    if function is not None and not isinstance(function, Mapping):
+        raise ValueError(f"{location}.function 必须是对象。")
+    function_values = function if isinstance(function, Mapping) else normalized
+
+    name = function_values.get("name") or normalized.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(f"{location} 缺少函数名。")
+    arguments = function_values.get("arguments")
+    if arguments is None:
+        arguments = normalized.get("arguments")
+    # 复用统一助手：非字符串参数按 JSON 文本发送，None 保持空串，
+    # 与 Responses 适配和流式工具调用使用同一套规则。
+    arguments = normalize_tool_arguments(arguments)
+
+    call_id = normalized.get("id") or normalized.get("call_id")
+    if not isinstance(call_id, str) or not call_id.strip():
+        raise ValueError(f"{location} 缺少 id/call_id。")
+
+    item: dict[str, Any] = {
+        "id": call_id,
+        "type": normalized.get("type") or "function",
+        "function": {"name": name, "arguments": arguments},
+    }
+    return item
+
+
+def normalize_chat_messages(
+    messages: Sequence[Mapping[str, Any]],
+    location: str = "messages",
+) -> list[dict[str, Any]]:
+    """归一化 Chat Completions 消息，转换工具调用并保留其它字段。"""
+    normalized: list[dict[str, Any]] = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, Mapping):
+            raise ValueError(f"{location}[{index}] 必须是对象。")
+        item = dict(message)
+        tool_calls = item.get("tool_calls")
+        if tool_calls is not None:
+            if isinstance(tool_calls, (str, bytes, bytearray)) or not isinstance(
+                tool_calls, Sequence
+            ):
+                raise ValueError(f"{location}[{index}].tool_calls 必须是序列。")
+            item["tool_calls"] = [
+                _chat_tool_call_item(
+                    tool_call, f"{location}[{index}].tool_calls[{call_index}]"
+                )
+                for call_index, tool_call in enumerate(tool_calls)
+            ]
+        normalized.append(item)
+    return normalized
+
+
 def normalize_messages(
     prompt: str | None,
     system_prompt: str | None,
@@ -333,11 +401,7 @@ def normalize_messages(
     if messages is not None:
         if isinstance(messages, (str, bytes, bytearray)) or not isinstance(messages, Sequence):
             raise ValueError("messages 必须是消息对象序列。")
-        normalized: list[dict[str, Any]] = []
-        for index, message in enumerate(messages):
-            if not isinstance(message, Mapping):
-                raise ValueError(f"messages[{index}] 必须是对象。")
-            normalized.append(dict(message))
+        normalized = normalize_chat_messages(messages)
         if system_prompt and not any(message.get("role") == "system" for message in normalized):
             normalized.insert(0, {"role": "system", "content": system_prompt})
         return normalized
