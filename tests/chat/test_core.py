@@ -392,3 +392,34 @@ def test_start_chat_session_async_reverts_llm_after_editor_mutation(monkeypatch)
 
     assert edited_configs[0]["active_llm_configuration"] == "new-model"
     assert RealishChatbot.last_instance.session_config.active_llm_configuration == "old-model"
+
+
+def test_redacting_formatter_scrubs_cached_traceback_for_later_handlers():
+    """脱敏 handler 之后的普通 handler 不能拿到原始 traceback。
+
+    ``logging.Formatter`` 把格式化后的 traceback 缓存在 ``record.exc_text``，
+    后续 handler 会复用该缓存。脱敏 formatter 必须在写回缓存前完成脱敏，否则
+    宿主挂在同一 logger 上的普通 handler 仍会输出原始凭证。
+    """
+    import io
+    import logging
+    import sys
+
+    try:
+        raise RuntimeError("Authorization: Bearer sk-cached-traceback-secret")
+    except RuntimeError:
+        exc_info = sys.exc_info()
+
+    redacting = logging.StreamHandler(io.StringIO())
+    redacting.setFormatter(RedactingFormatter("%(message)s"))
+    plain = logging.StreamHandler(io.StringIO())
+    plain.setFormatter(logging.Formatter("%(message)s"))
+
+    logger = logging.getLogger("redaction-cache-test")
+    logger.propagate = False
+    logger.handlers = [redacting, plain]
+    logger.setLevel(logging.ERROR)
+    logger.error("request failed", exc_info=exc_info)
+
+    assert "sk-cached-traceback-secret" not in redacting.stream.getvalue()
+    assert "sk-cached-traceback-secret" not in plain.stream.getvalue()

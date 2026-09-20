@@ -34,6 +34,14 @@ SENSITIVE_OPTION_KEYS = frozenset(
         "xapikey",
         "accesskey",
         "secretkey",
+        # 火山引擎 SDK 的客户端凭证键名（``ak``/``sk``）；本项目自己就用它们
+        # 承载 VOLC_ACCESS_KEY / VOLC_SECRET_KEY，因此必须和 ``api_key`` 一样
+        # 被识别为凭证。按规范化后的完整键名精确匹配，``task``/``risk``/``ask``
+        # 这类普通字段不会命中。
+        "ak",
+        "sk",
+        # Azure 存储的 ``account_key`` 也是凭证键名。
+        "accountkey",
         "token",
         "password",
         "passwd",
@@ -96,8 +104,17 @@ _KEY_VALUE_TEXT_RE = re.compile(
 )
 _URL_USERINFO_RE = re.compile(r"(?i)(https?://)([^\s/@:]+):([^\s/@]+)@")
 _URL_QUERY_SECRET_RE = re.compile(
-    r"(?i)([?&](?:api[_-]?key|access[_-]?key|secret[_-]?key|token|password|authorization)=)"
+    r"(?i)([?&](?:api[_-]?key|access[_-]?key|secret[_-]?key|account[_-]?key"
+    r"|ak|sk|token|password|authorization)=)"
     r"[^&#\s]+"
+)
+# ``ak``/``sk`` 是火山引擎凭证键名，``account_key`` 是 Azure 存储凭证键名。
+# 这些键很短，必须用词边界约束，否则 ``task = value`` 里的 ``sk`` 会被误脱敏。
+_SHORT_CREDENTIAL_KEY_RE = re.compile(
+    r'''(?i)(?<![A-Za-z0-9])'''
+    r'''(ak|sk|account[_-]?key|secret[_-]?access[_-]?key)["']?'''
+    r'''(\s*[:=]\s*)'''
+    r'''(?:"[^"]*"|'[^']*'|[^\s,;}']+)'''
 )
 _OPENAI_KEY_RE = re.compile(r"\b(?:sk|rk|sess)-[A-Za-z0-9_-]{8,}\b", re.IGNORECASE)
 _GOOGLE_API_KEY_RE = re.compile(r"\bAIza[0-9A-Za-z_-]{20,}\b")
@@ -109,6 +126,7 @@ def redact_sensitive_text(value: Any) -> str:
         value = str(value)
     redacted = _BEARER_TEXT_RE.sub("Bearer [REDACTED]", value)
     redacted = _KEY_VALUE_TEXT_RE.sub(r"\1=[REDACTED]", redacted)
+    redacted = _SHORT_CREDENTIAL_KEY_RE.sub(r"\1=[REDACTED]", redacted)
     redacted = _URL_USERINFO_RE.sub(r"\1[REDACTED]:[REDACTED]@", redacted)
     redacted = _URL_QUERY_SECRET_RE.sub(r"\1[REDACTED]", redacted)
     redacted = _OPENAI_KEY_RE.sub("[REDACTED]", redacted)

@@ -9,10 +9,28 @@ from src.utils.security import redact_sensitive_text
 
 
 class RedactingFormatter(logging.Formatter):
-    """在格式化完整 traceback 后脱敏，避免异常链泄漏凭证。"""
+    """在格式化完整 traceback 后脱敏，避免异常链泄漏凭证。
+
+    ``logging.Formatter.format`` 会把格式化后的 traceback 缓存在
+    ``record.exc_text`` 上，后续 handler 直接复用该缓存。如果本 formatter 只是
+    在 ``super().format()`` 之后脱敏，缓存里留下的仍是未脱敏文本，随后执行的
+    非脱敏 handler（例如宿主应用自行挂在 root logger 上的 handler）就会拿到原始
+    凭证。因此这里在格式化前清空缓存、在脱敏后写回，使缓存内容本身也是脱敏的。
+
+    边界：Python logging 的 handler 顺序决定，只有在脱敏 handler 先于其它
+    handler 执行时才能保护它们。项目自身的 logger 满足该前提（子 logger 的
+    handler 先执行，再传播到 root）；若宿主在同一个 logger 上把普通 handler
+    排在脱敏 handler 之前，那个 handler 已先输出了原始内容，无法追回。
+    """
 
     def format(self, record: logging.LogRecord) -> str:
-        return redact_sensitive_text(super().format(record))
+        record.exc_text = None
+        formatted = super().format(record)
+        # Formatter 会把 traceback 写回 ``record.exc_text``；用脱敏结果覆盖，
+        # 让后续 handler 复用到的缓存也是脱敏后的文本。
+        if record.exc_text is not None:
+            record.exc_text = redact_sensitive_text(record.exc_text)
+        return redact_sensitive_text(formatted)
 
 def get_chat_logger() -> logging.Logger:
     """
