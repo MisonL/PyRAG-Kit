@@ -5889,3 +5889,409 @@ def test_anthropic_version_parser_requires_a_word_boundary(model_name):
     provider._options = {}
 
     assert provider._sampling_controls_deprecated(model_name) is False
+
+
+# ── 回归：Ark Responses 非流式正文提取 ──
+
+
+def _ark_response(output, *, status="completed"):
+    """用真实 Ark SDK 模型构造响应，避免伪造线上不存在的字段。
+
+    此前测试普遍使用 ``SimpleNamespace(output_text=...)``，但 Ark 的
+    ``Response`` 没有 ``output_text``（OpenAI SDK 才把它实现为聚合 property），
+    正文位于 ``output[].content[].text``。伪造该字段会让测试永远通过，掩盖
+    真实环境下的空正文缺陷。
+    """
+    from volcenginesdkarkruntime.types.responses.response import Response
+
+    return Response.model_validate(
+        {
+            "id": "resp_test",
+            "object": "response",
+            "created_at": 1,
+            "model": "ark-model",
+            "status": status,
+            "tools": [],
+            "output": output,
+        }
+    )
+
+
+def test_ark_responses_non_stream_extracts_text_from_output_content():
+    """Ark 的 Response 没有 ``output_text`` 属性，正文必须从 output 内容块取。
+
+    只读 ``output_text`` 会让所有非流式入口返回空文本且不报错，上层
+    ``identify_intent`` 随后抛出「意图识别返回空结果」。
+    """
+    response = _ark_response(
+        [
+            {
+                "type": "message",
+                "id": "msg_1",
+                "role": "assistant",
+                "status": "completed",
+                "content": [
+                    {"type": "output_text", "text": "这是真实回答。", "annotations": []}
+                ],
+            }
+        ]
+    )
+
+    assert VolcengineProvider._extract_result(response).text == "这是真实回答。"
+
+
+def test_ark_response_model_has_no_output_text_attribute():
+    """固定 SDK 事实：Ark 的 Response 不提供 ``output_text``。
+
+    该断言失败说明 SDK 改变了响应形状，届时可以重新评估提取逻辑。
+    """
+    from volcenginesdkarkruntime.types.responses.response import Response
+
+    assert "output_text" not in Response.model_fields
+    assert not hasattr(Response, "output_text")
+
+
+def test_ark_responses_completed_response_without_any_content_fails_loudly():
+    """标记 completed 却无正文、工具调用、拒答与推理时，必须显式失败。
+
+    项目规则禁止用占位结果掩盖失败：静默返回空文本会让调用方拿到空串后
+    继续执行，最终表现为难以定位的「空结果」错误。
+    """
+    with pytest.raises(RuntimeError, match="未包含任何正文"):
+        VolcengineProvider._extract_result(_ark_response([]))
+
+
+def test_ark_responses_reasoning_only_response_is_still_valid():
+    """只有推理内容、没有正文的响应是合法的，不能被 fail-closed 误伤。"""
+    response = _ark_response(
+        [
+            {
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": [{"type": "summary_text", "text": "Ark 思考"}],
+            }
+        ]
+    )
+
+    result = VolcengineProvider._extract_result(response)
+
+    assert result.text == ""
+    assert result.reasoning == "Ark 思考"
+
+
+# ── 回归：动态资源树必须与显式 Facade 共用能力门禁 ──
+
+
+def _ark_resources_without_verified_protocols(calls):
+    """构造未登记 server_verified_protocols 的 Ark provider 与资源 Facade。"""
+    from src.providers.volcengine import ArkResources
+
+    provider = object.__new__(VolcengineProvider)
+    provider._provider = "volcengine"
+    provider._protocol = "responses"
+    provider._server_verified_protocols = frozenset()
+    provider._options = {}
+    object.__setattr__(
+        provider,
+        "_client",
+        SimpleNamespace(
+            responses=SimpleNamespace(
+                create=lambda **kwargs: calls.append(kwargs) or "remote",
+                retrieve=lambda **kwargs: calls.append(kwargs) or "remote",
+            ),
+            files=SimpleNamespace(create=lambda **kwargs: "local-file"),
+        ),
+    )
+    return provider, ArkResources(provider)
+
+
+def test_ark_dynamic_responses_resource_enforces_server_verification():
+    """``resources.responses.create(...)`` 必须与 ``create_response()`` 同样受检。
+
+    动态资源树此前只做凭证校验，绕过了 server_verified_protocols 门禁，会把
+    本地 SDK 资源直接发往未验证的服务端。
+    """
+    calls: list[dict[str, object]] = []
+    _, resources = _ark_resources_without_verified_protocols(calls)
+
+    with pytest.raises(ValueError, match="未验证 Responses"):
+        resources.responses.create(model="ark-model", input="hi")
+    with pytest.raises(ValueError, match="未验证 Responses"):
+        resources.responses.retrieve(response_id="resp-1")
+
+    assert calls == []
+
+
+def test_ark_dynamic_non_responses_resources_are_not_gated():
+    """能力门禁只针对 responses 资源，files 等同名资源不能被误拦。"""
+    calls: list[dict[str, object]] = []
+    _, resources = _ark_resources_without_verified_protocols(calls)
+
+    assert resources.files.create(file="f") == "local-file"
+
+
+def test_ark_dynamic_responses_resource_passes_once_protocol_is_verified():
+    """登记 server_verified_protocols 后动态路径应正常放行。"""
+    calls: list[dict[str, object]] = []
+    provider, resources = _ark_resources_without_verified_protocols(calls)
+    provider._server_verified_protocols = frozenset({"responses"})
+
+    assert resources.responses.create(model="ark-model", input="hi") == "remote"
+    assert len(calls) == 1
+
+
+def test_ark_resource_guard_keeps_credential_check_before_capability_check():
+    """凭证问题必须优先报出，不能被能力错误掩盖成配置问题。"""
+    calls: list[dict[str, object]] = []
+    _, resources = _ark_resources_without_verified_protocols(calls)
+
+    with pytest.raises(ValueError, match="凭证"):
+        resources.responses.create(model="ark-model", input="hi", api_key="sk-secret")
+
+
+# ── 回归：Ark instructions × caching 互斥必须覆盖所有构造路径 ──
+
+
+def _ark_provider_for_request_build(options=None):
+    provider = object.__new__(VolcengineProvider)
+    provider._provider = "volcengine"
+    provider._model_name = "ark-model"
+    provider._protocol = "responses"
+    provider._options = options or {}
+    return provider
+
+
+@pytest.mark.parametrize(
+    "request_kwargs",
+    [
+        pytest.param({"prompt": "hi", "caching": {"type": "enabled"}}, id="top-level-caching"),
+        pytest.param(
+            {"prompt": "hi", "extra_body": {"caching": {"type": "enabled"}}},
+            id="request-extra-body",
+        ),
+    ],
+)
+def test_ark_responses_rejects_instructions_with_enabled_caching_on_every_path(request_kwargs):
+    """``caching`` 也可从 ``extra_body`` 进来，Ark SDK 会把它合并进请求体，
+    服务端看到的仍是 ``caching=enabled``。只查顶层参数会漏掉这条路径。"""
+    provider = _ark_provider_for_request_build()
+
+    with pytest.raises(ValueError, match="互斥"):
+        provider._build_responses_request(CompletionRequest(**request_kwargs))
+
+
+def test_ark_responses_rejects_caching_enabled_via_model_options_extra_body():
+    """模型级 options.extra_body 同样会被并入请求体。"""
+    provider = _ark_provider_for_request_build(
+        {"extra_body": {"caching": {"type": "enabled"}}}
+    )
+
+    with pytest.raises(ValueError, match="互斥"):
+        provider._build_responses_request(CompletionRequest(prompt="hi"))
+
+
+def test_ark_native_response_kwargs_reject_instructions_with_enabled_caching():
+    """原生 create_response/async_create_response 走 kwargs 校验，也必须受检。"""
+    with pytest.raises(ValueError, match="互斥"):
+        VolcengineProvider._validate_native_response_kwargs(
+            {
+                "model": "ark-model",
+                "input": "hi",
+                "instructions": "system",
+                "caching": {"type": "enabled"},
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        pytest.param(
+            {"model": "m", "input": "hi", "caching": {"type": "enabled"}}, id="no-instructions"
+        ),
+        pytest.param(
+            {"model": "m", "input": "hi", "instructions": "s", "caching": {"type": "disabled"}},
+            id="caching-disabled",
+        ),
+        pytest.param({"model": "m", "input": "hi", "instructions": "s"}, id="no-caching"),
+    ],
+)
+def test_ark_native_response_kwargs_allow_non_conflicting_combinations(kwargs):
+    """合法组合不能被互斥检查误伤。"""
+    assert VolcengineProvider._validate_native_response_kwargs(kwargs)["model"] == "m"
+
+
+# ── 回归：Ark 专属内容块不能经顶层 item 形态绕过 variant 守卫 ──
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"type": "input_audio", "audio": "AAAA"},
+        {"type": "input_video", "video": "BBBB"},
+        {"type": "input_image", "image_url": "u", "image_pixel_limit": {"max_pixels": 100}},
+    ],
+)
+def test_openai_responses_rejects_ark_only_blocks_as_top_level_items(item):
+    """同一个 Ark 专属块写成 content 会被拒、写成顶层 item 却直通请求体，
+    等于绕过了 variant 守卫。两种形态必须一致拒绝。"""
+    with pytest.raises(ValueError):
+        normalize_responses_input(None, None, [dict(item)], provider="openai")
+
+
+def test_ark_provider_allows_ark_only_blocks_as_top_level_items():
+    """Ark 渠道本身要能发这些块，守卫不能把合法用法一并拦下。"""
+    converted = normalize_responses_input(
+        None,
+        None,
+        [{"type": "input_audio", "audio_url": "https://example.invalid/a.mp3"}],
+        provider="ark",
+    )
+
+    assert converted[0]["type"] == "input_audio"
+
+
+# ── 回归：custom_tool_call 回填不能被强制 JSON 解析 ──
+
+
+def test_responses_custom_tool_call_round_trip_preserves_free_form_input():
+    """Responses custom tool 的 ``input`` 是任意文本（SDK 契约无 JSON 约束），
+    强制 json.loads 会让多轮 custom tool 在请求边界直接失败。"""
+    converted = normalize_responses_input(
+        None,
+        None,
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "type": "custom_tool_call",
+                        "id": "ctc_1",
+                        "call_id": "call_abc",
+                        "name": "my_custom_tool",
+                        "arguments": "any free-form text, not JSON",
+                    }
+                ],
+            }
+        ],
+        provider="openai",
+    )
+
+    assert converted[0]["type"] == "custom_tool_call"
+    assert converted[0]["input"] == "any free-form text, not JSON"
+    assert converted[0]["call_id"] == "call_abc"
+
+
+def test_responses_custom_tool_call_accepts_empty_input():
+    """空 input 是合法值（custom tool 无参数），不能被当成无效 JSON 拒绝。"""
+    converted = normalize_responses_input(
+        None,
+        None,
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"type": "custom_tool_call", "call_id": "c", "name": "f", "arguments": ""}
+                ],
+            }
+        ],
+        provider="openai",
+    )
+
+    assert converted[0]["input"] == ""
+
+
+def test_responses_function_call_still_normalizes_json_arguments():
+    """function_call 必须继续做 JSON 规范化，不能被 custom 分支影响。"""
+    converted = normalize_responses_input(
+        None,
+        None,
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"type": "function_call", "call_id": "c1", "name": "f", "arguments": '{"a":1}'}
+                ],
+            }
+        ],
+        provider="openai",
+    )
+
+    assert converted[0]["type"] == "function_call"
+    assert converted[0]["arguments"] == '{"a":1}'
+
+
+def test_chat_messages_do_not_leak_responses_only_type_marker():
+    """Chat Completions 路径不能带上 Responses 专属的内部字段，否则它会随
+    请求体发给 API。"""
+    normalized = normalize_chat_messages(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "c1", "type": "custom_tool_call", "name": "n", "input": '{"a":1}'}
+                ],
+            }
+        ]
+    )
+
+    assert normalized[0]["tool_calls"] == [
+        {"id": "c1", "type": "function", "function": {"name": "n", "arguments": '{"a":1}'}}
+    ]
+
+
+def test_responses_round_trip_keeps_call_id_for_streamed_tool_calls():
+    """流式事件同时给出 ``id``（输出项 ID）与 ``call_id``（调用 ID），两者不同。
+
+    Responses 用 ``call_id`` 关联 ``function_call`` 与 ``function_call_output``，
+    若 Chat 归一化只保留 ``id``，回填时输出项就配不上调用。
+    """
+    converted = normalize_responses_input(
+        None,
+        None,
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "fc_0123",
+                        "call_id": "call_abc",
+                        "type": "function_call",
+                        "name": "f",
+                        "arguments": "{}",
+                    }
+                ],
+            }
+        ],
+        provider="openai",
+    )
+
+    assert converted[0]["call_id"] == "call_abc"
+    assert converted[0]["id"] == "fc_0123"
+
+
+def test_responses_function_call_output_pairs_with_preserved_call_id():
+    """回填的 function_call 与 function_call_output 必须共享同一 call_id。"""
+    converted = normalize_responses_input(
+        None,
+        None,
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "fc_0123",
+                        "call_id": "call_abc",
+                        "type": "function_call",
+                        "name": "f",
+                        "arguments": "{}",
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_abc", "content": "result"},
+        ],
+        provider="openai",
+    )
+
+    assert converted[0]["call_id"] == converted[1]["call_id"] == "call_abc"
