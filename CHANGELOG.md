@@ -30,7 +30,7 @@
 - 移除 iFlow 渠道及其配置示例。
 - 移除 qwen rerank 配置示例；该渠道不提供 rerank 能力，调用时会显式报错。
 - 发布脚本新增目标环境校验，`--target` 与主机系统/架构不匹配时在清理构建产物前显式失败，不再生成错误架构的发布包。
-- Qwen Base URL 改为 OpenAI 兼容接口 `https://dashscope.aliyuncs.com/compatible-mode/v1`；Volcengine Base URL 改为 Ark API `https://ark.cn-beijing.volces.com/api/v3`。旧端点已失效，配置仍为旧值时会在加载时给出显式升级警告。
+- Qwen Base URL 改为 OpenAI 兼容接口 `https://dashscope.aliyuncs.com/compatible-mode/v1`；Volcengine Base URL 改为 Ark API `https://ark.cn-beijing.volces.com/api/v3`。配置仍为旧值时会在加载时给出显式升级警告：DashScope 原生 `api/v1` 不提供本仓库请求的 `{base_url}/chat/completions` 路径，火山旧域名 `maas-api.ml-platform-cn-beijing.volces.com` 则已停止服务。百炼的 `/responses` 只挂在业务空间专属域名下，默认共享域名不可用，文档已补充说明。
 - Jina Rerank 与 SiliconFlow Rerank 一致，`return_documents` 固定为 `True` 且不允许被 `options` 覆盖。
 
 ### 测试与文档

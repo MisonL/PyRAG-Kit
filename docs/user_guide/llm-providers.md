@@ -113,6 +113,8 @@ Embedding 文档和查询会区分任务类型：Google 使用 `RETRIEVAL_DOCUME
 
 这里的支持表示本地适配器能够发出 Responses 请求，不代表每个 Qwen、SiliconFlow、Ollama、LM Studio、DeepSeek 或 Grok 的兼容服务端都已实现 `/responses`。工厂的 `protocol_status()` 会分别返回 `adapter_supported` 与 `server_verified`；当前仓库未对这些外部 Base URL 做真实渠道验收，`server_verified` 默认是 `false`。启用前请确认目标 Base URL 的服务端文档和实际能力；不支持时应删除 `protocol` 或改回 `chat_completions`。
 
+注意「供应商支持 Responses」不等于「你配置的那个 Base URL 支持 Responses」。百炼（DashScope）的 `/responses` 挂在业务空间专属域名 `https://{WorkspaceId}.{region}.maas.aliyuncs.com/compatible-mode/v1` 下，默认的共享域名 `dashscope.aliyuncs.com/compatible-mode/v1` 并未提供该路径；百炼旧版 Responses 路径 `/api/v2/apps/protocols/compatible-mode/v1/responses` 也已停止维护。若在默认域名上启用 `protocol = "responses"`，请求会收到 HTTP 404，此时应改用专属域名或回到 `chat_completions`。
+
 ### 3. 定义模型实例
 
 所有可供程序使用的模型都在 `config.toml` 中以 TOML 表定义，分为三类：

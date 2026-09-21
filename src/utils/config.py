@@ -339,8 +339,13 @@ class Settings(BaseSettings):
         ``compatible-mode/v1``，并把火山默认域名从
         ``maas-api.ml-platform-cn-beijing.volces.com`` 换成
         ``ark.cn-beijing.volces.com/api/v3``。旧的 ``config.toml`` 会覆盖新默认值，
-        使请求在运行期收到 404/502。这里在配置加载时就明确提示如何修正，而不是让
-        用户从 404 反推原因；显式配置的自建或代理端点不受影响。
+        使请求在运行期失败。这里在配置加载时就明确提示如何修正，而不是让用户从
+        错误响应反推原因；显式配置的自建或代理端点不受影响。
+
+        两处旧值的失效方式不同：DashScope 原生 ``/api/v1`` 本身仍在服务，但路径是
+        ``/services/aigc/text-generation/generation``，而本项目按 OpenAI 兼容协议请求
+        ``{base_url}/chat/completions``，因此该值在本项目内不可用；火山旧域名则确实
+        已下线。
 
         只警告不阻断：旧值是可修复的配置问题而非安全边界，直接失败会让仍在使用
         旧配置的部署完全无法启动。
@@ -349,18 +354,20 @@ class Settings(BaseSettings):
             "qwen_base_url": (
                 "https://dashscope.aliyuncs.com/api/v1",
                 "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "该端点不提供 {base_url}/chat/completions",
             ),
             "volc_base_url": (
                 "https://maas-api.ml-platform-cn-beijing.volces.com",
                 "https://ark.cn-beijing.volces.com/api/v3",
+                "旧域名已停止服务",
             ),
         }
-        for field_name, (old_url, new_url) in retired.items():
+        for field_name, (old_url, new_url, reason) in retired.items():
             current = getattr(self, field_name, None)
             if isinstance(current, str) and current.rstrip("/") == old_url:
                 warnings.warn(
-                    f"{field_name} 指向已失效的旧端点 {old_url}，"
-                    f"请改为 {new_url}（旧端点会返回 404）。",
+                    f"{field_name} 指向旧端点 {old_url}（{reason}），"
+                    f"请改为 {new_url}。",
                     UserWarning,
                     stacklevel=2,
                 )
