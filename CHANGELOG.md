@@ -28,6 +28,7 @@
 ### 移除与调整
 
 - 移除 Dify 上游子模块；`src/etl/`、`src/retrieval/` 等移植代码继续遵守 `DIFY_LICENSE` 并保留上游版权声明。
+- 清理死代码：移除 `has_system_message`、`_configured_extra_body_keys`、`SnapshotRepository.write_stats`/`load_stats`/`load_active_manifest`，以及 `recursive_text_splitter` 中未被引用的 `DEFAULT_CHILD_CHUNK_*` 常量。这些逻辑均已在调用点内联或由框架通过装饰器调用，保留会造成同一行为的两处实现。
 - 移除 iFlow 渠道及其配置示例。
 - 移除 qwen rerank 配置示例；该渠道不提供 rerank 能力，调用时会显式报错。
 - 发布脚本新增目标环境校验，`--target` 与主机系统/架构不匹配时在清理构建产物前显式失败，不再生成错误架构的发布包。

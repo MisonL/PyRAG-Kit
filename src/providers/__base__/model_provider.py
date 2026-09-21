@@ -967,10 +967,6 @@ def normalize_responses_input(
     return converted
 
 
-def has_system_message(messages: Sequence[Mapping[str, Any]] | None) -> bool:
-    """判断调用方是否已经在消息列表中提供 system 消息。"""
-    return bool(messages and any(message.get("role") == "system" for message in messages))
-
 
 def normalize_usage(usage: Any) -> dict[str, Any]:
     """将常见供应商 usage 结构规范为统一 token 字段。"""

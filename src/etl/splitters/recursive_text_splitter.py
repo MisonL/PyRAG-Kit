@@ -13,9 +13,6 @@ from .base import BaseSplitter
 
 logger = get_module_logger(__name__)
 
-DEFAULT_CHILD_CHUNK_SIZE = 300
-DEFAULT_CHILD_CHUNK_OVERLAP = 30
-
 class RecursiveTextSplitter(BaseSplitter):
     """
     递归文本分割器。

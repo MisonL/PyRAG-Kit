@@ -438,15 +438,6 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             status = self._field(response, "status")
         return response
 
-    def _configured_extra_body_keys(self) -> set[str]:
-        """返回模型级 extra_body 的显式字段名，用于冲突检测。"""
-        configured = (getattr(self, "_options", {}) or {}).get("extra_body")
-        if configured is None:
-            return set()
-        if not isinstance(configured, Mapping):
-            raise ValueError("Provider options.extra_body 必须是对象。")
-        return set(configured)
-
     def _compat_extra_options(self) -> dict[str, Any]:
         return {
             key: value

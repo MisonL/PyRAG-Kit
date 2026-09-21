@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import json
 import shutil
 import tomllib
 import uuid
 from pathlib import Path
-from typing import Any
 
 from src.runtime.contracts import KnowledgeSnapshotManifest, RunConfig
 
@@ -69,18 +67,6 @@ class SnapshotRepository:
             data = tomllib.load(file)
         return KnowledgeSnapshotManifest.from_mapping(data)
 
-    def write_stats(self, snapshot_dir: Path, stats: dict[str, Any]) -> None:
-        (snapshot_dir / "stats.json").write_text(
-            json.dumps(stats, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-
-    def load_stats(self, snapshot_dir: Path) -> dict[str, Any]:
-        stats_path = snapshot_dir / "stats.json"
-        if not stats_path.exists():
-            return {}
-        return json.loads(stats_path.read_text(encoding="utf-8"))
-
     def validate_snapshot_dir(self, snapshot_dir: Path) -> None:
         required_files = [
             snapshot_dir / "manifest.toml",
@@ -93,10 +79,3 @@ class SnapshotRepository:
         missing_files = [str(path.name) for path in required_files if not path.exists()]
         if missing_files:
             raise FileNotFoundError(f"知识快照不完整，缺少文件: {', '.join(missing_files)}")
-
-    def load_active_manifest(self) -> KnowledgeSnapshotManifest | None:
-        snapshot_dir = self.get_active_snapshot_dir()
-        if snapshot_dir is None:
-            return None
-        self.validate_snapshot_dir(snapshot_dir)
-        return self.load_manifest(snapshot_dir)
