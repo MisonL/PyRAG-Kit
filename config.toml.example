@@ -126,10 +126,12 @@ model_name = "text-embedding-v4"
 # 提供商实现标识
 provider = "volcengine"
 # API 实际模型名。bge-large-zh 已不在方舟模型列表中。
-# 注意：本行未经官方来源确证——方舟文档站是 JS 渲染，且 AK/SK 签名接口需要账号
-# 凭证才能校验模型 ID。请在方舟控制台「开通管理 / 模型广场」核对当前可开通的
-# 文本向量化模型后替换。这里走文本 embeddings.create，不要填 doubao-embedding-vision
-# 这类多模态模型（那需要 multimodal_embeddings.create）。
+# doubao-embedding-text-240715 已于 2025-12-26 停止新购（EOM），且不在方舟当前
+# 模型列表的「向量化能力」章节中；官方下线公告给出的迁移目标只有
+# doubao-embedding-vision-251215（多模态向量化模型，也接受纯文本输入）。
+# 迁移前请在方舟控制台「开通管理」确认账号可开通的向量化模型。
+# 注意：本项目的火山 embedding 走文本 embeddings.create（/api/v3/embeddings），
+# 而 vision 系列官方示例走 /api/v3/embeddings/multimodal；启用前需实测确认。
 model_name = "doubao-embedding-text-240715"
 
 # ollama 向量化模型
