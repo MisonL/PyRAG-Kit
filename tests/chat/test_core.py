@@ -3,20 +3,21 @@ from types import SimpleNamespace
 
 from rich.console import Console
 
-from src.chat.core import Chatbot, _safe_exception_text, start_chat_session_async
+from src.chat.core import Chatbot, start_chat_session_async
 from src.runtime.contracts import SessionConfig
 from src.utils.config import ModelDetail, RetrievalMethod
 from src.utils.log_manager import RedactingFormatter
+from src.utils.security import safe_exception_text
 
 
 def test_safe_exception_text_redacts_credentials():
-    text = _safe_exception_text(RuntimeError("Authorization: Bearer sk-secret-token"))
+    text = safe_exception_text(RuntimeError("Authorization: Bearer sk-secret-token"))
     assert "sk-secret-token" not in text
     assert "REDACTED" in text
 
 
 def test_safe_exception_text_redacts_json_credentials():
-    text = _safe_exception_text(RuntimeError('{"api_key": "secret-value"}'))
+    text = safe_exception_text(RuntimeError('{"api_key": "secret-value"}'))
     assert "secret-value" not in text
     assert "REDACTED" in text
 

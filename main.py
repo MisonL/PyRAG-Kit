@@ -24,6 +24,7 @@ from src.ui.display_utils import CONSOLE_WIDTH
 
 # 从新的配置模块导入 settings 实例
 from src.utils.config import get_settings, resolve_app_root
+from src.utils.security import safe_exception_text
 
 console = Console()
 VERSION = "1.4.0" # 程序版本
@@ -192,7 +193,7 @@ def main():
             console.print("\n[bold yellow]检测到中断信号，正在退出程序... 再见！[/bold yellow]")
             sys.exit(0)
         except Exception as e:  # noqa: BLE001 - top-level CLI boundary reports failures
-            console.print(f"\n[bold red]程序运行期间发生错误:[/bold red] {e}")
+            console.print(f"\n[bold red]程序运行期间发生错误:[/bold red] {safe_exception_text(e)}")
             console.print("[bold red]请检查错误信息并重试。[/bold red]")
 
 if __name__ == "__main__":

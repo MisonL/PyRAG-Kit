@@ -32,16 +32,7 @@ from ..ui.config_menu import launch_config_editor
 from ..ui.display_utils import display_chat_config, get_relative_path
 from ..utils.config import get_settings
 from ..utils.log_manager import get_chat_logger
-from ..utils.security import redact_sensitive_text
-
-
-def _safe_exception_text(exc: BaseException) -> str:
-    """终端显示错误类型和上下文，同时遮蔽常见凭证格式。"""
-    message = str(exc).strip()
-    if not message:
-        return type(exc).__name__
-    message = redact_sensitive_text(message)
-    return f"{type(exc).__name__}: {message[:240]}"
+from ..utils.security import safe_exception_text
 
 
 class Chatbot:
@@ -101,7 +92,7 @@ class Chatbot:
         except Exception as exc:  # noqa: BLE001 - reload boundary reports provider failures
             if new_model is not None and new_model is not self.llm_model:
                 self._dispose_model(new_model)
-            self.console.print(f"[bold red]重载 LLM 出错: {_safe_exception_text(exc)}[/bold red]")
+            self.console.print(f"[bold red]重载 LLM 出错: {safe_exception_text(exc)}[/bold red]")
             return False
 
     def _dispose_model(self, model: LargeLanguageModel) -> None:
@@ -111,7 +102,7 @@ class Chatbot:
         except Exception as exc:  # noqa: BLE001 - teardown continues after SDK failures
             self.logger.warning(
                 "关闭 LLM Provider 失败: %s",
-                redact_sensitive_text(str(exc)),
+                safe_exception_text(exc),
             )
 
     async def _adispose_model(self, model: LargeLanguageModel) -> None:
@@ -126,7 +117,7 @@ class Chatbot:
             except Exception as exc:  # noqa: BLE001 - teardown continues after SDK failures
                 self.logger.warning(
                     "异步关闭 LLM Provider 失败: %s",
-                    redact_sensitive_text(str(exc)),
+                    safe_exception_text(exc),
                 )
                 return
         await asyncio.to_thread(self._dispose_model, model)
@@ -146,7 +137,7 @@ class Chatbot:
             except Exception as exc:  # noqa: BLE001 - teardown continues after SDK failures
                 self.logger.warning(
                     "关闭检索服务失败: %s",
-                    redact_sensitive_text(str(exc)),
+                    safe_exception_text(exc),
                 )
 
     async def aclose(self) -> None:
@@ -166,7 +157,7 @@ class Chatbot:
             except Exception as exc:  # noqa: BLE001 - teardown continues after SDK failures
                 self.logger.warning(
                     "异步关闭检索服务失败: %s",
-                    redact_sensitive_text(str(exc)),
+                    safe_exception_text(exc),
                 )
         else:
             close_retrieval = getattr(retrieval_service, "close", None)
@@ -178,7 +169,7 @@ class Chatbot:
                 except Exception as exc:  # noqa: BLE001 - teardown continues after SDK failures
                     self.logger.warning(
                         "关闭检索服务失败: %s",
-                        redact_sensitive_text(str(exc)),
+                        safe_exception_text(exc),
                     )
 
     def apply_config_update(self, updated_config: SessionConfig | dict[str, Any], llm_needs_reload: bool) -> None:
@@ -224,7 +215,7 @@ class Chatbot:
                 await self._adispose_model(new_model)
             if previous_config is not None:
                 self.session_config = previous_config
-            self.console.print(f"[bold red]重载 LLM 出错: {_safe_exception_text(exc)}[/bold red]")
+            self.console.print(f"[bold red]重载 LLM 出错: {safe_exception_text(exc)}[/bold red]")
             self.console.print("[bold yellow]LLM 切换失败，已保留当前模型配置。[/bold yellow]")
 
     async def _identify_intent_async(self, user_query: str) -> str:
@@ -282,12 +273,12 @@ class Chatbot:
                 full_response,
             )
         except Exception as exc:
-            error_text = redact_sensitive_text(str(exc))
+            error_text = safe_exception_text(exc)
             self.logger.exception(
                 "聊天请求处理失败: %s",
                 error_text,
             )
-            self.console.print(f"[red]LLM 异步生成出错: {_safe_exception_text(exc)}[/red]")
+            self.console.print(f"[red]LLM 异步生成出错: {safe_exception_text(exc)}[/red]")
             # 已经输出部分内容时不要追加道歉文本，避免用户收到混合响应；
             # 具体异常已通过日志和控制台显式记录。
             if not full_response:

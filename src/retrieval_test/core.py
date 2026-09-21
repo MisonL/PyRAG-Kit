@@ -16,6 +16,7 @@ from ..services.retrieval_service import RetrievalService
 from ..ui.display_utils import get_relative_path
 from ..utils.config import get_settings
 from ..utils.log_manager import get_module_logger
+from ..utils.security import safe_exception_text
 from .excel_logger import ExcelLogger
 
 console = Console()
@@ -49,7 +50,7 @@ async def run_retrieval_test_async():
     try:
         excel_logger = ExcelLogger()
     except Exception as exc:  # noqa: BLE001 - interactive setup reports all failures
-        logger.error("ExcelLogger 初始化失败: %s", exc)
+        logger.error("ExcelLogger 初始化失败: %s", safe_exception_text(exc))
 
     try:
         run_config = build_run_config(get_settings())
@@ -57,7 +58,7 @@ async def run_retrieval_test_async():
         vector_store = VectorStoreFactory.get_default_vector_store()
         retrieval_service = RetrievalService(vector_store, EmbeddingService(run_config))
     except Exception as exc:  # noqa: BLE001 - interactive setup reports all failures
-        console.print(f"[red]数据库加载失败: {exc}[/red]")
+        console.print(f"[red]数据库加载失败: {safe_exception_text(exc)}[/red]")
         return
 
     while True:
@@ -76,8 +77,8 @@ async def run_retrieval_test_async():
         except (KeyboardInterrupt, EOFError):
             break
         except Exception as exc:  # noqa: BLE001 - interactive loop remains usable
-            console.print(f"[red]召回测试出错: {exc}[/red]")
-            logger.error("召回测试出错: %s", exc)
+            console.print(f"[red]召回测试出错: {safe_exception_text(exc)}[/red]")
+            logger.error("召回测试出错: %s", safe_exception_text(exc))
 
 
 def run_retrieval_test():
