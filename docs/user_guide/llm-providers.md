@@ -24,6 +24,19 @@ PyRAG-Kit 的一个核心优势是其高度的灵活性和可扩展性，尤其�
 *   **SiliconFlow**: 一个集成了多种开源模型的平台，可通过其统一 API 调用。
 *   **Jina AI**: 主要用于提供高质量的 Rerank 模型。
 
+> **火山引擎向量化的已知问题**：示例配置中的 `doubao-embedding-text-240715` 已于
+> 2025-12-26 停止新购（EOM），且不在方舟「向量化能力」模型列表中。方舟官方给出的迁移目标是
+> `doubao-embedding-vision-251215`，但该项目走 `/api/v3/embeddings/multimodal`，与本项目火山
+> embedding 使用的文本 `embeddings.create` 不是同一条路径，**迁移前需要实测确认**。
+> embedding 模型只有 EOM 阶段、不涉及 EOS，已有接入点不受影响，因此示例配置暂未改动该值。
+> 默认的知识库链路使用离线 `local-hash`，不受此问题影响。
+
+> **百炼的 Responses 端点挂在专属域名下**：`/responses` 只存在于业务空间专属域名
+> `https://{WorkspaceId}.{region}.maas.aliyuncs.com/compatible-mode/v1`，默认共享域名
+> `dashscope.aliyuncs.com/compatible-mode/v1` 并未提供该路径；旧版
+> `/api/v2/apps/protocols/compatible-mode/v1/responses` 已停止维护。在默认域名上启用
+> `protocol = "responses"` 会收到 HTTP 404。
+
 ### 本地化模型
 
 *   **Ollama**: 支持通过 Ollama 在本地运行的各种开源模型，如 Llama 3.1、Gemma 3 等。
@@ -182,3 +195,40 @@ model_name = "gpt-5.6-sol"
 3.  **重启程序**: 保存 `config.toml` 文件并重新启动 `uv run main.py`。
 
 现在，您就可以在 `/config` 菜单的“切换模型” -> “语言模型 (LLM)” 选项中看到并选择 `sf-glm-5-3` 了。
+
+### 模型 ID 会退役，示例值不等于长期有效
+
+各厂商会定期下线旧模型 ID，届时调用会直接失败（通常表现为 404 或 503 `model_not_found`），
+错误来自服务端而非本项目。示例配置中的模型 ID 是写入时仍可用的值，长期使用前请在对应平台的
+模型列表中核对。
+
+已知的退役规律与替代项见 `CHANGELOG.md` 的 `[1.4.0]` 节；概览：
+
+| 渠道 | 已退役 | 现行替代 |
+| --- | --- | --- |
+| Google | `text-embedding-004` | `gemini-embedding-2`（向量空间不兼容，需重建快照） |
+| OpenAI | `gpt-4o`、`gpt-3.5-turbo` | `gpt-5.6-sol` / `gpt-5.6-terra` |
+| Anthropic | `claude-3-5-sonnet-20240620` | `claude-sonnet-4-6` |
+| DeepSeek | `deepseek-chat` | `deepseek-v4-pro` / `deepseek-v4-flash` |
+| 火山方舟 | `doubao-pro-32k`、`bge-large-zh` | `doubao-seed-2-0-lite-260428`；向量化见下方说明 |
+| SiliconFlow | `Qwen/Qwen2-7B-Instruct`、`Qwen/Qwen3-8B` | `Qwen/Qwen3.5-27B` |
+
+### 部分模型有专属参数限制
+
+个别模型对请求字段有额外约束，本项目会在构造请求前显式报错，而不是把非法请求发到服务端：
+
+- **`kimi-k3`** 只接受 `temperature = 1`。项目默认 `chat_temperature = 0.7` 会触发 HTTP 400，
+  需在该模型条目中覆盖：
+
+  ```toml
+  [llm_configurations.kimi-k3]
+  provider = "openai"
+  model_name = "kimi-k3"
+  options = { temperature = 1 }
+  ```
+
+- **Ark Responses 的 `instructions` 与 `caching` 互斥**：官方规定配置 `instructions` 后本轮请求
+  无法写入或使用缓存，`caching = {"type": "enabled"}` 时服务端直接报错。注意
+  `CompletionRequest.system_prompt` 带兼容默认值，未显式传入时也会设置 `instructions`；
+  如需两者并存，请显式传 `system_prompt=None` 并把系统提示放进 `messages`。
+
