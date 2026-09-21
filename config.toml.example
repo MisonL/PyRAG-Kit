@@ -125,8 +125,11 @@ model_name = "text-embedding-v4"
 [embedding_configurations.volcengine]
 # 提供商实现标识
 provider = "volcengine"
-# API 实际模型名（bge-large-zh 已不在方舟模型列表中；这里走文本 embeddings.create，
-# 不要用 doubao-embedding-vision 这类多模态模型）
+# API 实际模型名。bge-large-zh 已不在方舟模型列表中。
+# 注意：本行未经官方来源确证——方舟文档站是 JS 渲染，且 AK/SK 签名接口需要账号
+# 凭证才能校验模型 ID。请在方舟控制台「开通管理 / 模型广场」核对当前可开通的
+# 文本向量化模型后替换。这里走文本 embeddings.create，不要填 doubao-embedding-vision
+# 这类多模态模型（那需要 multimodal_embeddings.create）。
 model_name = "doubao-embedding-text-240715"
 
 # ollama 向量化模型

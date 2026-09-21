@@ -109,6 +109,22 @@ def test_settings_defaults(monkeypatch, tmp_path):
     assert "jina" not in settings.embedding_configurations
 
 
+def test_settings_builtin_model_ids_are_current(monkeypatch, tmp_path):
+    """兜底默认值必须是当前有效的官方 ID，避免新用户照抄到已失效模型。"""
+    monkeypatch.setattr("src.utils.config.CONFIG_TOML_PATH", tmp_path / "absent.toml")
+    settings = Settings(_env_file=None)
+
+    # Google 的裸名 ``embedding-001`` 不是有效 ID；退役的 ``text-embedding-004``
+    # 也不能作为兜底值。
+    assert settings.embedding_configurations["google"].model_name == "gemini-embedding-2"
+    # SiliconFlow 官方模型广场使用 ``BAAI/`` 命名空间，不存在 ``alibaba/`` 前缀；
+    # 现行 rerank ID 是 ``bge-reranker-v2-m3``，没有 ``bge-reranker-large``。
+    assert settings.embedding_configurations["siliconflow"].model_name == "BAAI/bge-large-zh-v1.5"
+    assert settings.rerank_configurations["siliconflow"].model_name == "BAAI/bge-reranker-v2-m3"
+    # Ollama 官方库的现行 tag 是带次版本号的 ``llama3.1``。
+    assert settings.llm_configurations["ollama"].model_name == "llama3.1"
+
+
 def test_settings_dump_hides_credentials_by_default():
     settings = Settings(openai_api_key="sk-test", lm_studio_api_key="local-secret")
 

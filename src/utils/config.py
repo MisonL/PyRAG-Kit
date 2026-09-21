@@ -239,13 +239,14 @@ class Settings(BaseSettings):
 
     # --- [MODEL_CONFIGURATIONS] ---
     embedding_configurations: dict[str, ModelDetail] = Field(default_factory=lambda: {
+        # 与 llm_configurations 同理：兜底值必须写成当前有效的官方 ID。
         "local-hash": ModelDetail(provider="local-hash", model_name="local-hash-256"),
-        "google": ModelDetail(provider="google", model_name="embedding-001"),
-        "siliconflow": ModelDetail(provider="siliconflow", model_name="alibaba/bge-large-zh-v1.5"),
+        "google": ModelDetail(provider="google", model_name="gemini-embedding-2"),
+        "siliconflow": ModelDetail(provider="siliconflow", model_name="BAAI/bge-large-zh-v1.5"),
         "openai": ModelDetail(provider="openai", model_name="text-embedding-3-small"),
     })
     rerank_configurations: dict[str, ModelDetail] = Field(default_factory=lambda: {
-        "siliconflow": ModelDetail(provider="siliconflow", model_name="alibaba/bge-reranker-large"),
+        "siliconflow": ModelDetail(provider="siliconflow", model_name="BAAI/bge-reranker-v2-m3"),
     })
     llm_configurations: dict[str, ModelDetail] = Field(default_factory=lambda: {
         # 默认条目只作为缺失配置时的兜底；模型名保持在写就时仍可用的现行 ID，
@@ -258,7 +259,7 @@ class Settings(BaseSettings):
         "volcengine": ModelDetail(provider="volcengine", model_name="doubao-seed-2-0-lite-260428"),
         "siliconflow": ModelDetail(provider="siliconflow", model_name="deepseek-ai/DeepSeek-V3.2"),
         "openai": ModelDetail(provider="openai", model_name="gpt-5.6-sol"),
-        "ollama": ModelDetail(provider="ollama", model_name="llama3"),
+        "ollama": ModelDetail(provider="ollama", model_name="llama3.1"),
         "lm-studio": ModelDetail(provider="lm-studio", model_name="LM-Studio-Community/Meta-Llama-3-8B-Instruct-GGUF"),
     })
 
