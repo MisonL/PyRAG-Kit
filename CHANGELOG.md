@@ -35,7 +35,8 @@
 
 ### 测试与文档
 
-- 新增 Provider 协议适配、SDK 能力、凭证边界、Rerank 契约与失败语义回归测试；测试总数增至 800。
+- 新增 Provider 协议适配、SDK 能力、凭证边界、Rerank 契约与失败语义回归测试；测试总数增至 817。
+- 为活动快照的 embedding 兼容性检测补充回归测试：快照记录的 embedding provider 或模型名与当前运行配置不一致时必须显式失败，避免用错向量空间后静默产出错误检索结果。
 - 引入 Ruff、Bandit 与 MyPy 到开发依赖，并补齐对应配置。
 - 更新 `README.md`、`AGENTS.md` 与 `docs/`，同步协议选择、`options` 边界、原生资源入口和 Vertex ADC 配置口径。
 - 核对各渠道官方现状并刷新配置示例：Google Embedding 改用 `gemini-embedding-2`（`text-embedding-004` 已于 2026-01-14 退役），OpenAI 改用 `gpt-5.6-*`（`gpt-3.5-turbo` 于 2026-10-23 退役），Anthropic 改用 `claude-sonnet-4-6`（`claude-3-5-sonnet-20240620` 已于 2025-10-28 退役），DeepSeek 改用 `deepseek-v4-pro`/`deepseek-v4-flash`（`deepseek-chat` 已于 2026-07-24 退役），火山改用 `doubao-seed-2-0-lite-260428` 与 `doubao-embedding-text-240715`（`doubao-pro-32k`、`bge-large-zh` 已不在方舟模型列表），Qwen 改用 `qwen3.8-max`/`qwen3.7-plus`，SiliconFlow 改用 `Qwen/Qwen3.5-27B`/`deepseek-ai/DeepSeek-V3.2`（复核发现 `Qwen/Qwen3-8B` 已不在该平台在售列表，其 Qwen 对话模型现从 Qwen3.5-27B 起步），Grok 改用 `grok-4.6`（`llama3-70b-8192` 实为 Groq 的 ID，不属于 xAI），Ollama 改用 `llama3.1`/`gemma3`。示例配置的键名同步改为与模型一致，模型内置默认值一并更新；内置 embedding 与 rerank 兜底值此前含无效 ID（Google 的裸名 `embedding-001`、SiliconFlow 不存在的 `alibaba/` 命名空间与已下线的 `bge-reranker-large`、Ollama 的 `llama3`），现分别改为 `gemini-embedding-2`、`BAAI/bge-large-zh-v1.5`、`BAAI/bge-reranker-v2-m3` 与 `llama3.1`。

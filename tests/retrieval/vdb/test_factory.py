@@ -34,6 +34,10 @@ class MockFaissStore(VectorStoreBase):
     def load(self, path: str):
         """模拟加载操作"""
 
+    def load_snapshot(self, snapshot_dir: str):
+        """模拟从快照目录加载，记录路径供断言。"""
+        self.file_path = snapshot_dir
+
     def get_embedding_model(self) -> Any:
         """模拟获取嵌入模型"""
         return MagicMock() # 返回一个模拟的嵌入模型
@@ -120,3 +124,66 @@ def test_get_default_vector_store_without_loading_existing():
     store = VectorStoreFactory.get_default_vector_store(load_existing=False)
     assert isinstance(store, MockFaissStore)
     assert store.file_path is None
+
+def _write_snapshot(root, snapshot_id, provider, model):
+    """按真实快照目录结构写入一个活动快照，供兼容性检测使用。"""
+    from pathlib import Path
+
+    from src.runtime.contracts import KnowledgeSnapshotManifest
+
+    snapshot_dir = Path(root) / snapshot_id
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    manifest = KnowledgeSnapshotManifest.create(
+        snapshot_id=snapshot_id,
+        store_type="faiss",
+        embedding_provider=provider,
+        embedding_model=model,
+        chunk_mode="standard",
+        source_digest="test-digest",
+        document_count=1,
+        chunk_count=1,
+    )
+    (snapshot_dir / "manifest.toml").write_text(manifest.to_toml(), encoding="utf-8")
+    # 快照目录校验要求这一组文件同时存在；兼容性检测发生在 load_snapshot 之前，
+    # 所以这里只需占位内容，不参与断言。
+    for name in ("chunks.pkl", "parents.pkl", "semantic.index", "embeddings.npy", "stats.json"):
+        (snapshot_dir / name).write_bytes(b"")
+    (Path(root) / "ACTIVE_SNAPSHOT").write_text(snapshot_id, encoding="utf-8")
+    return snapshot_dir
+
+
+def test_default_vector_store_rejects_mismatched_embedding_provider(tmp_path):
+    """活动快照的 embedding provider 与当前运行配置不同时必须显式失败。
+
+    向量空间不兼容时静默加载会产出错误的检索结果，因此这里要求抛出
+    带快照值与当前值的 RuntimeError，而不是继续使用旧索引。
+    """
+    from src.utils.config import get_settings
+
+    settings = get_settings()
+    _write_snapshot(settings.snapshot_root, "kb-mismatch", "openai", "text-embedding-3-large")
+
+    with pytest.raises(RuntimeError, match="embedding 配置与当前运行配置不一致"):
+        VectorStoreFactory.get_default_vector_store()
+
+
+def test_default_vector_store_rejects_mismatched_embedding_model(tmp_path):
+    """provider 相同但模型名不同同样不兼容，也必须拦截。"""
+    from src.utils.config import get_settings
+
+    settings = get_settings()
+    _write_snapshot(settings.snapshot_root, "kb-model-mismatch", "local-hash", "local-hash-512")
+
+    with pytest.raises(RuntimeError, match="embedding 配置与当前运行配置不一致"):
+        VectorStoreFactory.get_default_vector_store()
+
+
+def test_default_vector_store_accepts_matching_embedding(tmp_path):
+    """配置一致时正常加载，不应触发兼容性错误。"""
+    from src.utils.config import get_settings
+
+    settings = get_settings()
+    _write_snapshot(settings.snapshot_root, "kb-match", "local-hash", "local-hash-256")
+
+    store = VectorStoreFactory.get_default_vector_store()
+    assert isinstance(store, MockFaissStore)
