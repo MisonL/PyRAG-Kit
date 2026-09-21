@@ -332,6 +332,7 @@ def _chat_tool_call_item(
     location: str,
     *,
     require_call_id: bool = False,
+    keep_responses_type: bool = False,
 ) -> dict[str, Any]:
     """将工具调用归一化为 OpenAI Chat Completions 的嵌套结构。
 
@@ -376,9 +377,8 @@ def _chat_tool_call_item(
 
     # Chat Completions 的 ``tool_calls[].type`` 只接受 ``function``；Responses 的
     # ``function_call``/``custom_tool_call`` 与流式片段都要映射回该取值。
-    tool_type = normalized.get("type")
-    if not isinstance(tool_type, str) or tool_type not in _CHAT_TOOL_CALL_TYPES:
-        tool_type = "function"
+    source_type = normalized.get("type")
+    tool_type = source_type if source_type in _CHAT_TOOL_CALL_TYPES else "function"
 
     item: dict[str, Any] = {
         "type": tool_type,
@@ -386,6 +386,20 @@ def _chat_tool_call_item(
     }
     if call_id is not None:
         item["id"] = call_id
+    # Responses 需要区分 ``custom_tool_call``（其 ``input`` 是任意文本，不做
+    # JSON 规范化），但 Chat Completions 只有 ``function`` 一种取值。调用方若
+    # 来自 Responses 路径，就在类型被改写时记录原值，避免多轮 custom tool
+    # 回填被误当 function_call。默认不记录，防止该内部字段进入 Chat 请求体。
+    if keep_responses_type and source_type != tool_type:
+        item["_responses_tool_call_type"] = source_type
+    # Responses 用 ``call_id`` 关联 ``function_call`` 与 ``function_call_output``，
+    # 而流式事件会同时给出 ``id``（输出项 ID）与 ``call_id``（调用 ID）两个不同
+    # 的值。Chat 归一化只保留 ``id``，会把 ``call_id`` 丢掉，导致回填 Responses
+    # 时输出项配不上调用。这里在 Responses 路径上一并保留。
+    if keep_responses_type:
+        source_call_id = normalized.get("call_id")
+        if isinstance(source_call_id, str) and source_call_id.strip():
+            item["call_id"] = source_call_id
     return item
 
 
@@ -394,8 +408,14 @@ def normalize_chat_messages(
     location: str = "messages",
     *,
     require_tool_call_ids: bool = False,
+    keep_responses_type: bool = False,
 ) -> list[dict[str, Any]]:
-    """归一化 Chat Completions 消息，转换工具调用并保留其它字段。"""
+    """归一化 Chat Completions 消息，转换工具调用并保留其它字段。
+
+    ``keep_responses_type`` 由 Responses 路径开启，用于保留
+    ``custom_tool_call`` 这类 Chat Completions 不支持的原始调用类型；
+    Chat 路径保持默认关闭，避免内部字段进入请求体。
+    """
     normalized: list[dict[str, Any]] = []
     for index, message in enumerate(messages):
         if not isinstance(message, Mapping):
@@ -412,6 +432,7 @@ def normalize_chat_messages(
                     tool_call,
                     f"{location}[{index}].tool_calls[{call_index}]",
                     require_call_id=require_tool_call_ids,
+                    keep_responses_type=keep_responses_type,
                 )
                 for call_index, tool_call in enumerate(tool_calls)
             ]
@@ -425,6 +446,7 @@ def normalize_messages(
     messages: Sequence[Mapping[str, Any]] | None,
     *,
     require_tool_call_ids: bool = False,
+    keep_responses_type: bool = False,
 ) -> list[dict[str, Any]]:
     """生成不修改调用方对象的标准消息列表。
 
@@ -437,6 +459,7 @@ def normalize_messages(
         normalized = normalize_chat_messages(
             messages,
             require_tool_call_ids=require_tool_call_ids,
+            keep_responses_type=keep_responses_type,
         )
         if system_prompt and not any(message.get("role") == "system" for message in normalized):
             normalized.insert(0, {"role": "system", "content": system_prompt})
@@ -485,6 +508,38 @@ def _responses_provider_variant(provider: str) -> str:
     """规范化 Responses 目标 SDK 变体。"""
     normalized = str(provider).strip().lower().replace("-", "_")
     return "ark" if normalized in {"ark", "volcengine", "volc_engine"} else "openai"
+
+
+# Ark 专属的 Responses 内容块类型；OpenAI 兼容端点不接受这些块。
+_ARK_ONLY_RESPONSES_ITEM_TYPES = frozenset(
+    {"input_audio", "audio_url", "input_video", "video_url"}
+)
+
+
+def _reject_unsupported_responses_item(
+    item: Mapping[str, Any],
+    location: str,
+    provider: str,
+) -> None:
+    """拒绝经顶层 item 形态绕过 variant 守卫的供应商专属内容块。
+
+    ``normalize_responses_input`` 对带 ``content`` 的消息走
+    ``_responses_message_content``，那里会按 provider 变体拒绝 Ark 专属块。
+    但原生 Responses item（``{"type": "input_audio", ...}``）没有 ``content``，
+    会直通到请求体，因此需要在这里做等价检查，避免同一种块因书写位置不同
+    而一个被拒、一个静默发给不支持它的端点。
+    """
+    if _responses_provider_variant(provider) == "ark":
+        return
+    item_type = item.get("type")
+    if item_type in _ARK_ONLY_RESPONSES_ITEM_TYPES:
+        raise ValueError(
+            f"{location} 的 {item_type} 内容块当前不受 Responses SDK 支持。"
+        )
+    if "image_pixel_limit" in item:
+        raise ValueError(
+            f"{location}.image_pixel_limit 不受 OpenAI Responses SDK 支持。"
+        )
 
 
 def _responses_content_part(
@@ -793,16 +848,33 @@ def _responses_function_call_item(
     if not isinstance(name, str) or not name.strip():
         raise ValueError(f"{location} 缺少函数名。")
 
-    arguments = function_values.get(
+    raw_arguments = function_values.get(
         "arguments",
         tool_call.get("arguments", tool_call.get("input")),
     )
-    item: dict[str, Any] = {
-        "type": "function_call",
-        "call_id": call_id,
-        "name": name,
-        "arguments": _responses_json_text(arguments, f"{location}.arguments"),
-    }
+    # Responses 的 custom tool 按 SDK 契约接受任意文本（``input: str``，无 JSON
+    # 约束），Provider 自己产出的 ``custom_tool_call`` 也带任意文本。若把它当
+    # function_call 强制 json.loads，多轮 custom tool 回填会在请求边界直接失败。
+    # 因此按类型分流：custom 保留原始文本，function 才做 JSON 规范化。
+    #
+    # 优先取 _chat_tool_call_item 保留的原始类型：``type`` 已被归一化为 Chat
+    # Completions 唯一允许的 ``function``，直接读它会丢掉 custom 语义。
+    source_type = tool_call.get("_responses_tool_call_type") or tool_call.get("type")
+    if source_type == "custom_tool_call":
+        custom_input = "" if raw_arguments is None else str(raw_arguments)
+        item: dict[str, Any] = {
+            "type": "custom_tool_call",
+            "call_id": call_id,
+            "name": name,
+            "input": custom_input,
+        }
+    else:
+        item = {
+            "type": "function_call",
+            "call_id": call_id,
+            "name": name,
+            "arguments": _responses_json_text(raw_arguments, f"{location}.arguments"),
+        }
     # A Chat Completions ``id`` is the call identifier, not the Responses
     # output-item identifier. Do not duplicate it as ``id`` unless the caller
     # supplied a distinct Responses-style ``call_id`` explicitly.
@@ -882,6 +954,9 @@ def normalize_responses_input(
         system_prompt,
         messages,
         require_tool_call_ids=True,
+        # Responses 需要区分 custom_tool_call 与 function_call：前者的 input
+        # 是任意文本，不做 JSON 规范化。Chat 路径不开启该开关。
+        keep_responses_type=True,
     )
     if messages is None and prompt is not None:
         return prompt
@@ -963,6 +1038,12 @@ def normalize_responses_input(
                 location,
                 provider=provider,
             )
+        else:
+            # 原生 Responses item 形态（例如 ``{"type": "input_audio", ...}``）
+            # 不带 role/content，因此不会经过 _responses_message_content 的
+            # 内容块转换。同一个 Ark 专属块写成 content 会被拒、写成顶层 item
+            # 却静默发出，等于绕过了 variant 守卫，因此这里补一次等价检查。
+            _reject_unsupported_responses_item(normalized_message, location, provider)
         converted.append(normalized_message)
     return converted
 
