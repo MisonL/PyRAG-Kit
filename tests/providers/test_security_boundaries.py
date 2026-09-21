@@ -50,3 +50,24 @@ def test_security_redacts_short_credential_key_assignments(value):
 def test_security_does_not_redact_ordinary_text_with_ak_or_sk(value):
     """普通文本里的 ``sk``/``ak`` 子串不能被当成凭证脱敏。"""
     assert redact_sensitive_text(value) == value
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Incorrect API key provided: sk-abc***...***xyz.",
+        "Invalid token: rk-abc*******************def",
+        "key sess-abcd****wxyz rejected",
+    ],
+)
+def test_security_redacts_masked_credential_shapes(value):
+    """服务端错误里「首尾可见、中间掩码」的凭证形态也要脱敏。
+
+    ``_OPENAI_KEY_RE`` 要求 ``sk-`` 后连续 8 个以上字母数字，星号会中断匹配，
+    这类字符串此前会原样落进日志。
+    """
+    redacted = redact_sensitive_text(value)
+    assert "[REDACTED]" in redacted
+    assert "sk-abc" not in redacted
+    assert "rk-abc" not in redacted
+    assert "sess-abcd" not in redacted

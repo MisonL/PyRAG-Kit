@@ -19,7 +19,7 @@
 
 - 新增配置、请求与日志边界的凭证校验：模型级 `options` 与请求级扩展不得携带密钥、请求头、query 或 Base URL 覆盖，资源 Facade 的关键字与位置参数同样受检。
 - 凭证键识别补齐火山引擎的 `ak`/`sk` 与 Azure 存储的 `account_key`；此前这些键可绕过请求覆盖校验，而 `api_key` 会被拒绝。
-- 日志与错误信息统一脱敏常见凭证表示（Bearer、API key、URL userinfo 与 query）；补齐 `ak=`/`sk=`/`account_key=` 形式。
+- 日志与错误信息统一脱敏常见凭证表示（Bearer、API key、URL userinfo 与 query）；补齐 `ak=`/`sk=`/`account_key=` 形式，以及服务端错误里「首尾可见、中间掩码」的凭证形态（如 `sk-abc***...***xyz`，此前会原样落进日志）。
 - 修复脱敏日志 formatter 的缓存泄漏：`logging.Formatter` 会把格式化后的 traceback 缓存在 `record.exc_text` 上供后续 handler 复用，先格式化后脱敏会让同一 logger 上的非脱敏 handler 输出原始凭证；现在脱敏结果会写回缓存。
 - 兼容渠道不再被当作官方 OpenAI 端点放行 SDK 专属资源；仅精确匹配 `https://api.openai.com/v1` 时按 SDK 契约放行。
 - 收紧失败语义：凭证、SDK 或远端调用失败时显式报错，不再以空 embedding、零分 rerank 或占位回答掩盖失败。
@@ -35,7 +35,7 @@
 
 ### 测试与文档
 
-- 新增 Provider 协议适配、SDK 能力、凭证边界、Rerank 契约与失败语义回归测试；测试总数增至 817。
+- 新增 Provider 协议适配、SDK 能力、凭证边界、Rerank 契约与失败语义回归测试；测试总数增至 820。
 - 为活动快照的 embedding 兼容性检测补充回归测试：快照记录的 embedding provider 或模型名与当前运行配置不一致时必须显式失败，避免用错向量空间后静默产出错误检索结果。
 - 引入 Ruff、Bandit 与 MyPy 到开发依赖，并补齐对应配置。
 - 更新 `README.md`、`AGENTS.md` 与 `docs/`，同步协议选择、`options` 边界、原生资源入口和 Vertex ADC 配置口径。

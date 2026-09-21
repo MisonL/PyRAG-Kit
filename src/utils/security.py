@@ -117,6 +117,12 @@ _SHORT_CREDENTIAL_KEY_RE = re.compile(
     r'''(?:"[^"]*"|'[^']*'|[^\s,;}']+)'''
 )
 _OPENAI_KEY_RE = re.compile(r"\b(?:sk|rk|sess)-[A-Za-z0-9_-]{8,}\b", re.IGNORECASE)
+# 服务端返回的错误信息常带「首尾可见、中间掩码」的凭证形态，例如
+# ``sk-abc***...***xyz``。``_OPENAI_KEY_RE`` 要求 ``sk-`` 后连续 8 个以上
+# 字母数字，星号会中断匹配，于是整串原样落进日志。这里单独覆盖掩码形态。
+_MASKED_CREDENTIAL_RE = re.compile(
+    r"(?i)\b(?:sk|rk|sess)-[A-Za-z0-9_-]{2,}\*{3,}[A-Za-z0-9_-]*"
+)
 _GOOGLE_API_KEY_RE = re.compile(r"\bAIza[0-9A-Za-z_-]{20,}\b")
 
 
@@ -129,6 +135,7 @@ def redact_sensitive_text(value: Any) -> str:
     redacted = _SHORT_CREDENTIAL_KEY_RE.sub(r"\1=[REDACTED]", redacted)
     redacted = _URL_USERINFO_RE.sub(r"\1[REDACTED]:[REDACTED]@", redacted)
     redacted = _URL_QUERY_SECRET_RE.sub(r"\1[REDACTED]", redacted)
+    redacted = _MASKED_CREDENTIAL_RE.sub("[REDACTED]", redacted)
     redacted = _OPENAI_KEY_RE.sub("[REDACTED]", redacted)
     return _GOOGLE_API_KEY_RE.sub("[REDACTED]", redacted)
 
