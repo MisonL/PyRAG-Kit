@@ -96,17 +96,64 @@ _BEARER_TEXT_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
 # word as a credential causes ordinary text (``token usage``) to be rejected by
 # ``find_sensitive_option_paths``.  Require a credential-like value for that
 # form: at least twelve token characters and one digit or token punctuation.
+# 文本脱敏与 is_sensitive_option_key 必须使用同一套凭证键名，否则会出现
+# 「配置边界判为敏感、日志里却明文输出」的漏洞（client_secret、private_key、
+# credentials 都曾如此）。下面显式列出可在文本中安全识别的键名，所有文本正则
+# 均由它派生；``[_-]?`` 同时覆盖 ``client_secret`` 与 ``clientsecret``。
+#
+# 不含 ak/sk：这两个键太短，需要独立的词边界正则（见 _SHORT_CREDENTIAL_KEY_RE），
+# 否则 ``task = value`` 里的 sk 会被误脱敏。
+# 也不含 base_url / client_args / http_client 等连接类键名：它们在配置边界被禁止
+# 是因为会覆盖请求边界，本身不是凭证；纳入文本识别会让普通配置值被误判为凭证。
+_TEXT_CREDENTIAL_KEYS = (
+    "secret[_-]?access[_-]?key",
+    "ssh[_-]?private[_-]?key",
+    "proxy[_-]?authorization",
+    "secret[_-]?credential",
+    "workload[_-]?identity",
+    "x[_-]?access[_-]?token",
+    "x[_-]?auth[_-]?token",
+    "x[_-]?api[_-]?key",
+    "admin[_-]?api[_-]?key",
+    "encryption[_-]?key",
+    "signing[_-]?key",
+    "private[_-]?key",
+    "client[_-]?secret",
+    "secret[_-]?value",
+    "webhook[_-]?secret",
+    "account[_-]?key",
+    "access[_-]?token",
+    "auth[_-]?token",
+    "access[_-]?key",
+    "secret[_-]?key",
+    "auth[_-]?key",
+    "set[_-]?cookie",
+    "google[_-]?key",
+    "goog[_-]?key",
+    "ssh[_-]?key",
+    "api[_-]?key",
+    "authorization",
+    "credential",
+    "credentials",
+    "password",
+    "passwd",
+    "cookie",
+    "secret",
+    "token",
+    "auth",
+    "bearer",
+)
+_TEXT_CREDENTIAL_KEY_PATTERN = "|".join(_TEXT_CREDENTIAL_KEYS)
+
 _KEY_VALUE_TEXT_RE = re.compile(
-    r'''(?i)(api[_-]?key|access[_-]?key|secret[_-]?key|authorization|token|password)["']?'''
+    r"(?i)(?<![A-Za-z0-9])(" + _TEXT_CREDENTIAL_KEY_PATTERN + r")[\"']?"
     r'''(\s*[:=]\s*|\s+(?=["']|'''
     r'''(?=[A-Za-z0-9._~+/=-]{12,}(?:[\s,;}']|$))[A-Za-z0-9._~+/=-]*[0-9._~+/=-]))'''
     r'''(?:"[^"]*"|'[^']*'|[^\s,;}']+)'''
 )
 _URL_USERINFO_RE = re.compile(r"(?i)(https?://)([^\s/@:]+):([^\s/@]+)@")
 _URL_QUERY_SECRET_RE = re.compile(
-    r"(?i)([?&](?:api[_-]?key|access[_-]?key|secret[_-]?key|account[_-]?key"
-    r"|ak|sk|token|password|authorization)=)"
-    r"[^&#\s]+"
+    r"(?i)([?&](?:" + _TEXT_CREDENTIAL_KEY_PATTERN + r"|ak|sk)=)[^&#\s]+"
 )
 # ``ak``/``sk`` 是火山引擎凭证键名，``account_key`` 是 Azure 存储凭证键名。
 # 这些键很短，必须用词边界约束，否则 ``task = value`` 里的 ``sk`` 会被误脱敏。
@@ -121,7 +168,9 @@ _OPENAI_KEY_RE = re.compile(r"\b(?:sk|rk|sess)-[A-Za-z0-9_-]{8,}\b", re.IGNORECA
 # ``sk-abc***...***xyz``。``_OPENAI_KEY_RE`` 要求 ``sk-`` 后连续 8 个以上
 # 字母数字，星号会中断匹配，于是整串原样落进日志。这里单独覆盖掩码形态。
 _MASKED_CREDENTIAL_RE = re.compile(
-    r"(?i)\b(?:sk|rk|sess)-[A-Za-z0-9_-]{2,}\*{3,}[A-Za-z0-9_-]*"
+    # 掩码段可含 ``*``、``.``、``…`` 等占位字符，且尾部可能还有可见片段，
+    # 因此尾部字符类要一并覆盖，否则 ``sk-abc***...***xyz`` 只吃掉前半段。
+    r"(?i)\b(?:sk|rk|sess)-[A-Za-z0-9_.-]{2,}[*\u2026.]{2,}[A-Za-z0-9_.*-]*"
 )
 _GOOGLE_API_KEY_RE = re.compile(r"\bAIza[0-9A-Za-z_-]{20,}\b")
 
@@ -130,14 +179,30 @@ def redact_sensitive_text(value: Any) -> str:
     """脱敏异常、日志和请求错误中的常见凭证表示。"""
     if not isinstance(value, str):
         value = str(value)
-    redacted = _BEARER_TEXT_RE.sub("Bearer [REDACTED]", value)
+    # 掩码形态必须最先处理：``_BEARER_TEXT_RE`` 会先吃掉 ``Bearer sk-abc``
+    # 的可见前缀，使后续的 ``sk-`` 锚点失效，尾部掩码片段就会残留。
+    redacted = _MASKED_CREDENTIAL_RE.sub("[REDACTED]", value)
+    redacted = _BEARER_TEXT_RE.sub("Bearer [REDACTED]", redacted)
     redacted = _KEY_VALUE_TEXT_RE.sub(r"\1=[REDACTED]", redacted)
     redacted = _SHORT_CREDENTIAL_KEY_RE.sub(r"\1=[REDACTED]", redacted)
     redacted = _URL_USERINFO_RE.sub(r"\1[REDACTED]:[REDACTED]@", redacted)
     redacted = _URL_QUERY_SECRET_RE.sub(r"\1[REDACTED]", redacted)
-    redacted = _MASKED_CREDENTIAL_RE.sub("[REDACTED]", redacted)
     redacted = _OPENAI_KEY_RE.sub("[REDACTED]", redacted)
     return _GOOGLE_API_KEY_RE.sub("[REDACTED]", redacted)
+
+
+
+def safe_exception_text(exc: BaseException) -> str:
+    """把异常转成可安全展示的文本：脱敏凭证，并限制长度。
+
+    终端与日志是凭证最容易泄漏的出口——SDK 的异常消息常回显请求头或
+    URL。所有面向用户的异常输出都应经过这里，而不是直接 ``str(exc)``
+    或把异常对象交给 ``console.print`` / ``logger.error``。
+    """
+    message = str(exc).strip()
+    if not message:
+        return type(exc).__name__
+    return f"{type(exc).__name__}: {redact_sensitive_text(message)[:240]}"
 
 
 def _copy_nested(value: Any) -> Any:
@@ -240,7 +305,11 @@ def _url_credential_paths(value: Any, path: str) -> list[str]:
     try:
         parsed = urlsplit(value)
     except ValueError:
-        return []
+        # urlsplit 对畸形 URL（例如 ``https://[::1``）抛 ValueError。这不是
+        # 「值不是 URL」而是「无法解析」，不能就此放弃检查：该分支是叶子值的
+        # 唯一入口，直接 return 会让任意凭证随一个畸形前缀整体绕过边界校验。
+        # 退回文本脱敏判定，保持与正常 URL 路径一致的严格度。
+        return [path or "value"] if redact_sensitive_text(value) != value else []
     found: list[str] = []
     if redact_sensitive_text(value) != value:
         found.append(path or "value")
