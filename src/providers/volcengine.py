@@ -912,6 +912,21 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
                 "Ark Responses",
                 set(params).difference({"extra_body"}),
             )
+        # 官方文档明确：``instructions`` 不可与缓存能力一起使用，``caching`` 配置为
+        # ``{"type": "enabled"}`` 时请求会直接报错。SDK 不做本地校验，会原样发到
+        # 服务端，因此在构造阶段显式拒绝，避免用户从远端错误反推原因。
+        if params.get("instructions") is not None:
+            enabled_caching = params.get("caching")
+            if isinstance(enabled_caching, Mapping) and enabled_caching.get("type") == "enabled":
+                raise ValueError(
+                    "Ark Responses 的 instructions 与 caching={\"type\": \"enabled\"} 互斥："
+                    "官方规定配置 instructions 后本轮请求无法写入或使用缓存，caching 为 "
+                    "enabled 时请求会直接报错。instructions 来自 system_prompt，"
+                    "注意 CompletionRequest.system_prompt 有兼容默认值"
+                    "（未显式传入时为 \"You are a helpful assistant.\"）；"
+                    "请显式传入 system_prompt=None 并改用 messages 携带系统提示，"
+                    "或移除 caching。"
+                )
         return params
 
     @classmethod

@@ -11,6 +11,7 @@
 - 修复多轮工具调用的历史归一化：共享的 `normalize_messages` 不再强制要求工具调用带 `id`，因为 Gemini 的 `FunctionCall.id` 是可选字段且 SDK 默认 `None`，否则把上一轮工具调用回填给 Google 会在请求发出前被本地拒绝；需要 `id` 的 Chat Completions 与 Responses 改为显式校验。同一处还修复了 `input` 参数别名被静默清空，以及 `function_call`/`custom_tool_call` 类型未映射为 `function` 的问题。
 - 支持 Chat Completions、Responses、Google Generate Content 和 Anthropic Messages 四类线协议；OpenAI 兼容渠道与 Ark 可通过 `protocol = "responses"` 选择 Responses，Ark 的 `ark` 取值是 Chat Completions 的别名。
 - Responses 对非官方端点要求 `options.server_verified_protocols = ["responses"]` 显式登记；未登记时工厂、Provider 和资源 Facade 均在请求前拒绝，避免把本地 SDK 资源误发到未实现 `/responses` 的服务端。
+- Ark Responses 在构造阶段拒绝 `instructions` 与 `caching={"type": "enabled"}` 同时出现：官方规定配置 `instructions` 后本轮请求无法写入或使用缓存，`caching` 为 `enabled` 时服务端直接报错，而 SDK 不做本地校验。错误信息会指出 `instructions` 来自 `system_prompt` 的兼容默认值，并给出改走 `messages` 的修复方式。
 - 新增原生资源 Facade，显式暴露文件、批处理、缓存、向量库、token 计数、调优等 SDK 能力，不再把资源生命周期混入普通聊天请求。
 - 深度适配 Google GenAI、Anthropic、Volcengine Ark、Jina 与 SiliconFlow Rerank；OpenAI 兼容渠道复用 `openai` SDK，Jina 与 SiliconFlow Rerank 使用 HTTP JSON。
 - Embedding 区分文档与查询任务类型：Google 使用 `RETRIEVAL_DOCUMENT` 与 `RETRIEVAL_QUERY`。
@@ -35,7 +36,7 @@
 
 ### 测试与文档
 
-- 新增 Provider 协议适配、SDK 能力、凭证边界、Rerank 契约与失败语义回归测试；测试总数增至 820。
+- 新增 Provider 协议适配、SDK 能力、凭证边界、Rerank 契约与失败语义回归测试；测试总数增至 823。
 - 为活动快照的 embedding 兼容性检测补充回归测试：快照记录的 embedding provider 或模型名与当前运行配置不一致时必须显式失败，避免用错向量空间后静默产出错误检索结果。
 - 引入 Ruff、Bandit 与 MyPy 到开发依赖，并补齐对应配置。
 - 更新 `README.md`、`AGENTS.md` 与 `docs/`，同步协议选择、`options` 边界、原生资源入口和 Vertex ADC 配置口径。

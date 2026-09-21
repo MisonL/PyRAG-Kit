@@ -749,6 +749,72 @@ def test_openai_chat_explicit_extra_body_extensions_cannot_be_silently_overridde
         provider._build_chat_request(prompt="hi", stream=False, **kwargs)
 
 
+def test_ark_responses_rejects_instructions_with_enabled_caching():
+    """官方规定 ``instructions`` 与 ``caching={"type": "enabled"}`` 互斥。
+
+    配置 instructions 后本轮请求无法写入或使用缓存，caching 为 enabled 时
+    服务端会直接报错；SDK 不做本地校验，因此这里要求在构造阶段显式失败。
+    """
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "doubao-model"
+    provider._protocol = "responses"
+    provider._options = {"server_verified_protocols": ["responses"]}
+
+    with pytest.raises(ValueError, match="instructions.*caching"):
+        provider._build_responses_request(
+            CompletionRequest(
+                prompt="hi",
+                system_prompt="你是助手",
+                caching={"type": "enabled"},
+                stream=False,
+            )
+        )
+
+
+def test_ark_responses_accepts_system_prompt_without_enabled_caching():
+    """未启用 caching 时 instructions 正常透传；caching 非 enabled 也不拦截。"""
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "doubao-model"
+    provider._protocol = "responses"
+    provider._options = {"server_verified_protocols": ["responses"]}
+
+    params = provider._build_responses_request(
+        CompletionRequest(prompt="hi", system_prompt="你是助手", stream=False)
+    )
+    assert params["instructions"] == "你是助手"
+    assert "caching" not in params
+
+    params = provider._build_responses_request(
+        CompletionRequest(
+            prompt="hi", system_prompt="你是助手", caching={"type": "disabled"}, stream=False
+        )
+    )
+    assert params["instructions"] == "你是助手"
+    assert params["caching"] == {"type": "disabled"}
+
+
+def test_ark_responses_enabled_caching_ok_without_instructions():
+    """把系统提示放进 messages 并显式关闭 system_prompt 时，caching 可正常启用。"""
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "doubao-model"
+    provider._protocol = "responses"
+    provider._options = {"server_verified_protocols": ["responses"]}
+
+    params = provider._build_responses_request(
+        CompletionRequest(
+            messages=[
+                {"role": "system", "content": "你是助手"},
+                {"role": "user", "content": "hi"},
+            ],
+            system_prompt=None,
+            caching={"type": "enabled"},
+            stream=False,
+        )
+    )
+    assert "instructions" not in params
+    assert params["caching"] == {"type": "enabled"}
+
+
 @pytest.mark.parametrize("field", ["top_k", "seed", "stop", "reasoning"])
 def test_openai_responses_explicit_extra_body_extensions_cannot_be_silently_overridden(field):
     provider = object.__new__(OpenAICompatibleProvider)
