@@ -1494,12 +1494,14 @@ def _guard_provider_resource_method(method: Callable[..., Any]) -> Callable[...,
 
         @wraps(method)
         async def async_wrapper(provider: Any, *args: Any, **kwargs: Any) -> Any:
-            resource_guard = getattr(provider, "_require_provider_resource", None)
-            if callable(resource_guard):
-                resource_guard(method.__name__)
+            # 凭证校验先行：它约束参数本身，与渠道是否具备该能力无关。
+            # 顺序反了会让携带凭证的调用报出能力错误，把安全问题掩盖成配置问题。
             safe_args, safe_kwargs = _sanitize_resource_call(
                 method, provider, args, kwargs
             )
+            resource_guard = getattr(provider, "_require_provider_resource", None)
+            if callable(resource_guard):
+                resource_guard(method.__name__)
             provider_call_is_valid = _provider_call_accepts_arguments(
                 method, provider, safe_args, safe_kwargs
             )
@@ -1525,12 +1527,13 @@ def _guard_provider_resource_method(method: Callable[..., Any]) -> Callable[...,
 
     @wraps(method)
     def wrapper(provider: Any, *args: Any, **kwargs: Any) -> Any:
-        resource_guard = getattr(provider, "_require_provider_resource", None)
-        if callable(resource_guard):
-            resource_guard(method.__name__)
+        # 与 async_wrapper 保持同一顺序：先凭证，后能力。
         safe_args, safe_kwargs = _sanitize_resource_call(
             method, provider, args, kwargs
         )
+        resource_guard = getattr(provider, "_require_provider_resource", None)
+        if callable(resource_guard):
+            resource_guard(method.__name__)
         provider_call_is_valid = _provider_call_accepts_arguments(
             method, provider, safe_args, safe_kwargs
         )

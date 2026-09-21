@@ -56,6 +56,26 @@ def _load_ark_clients() -> tuple[type[Any], type[Any]]:
     return Ark, AsyncArk
 
 
+
+def _ark_responses_output_text(response: Any) -> str:
+    """从 Responses 的 ``output[].content[]`` 提取助手正文。
+
+    Ark 的 ``Response`` 模型没有 ``output_text`` 字段（OpenAI SDK 把它实现为
+    聚合 property），正文只在 ``output`` 项的 ``content`` 里。只取
+    ``output_text``/``text`` 类型的内容块，避免把 reasoning 与 refusal 文本
+    混进正文。
+    """
+    chunks: list[str] = []
+    for item in field(response, "output", []) or []:
+        for content in field(item, "content", []) or []:
+            if field(content, "type") not in {"output_text", "text"}:
+                continue
+            piece = field(content, "text")
+            if isinstance(piece, str):
+                chunks.append(piece)
+    return "".join(chunks)
+
+
 class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
     """火山引擎 Ark Provider，支持 Chat Completions、Responses 和 Embeddings。"""
 
@@ -353,6 +373,17 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
                 )
             normalized.add(protocol)
         return frozenset(normalized)
+
+    def _require_provider_resource(self, method_name: str) -> None:
+        """在原生资源方法触达 SDK 前校验 Ark 渠道能力。
+
+        ``method_name`` 可能是显式方法名（``create_response``），也可能是动态
+        资源树路径（``volcengine.responses.create``）。按路径分段判断，避免把
+        ``files.create`` 这类同名但无关的调用一并拦下。
+        """
+        segments = method_name.split(".")
+        if "responses" in segments or method_name.endswith("_response") or "response" in segments:
+            self._require_responses_resource(method_name)
 
     def _require_responses_resource(self, operation: str) -> None:
         """阻止未验证的 Ark Responses 请求到达远端。"""
@@ -912,12 +943,29 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
                 "Ark Responses",
                 set(params).difference({"extra_body"}),
             )
-        # 官方文档明确：``instructions`` 不可与缓存能力一起使用，``caching`` 配置为
-        # ``{"type": "enabled"}`` 时请求会直接报错。SDK 不做本地校验，会原样发到
-        # 服务端，因此在构造阶段显式拒绝，避免用户从远端错误反推原因。
-        if params.get("instructions") is not None:
-            enabled_caching = params.get("caching")
-            if isinstance(enabled_caching, Mapping) and enabled_caching.get("type") == "enabled":
+        self._reject_instructions_with_enabled_caching(params)
+        return params
+
+    @staticmethod
+    def _reject_instructions_with_enabled_caching(params: Mapping[str, Any]) -> None:
+        """拒绝 ``instructions`` 与 ``caching={"type": "enabled"}`` 同时出现。
+
+        官方文档明确二者互斥：配置 ``instructions`` 后本轮请求无法写入或使用
+        缓存，``caching`` 为 ``enabled`` 时服务端直接报错。SDK 不做本地校验，
+        会原样发到服务端，因此在构造阶段显式拒绝，避免用户从远端 400 反推。
+
+        ``caching`` 有两条来源：顶层参数，以及 ``extra_body``（Ark SDK 在
+        ``_base_client`` 里把 ``extra_body`` 合并进请求体，服务端看到的仍是
+        ``caching=enabled``）。两条都要检查，否则该守卫可被绕过。
+        """
+        if params.get("instructions") is None:
+            return
+        candidates = [params.get("caching")]
+        extra_body = params.get("extra_body")
+        if isinstance(extra_body, Mapping):
+            candidates.append(extra_body.get("caching"))
+        for candidate in candidates:
+            if isinstance(candidate, Mapping) and candidate.get("type") == "enabled":
                 raise ValueError(
                     "Ark Responses 的 instructions 与 caching={\"type\": \"enabled\"} 互斥："
                     "官方规定配置 instructions 后本轮请求无法写入或使用缓存，caching 为 "
@@ -927,7 +975,6 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
                     "请显式传入 system_prompt=None 并改用 messages 携带系统提示，"
                     "或移除 caching。"
                 )
-        return params
 
     @classmethod
     def _validate_native_response_kwargs(cls, kwargs: Mapping[str, Any]) -> dict[str, Any]:
@@ -960,6 +1007,10 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             if not isinstance(params["session"], Mapping):
                 raise ValueError("Ark Responses session 必须是对象。")
             params["session"] = dict(params["session"])
+        # 原生入口同样要执行 instructions 与 caching 的互斥校验，否则用户
+        # 绕过 Facade 直接调用 create_response/async_create_response 时会从
+        # 远端 400 才得知参数冲突。
+        cls._reject_instructions_with_enabled_caching(params)
         return params
 
     def _embedding_options(self) -> dict[str, Any]:
@@ -1070,6 +1121,12 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         output_text = field(response, "output_text")
         if isinstance(output_text, str):
             text = output_text
+        if not text:
+            # Ark 的 Response 没有 OpenAI 那样的 ``output_text`` 聚合属性，
+            # 正文位于 ``output[].content[].text``。缺了这一步，所有非流式
+            # 入口都会返回空文本而不报错。仅在没有 choices 文本时启用，避免
+            # 覆盖 Chat Completions 分支已经取到的内容。
+            text = _ark_responses_output_text(response)
         for item in field(response, "output", []) or []:
             item_type = field(item, "type")
             if item_type in {"function_call", "custom_tool_call"}:
@@ -1122,6 +1179,22 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
                 candidate_refusal = field(content, "refusal") or field(content, "text")
                 if isinstance(candidate_refusal, str) and candidate_refusal:
                     refusal = candidate_refusal
+        if (
+            not choices
+            and not text
+            and not calls
+            and not refusal
+            and not reasoning
+            and field(response, "status") == "completed"
+        ):
+            # 项目规则禁止用占位结果掩盖失败。Responses 响应标记为 completed
+            # 却既无正文、无工具调用、也无拒答与推理，说明响应结构与预期不符
+            # （例如 SDK 改了字段形状）。此时静默返回空文本会让上层拿到空串后
+            # 继续，最终表现为难以定位的「空结果」错误，因此在边界显式失败。
+            raise RuntimeError(
+                "Ark Responses 响应已完成但未包含任何正文、工具调用或拒答内容；"
+                "请检查响应结构与 SDK 版本是否匹配。"
+            )
         return CompletionResult(text=text, tool_calls=calls, usage=usage_dict,
                                 finish_reason=field(choices[0], "finish_reason") if choices else field(response, "status"),
                                 response_id=field(response, "id"), refusal=refusal,

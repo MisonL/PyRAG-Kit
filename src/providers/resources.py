@@ -62,6 +62,9 @@ class _NativeResourceProxy:
         return wrapped
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        # 先做凭证校验：它约束的是「参数能不能出现在请求里」，与渠道是否具备
+        # 该能力无关，也是更根本的边界。顺序反了会让携带凭证的调用报出能力
+        # 错误，把真正的安全问题掩盖成配置问题。
         safe_args = validate_secret_free_resource_args(
             args,
             f"{_resource_provider_label(self._provider)} 原生资源 {self._path}",
@@ -70,6 +73,15 @@ class _NativeResourceProxy:
             kwargs,
             f"{_resource_provider_label(self._provider)} 原生资源 {self._path}",
         )
+        # 再做能力门禁：动态访问的资源节点必须和显式 Facade 方法受同一套约束。
+        # 只做凭证校验不够：``resources.responses.create(...)`` 这类路径会绕过
+        # server_verified_protocols 检查，把本地 SDK 资源直接发往未验证的服务端。
+        resource_guard = getattr(self._provider, "_require_provider_resource", None)
+        if callable(resource_guard):
+            # 传完整路径（``volcengine.responses.create``）而不是末段方法名：
+            # ``files.create`` 与 ``responses.create`` 末段相同，只看方法名无法
+            # 区分该走哪条能力门禁。
+            resource_guard(self._path)
         # Call results are deliberately not wrapped.  They are response models,
         # pagers, streams, or context managers rather than mutable resource
         # trees; preserving their SDK identity keeps normal client code intact.
