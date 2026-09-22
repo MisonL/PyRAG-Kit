@@ -389,3 +389,95 @@ def test_connection_only_keys_are_deliberately_excluded_from_text_redaction():
         assert key in SENSITIVE_OPTION_KEYS, key
         text = f"{key}=https://example.invalid/v1"
         assert redact_sensitive_text(text) == text, key
+
+
+# ── 回归：值的形态约束不能收窄真凭证的取值域 ──
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "password: FakePwOnly",
+        "api_key: abcdefgh",
+        "token: mytoken",
+        "secret: abcdefgh",
+        "client_secret: abcdefgh",
+        "passwd: FakePwOnly",
+        "credential: abcdefgh",
+    ],
+)
+def test_security_redacts_short_alphabetic_credential_values(value):
+    """短且纯字母的值也是凭证。
+
+    此前对全部键名统一加「≥12 字符或含数字/符号」的形态约束，使
+    ``password: FakePwOnly`` 这类键值对整条漏检——那是比误判更严重的净漏检。
+    形态约束只该用于排除误判源，不该收窄真凭证的取值域。
+    """
+    assert redact_sensitive_text(value) != value
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["oauth: 2.0", "topsecret: 42", "sessiontoken: x1", "mytoken: abc12345", "xxtoken: 99"],
+)
+def test_security_does_not_flag_ordinary_identifiers_ending_in_credential_words(value):
+    """以凭证词结尾的普通标识符不能被从词中间切开。
+
+    ``is_sensitive_option_key`` 按 camelCase 边界切词，``topsecret`` 切出的是
+    单个词 ``topsecret``，判为**非敏感**；文本侧若不加界断言就会命中里面的
+    ``secret``，而边界校验用「值是否被改写」判断，于是合法配置被误拒。
+    """
+    assert redact_sensitive_text(value) == value
+
+
+# ── 回归：掩码规则的性能与尾部裁剪 ──
+
+
+def test_security_masked_rule_stays_linear_on_long_trailing_runs():
+    """掩码尾部不能引入二次回溯。
+
+    ``redact_sensitive_text`` 挂在每条日志的 formatter 上，一个回显掩码密钥
+    前缀、后面跟长 token 的错误体就能拖住进程。逐字符前瞻的写法在尾部无冒号
+    时退化成 O(n²)。
+    """
+    import time
+
+    text = "sk-abc***" + "deadbeef" * 500
+
+    start = time.perf_counter()
+    redact_sensitive_text(text)
+    elapsed = time.perf_counter() - start
+
+    # 线性实现约 0.1ms；二次实现约 500ms。留足余量避免 CI 抖动误报。
+    assert elapsed < 0.1, f"耗时 {elapsed * 1000:.1f}ms，疑似二次回溯"
+
+
+def test_security_masked_rule_keeps_adjacent_key_name_for_key_value_rule():
+    """掩码尾部混进的敏感键名要留给键值规则处理，否则值变明文。"""
+    secret = "SECRETVALUE1234567890"
+    redacted = redact_sensitive_text(f"sk-abc***token={secret}")
+
+    assert secret not in redacted
+    assert redacted == "[REDACTED]token=[REDACTED]"
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["sk-abc***defghijkl: boom", "sess-abc***tail: unauthorized", "sk-abc***xyz: boom"],
+)
+def test_security_masked_rule_consumes_visible_trailing_fragment(text):
+    """尾部可见片段不是键名时，应随掩码一起吃掉，不能留在 ``[REDACTED]`` 之后。"""
+    assert redact_sensitive_text(text).startswith("[REDACTED]")
+
+
+def test_security_bearer_rule_redacts_alphabetic_token_adjacent_to_cjk():
+    """``Bearer`` 分支的界断言此前是 ``\\b``，在中文两侧不成立。
+
+    这条断言此前无测试锚定：CJK 用例都由 ``_OPENAI_KEY_RE`` 等兜底满足，
+    回退 bearer 那一行测试仍全绿。
+    """
+    token = "abcdefghijklmnopqrst"
+    rendered = redact_sensitive_text(f"鉴权失败Bearer {token}")
+
+    assert token not in rendered
+    assert "[REDACTED]" in rendered

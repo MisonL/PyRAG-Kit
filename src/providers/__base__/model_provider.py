@@ -545,6 +545,22 @@ _RESPONSES_CONTENT_BLOCK_TYPES = frozenset(
 )
 
 
+def _reject_unsupported_responses_top_level_fields(
+    item: Mapping[str, Any],
+    location: str,
+    provider: str,
+) -> None:
+    """拒绝 OpenAI 兼容渠道发出 Ark 专属的顶层字段。
+
+    这类字段与 item 类型无关：无论写成内容块、原生 item 还是普通消息的顶层
+    字段，OpenAI Responses 都不接受。只检查内容块路径会留下旁路。
+    """
+    if _responses_provider_variant(provider) == "ark":
+        return
+    if "image_pixel_limit" in item:
+        raise ValueError(f"{location}.image_pixel_limit 不受 OpenAI Responses SDK 支持。")
+
+
 def _normalize_responses_native_item(
     item: Mapping[str, Any],
     location: str,
@@ -561,9 +577,20 @@ def _normalize_responses_native_item(
     校验与形状归一化（例如把嵌套的 ``image_url`` 对象展平成 SDK 期望的扁平
     形式）。其余键按原样保留。
     """
+    # ``image_pixel_limit`` 是 Ark 专属字段，与 item 类型无关：无论写成内容块
+    # 还是顶层字段，OpenAI 兼容渠道都不能发出。这个检查必须在类型门禁之前，
+    # 否则 ``{"type": "reasoning", "image_pixel_limit": ...}`` 这类非内容块
+    # item 会整体跳过校验——只是把绕过点从 ``content`` 键换成了 ``type`` 键。
+    _reject_unsupported_responses_top_level_fields(item, location, provider)
+
     item_type = item.get("type")
-    if item_type not in _RESPONSES_CONTENT_BLOCK_TYPES:
-        return dict(item)
+    # ``type`` 可能是任意 JSON 值。直接做集合查找对不可哈希的值（``list``/
+    # ``dict``）会抛 ``TypeError: unhashable type``，把可诊断的类型错误变成
+    # 崩溃；非字符串的 ``type`` 一律交给 ``_responses_content_part`` 报错。
+    if not isinstance(item_type, str) or item_type not in _RESPONSES_CONTENT_BLOCK_TYPES:
+        if isinstance(item_type, str) or item_type is None:
+            return dict(item)
+        return _responses_content_part(item, location, provider=provider)
     converted = _responses_content_part(item, location, provider=provider)
     # 内容块转换只产出 SDK 输入联合里的字段；``id``/``status`` 等 item 级
     # 元数据不在其中，需要保留。
@@ -595,6 +622,11 @@ def _responses_content_part(
 
     source = dict(part)
     part_type = source.get("type")
+    # ``type`` 是任意 JSON 值。下面所有分支都用集合成员判断，对不可哈希的值
+    # （``list``/``dict``）会抛 ``TypeError: unhashable type``，把可诊断的
+    # 类型错误变成崩溃。非字符串统一在此显式失败。
+    if not isinstance(part_type, str) or not part_type.strip():
+        raise ValueError(f"{location}.type 必须是非空字符串。")
     variant = _responses_provider_variant(provider)
     if part_type in {"text", "input_text", "output_text"}:
         text = source.get("text")
@@ -821,8 +853,6 @@ def _responses_content_part(
             raise ValueError(f"{location}.prompt_cache_breakpoint 不受 Ark Responses SDK 支持。")
         return converted
 
-    if not isinstance(part_type, str) or not part_type.strip():
-        raise ValueError(f"{location}.type 必须是非空字符串。")
     raise ValueError(f"{location} 的内容类型 {part_type} 不受 Responses SDK 支持。")
 
 
@@ -1084,11 +1114,18 @@ def normalize_responses_input(
                 location,
                 provider=provider,
             )
+        # 顶层字段也要查：``image_pixel_limit`` 与 ``type``/``content`` 都无关，
+        # 写在消息顶层时不会经过内容块转换，OpenAI 兼容渠道不能发出。
+        _reject_unsupported_responses_top_level_fields(normalized_message, location, provider)
         # 顶层 item 形态（例如 ``{"type": "input_audio", ...}``）不带 role，
         # 会直通到请求体。这里统一做一次归一化与校验——注意不能以「有没有
         # ``content`` 键」来分流：加一个无关的 ``content`` 键就能改走上面的
         # 分支，从而绕过顶层路径的全部变体校验。
-        if normalized_message.get("type") in _RESPONSES_CONTENT_BLOCK_TYPES:
+        # 归一化并校验顶层 item 形态。这里不能只判「``type`` 是否在内容块
+        # 集合里」：集合查找对不可哈希的值会抛 ``TypeError``；也不能只在没有
+        # ``role`` 时调用——``{"role": "user", "type": "input_audio", ...}``
+        # 会跳过类型校验直通请求体。
+        if "role" not in normalized_message or "type" in normalized_message:
             normalized_message = _normalize_responses_native_item(
                 normalized_message, location, provider
             )

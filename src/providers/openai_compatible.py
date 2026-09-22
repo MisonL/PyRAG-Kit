@@ -3,7 +3,7 @@ import inspect
 import math
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Generator, Iterator, Mapping
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 from urllib.parse import urlsplit
 
 import openai
@@ -597,17 +597,45 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     # 与显式 Facade 名（``create_response``）不同形。只看显式名会让动态路径
     # 拿到 capability=None 直接放行，正是 server_verified_protocols 门禁要堵的
     # 旁路。这里按路径分段识别资源树。
-    _RESPONSES_RESOURCE_SEGMENTS = frozenset({"responses", "input_items", "input_tokens"})
-    _FILES_RESOURCE_SEGMENTS = frozenset({"files", "uploads"})
+    # 资源树分段 → 能力名。必须与 ``_resource_capability_for_method`` 的显式
+    # 映射覆盖同一批能力：只覆盖 responses/files 会让
+    # ``resources.batches.create`` 这类写法拿到 capability=None 直接放行，
+    # 而显式名 ``create_batch`` 会被拦——同一能力因书写形式不同而区别对待，
+    # 正是本门禁要消灭的旁路。
+    #
+    # ``uploads`` 与 ``files`` 是两项独立能力（SDK 里也分属不同资源），
+    # 不能坍缩成同一个名字。
+    _RESOURCE_SEGMENTS_TO_CAPABILITY: ClassVar[Mapping[str, str]] = {
+        "responses": "responses",
+        "input_items": "responses",
+        "input_tokens": "responses",
+        "files": "files",
+        "uploads": "uploads",
+        "batches": "batches",
+        "vector_stores": "vector_stores",
+        "models": "models",
+        "moderation": "moderation",
+        "images": "images",
+        "audio": "audio",
+        "videos": "videos",
+        "conversations": "conversations",
+        "containers": "containers",
+        "fine_tuning": "fine_tuning",
+        "evals": "evals",
+        "skills": "skills",
+        "realtime": "realtime",
+        "webhooks": "webhooks",
+        "admin": "admin",
+        "content_provenance_checks": "content_provenance_checks",
+    }
 
     @classmethod
     def _resource_capability_for_path(cls, method_name: str) -> str | None:
         """从动态资源树路径推断能力名称。"""
-        segments = method_name.split(".")
-        if any(segment in cls._RESPONSES_RESOURCE_SEGMENTS for segment in segments):
-            return "responses"
-        if any(segment in cls._FILES_RESOURCE_SEGMENTS for segment in segments):
-            return "files"
+        for segment in method_name.split("."):
+            capability = cls._RESOURCE_SEGMENTS_TO_CAPABILITY.get(segment)
+            if capability is not None:
+                return capability
         return None
 
     def _require_provider_resource(

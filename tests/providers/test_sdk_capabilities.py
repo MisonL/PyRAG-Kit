@@ -21,7 +21,7 @@ from src.providers.google import GoogleProvider
 from src.providers.openai import OpenAIProvider
 from src.providers.openai_compatible import OpenAICompatibleProvider
 from src.providers.resources import AsyncGoogleResources, GoogleResources
-from src.providers.volcengine import VolcengineProvider
+from src.providers.volcengine import _ARK_BUILTIN_TOOL_ITEM_TYPES, VolcengineProvider
 from src.utils.config import ModelDetail
 from src.utils.security import (
     find_sensitive_option_paths,
@@ -6643,19 +6643,73 @@ def test_ark_dynamic_responses_create_allows_valid_request():
         },
         {"type": "mcp_call", "id": "c1", "name": "n", "arguments": "{}", "server_label": "s"},
         {"type": "mcp_list_tools", "id": "m1", "server_label": "s", "tools": []},
-        {"type": "reasoning", "id": "r1", "summary": []},
+        {"type": "agent_tool_call", "id": "a1", "name": "agent", "status": "completed"},
     ],
 )
 def test_ark_builtin_tool_items_are_not_treated_as_malformed(item):
     """内置工具（web_search_call、mcp_call 等）的调用项既无正文也不是
     function_call，但都是 SDK 输出项联合的正式成员，属正常中间态——没有工具
     调用就不可能有后续轮次。判为「结构不符」会让这类响应无法处理。
+
+    ``reasoning`` 不在豁免之列：它不是工具调用，本轮有摘要时走 ``reasoning``
+    字段放行；空摘要且无正文、无工具调用时确实什么都没有，报错才对。
     """
     response = _ark_response([item])
 
     result = VolcengineProvider._extract_result(response)
 
     assert result.text == ""
+
+
+def test_ark_empty_reasoning_item_is_not_a_silent_success():
+    """空摘要的 reasoning 项不构成有效响应。
+
+    把它列入豁免会让「completed 但什么都没有」静默返回空成功，掩盖失败
+    （项目规则禁止）。
+    """
+    response = _ark_response([{"type": "reasoning", "id": "r1", "summary": []}])
+
+    with pytest.raises(RuntimeError, match="未包含任何正文"):
+        VolcengineProvider._extract_result(response)
+
+
+def test_ark_builtin_item_whitelist_covers_sdk_union():
+    """白名单必须覆盖 SDK 输出项联合的全部成员（除已单独处理的）。
+
+    手工维护的清单会随 SDK 演进漏掉新成员，那类响应会突然无法处理——这正是
+    ``image_process``、``agent_tool_call`` 曾经的状态。这里对差集断言。
+    """
+    import typing
+
+    from volcenginesdkarkruntime.types.responses.response import ResponseOutputItem
+
+    def flatten(union, seen=None):
+        seen = seen or set()
+        found = []
+        for member in typing.get_args(union):
+            if member in seen:
+                continue
+            seen.add(member)
+            if typing.get_origin(member) is typing.Union:
+                found.extend(flatten(member, seen))
+            else:
+                found.append(member)
+        return found
+
+    union_types = set()
+    for member in flatten(ResponseOutputItem):
+        type_field = getattr(member, "model_fields", {}).get("type")
+        if type_field is None:
+            continue
+        literals = typing.get_args(type_field.annotation)
+        if literals:
+            union_types.add(literals[0])
+
+    # ``message`` 由正文提取处理，``function_call`` 归入 tool_calls，
+    # ``reasoning`` 有摘要时经 reasoning 字段放行。
+    handled = {"message", "function_call", "reasoning"}
+
+    assert union_types - handled - _ARK_BUILTIN_TOOL_ITEM_TYPES == set()
 
 
 def test_ark_empty_completed_response_still_fails_loudly():
@@ -7056,3 +7110,194 @@ def test_ark_responses_native_item_proxy_hides_implementation_slots():
         assert internal not in dir(proxy), internal
     # 隐藏的是自动补全，不是访问能力。
     assert proxy._value is provider._client.responses
+
+
+# ── 回归：资源代理不能经私有名转发到底层 SDK ──
+
+
+def test_native_resource_proxy_blocks_private_attribute_forwarding():
+    """``__slots__`` 封闭了自有 ``__dict__``，但 ``__getattr__`` 会把私有名
+    转发给底层 SDK 节点——``proxy.__dict__["_client"]`` 能拿到未包装的原始
+    客户端，绕开全部凭证扫描与能力门禁。出口应是文档化的 ``.native``。
+    """
+    import httpx
+    from volcenginesdkarkruntime import Ark
+
+    provider = object.__new__(VolcengineProvider)
+    provider._provider = "volcengine"
+    provider._model_name = "ark-model"
+    provider._protocol = "chat_completions"
+    provider._server_verified_protocols = frozenset()
+    provider._options = {}
+    object.__setattr__(
+        provider,
+        "_client",
+        Ark(
+            api_key="test-key",
+            base_url="https://ark.example.invalid/api/v3",
+            http_client=httpx.Client(
+                transport=httpx.MockTransport(
+                    lambda _request: httpx.Response(
+                        200, json={"id": "r", "status": "completed", "output": []}
+                    )
+                )
+            ),
+        ),
+    )
+
+    proxy = provider.resources.responses
+
+    for private in ("__dict__", "_client", "_post", "_get", "_delete"):
+        with pytest.raises(AttributeError):
+            getattr(proxy, private)
+    # 文档化的出口仍可用。
+    assert provider.resources.native is provider._client
+
+
+def test_native_resource_proxy_dir_lists_only_public_resource_names():
+    """``dir()`` 不能提示可直达原始 SDK 的私有通路。"""
+    provider = object.__new__(VolcengineProvider)
+    provider._provider = "volcengine"
+    provider._model_name = "ark-model"
+    provider._protocol = "responses"
+    provider._server_verified_protocols = frozenset()
+    provider._options = {}
+    object.__setattr__(
+        provider,
+        "_client",
+        SimpleNamespace(
+            responses=SimpleNamespace(create=lambda **_kwargs: "remote", retrieve=lambda **_k: "r")
+        ),
+    )
+
+    listed = dir(provider.resources.responses)
+
+    assert not [name for name in listed if name.startswith("_")], listed
+    assert "create" in listed
+
+
+# ── 回归：caching 取值的大小写与空白变体 ──
+
+
+@pytest.mark.parametrize(
+    "caching",
+    [
+        {"type": "enabled"},
+        {"type": "ENABLED"},
+        {"type": "Enabled"},
+        {"type": " enabled"},
+        {"type": "  ENABLED  "},
+    ],
+)
+def test_ark_responses_mutual_exclusion_normalizes_caching_type(caching):
+    """SDK 的 ``ResponseCaching.type`` 是类型注解、不做运行时校验，
+    ``"ENABLED"`` 会原样发到服务端。精确比较会让大小写变体绕过互斥检查。"""
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "ark-model"
+    provider._protocol = "responses"
+    provider._options = {"server_verified_protocols": ["responses"]}
+
+    with pytest.raises(ValueError, match="互斥"):
+        provider._build_responses_request(
+            CompletionRequest(prompt="hi", system_prompt="sys", caching=caching, stream=False)
+        )
+
+
+@pytest.mark.parametrize("caching", [{"type": "disabled"}, {"type": "DISABLED"}, {}])
+def test_ark_responses_mutual_exclusion_allows_non_enabled_caching(caching):
+    """未启用 caching 时 instructions 正常透传。"""
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "ark-model"
+    provider._protocol = "responses"
+    provider._options = {"server_verified_protocols": ["responses"]}
+
+    params = provider._build_responses_request(
+        CompletionRequest(prompt="hi", system_prompt="sys", caching=caching, stream=False)
+    )
+
+    assert params["instructions"] == "sys"
+
+
+# ── 回归：动态路径的参数校验不按动词白名单 ──
+
+
+def test_ark_dynamic_responses_validation_is_not_verb_based():
+    """按 ``{"create", "generate"}`` 判断会漏掉 ``async_create`` 这类 SDK
+    演进后新增的写法；应按参数里是否出现受校验字段判断。"""
+    resources, captured = _ark_provider_with_recording_client(
+        protocol="responses", verified=["responses"]
+    )
+    # 模拟 SDK 演进后新增的动词：按动词白名单判断会漏掉它。
+    resources.provider._client.responses.async_create = (  # type: ignore[attr-defined]
+        lambda **kwargs: captured.append(("responses.async_create", kwargs)) or "remote"
+    )
+
+    with pytest.raises(ValueError, match="互斥"):
+        resources.responses.async_create(
+            model="ark-model", input="x", instructions="sys", caching={"type": "enabled"}
+        )
+
+    assert captured == []
+
+
+# ── 回归：动态路径的能力映射要覆盖全部能力 ──
+
+
+@pytest.mark.parametrize(
+    ("path", "capability"),
+    [
+        ("deepseek.batches.create", "batches"),
+        ("deepseek.vector_stores.create", "vector_stores"),
+        ("deepseek.images.generate", "images"),
+        ("deepseek.containers.create", "containers"),
+        ("deepseek.audio.speech.create", "audio"),
+        ("deepseek.files.create", "files"),
+        # uploads 与 files 是两项独立能力，不能坍缩。
+        ("deepseek.uploads.create", "uploads"),
+    ],
+)
+def test_openai_compatible_dynamic_path_resolves_capability(path, capability):
+    """只覆盖 responses/files 会让其余动态路径拿到 ``None`` 直接放行，而显式
+    Facade 名会被拦——同一能力因书写形式不同而区别对待。"""
+    assert OpenAICompatibleProvider._resource_capability_for_path(path) == capability
+
+
+# ── 回归：顶层 Ark 专属字段与带 role 的 Ark 专属块 ──
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"image_pixel_limit": {"max_pixels": 1}},
+        {"type": "message", "role": "user", "content": "hi", "image_pixel_limit": {"m": 1}},
+        {"role": "user", "content": "hi", "image_pixel_limit": {"m": 1}},
+        {"role": "user", "content": "x", "type": "input_audio", "audio_url": "u"},
+        {"role": "system", "content": "x", "type": "input_video", "video_url": "u"},
+    ],
+)
+def test_openai_responses_rejects_ark_only_fields_in_every_position(message):
+    """Ark 专属字段与 ``type``/``content``/``role`` 都无关：写成内容块、原生
+    item 还是普通消息顶层，OpenAI 兼容渠道都不能发出。只查一条路径会留下旁路。
+    """
+    with pytest.raises(ValueError, match="不受|缺少"):
+        normalize_responses_input(None, None, [message], provider="openai")
+
+
+@pytest.mark.parametrize("bad_type", [["input_text"], {"a": 1}, 123])
+def test_responses_content_type_must_be_hashable_string(bad_type):
+    """``type`` 是任意 JSON 值，直接做集合查找会抛
+    ``TypeError: unhashable type``，把可诊断的类型错误变成崩溃。"""
+    with pytest.raises(ValueError, match="type 必须是非空字符串"):
+        normalize_responses_input(None, None, [{"type": bad_type, "text": "x"}], provider="openai")
+
+
+def test_ark_responses_accepts_ark_only_fields():
+    """补全校验后 Ark 渠道自身仍要放行。"""
+    converted = normalize_responses_input(
+        None,
+        None,
+        [{"type": "input_image", "image_url": "u", "image_pixel_limit": {"m": 1}}],
+        provider="ark",
+    )
+
+    assert converted[0]["image_pixel_limit"] == {"m": 1}

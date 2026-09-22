@@ -148,27 +148,81 @@ _TEXT_CREDENTIAL_KEYS = (
 )
 _TEXT_CREDENTIAL_KEY_PATTERN = "|".join(_TEXT_CREDENTIAL_KEYS)
 
-# 值的形态约束：凭证值要么被引号包裹，要么含数字或符号，要么足够长。
-# 缺了它，``auth: none``、``cookie: enabled``、``secret: false`` 这类普通文本
-# 会被判为凭证——而 find_sensitive_option_paths 用
-# ``redact_sensitive_text(value) != value`` 判断值里有没有凭证，于是合法配置
-# （例如 vector_stores.search(query="...") 的检索词、extra_body 里的提示词或
-# JSON schema）会在边界被误拒。
-_CREDENTIAL_VALUE_SHAPE = (
-    r"""(?:"[^"]*"|'[^']*'"""
-    r"""|(?=[A-Za-z0-9._~+/=-]*[0-9._~+/=-])[A-Za-z0-9._~+/=-]{2,}"""
-    r"""|[A-Za-z0-9._~+/=-]{12,})"""
+# 键名前的界断言。这里必须比 ``\b`` 宽、比「任意位置」窄：
+#
+# - 不要 ``(?<![A-Za-z0-9])``：``is_sensitive_option_key`` 按 camelCase 边界
+#   切词，``dbPassword``/``myApiKey``/``userToken`` 都判为敏感；要求键名前是
+#   非字母数字，这些键名会在日志里明文输出。
+# - 也不能完全不要断言：那样 ``oauth``、``topsecret``、``sessiontoken`` 会从
+#   词中间匹配到 ``auth``/``secret``/``token``，而配置边界判它们是**非敏感**
+#   （切词后是单个词，不命中）。因 find_sensitive_option_paths 用
+#   「值是否被改写」判断值里有没有凭证，这会误拒合法配置。
+#
+# 因此界断言取「非字母数字**或** camelCase 边界」：
+# ``dbPassword`` 的 ``Password`` 前是小写字母接大写，属驼峰边界，命中；
+# ``topsecret`` 里的 ``secret`` 前是小写字母接小写，不是边界，不命中——
+# 与 ``is_sensitive_option_key`` 的切词口径一致。
+#
+# 注意断言必须保持大小写敏感，因此 ``(?i)`` 不能写在最前面——否则
+# ``(?<=[a-z0-9])(?=[A-Z])`` 的 ``[A-Z]`` 会匹配任意大小写字母，``oauth``
+# 里的 ``auth``（前一个字符是 ``o``）会被当成驼峰边界。忽略大小写只作用于
+# 键名本身（``(?i:...)`` 局部开启）。
+_CREDENTIAL_KEY_HEAD = r"(?:(?<![A-Za-z0-9])|(?<=[a-z0-9])(?=[A-Z]))"
+#
+# 非凭证字面量：``auth: none``、``cookie: enabled``、``secret: false``、
+# ``token: 0`` 是文档与提示词里的常见写法，判为凭证会让合法配置在边界被误拒
+# （find_sensitive_option_paths 用「值是否被改写」判断值里有没有凭证）。
+#
+# 这里用**枚举字面量**而不是「值的长度/字符构成」来排除：形态启发式无法区分
+# ``password: FakePwOnly`` 与 ``auth: none``——两者都是 12 字符以下的纯字母值，
+# 加长度下限会把前者这类真凭证一并放过（净漏检），加字符类型要求同理。
+# 误判源是有限的几个状态字面量，枚举它们更精确。
+_NON_CREDENTIAL_VALUE = (
+    r"(?:none|true|false|null|nil|enabled|disabled|on|off|auto|yes|no"
+    # ``bearer`` 的值是 token 本身而不是状态，但 ``The bearer: standard``
+    # 这类描述里 ``standard`` 是普通词，与 ``auth: none`` 同属误判源。
+    r"|standard|required|optional|default|basic|empty|unset"
+    r"|\d+)"
 )
 
-_KEY_VALUE_TEXT_RE = re.compile(
-    # 不加「键名前必须是非字母数字」的前视断言：is_sensitive_option_key 按
-    # camelCase 边界切词，``myApiKey``/``dbPassword``/``userToken`` 都判为敏感；
-    # 若文本正则要求键名前是非字母数字，这些键名会在日志里明文输出，
-    # 正是本文件要消灭的那类「配置边界敏感、文本明文」不一致。
-    r"(?i)(" + _TEXT_CREDENTIAL_KEY_PATTERN + r")[\"']?"
-    r"""(\s*[:=]\s*|\s+(?=["']|"""
-    r"""(?=[A-Za-z0-9._~+/=-]{12,}(?:[\s,;}']|$))[A-Za-z0-9._~+/=-]*[0-9._~+/=-]))"""
-    + _CREDENTIAL_VALUE_SHAPE
+_ANY_VALUE_SHAPE = r"""(?:"[^"]*"|'[^']*'|[^\s,;}']+)"""
+
+_BARE_CREDENTIAL_KEYWORD_PATTERN = "|".join(
+    key for key in _TEXT_CREDENTIAL_KEYS if re.fullmatch(r"[a-z]+", key)
+)
+_QUALIFIED_CREDENTIAL_KEY_PATTERN = "|".join(
+    key for key in _TEXT_CREDENTIAL_KEYS if not re.fullmatch(r"[a-z]+", key)
+)
+
+
+def _key_value_pattern(keys: str, value_prefix: str = "") -> str:
+    """拼出 ``键名 = 值`` 的文本脱敏模式。
+
+    ``keys`` 里每个分支都是完整键名（可含 ``[_-]?``），配合
+    ``_CREDENTIAL_KEY_HEAD`` 的「非字母数字或 camelCase 边界」断言，既让
+    ``dbPassword``/``myApiKey`` 命中，又不把 ``topsecret``/``sessiontoken``
+    从词中间切开——与 ``is_sensitive_option_key`` 的切词口径一致。
+
+    ``value_prefix`` 插在取值之前，用于排除非凭证字面量。
+    """
+    return (
+        _CREDENTIAL_KEY_HEAD + r"((?i:" + keys + r"))[\"']?"
+        r"""(\s*[:=]\s*|\s+(?=["']|"""
+        r"""(?=[A-Za-z0-9._~+/=-]{12,}(?:[\s,;}']|$))[A-Za-z0-9._~+/=-]*[0-9._~+/=-]))"""
+        + value_prefix
+        + _ANY_VALUE_SHAPE
+    )
+
+
+# 显式凭证键名（``password``、``api_key``、``client_secret``…）的值就是凭证，
+# 任何取值都脱敏；裸关键词（``auth``/``cookie``/``secret``/``token``/``bearer``）
+# 额外排除非凭证字面量。
+_KEY_VALUE_TEXT_RE = re.compile(_key_value_pattern(_QUALIFIED_CREDENTIAL_KEY_PATTERN))
+_BARE_KEYWORD_TEXT_RE = re.compile(
+    _key_value_pattern(
+        _BARE_CREDENTIAL_KEYWORD_PATTERN,
+        r"(?!(?:" + _NON_CREDENTIAL_VALUE + r")(?![A-Za-z0-9._~+/=-]))",
+    )
 )
 _URL_USERINFO_RE = re.compile(r"(?i)(https?://)([^\s/@:]+):([^\s/@]+)@")
 _URL_QUERY_SECRET_RE = re.compile(
@@ -192,12 +246,43 @@ _MASKED_CREDENTIAL_RE = re.compile(
     # 掩码段可含 ``*``、``.``、``…`` 等占位字符，尾部可能还有可见片段，
     # 因此尾部字符类要覆盖字母数字，否则 ``sk-abc***...***xyz`` 只吃掉前半段。
     #
-    # 但尾部每消费一个字符都要确认它不是紧邻键名的开头：``sk-abc***token=<secret>``
-    # 里的 ``token`` 若被吞进掩码匹配，后面的 ``token=<secret>`` 就失去锚点，
-    # 值会从脱敏变成明文（净漏检）。断言在键名之前停下，让键值规则处理它。
-    r"(?i)(?<![A-Za-z0-9])(?:sk|rk|sess)-[A-Za-z0-9_.-]{2,}[*\u2026.]{2,}"
-    r"(?:[A-Za-z0-9_.*-](?![A-Za-z0-9_-]*\s*[:=]))*"
+    # 但尾部不能吞掉紧邻的键名：``sk-abc***token=<secret>`` 里的 ``token``
+    # 若被吞进掩码匹配，后面的 ``token=<secret>`` 就失去锚点，值会从脱敏变成
+    # 明文（净漏检）。
+    #
+    # 尾部用单字符类贪婪匹配（无前瞻、无回溯），裁剪交给替换函数
+    # ``_redact_masked_credential``：正则里加断言会让引擎在游程的每个起点
+    # 重复扫描剩余串，尾部无冒号时退化成 O(n²)——``"sk-abc***" + "deadbeef"*500``
+    # 从 0.01ms 涨到 11ms，4000 字符时 1.4 秒。而 redact_sensitive_text 挂在
+    # 每条日志的 formatter 上，一个回显掩码密钥前缀加长 token 的错误体就能
+    # 拖住进程。
+    r"(?i)(?<![A-Za-z0-9])(?:sk|rk|sess)-[A-Za-z0-9_.-]{2,}[*\u2026.]{2,}[A-Za-z0-9_.*-]*"
 )
+
+
+def _redact_masked_credential(match: re.Match[str]) -> str:
+    """替换掩码凭证，但把混进尾部的敏感键名留给键值规则处理。
+
+    ``sk-abc***token=<secret>`` 里的 ``token`` 若被掩码整体吃掉，后面的
+    ``=<secret>`` 就失去锚点，值会从脱敏变成明文（净漏检）。这里从尾部
+    游程中找出最长的敏感键名后缀并保留，让 ``_KEY_VALUE_TEXT_RE`` 接续
+    处理。
+
+    只保留**完整键名**（能通过 ``is_sensitive_option_key``）的后缀：掩码
+    尾部本身可能就是可见片段（``sk-abc***xyz``），不能整段留下。
+    """
+    text = match.group(0)
+    # 键名是尾部那段连续的键名字符（``*``/``.``/``…`` 等掩码占位符不在其中），
+    # 整段判断是否为敏感键：``token``/``myApiKey`` 命中并保留，
+    # ``defghijkl``/``xyz`` 这类可见片段不命中，随掩码一起吃掉。
+    # 不用「从某处截断取后缀」：``sk`` 本身就是火山凭证键名，从 ``s`` 起算会
+    # 把 ``sk-abc***`` 切碎。
+    trailing = re.search(r"[A-Za-z0-9_-]+$", text)
+    if trailing is not None and is_sensitive_option_key(trailing.group(0)):
+        return "[REDACTED]" + trailing.group(0)
+    return "[REDACTED]"
+
+
 _GOOGLE_API_KEY_RE = re.compile(r"(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{20,}(?![A-Za-z0-9])")
 
 
@@ -207,9 +292,10 @@ def redact_sensitive_text(value: Any) -> str:
         value = str(value)
     # 掩码形态必须最先处理：``_BEARER_TEXT_RE`` 会先吃掉 ``Bearer sk-abc``
     # 的可见前缀，使后续的 ``sk-`` 锚点失效，尾部掩码片段就会残留。
-    redacted = _MASKED_CREDENTIAL_RE.sub("[REDACTED]", value)
+    redacted = _MASKED_CREDENTIAL_RE.sub(_redact_masked_credential, value)
     redacted = _BEARER_TEXT_RE.sub("Bearer [REDACTED]", redacted)
     redacted = _KEY_VALUE_TEXT_RE.sub(r"\1=[REDACTED]", redacted)
+    redacted = _BARE_KEYWORD_TEXT_RE.sub(r"\1=[REDACTED]", redacted)
     redacted = _SHORT_CREDENTIAL_KEY_RE.sub(r"\1=[REDACTED]", redacted)
     redacted = _URL_USERINFO_RE.sub(r"\1[REDACTED]:[REDACTED]@", redacted)
     redacted = _URL_QUERY_SECRET_RE.sub(r"\1[REDACTED]", redacted)

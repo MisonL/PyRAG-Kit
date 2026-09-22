@@ -51,10 +51,16 @@ class _NativeResourceProxy:
     def __dir__(self) -> list[str]:
         """从自动补全中隐藏实现细节，避免被当成公共 API 使用。
 
-        ``__slots__`` 里的名字默认都会出现在 ``dir()`` 中，IDE 会把
-        ``_value`` 提示给用户；而它并不是出口（出口是 ``.native``）。
+        两处来源都要过滤：``__slots__`` 里的自有槽位，以及 ``__getattr__``
+        转发来的底层 SDK 节点属性（其中含 ``_client`` 这类可直达原始客户端的
+        通路）。出口是文档化的 ``.native``。
         """
-        return [name for name in super().__dir__() if name not in self.__slots__]
+        # ``super().__dir__()`` 对 ``__slots__`` 类只给出 dunder 与槽位名，
+        # 真实资源名要经 ``__getattr__`` 从底层节点取（并缓存进 ``_children``）。
+        names = {name for name in super().__dir__() if not name.startswith("_")}
+        names.update(name for name in self._children if not name.startswith("_"))
+        names.update(name for name in dir(self._value) if not name.startswith("_"))
+        return sorted(names)
 
     def __init__(self, value: Any, provider: Any, path: str):
         self._value = value
@@ -62,7 +68,16 @@ class _NativeResourceProxy:
         self._path = path
         self._children: dict[str, Any] = {}
 
+    # 底层 SDK 节点的私有名不能经代理转发。``_NativeResourceProxy`` 没有
+    # 自己的 ``__dict__``（``__slots__`` 已封闭），因此 ``__getattr__`` 会把
+    # 这些名字转发给 SDK 节点——``proxy.__dict__["_client"]`` 能拿到未包装的
+    # 原始客户端，绕开全部凭证扫描与能力门禁。``.native`` 是文档化的出口，
+    # 这里要堵的是「实现细节意外成为第二条出口」。
+    _BLOCKED_ATTRIBUTES = frozenset({"__dict__", "__class__", "__weakref__"})
+
     def __getattr__(self, name: str) -> Any:
+        if name in self._BLOCKED_ATTRIBUTES or name.startswith("_"):
+            raise AttributeError(f"{type(self).__name__} 不暴露 {name!r}。")
         if name in self._children:
             return self._children[name]
         value = getattr(self._value, name)

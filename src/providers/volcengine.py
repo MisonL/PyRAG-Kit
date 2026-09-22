@@ -58,7 +58,16 @@ def _load_ark_clients() -> tuple[type[Any], type[Any]]:
 
 # Responses 的 output 里，除 message 与 function_call 外还有内置工具的调用项。
 # 这些项既无正文也不是 function_call，但都是 SDK ``ResponseOutputItem`` 联合的
-# 正式成员，属正常中间态而非「结构不符」。
+# 正式成员，且都是「需要后续轮次」的中间态——调用方要读 output 里的工具调用
+# 才能继续，因此返回空正文是正确的。
+#
+# 不含 ``reasoning``：它不是工具调用，本轮有摘要时 ``reasoning`` 字段非空，
+# 前面 ``and not reasoning`` 已经放行；只有空摘要且无正文、无工具调用时才走到
+# 失败分支，那确实是什么都没有，报错才对。把 reasoning 列入豁免会让这种响应
+# 静默返回空成功，掩盖失败（项目规则禁止）。
+#
+# 白名单需与 SDK 联合成员保持同步，`test_ark_builtin_item_whitelist_covers_sdk_union`
+# 会对差集断言。
 _ARK_BUILTIN_TOOL_ITEM_TYPES = frozenset(
     {
         "web_search_call",
@@ -67,9 +76,8 @@ _ARK_BUILTIN_TOOL_ITEM_TYPES = frozenset(
         "mcp_approval_request",
         "knowledge_search_call",
         "doubao_app_call",
-        # reasoning 项在模型本轮无推理摘要时 ``summary`` 为空列表，但项本身
-        # 合法（SDK 已把它作为独立 item 类型返回）。
-        "reasoning",
+        "image_process",
+        "agent_tool_call",
     }
 )
 
@@ -637,6 +645,12 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
     # （``volcengine.input_items.list`` 打的是 ``/responses/{id}/input_items``），
     # 只看分段会把它们漏掉；但 ``files.create`` 这类同名无关调用必须放行，
     # 因此用精确集合而不是子串匹配。
+    # 这些字段出现即说明调用意图是「创建/发起 Responses 请求」，无论方法名
+    # 是什么。用字段而非动词判断，避免 SDK 新增入口时漏检。
+    _ARK_RESPONSES_VALIDATED_KWARGS = frozenset(
+        {"input", "instructions", "caching", "model", "tools", "extra_body"}
+    )
+
     _ARK_RESPONSES_SUBRESOURCES = frozenset(
         {
             "input_items",
@@ -666,7 +680,11 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             or any(segment in self._ARK_RESPONSES_SUBRESOURCES for segment in segments)
         ):
             self._require_responses_resource(method_name)
-            if kwargs and segments[-1] in {"create", "generate"}:
+            # 不按动词白名单判断（``{"create", "generate"}`` 会漏掉
+            # ``async_create`` 这类 SDK 演进后新增的写法）。凡是参数里出现
+            # 受校验字段就执行同一套校验——这正是「动态路径与 Facade 受同一
+            # 约束」的判据。
+            if kwargs and self._ARK_RESPONSES_VALIDATED_KWARGS.intersection(kwargs):
                 self._validate_native_response_kwargs(kwargs)
 
     def _require_responses_resource(self, operation: str) -> None:
@@ -1272,7 +1290,13 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         if isinstance(extra_body, Mapping):
             candidates.append(extra_body.get("caching"))
         for candidate in candidates:
-            if isinstance(candidate, Mapping) and candidate.get("type") == "enabled":
+            if not isinstance(candidate, Mapping):
+                continue
+            # SDK 的 ``ResponseCaching.type`` 是 ``Literal["disabled","enabled"]``，
+            # 但那是类型注解、不做运行时校验：``"ENABLED"`` / ``" enabled"`` 会
+            # 原样发到服务端。归一化后再比较，否则大小写与空白变体可绕过互斥检查。
+            candidate_type = candidate.get("type")
+            if isinstance(candidate_type, str) and candidate_type.strip().lower() == "enabled":
                 raise ValueError(
                     'Ark Responses 的 instructions 与 caching={"type": "enabled"} 互斥：'
                     "官方规定配置 instructions 后本轮请求无法写入或使用缓存，caching 为 "
