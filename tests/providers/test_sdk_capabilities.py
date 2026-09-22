@@ -11,6 +11,7 @@ from src.providers.__base__.model_provider import (
     CompletionRequest,
     LargeLanguageModel,
     TextEmbeddingModel,
+    _normalize_responses_native_item,
     normalize_chat_messages,
     normalize_messages,
     normalize_responses_input,
@@ -7369,6 +7370,21 @@ def test_openai_responses_rejects_ark_only_top_level_fields(message):
     不支持它的端点。"""
     with pytest.raises(ValueError, match="不受 OpenAI Responses SDK 支持"):
         normalize_responses_input(None, None, [message], provider="openai")
+
+
+@pytest.mark.parametrize("field", ["input_audio", "input_video", "audio_url", "video_url"])
+def test_normalize_native_item_rejects_ark_only_fields_on_its_own(field):
+    """助手函数要能独立拦住 Ark 专属顶层字段。
+
+    ``normalize_responses_input`` 在进入原生 item 分支前已查过一遍，因此这层
+    守卫对当前唯一调用点是冗余的——但没有测试能区分它的存在，等于死代码。
+    这里直接调用助手，把它锚定住：若有人删掉这层自校验，助手被单独复用时
+    就会静默放行 Ark 专属字段。
+    """
+    with pytest.raises(ValueError, match="不受 OpenAI Responses SDK 支持"):
+        _normalize_responses_native_item(
+            {"role": "user", "content": "hi", field: "x"}, "loc", "openai"
+        )
 
 
 # ── 回归：顶层 Ark 专属字段与带 role 的 Ark 专属块 ──

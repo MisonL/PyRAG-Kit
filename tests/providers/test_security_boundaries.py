@@ -398,14 +398,15 @@ def test_connection_only_keys_are_deliberately_excluded_from_text_redaction():
 @pytest.mark.parametrize(
     "value",
     [
-        # 值必须「短且纯字母」——那是本用例要覆盖的属性（此前长度/字符构成
-        # 约束会把这类值放过）。用明显合成的标记而非常见口令词：后者会触发
-        # 仓库的密钥扫描告警，把提交历史染上无法消除的误报。
+        # 值必须**真的短**（12 字符以下）且纯字母——那正是本用例要覆盖的属性。
+        # 取值 ≥12 字符时旧规则本就能命中，回退源码后测试仍绿，等于没测。
+        # 用明显合成的标记而非常见口令词：后者会触发仓库的密钥扫描告警，
+        # 把提交历史染上无法消除的误报。
         "password: FakePwOnly",
         "api_key: FakeKeyOnly",
-        "token: FakeTokenOnly",
-        "secret: FakeSecretOnly",
-        "client_secret: FakeSecretOnly",
+        "token: FakeTokOnly",
+        "secret: FakeSecOnly",
+        "client_secret: FakeSecOnly",
         "passwd: FakePwOnly",
         "credential: FakeCredOnly",
     ],
@@ -416,8 +417,13 @@ def test_security_redacts_short_alphabetic_credential_values(value):
     此前对全部键名统一加「≥12 字符或含数字/符号」的形态约束，使
     ``password: FakePwOnly`` 这类键值对整条漏检——那是比误判更严重的净漏检。
     形态约束只该用于排除误判源，不该收窄真凭证的取值域。
+
+    断言检查**值本身**被替换，而不是「文本被改写过」：后者会被键名之外的
+    任何一处改写满足，回退被测机制后仍能通过。
     """
-    assert redact_sensitive_text(value) != value
+    key, _, secret = value.partition(": ")
+    assert secret not in redact_sensitive_text(value), value
+    assert redact_sensitive_text(value) == f"{key}=[REDACTED]", value
 
 
 @pytest.mark.parametrize(
@@ -437,6 +443,15 @@ def test_security_does_not_flag_ordinary_identifiers_ending_in_credential_words(
 # ── 回归：掩码规则的性能与尾部裁剪 ──
 
 
+def _time_redaction(text: str) -> float:
+    """返回一次脱敏的墙钟耗时（秒）。"""
+    import time
+
+    start = time.perf_counter()
+    redact_sensitive_text(text)
+    return time.perf_counter() - start
+
+
 def test_security_masked_rule_stays_linear_on_long_trailing_runs():
     """掩码尾部不能引入二次回溯。
 
@@ -444,21 +459,31 @@ def test_security_masked_rule_stays_linear_on_long_trailing_runs():
     前缀、后面跟长 token 的错误体就能拖住进程。逐字符前瞻的写法在尾部无冒号
     时退化成 O(n²)。
     """
-    import time
 
     # 尾随一个掩码占位符 ``.`` 是必需的：正则尾部字符类含 ``.``，游程因此
     # 一直延伸到串尾；替换函数若用无锚点的 ``re.search(r"[A-Za-z0-9_-]+$")``
     # 找后缀，引擎会在每个起点重试 ``+$``，退化成 O(n²)。少了这个尾随字符
     # 时游程恰好在串尾结束，二次实现也能通过，测试形同虚设。
+    #
+    # 两个维度都要拿捏：
+    #
+    # 1) 规模要足够大，让线性与二次的差距是**数量级**而非倍数。32000 字符
+    #    时线性约 8ms、二次约 9.6 秒，相差三个数量级；阈值取 0.5 秒，向上
+    #    离线性 60 倍、向下离二次 19 倍，两侧都不会被抖动穿透。此前用 4000
+    #    字符配 20ms 阈值，实测二次实现 5 轮里有 1 轮跑进阈值而误判通过。
+    #
+    # 2) 取多轮最小值而不是单次采样：单次墙钟受 GC 与调度影响，实测本机
+    #    p99.9 就到 100ms，单样本会撞上尾部事件误报。
+    #
+    # 尾随的 ``.`` 是必需的一维：它不在正则尾部字符类里，游程因此够不到
+    # ``$``，二次实现必然退化；无尾随字符时游程恰好延伸到串尾，二次实现
+    # 也能通过，那一维只用来守住常见形态、不承担区分职责。
     for suffix in ("", "."):
-        text = "sk-abc***" + "deadbeef" * 500 + suffix
+        text = "sk-abc***" + "deadbeef" * 4000 + suffix
 
-        start = time.perf_counter()
-        redact_sensitive_text(text)
-        elapsed = time.perf_counter() - start
+        best = min(_time_redaction(text) for _ in range(3))
 
-        # 线性实现约 0.3ms；二次实现约 90ms。留足余量避免 CI 抖动误报。
-        assert elapsed < 0.05, f"耗时 {elapsed * 1000:.1f}ms，疑似二次回溯（suffix={suffix!r}）"
+        assert best < 0.5, f"最快一轮耗时 {best * 1000:.1f}ms，疑似二次回溯（suffix={suffix!r}）"
 
 
 def test_security_masked_rule_keeps_adjacent_key_name_for_key_value_rule():
@@ -511,12 +536,21 @@ def test_security_redacts_acronym_prefixed_camel_case_keys(key):
 
 
 @pytest.mark.parametrize(
-    "text",
-    ["sk-abc***defghijkl: boom", "sess-abc***tail: unauthorized", "sk-abc***xyz: boom"],
+    ("text", "expected"),
+    [
+        ("sk-abc***defghijkl: boom", "[REDACTED]: boom"),
+        ("sess-abc***tail: unauthorized", "[REDACTED]: unauthorized"),
+        ("sk-abc***xyz: boom", "[REDACTED]: boom"),
+    ],
 )
-def test_security_masked_rule_consumes_visible_trailing_fragment(text):
-    """尾部可见片段不是键名时，应随掩码一起吃掉，不能留在 ``[REDACTED]`` 之后。"""
-    assert redact_sensitive_text(text).startswith("[REDACTED]")
+def test_security_masked_rule_consumes_visible_trailing_fragment(text, expected):
+    """尾部可见片段不是键名时，应随掩码一起吃掉，不能留在 ``[REDACTED]`` 之后。
+
+    断言用全文相等而不是 ``startswith("[REDACTED]")``：掩码前缀总会被替换成
+    ``[REDACTED]``，前缀断言在任何实现下都成立——包括尾部片段原样泄漏的实现，
+    等于没测。
+    """
+    assert redact_sensitive_text(text) == expected
 
 
 def test_security_bearer_rule_redacts_alphabetic_token_adjacent_to_cjk():
