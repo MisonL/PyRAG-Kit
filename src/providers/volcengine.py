@@ -647,8 +647,17 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
     # 因此用精确集合而不是子串匹配。
     # 这些字段出现即说明调用意图是「创建/发起 Responses 请求」，无论方法名
     # 是什么。用字段而非动词判断，避免 SDK 新增入口时漏检。
+    # 触发参数校验的字段。``extra_body`` 不在此列：它是 retrieve/delete/list
+    # 等非创建调用的**合法**参数（见 ``_ARK_RESPONSES_RETRIEVE_KEYS``），
+    # 出现在这些调用里不代表要执行创建校验。放进触发集会让
+    # ``resources.responses.retrieve("r1", extra_body={...})`` 被要求提供
+    # ``model`` 与 ``input``，而同样的调用走 Facade 是通过的——动态路径与
+    # Facade 的新不对称（方向相反：动态路径过严）。
+    #
+    # ``input``/``model`` 作为触发器是安全的：``create`` 二者皆必填，任何
+    # 带它们的调用本就该走创建校验，无法被规避。
     _ARK_RESPONSES_VALIDATED_KWARGS = frozenset(
-        {"input", "instructions", "caching", "model", "tools", "extra_body"}
+        {"input", "instructions", "caching", "model", "tools"}
     )
 
     _ARK_RESPONSES_SUBRESOURCES = frozenset(

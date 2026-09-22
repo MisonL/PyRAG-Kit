@@ -605,6 +605,12 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     #
     # ``uploads`` 与 ``files`` 是两项独立能力（SDK 里也分属不同资源），
     # 不能坍缩成同一个名字。
+    #
+    # 这里的键必须落在官方声明集 ``_OFFICIAL_OPENAI_RESOURCE_CAPABILITIES``
+    # 内：段映射一旦给出声明集之外的能力名，官方端点会从「放行」变成
+    # ``NotImplementedError``——而 ``OpenAIProvider.capabilities`` 里那些
+    # 资源（skills/realtime/webhooks/admin/content_provenance_checks）是
+    # 声明为可用的，用户看到可用、调用却被拦。
     _RESOURCE_SEGMENTS_TO_CAPABILITY: ClassVar[Mapping[str, str]] = {
         "responses": "responses",
         "input_items": "responses",
@@ -614,7 +620,11 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         "batches": "batches",
         "vector_stores": "vector_stores",
         "models": "models",
-        "moderation": "moderation",
+        # SDK 客户端的属性是复数 ``moderations``（``client.moderations``），
+        # 而显式 Facade 名 ``create_moderation`` 解析出的能力名是单数。两个
+        # 拼写都要映射到同一能力，否则 ``resources.moderations.create`` 拿到
+        # capability=None 直接放行，而 ``create_moderation`` 会被拦。
+        "moderations": "moderation",
         "images": "images",
         "audio": "audio",
         "videos": "videos",
@@ -622,11 +632,6 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         "containers": "containers",
         "fine_tuning": "fine_tuning",
         "evals": "evals",
-        "skills": "skills",
-        "realtime": "realtime",
-        "webhooks": "webhooks",
-        "admin": "admin",
-        "content_provenance_checks": "content_provenance_checks",
     }
 
     @classmethod

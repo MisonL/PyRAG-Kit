@@ -3,6 +3,7 @@
 import pytest
 
 from src.utils.security import (
+    find_sensitive_option_paths,
     is_sensitive_option_key,
     redact_sensitive_text,
     validate_secret_free_options,
@@ -445,14 +446,19 @@ def test_security_masked_rule_stays_linear_on_long_trailing_runs():
     """
     import time
 
-    text = "sk-abc***" + "deadbeef" * 500
+    # 尾随一个掩码占位符 ``.`` 是必需的：正则尾部字符类含 ``.``，游程因此
+    # 一直延伸到串尾；替换函数若用无锚点的 ``re.search(r"[A-Za-z0-9_-]+$")``
+    # 找后缀，引擎会在每个起点重试 ``+$``，退化成 O(n²)。少了这个尾随字符
+    # 时游程恰好在串尾结束，二次实现也能通过，测试形同虚设。
+    for suffix in ("", "."):
+        text = "sk-abc***" + "deadbeef" * 500 + suffix
 
-    start = time.perf_counter()
-    redact_sensitive_text(text)
-    elapsed = time.perf_counter() - start
+        start = time.perf_counter()
+        redact_sensitive_text(text)
+        elapsed = time.perf_counter() - start
 
-    # 线性实现约 0.1ms；二次实现约 500ms。留足余量避免 CI 抖动误报。
-    assert elapsed < 0.1, f"耗时 {elapsed * 1000:.1f}ms，疑似二次回溯"
+        # 线性实现约 0.3ms；二次实现约 90ms。留足余量避免 CI 抖动误报。
+        assert elapsed < 0.05, f"耗时 {elapsed * 1000:.1f}ms，疑似二次回溯（suffix={suffix!r}）"
 
 
 def test_security_masked_rule_keeps_adjacent_key_name_for_key_value_rule():
@@ -462,6 +468,46 @@ def test_security_masked_rule_keeps_adjacent_key_name_for_key_value_rule():
 
     assert secret not in redacted
     assert redacted == "[REDACTED]token=[REDACTED]"
+
+
+def test_security_masked_rule_keeps_non_sensitive_key_name_before_equals():
+    """掩码尾部游程后紧跟 ``=`` 时，它就是键值对的键名，必须保留。
+
+    尾部字符类不含 ``=``，匹配正好停在分隔符前；若把游程整段吃掉，
+    ``=<值>`` 会失去锚点，后续键值规则再也匹配不到，值从脱敏变明文。
+    即使键名本身不是敏感键（``xxxtoken``），掩码前缀也说明它是凭证的
+    可见尾部，后面的值必须一并脱敏。
+    """
+    secret = "FakeSecretValue9876"
+    for key in ("xxxtoken", "oauth", "topsecret", "xyz"):
+        redacted = redact_sensitive_text(f"sk-abc***{key}={secret}")
+        assert secret not in redacted, key
+        assert redacted == f"[REDACTED]{key}=[REDACTED]", key
+
+
+@pytest.mark.parametrize("literal", ["None", "NONE", "Null", "False", "Enabled", "TRUE"])
+def test_security_non_credential_literals_are_case_insensitive(literal):
+    """非凭证字面量枚举要大小写不敏感，否则 ``auth: None`` 会被判成凭证。
+
+    ``find_sensitive_option_paths`` 用「值是否被改写」判断值里有没有凭证，
+    枚举漏掉大写变体就会让合法配置在边界被拒。
+    """
+    assert find_sensitive_option_paths({"prompt": f"auth: {literal}"}) == []
+
+
+@pytest.mark.parametrize("key", ["HTTPBearer", "HTTPSSecret", "HTTPToken"])
+def test_security_redacts_acronym_prefixed_camel_case_keys(key):
+    """``is_sensitive_option_key`` 的切词有「大写串接小写词」这条分支。
+
+    文本侧的界断言此前只实现了前两条（非字母数字、小写接大写），
+    ``HTTPBearer`` 在配置边界判敏感、在文本里却明文输出——正是本文件
+    要消灭的那类不一致。
+    """
+    secret = "FakeSecretValue9876"
+    redacted = redact_sensitive_text(f"{key}: {secret}")
+
+    assert secret not in redacted
+    assert is_sensitive_option_key(key) is True
 
 
 @pytest.mark.parametrize(

@@ -553,10 +553,16 @@ def _reject_unsupported_responses_top_level_fields(
     """拒绝 OpenAI 兼容渠道发出 Ark 专属的顶层字段。
 
     这类字段与 item 类型无关：无论写成内容块、原生 item 还是普通消息的顶层
-    字段，OpenAI Responses 都不接受。只检查内容块路径会留下旁路。
+    字段，OpenAI Responses 都不接受。只检查内容块路径会留下旁路——
+    ``{"role": "user", "content": "hi", "input_audio": {...}}`` 带一个无关的
+    ``content`` 键就绕开了 ``_normalize_responses_native_item`` 的类型分流，
+    请求体里原样带上 Ark 专属块发给不支持它的端点。
     """
     if _responses_provider_variant(provider) == "ark":
         return
+    unsupported = sorted(_ARK_ONLY_RESPONSES_ITEM_TYPES.intersection(item))
+    if unsupported:
+        raise ValueError(f"{location}.{unsupported[0]} 不受 OpenAI Responses SDK 支持。")
     if "image_pixel_limit" in item:
         raise ValueError(f"{location}.image_pixel_limit 不受 OpenAI Responses SDK 支持。")
 

@@ -403,9 +403,20 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         """把实验性资源的版本差异转换成明确的能力错误。"""
         name = method_name.removeprefix("async_")
         resource_name: str | None = None
+        # 显式 Facade 名（``create_interaction``）与动态资源树路径
+        # （``google.interactions.create``）形状不同：前者把资源名嵌在方法名里，
+        # 后者是点分路径，资源名是一个独立分段。只按 ``startswith``/``_singular``
+        # 匹配会让所有动态路径都落到 ``None`` 直接放行——用户拿一个不含该资源的
+        # 客户端走 ``resources.interactions`` 就能绕开这道门禁。
+        segments = name.split(".")
         for candidate in self._EXPERIMENTAL_RESOURCE_LABELS:
             singular = candidate.removesuffix("s")
-            if name.startswith(singular) or f"_{singular}" in name:
+            if (
+                name.startswith(singular)
+                or f"_{singular}" in name
+                or candidate in segments
+                or singular in segments
+            ):
                 resource_name = candidate
                 break
         if resource_name is None:

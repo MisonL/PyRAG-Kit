@@ -167,7 +167,7 @@ _TEXT_CREDENTIAL_KEY_PATTERN = "|".join(_TEXT_CREDENTIAL_KEYS)
 # ``(?<=[a-z0-9])(?=[A-Z])`` 的 ``[A-Z]`` 会匹配任意大小写字母，``oauth``
 # 里的 ``auth``（前一个字符是 ``o``）会被当成驼峰边界。忽略大小写只作用于
 # 键名本身（``(?i:...)`` 局部开启）。
-_CREDENTIAL_KEY_HEAD = r"(?:(?<![A-Za-z0-9])|(?<=[a-z0-9])(?=[A-Z]))"
+_CREDENTIAL_KEY_HEAD = r"(?:(?<![A-Za-z0-9])|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z]))"
 #
 # 非凭证字面量：``auth: none``、``cookie: enabled``、``secret: false``、
 # ``token: 0`` 是文档与提示词里的常见写法，判为凭证会让合法配置在边界被误拒
@@ -221,7 +221,7 @@ _KEY_VALUE_TEXT_RE = re.compile(_key_value_pattern(_QUALIFIED_CREDENTIAL_KEY_PAT
 _BARE_KEYWORD_TEXT_RE = re.compile(
     _key_value_pattern(
         _BARE_CREDENTIAL_KEYWORD_PATTERN,
-        r"(?!(?:" + _NON_CREDENTIAL_VALUE + r")(?![A-Za-z0-9._~+/=-]))",
+        r"(?!(?i:" + _NON_CREDENTIAL_VALUE + r")(?![A-Za-z0-9._~+/=-]))",
     )
 )
 _URL_USERINFO_RE = re.compile(r"(?i)(https?://)([^\s/@:]+):([^\s/@]+)@")
@@ -256,30 +256,44 @@ _MASKED_CREDENTIAL_RE = re.compile(
     # 从 0.01ms 涨到 11ms，4000 字符时 1.4 秒。而 redact_sensitive_text 挂在
     # 每条日志的 formatter 上，一个回显掩码密钥前缀加长 token 的错误体就能
     # 拖住进程。
-    r"(?i)(?<![A-Za-z0-9])(?:sk|rk|sess)-[A-Za-z0-9_.-]{2,}[*\u2026.]{2,}[A-Za-z0-9_.*-]*"
+    r"(?i)(?<![A-Za-z0-9])(?:sk|rk|sess)-[A-Za-z0-9_.-]{2,}[*\u2026.]{2,}"
+    r"([A-Za-z0-9_.*-]*)"
+    # 尾部游程后紧跟 ``=`` 时它是键值对的键名：``sk-abc***xxxtoken=<secret>``。
+    # 键名本身可能不是敏感键（``xxxtoken`` 按 camelCase 切词判非敏感），
+    # 键值规则不会接手，值就会明文落进日志。这里把键值尾部一并纳入匹配，
+    # 由替换函数决定如何脱敏——掩码前缀已表明它是凭证的可见尾部。
+    # 尾随可选组不引入回溯：``=`` 不在前一个字符类里，引擎无需回退。
+    r"(?:(=)" + _ANY_VALUE_SHAPE + r")?"
 )
 
 
 def _redact_masked_credential(match: re.Match[str]) -> str:
-    """替换掩码凭证，但把混进尾部的敏感键名留给键值规则处理。
+    """替换掩码凭证，并处理混进尾部的键名与值。
 
-    ``sk-abc***token=<secret>`` 里的 ``token`` 若被掩码整体吃掉，后面的
-    ``=<secret>`` 就失去锚点，值会从脱敏变成明文（净漏检）。这里从尾部
-    游程中找出最长的敏感键名后缀并保留，让 ``_KEY_VALUE_TEXT_RE`` 接续
-    处理。
+    尾部游程后跟 ``=`` 时（``sk-abc***xxxtoken=<secret>``），游程是键值对的
+    键名、后面是它的值；键名可能不是敏感键，键值规则不会接手，因此这里把
+    值一并脱敏，只保留键名作为可读上下文。
 
-    只保留**完整键名**（能通过 ``is_sensitive_option_key``）的后缀：掩码
-    尾部本身可能就是可见片段（``sk-abc***xyz``），不能整段留下。
+    没有分隔符时，游程可能是凭证的可见片段（``sk-abc***xyz``），不能整段
+    留下；但敏感键名（``token``/``myApiKey``）要保留，让
+    ``_KEY_VALUE_TEXT_RE`` 接续处理 ``sk-abc***token: <secret>`` 这类写法。
     """
-    text = match.group(0)
-    # 键名是尾部那段连续的键名字符（``*``/``.``/``…`` 等掩码占位符不在其中），
-    # 整段判断是否为敏感键：``token``/``myApiKey`` 命中并保留，
+    # 键名游程由正则的 ``([A-Za-z0-9_.*-]*)`` 捕获（``*``/``.``/``…`` 等掩码
+    # 占位符不在其中），整段判断是否为敏感键：``token``/``myApiKey`` 命中并保留，
     # ``defghijkl``/``xyz`` 这类可见片段不命中，随掩码一起吃掉。
     # 不用「从某处截断取后缀」：``sk`` 本身就是火山凭证键名，从 ``s`` 起算会
     # 把 ``sk-abc***`` 切碎。
-    trailing = re.search(r"[A-Za-z0-9_-]+$", text)
-    if trailing is not None and is_sensitive_option_key(trailing.group(0)):
-        return "[REDACTED]" + trailing.group(0)
+    run = match.group(1)
+    # 键值尾部：游程是键名，后面的值同样属于凭证的可见尾部，一并脱敏。
+    # 这里不能只保留键名交给 ``_KEY_VALUE_TEXT_RE``——键名可能不是敏感键
+    # （``xxxtoken``/``oauth``），那条规则不会接手，值就明文落进日志。
+    if match.group(2) is not None:
+        return "[REDACTED]" + run + "=[REDACTED]"
+    # 没有分隔符时游程可能是凭证的可见片段（``sk-abc***xyz``），不能整段留下；
+    # 但敏感键名（``token``/``myApiKey``）要保留，让键值规则接续处理
+    # ``sk-abc***token: <secret>`` 这类冒号分隔的写法。
+    if run and is_sensitive_option_key(run):
+        return "[REDACTED]" + run
     return "[REDACTED]"
 
 

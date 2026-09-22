@@ -7262,6 +7262,115 @@ def test_openai_compatible_dynamic_path_resolves_capability(path, capability):
     assert OpenAICompatibleProvider._resource_capability_for_path(path) == capability
 
 
+def test_openai_compatible_dynamic_path_moderations_matches_explicit_name():
+    """SDK 客户端的属性是复数 ``moderations``，而显式 Facade 名
+    ``create_moderation`` 解析出的能力名是单数。段映射只写单数时
+    ``resources.moderations.create`` 拿到 ``None`` 直接放行，同一能力因
+    书写形式不同而区别对待。
+    """
+    assert OpenAICompatibleProvider._resource_capability_for_path(
+        "deepseek.moderations.create"
+    ) == ("moderation")
+    assert OpenAICompatibleProvider._resource_capability_for_method("create_moderation") == (
+        "moderation"
+    )
+
+
+def test_openai_compatible_segment_map_stays_within_declared_capabilities():
+    """段映射给出声明集之外的能力名，会把官方端点从「放行」变成
+    ``NotImplementedError``——而 ``OpenAIProvider.capabilities`` 里那些资源
+    （skills/realtime/webhooks/admin/content_provenance_checks）声明为可用，
+    用户看到可用、调用却被拦。
+    """
+    declared = OpenAICompatibleProvider._OFFICIAL_OPENAI_RESOURCE_CAPABILITIES
+    # ``responses`` 走 ``_require_responses_resource`` 专用分支，不受声明集约束。
+    extra = set(OpenAICompatibleProvider._RESOURCE_SEGMENTS_TO_CAPABILITY.values()) - set(declared)
+    assert extra == {"responses"}, extra
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "openai.skills.list",
+        "openai.realtime.client_secrets.create",
+        "openai.webhooks.list",
+        "openai.admin.api_keys.list",
+        "openai.content_provenance_checks.create",
+    ],
+)
+def test_official_openai_declared_resources_are_not_blocked_by_dynamic_path(path):
+    """``capabilities`` 声明这些资源可用，动态路径就不能拦下它们。"""
+    provider = object.__new__(OpenAIProvider)
+    provider._provider = "openai"
+    provider._require_provider_resource(path)
+
+
+def test_ark_dynamic_retrieve_with_extra_body_is_not_treated_as_create():
+    """``extra_body`` 是 retrieve/delete/list 的合法参数，不该触发创建校验。
+
+    把它放进触发集会让 ``resources.responses.retrieve("r1", extra_body={...})``
+    被要求提供 ``model`` 与 ``input``，而同样的调用走 Facade 是通过的——
+    动态路径与 Facade 的新不对称。
+    """
+    provider = object.__new__(VolcengineProvider)
+    provider._protocol = "responses"
+    provider._server_verified_protocols = ("responses",)
+
+    provider._require_provider_resource("volcengine.responses.retrieve", {"extra_body": {"a": 1}})
+    provider._require_provider_resource("volcengine.responses.delete", {"extra_body": {"a": 1}})
+
+
+def test_ark_dynamic_create_still_rejects_conflicting_instructions_and_caching():
+    """去掉 ``extra_body`` 触发器不能削弱创建路径的互斥校验。"""
+    provider = object.__new__(VolcengineProvider)
+    provider._protocol = "responses"
+    provider._server_verified_protocols = ("responses",)
+
+    with pytest.raises(ValueError, match="instructions"):
+        provider._require_provider_resource(
+            "volcengine.responses.create",
+            {"model": "m", "input": "x", "instructions": "sys", "caching": {"type": "ENABLED"}},
+        )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "google.interactions.create",
+        "google.agents.list",
+        "google.webhooks.create",
+        "google.environments.get",
+        "google.triggers.list",
+    ],
+)
+def test_google_dynamic_experimental_paths_are_gated(path):
+    """动态路径是点分形式，资源名是独立分段；只按 ``startswith``/``_singular``
+    匹配会让所有动态路径落到 ``None`` 直接放行——用户拿一个不含该资源的客户端
+    走 ``resources.interactions`` 就能绕开这道门禁。
+    """
+    provider = object.__new__(GoogleProvider)
+    provider._get_client = lambda: SimpleNamespace()
+
+    with pytest.raises(NotImplementedError, match="(?i)资源"):
+        provider._require_provider_resource(path)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"role": "user", "content": "hi", "input_audio": {"data": "x"}},
+        {"role": "user", "content": "hi", "input_video": {"data": "x"}},
+        {"role": "user", "content": "hi", "audio_url": "u"},
+        {"role": "user", "content": "hi", "video_url": "u"},
+    ],
+)
+def test_openai_responses_rejects_ark_only_top_level_fields(message):
+    """带一个无关的 ``content`` 键就绕开了类型分流，Ark 专属块原样发给
+    不支持它的端点。"""
+    with pytest.raises(ValueError, match="不受 OpenAI Responses SDK 支持"):
+        normalize_responses_input(None, None, [message], provider="openai")
+
+
 # ── 回归：顶层 Ark 专属字段与带 role 的 Ark 专属块 ──
 
 
