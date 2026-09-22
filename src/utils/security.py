@@ -195,45 +195,72 @@ _QUALIFIED_CREDENTIAL_KEY_PATTERN = "|".join(
 )
 
 
-def _key_value_pattern(keys: str, value_prefix: str = "") -> str:
-    """拼出 ``键名 = 值`` 的文本脱敏模式。
-
-    ``keys`` 里每个分支都是完整键名（可含 ``[_-]?``），配合
-    ``_CREDENTIAL_KEY_HEAD`` 的「非字母数字或 camelCase 边界」断言，既让
-    ``dbPassword``/``myApiKey`` 命中，又不把 ``topsecret``/``sessiontoken``
-    从词中间切开——与 ``is_sensitive_option_key`` 的切词口径一致。
-
-    ``value_prefix`` 插在取值之前，用于排除非凭证字面量。
-    """
-    return (
-        _CREDENTIAL_KEY_HEAD + r"((?i:" + keys + r"))[\"']?"
-        r"""(\s*[:=]\s*|\s+(?=["']|"""
-        r"""(?=[A-Za-z0-9._~+/=-]{12,}(?:[\s,;}']|$))[A-Za-z0-9._~+/=-]*[0-9._~+/=-]))"""
-        + value_prefix
-        + _ANY_VALUE_SHAPE
-    )
-
-
-# 显式凭证键名（``password``、``api_key``、``client_secret``…）的值就是凭证，
-# 任何取值都脱敏；裸关键词（``auth``/``cookie``/``secret``/``token``/``bearer``）
-# 额外排除非凭证字面量。
-_KEY_VALUE_TEXT_RE = re.compile(_key_value_pattern(_QUALIFIED_CREDENTIAL_KEY_PATTERN))
-_BARE_KEYWORD_TEXT_RE = re.compile(
-    _key_value_pattern(
-        _BARE_CREDENTIAL_KEYWORD_PATTERN,
-        r"(?!(?i:" + _NON_CREDENTIAL_VALUE + r")(?![A-Za-z0-9._~+/=-]))",
-    )
+# 键名候选：以凭证词开头、后接任意标识符字符。用「宽泛捕获 + 回调判定」
+# 而不是把每个完整键名写进正则：``passwordHash``/``tokenCount`` 这类
+# 「凭证词 + 另一个词」的键，在配置边界按切词判为敏感，正则里却列不全。
+# 候选只负责圈出可能的键名，是否敏感由 ``_is_credential_key`` 决定——与配置
+# 边界同一个函数，一致性由构造保证。
+#
+# 前缀 ``_CREDENTIAL_KEY_HEAD`` 保持大小写敏感：``topsecret``/``oauth`` 里的
+# ``secret``/``auth`` 前面是小写字母接小写，不是驼峰边界，不会从词中间切开。
+_CREDENTIAL_KEY_CANDIDATE = r"(?i:(?:" + "|".join(_TEXT_CREDENTIAL_KEYS) + r")[A-Za-z0-9_\-]*)"
+_CREDENTIAL_KEY_VALUE_RE = re.compile(
+    _CREDENTIAL_KEY_HEAD
+    # 尾随引号单独成组，替换时原样保留：``{"password": "x"}`` 里若把 ``"``
+    # 一起吃掉，会输出 ``{"password: [REDACTED]}`` 破坏 JSON 结构。
+    + r"("
+    + _CREDENTIAL_KEY_CANDIDATE
+    + r")([\"']?)"
+    + r"""(\s*[:=]\s*|\s+(?=["']|"""
+    r"""(?=[A-Za-z0-9._~+/=-]{12,}(?:[\s,;}']|$))[A-Za-z0-9._~+/=-]*[0-9._~+/=-]))"""
+    + r"("
+    + _ANY_VALUE_SHAPE
+    + r")"
 )
+
+# 裸关键词：值可能只是状态字面量（``auth: none``/``password: none``），
+# 需要形态约束。从 ``_TEXT_CREDENTIAL_KEYS`` 派生而不是手写，否则词表扩充
+# 时两处会失步——此前手写漏掉 ``password``/``credential`` 等五个，使
+# ``password: none`` 从「不脱敏」变成「脱敏」。
+_BARE_KEYWORD_KEYS = frozenset(key for key in _TEXT_CREDENTIAL_KEYS if re.fullmatch(r"[a-z]+", key))
+
+
+def _redact_credential_pair(match: re.Match[str]) -> str:
+    """键名判定为凭证时替换其值，否则原样返回。
+
+    键名交给 ``_is_credential_key`` 判定，与配置边界用的是同一个函数。
+    此前文本层用正则的字符断言去逼近切词逻辑，``passwordHash``/``tokenCount``
+    这类键在配置边界判敏感、在文本里却明文输出（而它们的合法配置值又会被
+    边界误拒），两个方向都不一致。
+    """
+    key, quote = match.group(1), match.group(2)
+    if not _is_credential_key(key):
+        return match.group(0)
+    value = match.group(4).strip("\"'")
+    # 裸关键词后接状态字面量时是普通文本（``auth: none``），不是凭证赋值。
+    # 显式凭证键名（``password``/``api_key``…）的值一律脱敏。
+    if normalize_option_key(key) in _BARE_KEYWORD_KEYS and re.fullmatch(
+        _NON_CREDENTIAL_VALUE, value, re.IGNORECASE
+    ):
+        return match.group(0)
+    return f"{key}{quote}{match.group(3)}[REDACTED]"
+
+
 _URL_USERINFO_RE = re.compile(r"(?i)(https?://)([^\s/@:]+):([^\s/@]+)@")
 _URL_QUERY_SECRET_RE = re.compile(
     r"(?i)([?&](?:" + _TEXT_CREDENTIAL_KEY_PATTERN + r"|ak|sk)=)[^&#\s]+"
 )
 # ``ak``/``sk`` 是火山引擎凭证键名，``account_key`` 是 Azure 存储凭证键名。
 # 这些键很短，必须用词边界约束，否则 ``task = value`` 里的 ``sk`` 会被误脱敏。
+#
+# 值同样要排除状态字面量：``sk``/``ak`` 在配置里常作开关（``sk: off``），
+# 与裸关键词（``auth: none``）是同一类误判源。此前只给裸关键词加了约束，
+# 这两个短键没有，口径不一致。
 _SHORT_CREDENTIAL_KEY_RE = re.compile(
     r"""(?i)(?<![A-Za-z0-9])"""
-    r"""(ak|sk|account[_-]?key|secret[_-]?access[_-]?key)["']?"""
+    r"""((?:ak|sk|account[_-]?key|secret[_-]?access[_-]?key))["']?"""
     r"""(\s*[:=]\s*)"""
+    r"""(?!""" + _NON_CREDENTIAL_VALUE + r"""(?![A-Za-z0-9._~+/=-]))"""
     r"""(?:"[^"]*"|'[^']*'|[^\s,;}']+)"""
 )
 _OPENAI_KEY_RE = re.compile(
@@ -308,8 +335,7 @@ def redact_sensitive_text(value: Any) -> str:
     # 的可见前缀，使后续的 ``sk-`` 锚点失效，尾部掩码片段就会残留。
     redacted = _MASKED_CREDENTIAL_RE.sub(_redact_masked_credential, value)
     redacted = _BEARER_TEXT_RE.sub("Bearer [REDACTED]", redacted)
-    redacted = _KEY_VALUE_TEXT_RE.sub(r"\1=[REDACTED]", redacted)
-    redacted = _BARE_KEYWORD_TEXT_RE.sub(r"\1=[REDACTED]", redacted)
+    redacted = _CREDENTIAL_KEY_VALUE_RE.sub(_redact_credential_pair, redacted)
     redacted = _SHORT_CREDENTIAL_KEY_RE.sub(r"\1=[REDACTED]", redacted)
     redacted = _URL_USERINFO_RE.sub(r"\1[REDACTED]:[REDACTED]@", redacted)
     redacted = _URL_QUERY_SECRET_RE.sub(r"\1[REDACTED]", redacted)
@@ -385,10 +411,15 @@ def normalize_option_key(key: Any) -> str:
     return "".join(char for char in str(key).lower() if char.isalnum())
 
 
-def is_sensitive_option_key(key: Any) -> bool:
-    """识别凭证键，避免把普通单词的 ``secret`` 子串误判为凭证。"""
+def _is_credential_key(key: Any) -> bool:
+    """判定键名是否为凭证键（不含连接类容器键）。
+
+    连接类容器键（``query``/``headers``/``params``）在配置边界同样被禁止，
+    但原因是会覆盖请求边界、本身不是凭证。文本脱敏只关心凭证，把它们一并
+    纳入会让普通配置值（``query: foo``）被误判为凭证。
+    """
     normalized = normalize_option_key(key)
-    if normalized in FORBIDDEN_OPTION_CONTAINERS or normalized in SENSITIVE_OPTION_KEYS:
+    if normalized in SENSITIVE_OPTION_KEYS:
         return True
 
     # 只对明确的词边界进行组合键识别；例如 ``secretary`` 不会命中，
@@ -438,7 +469,14 @@ def is_sensitive_option_key(key: Any) -> bool:
     ):
         return True
     compact = "".join(words)
-    return compact in SENSITIVE_OPTION_KEYS or compact in FORBIDDEN_OPTION_CONTAINERS
+    return compact in SENSITIVE_OPTION_KEYS
+
+
+def is_sensitive_option_key(key: Any) -> bool:
+    """识别凭证键与连接覆盖键，避免把普通单词的 ``secret`` 子串误判为凭证。"""
+    if normalize_option_key(key) in FORBIDDEN_OPTION_CONTAINERS:
+        return True
+    return _is_credential_key(key)
 
 
 def _url_credential_paths(value: Any, path: str) -> list[str]:

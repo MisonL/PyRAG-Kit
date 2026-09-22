@@ -646,7 +646,12 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     def _require_provider_resource(
         self, method_name: str, kwargs: Mapping[str, Any] | None = None
     ) -> None:
-        """在原生资源方法真正触达 SDK 前校验渠道能力。"""
+        """在原生资源方法真正触达 SDK 前校验渠道能力。
+
+        ``kwargs`` 未使用：本 Provider 不在 Facade 上做参数校验，动态路径
+        因此没有可绕过的参数约束（兼容渠道的动态路径也不可达——
+        ``OpenAICompatibleResources._delegate_native`` 为 ``False``）。
+        """
         capability = self._resource_capability_for_method(method_name)
         if capability is None:
             # 显式 Facade 名匹配不上时，再按动态资源树路径判断。

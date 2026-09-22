@@ -422,8 +422,73 @@ def test_security_redacts_short_alphabetic_credential_values(value):
     任何一处改写满足，回退被测机制后仍能通过。
     """
     key, _, secret = value.partition(": ")
-    assert secret not in redact_sensitive_text(value), value
-    assert redact_sensitive_text(value) == f"{key}=[REDACTED]", value
+    redacted = redact_sensitive_text(value)
+    assert secret not in redacted, value
+    # 只要求键名与值被正确处理，不钉死分隔符：实现保留原文的 ``:``/``=``，
+    # 不会把分隔符改写成 ``=``（那会篡改被脱敏文本的结构）。
+    assert redacted == f"{key}: [REDACTED]", value
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "passwordHash",
+        "passwordSalt",
+        "tokenCount",
+        "tokenExpiry",
+        "cookieJar",
+        "cookieName",
+        "apikeyValue",
+        "bearerFormat",
+        "accessTokenHash",
+        "authTokenCount",
+        "password_hash",
+        "token_count",
+        "cookie_jar",
+    ],
+)
+def test_security_text_and_boundary_agree_on_compound_credential_keys(key):
+    """文本脱敏与配置边界必须对同一个键给出相同判定。
+
+    ``is_sensitive_option_key`` 按 camelCase/分隔符切词，``passwordHash`` 切出
+    ``password``+``hash`` 判为敏感；文本侧此前只用正则的字符断言逼近这套切词，
+    这些「凭证词 + 另一个词」的键因此出现双向不一致：真凭证在日志里明文输出，
+    而键名相同的合法配置值又在边界被误拒。现在文本侧也调用同一个判定函数。
+    """
+    secret = "FakeSecretValue9876"
+    redacted = redact_sensitive_text(f"{key}: {secret}")
+
+    assert is_sensitive_option_key(key) is True, key
+    assert secret not in redacted, key
+    assert redacted == f"{key}: [REDACTED]", key
+
+
+@pytest.mark.parametrize(
+    "key", ["topsecret", "sessiontoken", "oauth", "passwordless", "secretive", "cookiecutter"]
+)
+def test_security_text_and_boundary_agree_on_non_credential_lookalikes(key):
+    """切词后只有一个普通词的键，两侧都要放行。
+
+    这些键含凭证词的子串，但按切词不是凭证——文本侧若从词中间切开，会让
+    ``find_sensitive_option_paths`` 据此拒绝合法配置。
+    """
+    value = "plainvalue"
+    redacted = redact_sensitive_text(f"{key}: {value}")
+
+    assert is_sensitive_option_key(key) is False, key
+    assert redacted == f"{key}: {value}", key
+
+
+@pytest.mark.parametrize("literal", ["none", "off", "enabled", "false", "0"])
+def test_security_short_credential_keys_exclude_state_literals(literal):
+    """``sk``/``ak`` 在配置里常作开关，状态字面量不该被当成凭证值。
+
+    这两个键与裸关键词（``auth``/``token``）是同一类误判源，此前只给裸关键词
+    加了值约束，短键没有，口径不一致。
+    """
+    text = f"sk: {literal}"
+
+    assert redact_sensitive_text(text) == text
 
 
 @pytest.mark.parametrize(

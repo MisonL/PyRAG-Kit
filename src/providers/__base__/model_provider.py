@@ -1799,6 +1799,15 @@ class LargeLanguageModel(ABC):
         ``kwargs`` 是即将交给原生方法的调用参数。动态资源路径不经过 Facade，
         因此 Provider 若在 Facade 上做了参数校验，需要在这里对同一组参数
         再校验一次，否则动态路径成为绕过参数约束的旁路。
+
+        目前只有 ``VolcengineProvider`` 需要这么做（``_validate_native_response_kwargs``
+        校验 ``instructions`` 与 ``caching`` 的互斥）。其余 Provider 不在 Facade
+        上做参数校验，因此忽略 ``kwargs`` 与契约一致，不是遗漏——新增 Facade
+        参数校验时必须同步到这里，否则动态路径会成为旁路。
+
+        凭证边界不依赖本钩子：``_NativeResourceProxy.__call__`` 在调用门禁
+        之前已对同一组参数执行 ``validate_secret_free_resource_*``，两条路径
+        的凭证约束一致。
         """
         return
 

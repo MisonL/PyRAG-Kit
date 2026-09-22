@@ -400,7 +400,12 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
     def _require_provider_resource(
         self, method_name: str, kwargs: Mapping[str, Any] | None = None
     ) -> None:
-        """把实验性资源的版本差异转换成明确的能力错误。"""
+        """把实验性资源的版本差异转换成明确的能力错误。
+
+        ``kwargs`` 未使用：本 Provider 的原生资源方法不做参数校验，动态路径
+        没有可绕过的参数约束。凭证边界由 ``_NativeResourceProxy.__call__``
+        在调用本钩子前统一执行。
+        """
         name = method_name.removeprefix("async_")
         resource_name: str | None = None
         # 显式 Facade 名（``create_interaction``）与动态资源树路径
