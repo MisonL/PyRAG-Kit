@@ -384,7 +384,7 @@ def _chat_tool_call_item(
     source_type = normalized.get("type")
     # 非字符串的 ``type``（例如 ``["function"]``）直接做集合查找会抛
     # ``TypeError: unhashable type``，把「类型不合法」变成崩溃。此处与
-    # ``_reject_unsupported_responses_item`` 的守卫保持同一口径：先做
+    # ``_normalize_responses_native_item`` 的守卫保持同一口径：先做
     # isinstance 短路，再按取值映射。
     tool_type = (
         source_type
@@ -525,27 +525,52 @@ def _responses_provider_variant(provider: str) -> str:
 # Ark 专属的 Responses 内容块类型；OpenAI 兼容端点不接受这些块。
 _ARK_ONLY_RESPONSES_ITEM_TYPES = frozenset({"input_audio", "audio_url", "input_video", "video_url"})
 
+# 顶层 item 形态能书写的全部内容块类型。这些类型在 ``_responses_content_part``
+# 里已有完整校验（provider 变体、必填字段、取值范围），顶层路径必须复用同一套
+# 实现，否则会出现「写成 content 被拒、写成顶层 item 却放行」的不一致。
+_RESPONSES_CONTENT_BLOCK_TYPES = frozenset(
+    {
+        "text",
+        "input_text",
+        "output_text",
+        "audio_url",
+        "input_audio",
+        "video_url",
+        "input_video",
+        "image_url",
+        "input_image",
+        "file",
+        "input_file",
+    }
+)
 
-def _reject_unsupported_responses_item(
+
+def _normalize_responses_native_item(
     item: Mapping[str, Any],
     location: str,
     provider: str,
-) -> None:
-    """拒绝经顶层 item 形态绕过 variant 守卫的供应商专属内容块。
+) -> dict[str, Any]:
+    """归一化原生 Responses item，并复用内容块的完整校验。
 
-    ``normalize_responses_input`` 对带 ``content`` 的消息走
-    ``_responses_message_content``，那里会按 provider 变体拒绝 Ark 专属块。
-    但原生 Responses item（``{"type": "input_audio", ...}``）没有 ``content``，
-    会直通到请求体，因此需要在这里做等价检查，避免同一种块因书写位置不同
-    而一个被拒、一个静默发给不支持它的端点。
+    原生 item（``{"type": "input_audio", ...}``）不带 ``content``，会直通到
+    请求体。若只在这里做少量检查，同一种块会因书写位置不同而一个被拒、一个
+    静默发给不支持它的端点——加一个无关的 ``content`` 键就能改走另一条路径，
+    从而绕过全部变体校验。
+
+    因此类型属于内容块时，整项交给 ``_responses_content_part``：它同时完成
+    校验与形状归一化（例如把嵌套的 ``image_url`` 对象展平成 SDK 期望的扁平
+    形式）。其余键按原样保留。
     """
-    if _responses_provider_variant(provider) == "ark":
-        return
     item_type = item.get("type")
-    if item_type in _ARK_ONLY_RESPONSES_ITEM_TYPES:
-        raise ValueError(f"{location} 的 {item_type} 内容块当前不受 Responses SDK 支持。")
-    if "image_pixel_limit" in item:
-        raise ValueError(f"{location}.image_pixel_limit 不受 OpenAI Responses SDK 支持。")
+    if item_type not in _RESPONSES_CONTENT_BLOCK_TYPES:
+        return dict(item)
+    converted = _responses_content_part(item, location, provider=provider)
+    # 内容块转换只产出 SDK 输入联合里的字段；``id``/``status`` 等 item 级
+    # 元数据不在其中，需要保留。
+    for key in ("id", "status"):
+        if key in item and key not in converted:
+            converted[key] = item[key]
+    return converted
 
 
 def _responses_content_part(
@@ -857,7 +882,11 @@ def _responses_function_call_item(
     # Completions 唯一允许的 ``function``，直接读它会丢掉 custom 语义。
     source_type = tool_call.get("_responses_tool_call_type") or tool_call.get("type")
     if source_type == "custom_tool_call":
-        custom_input = "" if raw_arguments is None else str(raw_arguments)
+        # SDK 契约里 ``input`` 是任意文本。结构化值（dict/list）必须走 JSON
+        # 编码而不是 ``str()``：后者产出 Python repr（单引号、``None``/``True``
+        # 字面量），同一份数据经 ``assistant.tool_calls`` 路径会被 JSON 编码，
+        # 两条路径对同一输入给出不同文本。
+        custom_input = "" if raw_arguments is None else normalize_tool_arguments(raw_arguments)
         item: dict[str, Any] = {
             "type": "custom_tool_call",
             "call_id": call_id,
@@ -1055,12 +1084,14 @@ def normalize_responses_input(
                 location,
                 provider=provider,
             )
-        else:
-            # 原生 Responses item 形态（例如 ``{"type": "input_audio", ...}``）
-            # 不带 role/content，因此不会经过 _responses_message_content 的
-            # 内容块转换。同一个 Ark 专属块写成 content 会被拒、写成顶层 item
-            # 却静默发出，等于绕过了 variant 守卫，因此这里补一次等价检查。
-            _reject_unsupported_responses_item(normalized_message, location, provider)
+        # 顶层 item 形态（例如 ``{"type": "input_audio", ...}``）不带 role，
+        # 会直通到请求体。这里统一做一次归一化与校验——注意不能以「有没有
+        # ``content`` 键」来分流：加一个无关的 ``content`` 键就能改走上面的
+        # 分支，从而绕过顶层路径的全部变体校验。
+        if normalized_message.get("type") in _RESPONSES_CONTENT_BLOCK_TYPES:
+            normalized_message = _normalize_responses_native_item(
+                normalized_message, location, provider
+            )
         converted.append(normalized_message)
     return converted
 

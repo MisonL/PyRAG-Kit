@@ -1257,14 +1257,18 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         缓存，``caching`` 为 ``enabled`` 时服务端直接报错。SDK 不做本地校验，
         会原样发到服务端，因此在构造阶段显式拒绝，避免用户从远端 400 反推。
 
-        ``caching`` 有两条来源：顶层参数，以及 ``extra_body``（Ark SDK 在
-        ``_base_client`` 里把 ``extra_body`` 合并进请求体，服务端看到的仍是
-        ``caching=enabled``）。两条都要检查，否则该守卫可被绕过。
+        ``instructions`` 与 ``caching`` 各有两条来源：顶层参数，以及
+        ``extra_body``（Ark SDK 在 ``_base_client`` 里把 ``extra_body`` 合并
+        进请求体，服务端看到的仍是同名参数）。只查顶层会漏掉
+        ``extra_body={"instructions": ...}`` 配顶层 ``caching`` 这种组合。
         """
-        if params.get("instructions") is None:
+        extra_body = params.get("extra_body")
+        instructions = params.get("instructions")
+        if instructions is None and isinstance(extra_body, Mapping):
+            instructions = extra_body.get("instructions")
+        if instructions is None:
             return
         candidates = [params.get("caching")]
-        extra_body = params.get("extra_body")
         if isinstance(extra_body, Mapping):
             candidates.append(extra_body.get("caching"))
         for candidate in candidates:

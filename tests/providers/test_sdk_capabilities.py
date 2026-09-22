@@ -6845,3 +6845,167 @@ def test_ark_responses_public_entrypoints_return_text_from_output_content():
         == "这是真实回答。"
     )
     assert asyncio.run(_collect_ainvoke()) == ["这是真实回答。"]
+
+
+# ── 回归：顶层 item 形态不能绕过内容块的变体校验 ──
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"type": "input_audio", "audio_url": "u"},
+        # 加一个无关的 ``content`` 键就能改走消息分支，从而绕过顶层校验。
+        {"type": "input_audio", "audio_url": "u", "content": "x"},
+        {"role": "user", "content": "x", "type": "input_audio", "audio_url": "u"},
+        {"type": "input_image", "image_url": {"url": "u", "image_pixel_limit": {"m": 1}}},
+    ],
+)
+def test_openai_responses_rejects_ark_only_blocks_with_or_without_content_key(message):
+    """Ark 专属块写成顶层 item 时同样要拒。
+
+    分流若以「有没有 ``content`` 键」为依据，攻击者加一个无关的 ``content``
+    键即可改走另一条路径，绕过全部变体校验。
+    """
+    with pytest.raises(ValueError, match="不受|缺少"):
+        normalize_responses_input(None, None, [message], provider="openai")
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"type": "input_audio", "content": "x"},
+        {"type": "input_file", "filename": "a.txt"},
+        {"type": "input_video", "video_url": "u", "fps": "fast"},
+    ],
+)
+def test_ark_responses_validates_native_item_required_fields(message):
+    """顶层 item 形态也要做必填字段与取值范围校验，不能只查类型。"""
+    with pytest.raises(ValueError):
+        normalize_responses_input(None, None, [message], provider="ark")
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"type": "input_audio", "audio_url": "https://x/a.mp3"},
+        {"type": "input_video", "video_url": "https://x/v.mp4", "fps": 2},
+        {
+            "type": "input_image",
+            "image_url": "https://x/i.png",
+            "image_pixel_limit": {"max_pixels": 100},
+        },
+    ],
+)
+def test_ark_responses_still_accepts_valid_native_items(message):
+    """补全校验后，Ark 合法块不能被误拦。"""
+    converted = normalize_responses_input(None, None, [message], provider="ark")
+
+    assert converted[0]["type"] == message["type"]
+
+
+# ── 回归：instructions 与 caching 的互斥检查要覆盖 extra_body ──
+
+
+@pytest.mark.parametrize(
+    "request_kwargs",
+    [
+        # instructions 在 extra_body、caching 在顶层
+        {
+            "prompt": "hi",
+            "system_prompt": None,
+            "extra_body": {"instructions": "sys"},
+            "caching": {"type": "enabled"},
+        },
+        # 顶层 instructions、caching 在 extra_body
+        {
+            "prompt": "hi",
+            "system_prompt": "sys",
+            "extra_body": {"caching": {"type": "enabled"}},
+        },
+        # 两者都在 extra_body
+        {
+            "prompt": "hi",
+            "system_prompt": None,
+            "extra_body": {"instructions": "sys", "caching": {"type": "enabled"}},
+        },
+    ],
+)
+def test_ark_responses_mutual_exclusion_covers_extra_body(request_kwargs):
+    """``instructions`` 与 ``caching`` 各有顶层和 ``extra_body`` 两条来源。
+
+    SDK 会把 ``extra_body`` 合并进请求体，服务端看到的参数与顶层写法相同，
+    因此只查顶层会漏掉这些组合。
+    """
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "ark-model"
+    provider._protocol = "responses"
+    provider._options = {"server_verified_protocols": ["responses"]}
+
+    with pytest.raises(ValueError, match="互斥"):
+        provider._build_responses_request(CompletionRequest(stream=False, **request_kwargs))
+
+
+def test_ark_responses_mutual_exclusion_allows_either_alone():
+    """互斥检查不能误伤只出现一个的合法请求。"""
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "ark-model"
+    provider._protocol = "responses"
+    provider._options = {"server_verified_protocols": ["responses"]}
+
+    only_instructions = provider._build_responses_request(
+        CompletionRequest(prompt="hi", system_prompt="sys", stream=False)
+    )
+    only_caching = provider._build_responses_request(
+        CompletionRequest(
+            prompt="hi", system_prompt=None, caching={"type": "enabled"}, stream=False
+        )
+    )
+
+    assert only_instructions["instructions"] == "sys"
+    assert only_caching["caching"] == {"type": "enabled"}
+
+
+# ── 回归：custom tool 的结构化 input 编码要与 assistant 路径一致 ──
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [({"a": 1}, '{"a":1}'), ([1, 2], "[1,2]"), ("plain text", "plain text")],
+)
+def test_responses_custom_tool_input_uses_json_encoding(value, expected):
+    """``str()`` 对 dict/list 产出 Python repr（单引号），而同一份数据经
+    ``assistant.tool_calls`` 路径会被 JSON 编码，两条路径给出不同文本。"""
+    from src.providers.__base__.model_provider import _responses_function_call_item
+
+    item = _responses_function_call_item(
+        {"id": "c1", "type": "custom_tool_call", "name": "n", "input": value}, "loc"
+    )
+
+    assert item["input"] == expected
+
+
+def test_responses_custom_tool_input_matches_assistant_path_encoding():
+    """两条路径对同一输入必须给出同一文本。"""
+    from src.providers.__base__.model_provider import _responses_function_call_item
+
+    payload = {"nested": {"a": 1}, "list": [1, 2]}
+
+    via_item = _responses_function_call_item(
+        {"id": "c1", "type": "custom_tool_call", "name": "n", "input": payload}, "loc"
+    )
+    via_assistant = normalize_responses_input(
+        None,
+        None,
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "c1", "type": "custom_tool_call", "name": "n", "input": payload}
+                ],
+            }
+        ],
+        provider="ark",
+    )
+
+    assert via_item["input"] == via_assistant[0]["input"]
