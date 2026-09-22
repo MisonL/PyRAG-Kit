@@ -167,11 +167,20 @@ def run_smoke_test() -> int:
 
 
 def run_cli(argv: list[str] | None = None) -> int:
-    """解析启动参数并执行对应入口。"""
+    """解析启动参数并执行对应入口。
+
+    这里包住整个启动阶段：``display_banner`` 与 ``initialize_dependencies``
+    在 ``main()`` 的 ``try`` 之前执行，配置错误会以裸 traceback 落到终端。
+    import 期的失败由 ``get_settings`` 的边界负责（此处尚未执行）。
+    """
     args = list(sys.argv[1:] if argv is None else argv)
-    if "--smoke-test" in args:
-        return run_smoke_test()
-    main()
+    try:
+        if "--smoke-test" in args:
+            return run_smoke_test()
+        main()
+    except Exception as exc:  # noqa: BLE001 - top-level CLI boundary reports failures
+        console.print(f"[bold red]启动失败:[/bold red] {safe_exception_text(exc)}")
+        return 1
     return 0
 
 
