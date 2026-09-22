@@ -1,0 +1,55 @@
+name: quality
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Setup Python
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.11"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7.6.0
+
+      - name: Sync dependencies
+        run: uv sync --group dev
+
+      - name: Check lockfile is up to date
+        run: uv lock --check
+
+      # 格式化检查放在最前：它的失败最容易被后续步骤的输出淹没，
+      # 而且未格式化的代码会让 lint 的 diff 变得难以阅读。
+      - name: Check formatting
+        run: uv run ruff format --check main.py src scripts tests
+
+      - name: Lint
+        run: uv run ruff check main.py src scripts tests
+
+      - name: Type check
+        run: uv run mypy --cache-dir /tmp/pyrag-kit-mypy main.py src
+
+      - name: Security scan
+        run: uv run bandit -r main.py src scripts -ll
+
+      - name: Byte-compile
+        run: uv run python -m compileall -q main.py src scripts tests
+
+      - name: Test
+        run: uv run pytest -q
+
+      - name: Check for whitespace errors
+        run: git diff --check
