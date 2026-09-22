@@ -38,7 +38,9 @@ class ChatService:
             raise RuntimeError("意图识别返回空结果，无法继续检索。")
         return intent
 
-    async def retrieve(self, user_input: str, session_config: SessionConfig, console: Any) -> tuple[str, list[dict[str, Any]]]:
+    async def retrieve(
+        self, user_input: str, session_config: SessionConfig, console: Any
+    ) -> tuple[str, list[dict[str, Any]]]:
         intent = await self.identify_intent(user_input)
         documents = await self.retrieval_service.retrieve(intent, session_config, console=console)
         return intent, documents
@@ -71,8 +73,4 @@ class ChatService:
                 f"知识:\n{context}\n"
                 "回答要简洁。"
             )
-        return (
-            "你是一个智能客服。\n"
-            f"用户问题: {user_input}\n"
-            "没有找到相关知识。请礼貌告知。"
-        )
+        return f"你是一个智能客服。\n用户问题: {user_input}\n没有找到相关知识。请礼貌告知。"

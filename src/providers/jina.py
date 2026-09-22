@@ -16,6 +16,7 @@ from src.utils.security import redact_sensitive_text, validate_secret_free_paylo
 
 logger = get_module_logger(__name__)
 
+
 class JinaProvider(RerankModel):
     """
     Jina Rerank模型提供商。
@@ -23,7 +24,15 @@ class JinaProvider(RerankModel):
     """
 
     _OPTION_KEYS = frozenset(
-        {"return_documents", "max_chunks_per_doc", "late_chunking", "truncate", "embedding_type", "extra_body", "timeout"}
+        {
+            "return_documents",
+            "max_chunks_per_doc",
+            "late_chunking",
+            "truncate",
+            "embedding_type",
+            "extra_body",
+            "timeout",
+        }
     )
 
     def __init__(self, model_name: str, options: dict[str, Any] | None = None):
@@ -67,14 +76,12 @@ class JinaProvider(RerankModel):
             option_overlap = sorted(set(options).intersection(extra_body))
             if option_overlap:
                 raise ValueError(
-                    "Jina Rerank options 与 options.extra_body 重复: "
-                    + ", ".join(option_overlap)
+                    "Jina Rerank options 与 options.extra_body 重复: " + ", ".join(option_overlap)
                 )
             body_overlap = sorted(set(payload).intersection(extra_body))
             if body_overlap:
                 raise ValueError(
-                    "Jina Rerank options.extra_body 不允许覆盖请求字段: "
-                    + ", ".join(body_overlap)
+                    "Jina Rerank options.extra_body 不允许覆盖请求字段: " + ", ".join(body_overlap)
                 )
             options.update(dict(extra_body))
         payload.update(options)
@@ -102,7 +109,9 @@ class JinaProvider(RerankModel):
         if not isinstance(top_n, int) or isinstance(top_n, bool) or top_n < 1:
             raise ValueError("Jina Rerank top_n 必须是大于等于 1 的整数。")
 
-    def _parse_response(self, results: list[dict], documents: list[str]) -> tuple[list[int], list[float]]:
+    def _parse_response(
+        self, results: list[dict], documents: list[str]
+    ) -> tuple[list[int], list[float]]:
         if not isinstance(results, list):
             raise RuntimeError("Jina Rerank 响应缺少有效的 results 列表。")
         # 创建内容到索引的映射
@@ -126,17 +135,13 @@ class JinaProvider(RerankModel):
                     raise RuntimeError("Jina Rerank 响应包含重复 index。")
                 index = direct_index
                 document = res.get("document")
-                document_text = (
-                    document.get("text") if isinstance(document, Mapping) else document
-                )
+                document_text = document.get("text") if isinstance(document, Mapping) else document
                 if document_text is not None and document_text != documents[index]:
                     raise RuntimeError("Jina Rerank 响应 index 与 document 不匹配。")
                 positions.get(documents[index], []).remove(index)
             else:
                 document = res.get("document")
-                doc_content = (
-                    document.get("text") if isinstance(document, Mapping) else document
-                )
+                doc_content = document.get("text") if isinstance(document, Mapping) else document
                 if not isinstance(doc_content, str) or not positions.get(doc_content):
                     raise RuntimeError("Jina Rerank 响应无法映射到输入文档。")
                 index = positions[doc_content].pop(0)
@@ -154,20 +159,21 @@ class JinaProvider(RerankModel):
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
         retry=retry_if_exception(is_retryable_error),
-        reraise=True
+        reraise=True,
     )
     def rerank(self, query: str, documents: list[str], top_n: int) -> tuple[list[int], list[float]]:
         """同步 Rerank (CSE Sensor)。"""
         logger.info(f"调用 Jina Rerank ({self._model_name})，文档数: {len(documents)}")
         import httpx
+
         start_time = time.perf_counter()
-        
+
         try:
             with httpx.Client(timeout=self._request_timeout()) as client:
                 response = client.post(
                     self._base_url,
                     headers=self._get_headers(),
-                    json=self._prepare_payload(query, documents, top_n)
+                    json=self._prepare_payload(query, documents, top_n),
                 )
                 response.raise_for_status()
                 payload = response.json()
@@ -176,7 +182,7 @@ class JinaProvider(RerankModel):
                 results = payload.get("results")
                 if not isinstance(results, list):
                     raise RuntimeError("Jina Rerank 响应缺少有效的 results 列表。")
-                
+
             indices, scores = self._parse_response(results, documents)
             duration = time.perf_counter() - start_time
             logger.info(f"Jina Rerank ({self._model_name}) 完成，耗时: {duration:.2f}s")
@@ -194,20 +200,23 @@ class JinaProvider(RerankModel):
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
         retry=retry_if_exception(is_retryable_error),
-        reraise=True
+        reraise=True,
     )
-    async def arerank(self, query: str, documents: list[str], top_n: int) -> tuple[list[int], list[float]]:
+    async def arerank(
+        self, query: str, documents: list[str], top_n: int
+    ) -> tuple[list[int], list[float]]:
         """异步 Rerank (CSE Sensor)。"""
         logger.info(f"异步调用 Jina Rerank ({self._model_name})，文档数: {len(documents)}")
         import httpx
+
         start_time = time.perf_counter()
-        
+
         try:
             async with httpx.AsyncClient(timeout=self._request_timeout()) as aclient:
                 response = await aclient.post(
                     self._base_url,
                     headers=self._get_headers(),
-                    json=self._prepare_payload(query, documents, top_n)
+                    json=self._prepare_payload(query, documents, top_n),
                 )
                 response.raise_for_status()
                 payload = response.json()
@@ -216,7 +225,7 @@ class JinaProvider(RerankModel):
                 results = payload.get("results")
                 if not isinstance(results, list):
                     raise RuntimeError("Jina Rerank 响应缺少有效的 results 列表。")
-                
+
             indices, scores = self._parse_response(results, documents)
             duration = time.perf_counter() - start_time
             logger.info(f"Jina Rerank ({self._model_name}) 异步完成，耗时: {duration:.2f}s")

@@ -21,6 +21,7 @@ from src.utils.security import validate_secret_free_options
 # 1. 基础定义 (DEFINITIONS)
 # =================================================================
 
+
 # 项目根目录
 def resolve_app_root() -> Path:
     """
@@ -36,10 +37,12 @@ def resolve_app_root() -> Path:
 
 ROOT_DIR = resolve_app_root()
 # 配置文件路径
-CONFIG_TOML_PATH = ROOT_DIR / 'config.toml'
+CONFIG_TOML_PATH = ROOT_DIR / "config.toml"
+
 
 class RetrievalMethod(str, Enum):
     """定义知识库检索的策略枚举。"""
+
     SEMANTIC_SEARCH = "向量检索"
     FULL_TEXT_SEARCH = "全文检索"
     HYBRID_SEARCH = "混合检索"
@@ -57,6 +60,7 @@ class ModelProtocol(str, Enum):
 
 class ModelDetail(BaseModel):
     """定义单个模型配置的结构。"""
+
     provider: str
     model_name: str
     protocol: ModelProtocol | None = None
@@ -78,11 +82,7 @@ class ModelDetail(BaseModel):
         try:
             if provider == "google" and "http_options" in value:
                 http_options = value["http_options"]
-                remaining = {
-                    key: nested
-                    for key, nested in value.items()
-                    if key != "http_options"
-                }
+                remaining = {key: nested for key, nested in value.items() if key != "http_options"}
                 validated = validate_secret_free_options(remaining, "模型")
                 validated["http_options"] = validate_secret_free_options(
                     {"http_options": http_options},
@@ -92,7 +92,12 @@ class ModelDetail(BaseModel):
                 return validated
             return validate_secret_free_options(value, "模型")
         except ValueError as exc:
-            raise ValueError(str(exc).replace("模型 options 不允许包含凭证或请求头/query 配置", "模型 options 不允许包含凭证或连接字段")) from exc
+            raise ValueError(
+                str(exc).replace(
+                    "模型 options 不允许包含凭证或请求头/query 配置",
+                    "模型 options 不允许包含凭证或连接字段",
+                )
+            ) from exc
 
     @field_validator("protocol", mode="before")
     @classmethod
@@ -123,15 +128,18 @@ class ModelDetail(BaseModel):
             supported = ", ".join(protocol.value for protocol in ModelProtocol)
             raise ValueError(f"不支持的模型协议: {value}。可选值: {supported}") from exc
 
+
 # =================================================================
 # 2. 主配置模型 (MAIN SETTINGS MODEL)
 # =================================================================
+
 
 class Settings(BaseSettings):
     """
     定义整个应用的配置，使用Pydantic进行类型校验和分层加载。
     加载顺序: 环境变量 > .env 文件 > config.toml 文件 > 模型中定义的默认值。
     """
+
     # --- [API_KEYS] ---
     anthropic_api_key: str | None = Field(default=None, repr=False)
     google_api_key: str | None = Field(default=None, repr=False)
@@ -154,11 +162,19 @@ class Settings(BaseSettings):
 
     _secret_fields: ClassVar[frozenset[str]] = frozenset(
         {
-            "anthropic_api_key", "google_api_key", "siliconflow_api_key",
+            "anthropic_api_key",
+            "google_api_key",
+            "siliconflow_api_key",
             "gemini_api_key",
             "google_application_credentials",
-            "openai_api_key", "qwen_api_key", "ark_api_key", "volc_access_key",
-            "volc_secret_key", "jina_api_key", "deepseek_api_key", "grok_api_key",
+            "openai_api_key",
+            "qwen_api_key",
+            "ark_api_key",
+            "volc_access_key",
+            "volc_secret_key",
+            "jina_api_key",
+            "deepseek_api_key",
+            "grok_api_key",
             "lm_studio_api_key",
         }
     )
@@ -198,8 +214,8 @@ class Settings(BaseSettings):
     grok_base_url: str = "https://api.x.ai/v1"
 
     # --- [GENERAL] ---
-    log_level: str = "WARNING" # 新增 log_level 字段，默认级别调整为 WARNING
-    cache_path: str = ".cache" # 新增 cache_path 字段
+    log_level: str = "WARNING"  # 新增 log_level 字段，默认级别调整为 WARNING
+    cache_path: str = ".cache"  # 新增 cache_path 字段
     log_path: str = "data/logs"
     log_retention_days: int = 15
 
@@ -224,7 +240,7 @@ class Settings(BaseSettings):
     default_llm_provider: str = "google"
     default_embedding_provider: str = "local-hash"
     default_rerank_provider: str = "siliconflow"
-    default_vector_store: str = "faiss" # 新增向量存储默认提供商
+    default_vector_store: str = "faiss"  # 新增向量存储默认提供商
 
     # --- [CHAT] ---
     chat_retrieval_method: RetrievalMethod = RetrievalMethod.HYBRID_SEARCH
@@ -235,33 +251,47 @@ class Settings(BaseSettings):
     chat_rerank_enabled: bool = False
     chat_top_k: int = 5
     chat_score_threshold: float = 0.4
-    chat_temperature: float = 0.7 # 将 chat_temperature 移到这里
+    chat_temperature: float = 0.7  # 将 chat_temperature 移到这里
 
     # --- [MODEL_CONFIGURATIONS] ---
-    embedding_configurations: dict[str, ModelDetail] = Field(default_factory=lambda: {
-        # 与 llm_configurations 同理：兜底值必须写成当前有效的官方 ID。
-        "local-hash": ModelDetail(provider="local-hash", model_name="local-hash-256"),
-        "google": ModelDetail(provider="google", model_name="gemini-embedding-2"),
-        "siliconflow": ModelDetail(provider="siliconflow", model_name="BAAI/bge-large-zh-v1.5"),
-        "openai": ModelDetail(provider="openai", model_name="text-embedding-3-small"),
-    })
-    rerank_configurations: dict[str, ModelDetail] = Field(default_factory=lambda: {
-        "siliconflow": ModelDetail(provider="siliconflow", model_name="BAAI/bge-reranker-v2-m3"),
-    })
-    llm_configurations: dict[str, ModelDetail] = Field(default_factory=lambda: {
-        # 默认条目只作为缺失配置时的兜底；模型名保持在写就时仍可用的现行 ID，
-        # 避免新用户照抄到已退役模型。
-        "google": ModelDetail(provider="google", model_name="gemini-2.5-flash"),
-        "anthropic": ModelDetail(provider="anthropic", model_name="claude-sonnet-4-6"),
-        "qwen": ModelDetail(provider="qwen", model_name="qwen3.8-max"),
-        "deepseek": ModelDetail(provider="deepseek", model_name="deepseek-v4-pro"),
-        "grok": ModelDetail(provider="grok", model_name="grok-4.6"),
-        "volcengine": ModelDetail(provider="volcengine", model_name="doubao-seed-2-0-lite-260428"),
-        "siliconflow": ModelDetail(provider="siliconflow", model_name="deepseek-ai/DeepSeek-V3.2"),
-        "openai": ModelDetail(provider="openai", model_name="gpt-5.6-sol"),
-        "ollama": ModelDetail(provider="ollama", model_name="llama3.1"),
-        "lm-studio": ModelDetail(provider="lm-studio", model_name="LM-Studio-Community/Meta-Llama-3-8B-Instruct-GGUF"),
-    })
+    embedding_configurations: dict[str, ModelDetail] = Field(
+        default_factory=lambda: {
+            # 与 llm_configurations 同理：兜底值必须写成当前有效的官方 ID。
+            "local-hash": ModelDetail(provider="local-hash", model_name="local-hash-256"),
+            "google": ModelDetail(provider="google", model_name="gemini-embedding-2"),
+            "siliconflow": ModelDetail(provider="siliconflow", model_name="BAAI/bge-large-zh-v1.5"),
+            "openai": ModelDetail(provider="openai", model_name="text-embedding-3-small"),
+        }
+    )
+    rerank_configurations: dict[str, ModelDetail] = Field(
+        default_factory=lambda: {
+            "siliconflow": ModelDetail(
+                provider="siliconflow", model_name="BAAI/bge-reranker-v2-m3"
+            ),
+        }
+    )
+    llm_configurations: dict[str, ModelDetail] = Field(
+        default_factory=lambda: {
+            # 默认条目只作为缺失配置时的兜底；模型名保持在写就时仍可用的现行 ID，
+            # 避免新用户照抄到已退役模型。
+            "google": ModelDetail(provider="google", model_name="gemini-2.5-flash"),
+            "anthropic": ModelDetail(provider="anthropic", model_name="claude-sonnet-4-6"),
+            "qwen": ModelDetail(provider="qwen", model_name="qwen3.8-max"),
+            "deepseek": ModelDetail(provider="deepseek", model_name="deepseek-v4-pro"),
+            "grok": ModelDetail(provider="grok", model_name="grok-4.6"),
+            "volcengine": ModelDetail(
+                provider="volcengine", model_name="doubao-seed-2-0-lite-260428"
+            ),
+            "siliconflow": ModelDetail(
+                provider="siliconflow", model_name="deepseek-ai/DeepSeek-V3.2"
+            ),
+            "openai": ModelDetail(provider="openai", model_name="gpt-5.6-sol"),
+            "ollama": ModelDetail(provider="ollama", model_name="llama3.1"),
+            "lm-studio": ModelDetail(
+                provider="lm-studio", model_name="LM-Studio-Community/Meta-Llama-3-8B-Instruct-GGUF"
+            ),
+        }
+    )
 
     # --- [VALIDATORS] ---
     @field_validator("chat_top_k")
@@ -278,7 +308,7 @@ class Settings(BaseSettings):
             raise ValueError("chat_score_threshold 必须在 0 到 1 之间。")
         return value
 
-    @field_validator('log_level', mode='before')
+    @field_validator("log_level", mode="before")
     @classmethod
     def validate_log_level(cls, v: str) -> str:
         """验证日志级别是否有效。"""
@@ -295,9 +325,7 @@ class Settings(BaseSettings):
         info: ValidationInfo,
     ) -> dict[str, ModelDetail]:
         """Embedding/Rerank 配置不允许携带 LLM 线协议。"""
-        invalid = sorted(
-            key for key, detail in value.items() if detail.protocol is not None
-        )
+        invalid = sorted(key for key, detail in value.items() if detail.protocol is not None)
         if invalid:
             role = "Embedding" if info.field_name == "embedding_configurations" else "Rerank"
             raise ValueError(
@@ -306,7 +334,7 @@ class Settings(BaseSettings):
             )
         return value
 
-    @field_validator('chat_temperature', mode='before')
+    @field_validator("chat_temperature", mode="before")
     @classmethod
     def validate_chat_temperature(cls, v: Any) -> float:
         """验证聊天温度在 0.0 到 1.0 之间。"""
@@ -319,7 +347,7 @@ class Settings(BaseSettings):
             raise ValueError(f"聊天温度必须在 0.0 到 1.0 之间，但得到 {value}。")
         return value
 
-    @field_validator('hybrid_fusion_strategy', mode='before')
+    @field_validator("hybrid_fusion_strategy", mode="before")
     @classmethod
     def validate_hybrid_fusion_strategy(cls, v: Any) -> str:
         """验证混合检索融合策略。"""
@@ -329,7 +357,9 @@ class Settings(BaseSettings):
         normalized = v.strip().lower()
         valid_strategies = {"rrf", "weighted"}
         if normalized not in valid_strategies:
-            raise ValueError(f"无效的混合检索融合策略: {v}. 必须是 {', '.join(sorted(valid_strategies))}。")
+            raise ValueError(
+                f"无效的混合检索融合策略: {v}. 必须是 {', '.join(sorted(valid_strategies))}。"
+            )
         return normalized
 
     @model_validator(mode="after")
@@ -367,14 +397,13 @@ class Settings(BaseSettings):
             current = getattr(self, field_name, None)
             if isinstance(current, str) and current.rstrip("/") == old_url:
                 warnings.warn(
-                    f"{field_name} 指向旧端点 {old_url}（{reason}），"
-                    f"请改为 {new_url}。",
+                    f"{field_name} 指向旧端点 {old_url}（{reason}），请改为 {new_url}。",
                     UserWarning,
                     stacklevel=2,
                 )
         return self
 
-    @field_validator('retrieval_candidate_multiplier', mode='before')
+    @field_validator("retrieval_candidate_multiplier", mode="before")
     @classmethod
     def validate_retrieval_candidate_multiplier(cls, v: Any) -> int:
         """验证检索候选过量招募倍率。"""
@@ -387,7 +416,7 @@ class Settings(BaseSettings):
             raise ValueError(f"检索候选倍率必须大于等于 1，但得到 {value}。")
         return value
 
-    @field_validator('kb_splitter_separators', mode='before')
+    @field_validator("kb_splitter_separators", mode="before")
     @classmethod
     def split_separators(cls, v: Any) -> list[str]:
         """
@@ -404,19 +433,19 @@ class Settings(BaseSettings):
                 default_value = []
 
         # 如果输入为空（来自 .env 或环境变量的空字符串），则回退到默认值
-        if v is None or v == '':
+        if v is None or v == "":
             return default_value
 
         if isinstance(v, str):
             # 按逗号分割，并过滤掉空的元素
-            separators = [s.strip() for s in v.split(',') if s.strip()]
+            separators = [s.strip() for s in v.split(",") if s.strip()]
             # 如果分割后列表为空（例如，输入是" , "），也使用默认值
             return separators if separators else default_value
-        
+
         # 如果输入已经是列表或其他类型，直接返回
         return v
 
-    @field_validator('chat_retrieval_method', mode='before')
+    @field_validator("chat_retrieval_method", mode="before")
     @classmethod
     def validate_retrieval_method(cls, v: Any) -> Any:
         """允许使用枚举的键名（如HYBRID_SEARCH）或值（如'混合检索'）进行配置。"""
@@ -431,7 +460,9 @@ class Settings(BaseSettings):
         # 如果已经是枚举成员或无法转换，则让默认验证器处理
         return v
 
-    @field_validator('knowledge_base_path', 'pkl_path', 'snapshot_root', 'log_path', 'cache_path', mode='before')
+    @field_validator(
+        "knowledge_base_path", "pkl_path", "snapshot_root", "log_path", "cache_path", mode="before"
+    )
     @classmethod
     def resolve_path(cls, v: str) -> str:
         """将相对路径解析为绝对路径。"""
@@ -461,12 +492,13 @@ class Settings(BaseSettings):
         )
 
     model_config = SettingsConfigDict(
-        env_file='.env',
-        env_file_encoding='utf-8',
+        env_file=".env",
+        env_file_encoding="utf-8",
         case_sensitive=False,
-        extra='ignore',
+        extra="ignore",
         protected_namespaces=(),
     )
+
 
 def load_toml_config() -> dict[str, Any]:
     """
@@ -583,13 +615,13 @@ def load_toml_config() -> dict[str, Any]:
 
     return flat_config
 
+
 class TomlConfigSettingsSource(PydanticBaseSettingsSource):
     """
     一个 pydantic-settings 的自定义源，用于从 config.toml 文件加载配置。
     """
-    def get_field_value(
-        self, field: FieldInfo, field_name: str
-    ) -> tuple[Any, str, bool]:
+
+    def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
         # 在 __call__ 中处理所有逻辑，这里可以什么都不做
         return None, field_name, False
 
@@ -601,9 +633,11 @@ class TomlConfigSettingsSource(PydanticBaseSettingsSource):
         """
         return load_toml_config()
 
+
 # =================================================================
 # 3. 实例化并导出 (INSTANTIATE & EXPORT)
 # =================================================================
+
 
 @functools.lru_cache
 def get_settings() -> Settings:
@@ -612,6 +646,7 @@ def get_settings() -> Settings:
     加载顺序由 settings_customise_sources 定义。
     """
     return Settings()
+
 
 # 导出 get_settings 函数，供其他模块在需要时调用
 # 这样可以确保在测试中能够灵活地替换或模拟配置
@@ -623,6 +658,7 @@ def get_settings() -> Settings:
 # 目标: 最小化对现有代码的侵入性。
 # 策略: 保持旧的配置变量，但使其从新的settings实例派生。
 # 后续重构中，应逐步淘汰这些变量，直接使用 `get_settings()` 对象。
+
 
 def get_backward_compatible_configs() -> dict[str, Any]:
     """
@@ -695,7 +731,7 @@ def get_backward_compatible_configs() -> dict[str, Any]:
         "VOLC_BASE_URL": str(current_settings.volc_base_url),
         "GROK_BASE_URL": str(current_settings.grok_base_url),
     }
-    
+
     return {
         "KB_PATH": KB_PATH,
         "PKL_PATH": PKL_PATH,
@@ -709,6 +745,7 @@ def get_backward_compatible_configs() -> dict[str, Any]:
         "RERANK_CONFIGS": current_settings.rerank_configurations,
         "LLM_CONFIGS": current_settings.llm_configurations,
     }
+
 
 # --- 为了解决循环导入问题，将模型配置的导出移到最后 ---
 # 这些变量现在通过 get_backward_compatible_configs() 函数提供

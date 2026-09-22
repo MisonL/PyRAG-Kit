@@ -27,12 +27,15 @@ from src.utils.config import get_settings, resolve_app_root
 from src.utils.security import safe_exception_text
 
 console = Console()
-VERSION = "1.4.0" # 程序版本
+VERSION = "1.4.0"  # 程序版本
+
 
 # =================================================================
 # 应用程序界面 (APP UI)
 # =================================================================
-def create_gradient(text: str, start_color: tuple[int, int, int], end_color: tuple[int, int, int]) -> Text:
+def create_gradient(
+    text: str, start_color: tuple[int, int, int], end_color: tuple[int, int, int]
+) -> Text:
     """为文本创建从左到右的水平颜色渐变效果。"""
     text_obj = Text()
     total_length = len(text)
@@ -43,12 +46,13 @@ def create_gradient(text: str, start_color: tuple[int, int, int], end_color: tup
         text_obj.append(char, style=f"rgb({r},{g},{b})")
     return text_obj
 
+
 def display_banner():
     """显示程序的启动横幅。"""
     # 使用 'big' 字体，它是 standard 的加粗和放大版本，清晰且有冲击力
-    fig = pyfiglet.Figlet(font='big')
-    banner_text = fig.renderText('PyRAG-Kit')
-    
+    fig = pyfiglet.Figlet(font="big")
+    banner_text = fig.renderText("PyRAG-Kit")
+
     # 定义渐变色 (左蓝右红)
     blue_rgb = (0, 0, 255)
     red_rgb = (255, 0, 0)
@@ -69,28 +73,31 @@ def display_banner():
         if i == len(lines) - 2:
             line_content = line.rstrip()
             gradient_part = create_gradient(line_content, blue_rgb, red_rgb)
-            
+
             # 计算填充，确保署名在右下角对齐
             padding_size = banner_width - len(line_content) - len(attribution_text)
             padding_size = max(padding_size, 1)
-            
+
             padding = Text(" " * padding_size)
-            
+
             # 组合并打印该行
             console.print(gradient_part + padding + attribution_text)
         else:
             # 其他行正常打印渐变效果
             console.print(create_gradient(line, blue_rgb, red_rgb))
-    
+
     # 构建包含丰富链接和信息的欢迎面板
     welcome_text = Text(justify="center")
     welcome_text.append(f"欢迎使用 PyRAG-Kit - 版本 {VERSION}\n", style="bold cyan")
-    welcome_text.append("一个 Dify 核心逻辑的 Python 实现，用于本地验证其知识库向量化、分段及检索流程。\n\n", style="dim")
+    welcome_text.append(
+        "一个 Dify 核心逻辑的 Python 实现，用于本地验证其知识库向量化、分段及检索流程。\n\n",
+        style="dim",
+    )
     welcome_text.append("作者: ", style="bold")
     welcome_text.append("Mison", style="default")
     welcome_text.append("  ·  邮箱: ", style="bold")
     welcome_text.append("1360962086@qq.com", style="default")
-    welcome_text.append("\n") # 换行
+    welcome_text.append("\n")  # 换行
     welcome_text.append("GitHub: ", style="bold")
     # 使用正确的 GitHub 仓库地址
     github_url = "https://github.com/MisonL/PyRAG-Kit"
@@ -98,6 +105,7 @@ def display_banner():
 
     # 设置面板宽度与 banner 宽度一致
     console.print(Panel(welcome_text, border_style="green", width=banner_width))
+
 
 def display_menu():
     """使用rich库显示美化的交互式菜单。"""
@@ -108,7 +116,16 @@ def display_menu():
         "[bold cyan]3.[/bold cyan] 启动聊天机器人会话\n"
         "[bold cyan]4.[/bold cyan] 退出程序"
     )
-    console.print(Panel(menu_content, title="[bold yellow]主菜单[/bold yellow]", border_style="green", expand=False, highlight=True))
+    console.print(
+        Panel(
+            menu_content,
+            title="[bold yellow]主菜单[/bold yellow]",
+            border_style="green",
+            expand=False,
+            highlight=True,
+        )
+    )
+
 
 # =================================================================
 # 应用程序预热 (APP WARM-UP)
@@ -119,25 +136,26 @@ def initialize_dependencies():
     同时，主动管理缓存文件的位置。
     """
     console.print("[dim]正在初始化依赖项...[/dim]")
-    
+
     # 1. 执行日志清理
     src.utils.log_manager.cleanup_old_logs()
-    
+
     # 2. 使用从 settings 实例获取的缓存目录
     cache_dir = get_settings().cache_path
     if not os.path.exists(cache_dir):
         os.makedirs(cache_dir)
-    
+
     # 2. 预热jieba并完全抑制其所有启动日志
     with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
         import jieba
         import jieba.posseg as pseg
-        
+
         jieba.setLogLevel(jieba.logging.ERROR)
         jieba.dt.tmp_dir = str(cache_dir)
         list(pseg.cut(""))
 
     console.print("[dim]依赖项初始化完成。[/dim]")
+
 
 def run_smoke_test() -> int:
     """执行非交互式启动自检。"""
@@ -165,26 +183,65 @@ def main():
         display_menu()
         try:
             # 使用 prompt_toolkit 替代 console.input，并优化样式
-            choice = prompt(HTML('<skyblue><b>请输入选项 (1-4): </b></skyblue>'))
-            if choice == '1':
-                console.print(Panel("[bold green]开始执行知识库文档向量化处理...[/bold green]", border_style="green", width=CONSOLE_WIDTH))
+            choice = prompt(HTML("<skyblue><b>请输入选项 (1-4): </b></skyblue>"))
+            if choice == "1":
+                console.print(
+                    Panel(
+                        "[bold green]开始执行知识库文档向量化处理...[/bold green]",
+                        border_style="green",
+                        width=CONSOLE_WIDTH,
+                    )
+                )
                 # 延迟加载和执行
                 from scripts.embed_knowledge_base import main as run_embedding_process
+
                 run_embedding_process()
-                console.print(Panel("[bold green]向量化处理完成。[/bold green]", border_style="green", width=CONSOLE_WIDTH))
-            elif choice == '2':
-                console.print(Panel("[bold green]开始执行召回测试...[/bold green]", border_style="green", width=CONSOLE_WIDTH))
+                console.print(
+                    Panel(
+                        "[bold green]向量化处理完成。[/bold green]",
+                        border_style="green",
+                        width=CONSOLE_WIDTH,
+                    )
+                )
+            elif choice == "2":
+                console.print(
+                    Panel(
+                        "[bold green]开始执行召回测试...[/bold green]",
+                        border_style="green",
+                        width=CONSOLE_WIDTH,
+                    )
+                )
                 # 延迟加载和执行
                 from src.retrieval_test.core import run_retrieval_test
+
                 run_retrieval_test()
-                console.print(Panel("[bold green]召回测试完成。[/bold green]", border_style="green", width=CONSOLE_WIDTH))
-            elif choice == '3':
-                console.print(Panel("[bold green]启动聊天机器人会话...[/bold green]", border_style="green", width=CONSOLE_WIDTH))
+                console.print(
+                    Panel(
+                        "[bold green]召回测试完成。[/bold green]",
+                        border_style="green",
+                        width=CONSOLE_WIDTH,
+                    )
+                )
+            elif choice == "3":
+                console.print(
+                    Panel(
+                        "[bold green]启动聊天机器人会话...[/bold green]",
+                        border_style="green",
+                        width=CONSOLE_WIDTH,
+                    )
+                )
                 # 延迟加载和执行
                 from src.chat.core import start_chat_session
+
                 start_chat_session()
-                console.print(Panel("[bold green]聊天会话结束。[/bold green]", border_style="green", width=CONSOLE_WIDTH))
-            elif choice == '4':
+                console.print(
+                    Panel(
+                        "[bold green]聊天会话结束。[/bold green]",
+                        border_style="green",
+                        width=CONSOLE_WIDTH,
+                    )
+                )
+            elif choice == "4":
                 console.print("[bold]正在退出程序... 再见！[/bold]")
                 sys.exit(0)
             else:
@@ -195,6 +252,7 @@ def main():
         except Exception as e:  # noqa: BLE001 - top-level CLI boundary reports failures
             console.print(f"\n[bold red]程序运行期间发生错误:[/bold red] {safe_exception_text(e)}")
             console.print("[bold red]请检查错误信息并重试。[/bold red]")
+
 
 if __name__ == "__main__":
     sys.exit(run_cli())

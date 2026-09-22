@@ -147,9 +147,9 @@ _TEXT_CREDENTIAL_KEY_PATTERN = "|".join(_TEXT_CREDENTIAL_KEYS)
 
 _KEY_VALUE_TEXT_RE = re.compile(
     r"(?i)(?<![A-Za-z0-9])(" + _TEXT_CREDENTIAL_KEY_PATTERN + r")[\"']?"
-    r'''(\s*[:=]\s*|\s+(?=["']|'''
-    r'''(?=[A-Za-z0-9._~+/=-]{12,}(?:[\s,;}']|$))[A-Za-z0-9._~+/=-]*[0-9._~+/=-]))'''
-    r'''(?:"[^"]*"|'[^']*'|[^\s,;}']+)'''
+    r"""(\s*[:=]\s*|\s+(?=["']|"""
+    r"""(?=[A-Za-z0-9._~+/=-]{12,}(?:[\s,;}']|$))[A-Za-z0-9._~+/=-]*[0-9._~+/=-]))"""
+    r"""(?:"[^"]*"|'[^']*'|[^\s,;}']+)"""
 )
 _URL_USERINFO_RE = re.compile(r"(?i)(https?://)([^\s/@:]+):([^\s/@]+)@")
 _URL_QUERY_SECRET_RE = re.compile(
@@ -158,10 +158,10 @@ _URL_QUERY_SECRET_RE = re.compile(
 # ``ak``/``sk`` 是火山引擎凭证键名，``account_key`` 是 Azure 存储凭证键名。
 # 这些键很短，必须用词边界约束，否则 ``task = value`` 里的 ``sk`` 会被误脱敏。
 _SHORT_CREDENTIAL_KEY_RE = re.compile(
-    r'''(?i)(?<![A-Za-z0-9])'''
-    r'''(ak|sk|account[_-]?key|secret[_-]?access[_-]?key)["']?'''
-    r'''(\s*[:=]\s*)'''
-    r'''(?:"[^"]*"|'[^']*'|[^\s,;}']+)'''
+    r"""(?i)(?<![A-Za-z0-9])"""
+    r"""(ak|sk|account[_-]?key|secret[_-]?access[_-]?key)["']?"""
+    r"""(\s*[:=]\s*)"""
+    r"""(?:"[^"]*"|'[^']*'|[^\s,;}']+)"""
 )
 _OPENAI_KEY_RE = re.compile(r"\b(?:sk|rk|sess)-[A-Za-z0-9_-]{8,}\b", re.IGNORECASE)
 # 服务端返回的错误信息常带「首尾可见、中间掩码」的凭证形态，例如
@@ -189,7 +189,6 @@ def redact_sensitive_text(value: Any) -> str:
     redacted = _URL_QUERY_SECRET_RE.sub(r"\1[REDACTED]", redacted)
     redacted = _OPENAI_KEY_RE.sub("[REDACTED]", redacted)
     return _GOOGLE_API_KEY_RE.sub("[REDACTED]", redacted)
-
 
 
 def safe_exception_text(exc: BaseException) -> str:
@@ -277,9 +276,16 @@ def is_sensitive_option_key(key: Any) -> bool:
         if part
     ]
     if any(
-        word in {
-            "apikey", "accesstoken", "authtoken", "apitoken", "bearer",
-            "password", "cookie", "token",
+        word
+        in {
+            "apikey",
+            "accesstoken",
+            "authtoken",
+            "apitoken",
+            "bearer",
+            "password",
+            "cookie",
+            "token",
         }
         for word in words
     ):
@@ -287,9 +293,19 @@ def is_sensitive_option_key(key: Any) -> bool:
     if any(word == "secret" for word in words):
         return True
     if any(
-        left in {
-            "api", "access", "auth", "client", "secret", "private", "ssh",
-            "signing", "encryption", "goog", "google",
+        left
+        in {
+            "api",
+            "access",
+            "auth",
+            "client",
+            "secret",
+            "private",
+            "ssh",
+            "signing",
+            "encryption",
+            "goog",
+            "google",
         }
         and right in {"key", "token", "secret", "credential"}
         for left, right in pairwise(words)
@@ -375,8 +391,7 @@ def validate_secret_free_options(
     found = find_sensitive_option_paths(options, allowed_containers=allowed_containers)
     if found:
         raise ValueError(
-            f"{provider} options 不允许包含凭证或请求头/query 配置: "
-            + ", ".join(found)
+            f"{provider} options 不允许包含凭证或请求头/query 配置: " + ", ".join(found)
         )
     # 不能只复制最外层：模型配置通常包含 ``extra_body``、嵌套路由或
     # SDK 配置对象。递归复制可以防止调用方在 Provider 初始化后修改
@@ -409,8 +424,7 @@ def validate_secret_free_request_overrides(
         found = find_sensitive_option_paths(value)
         if found:
             raise ValueError(
-                f"{provider} 请求头/query 不允许包含凭证: "
-                f"{field_name}." + ", ".join(found)
+                f"{provider} 请求头/query 不允许包含凭证: {field_name}." + ", ".join(found)
             )
         copies[field_name] = _copy_nested(dict(value))
     return copies["extra_headers"], copies["extra_query"]
@@ -429,10 +443,7 @@ def validate_secret_free_payload(
         raise ValueError(f"{provider} {field_name} 必须是对象。")
     found = find_sensitive_option_paths(value)
     if found:
-        raise ValueError(
-            f"{provider} {field_name} 不允许包含凭证或连接字段: "
-            + ", ".join(found)
-        )
+        raise ValueError(f"{provider} {field_name} 不允许包含凭证或连接字段: " + ", ".join(found))
     return _copy_nested(dict(value))
 
 
@@ -467,8 +478,7 @@ def validate_secret_free_resource_kwargs(
     )
     if found:
         raise ValueError(
-            f"{provider} 资源参数不允许包含凭证或请求头/query 配置: "
-            + ", ".join(found)
+            f"{provider} 资源参数不允许包含凭证或请求头/query 配置: " + ", ".join(found)
         )
 
     normalized_keys: dict[str, Any] = {}
@@ -483,8 +493,7 @@ def validate_secret_free_resource_kwargs(
         normalized_keys[normalized] = key
     if duplicate_extension_keys:
         raise ValueError(
-            f"{provider} 资源参数包含重复的扩展字段: "
-            + ", ".join(duplicate_extension_keys)
+            f"{provider} 资源参数包含重复的扩展字段: " + ", ".join(duplicate_extension_keys)
         )
     headers_key = normalized_keys.get("extraheaders")
     query_key = normalized_keys.get("extraquery")

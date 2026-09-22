@@ -32,13 +32,15 @@ SAMPLE_MARKDOWN = """
 测试应该能正确处理这些内容。
 """
 
+
 @pytest.fixture(scope="module")
 def mock_markdown_document():
     """提供一个模拟的 Markdown Document 对象用于测试"""
     mock_path = MagicMock(spec=Path)
     mock_path.name = "test.md"
     mock_path.suffix = ".md"
-    return Document(content=SAMPLE_MARKDOWN, metadata={'source': str(mock_path)})
+    return Document(content=SAMPLE_MARKDOWN, metadata={"source": str(mock_path)})
+
 
 def test_full_etl_pipeline_for_markdown(mock_markdown_document):
     """
@@ -46,19 +48,19 @@ def test_full_etl_pipeline_for_markdown(mock_markdown_document):
     这个测试验证了从文件类型判断、处理器选择到最终切分的整个流程。
     """
     # 备份并临时修改全局配置以适应测试场景
-    current_settings = get_settings() # 获取当前配置
+    current_settings = get_settings()  # 获取当前配置
     original_chunk_size = current_settings.kb_chunk_size
     original_chunk_overlap = current_settings.kb_chunk_overlap
-    original_separators = current_settings.kb_splitter_separators # 备份分隔符
-    
+    original_separators = current_settings.kb_splitter_separators  # 备份分隔符
+
     # 临时设置较小的块大小，确保文档被分割
     current_settings.kb_chunk_size = 50
     current_settings.kb_chunk_overlap = 10
-    current_settings.kb_splitter_separators = ["\n\n", "\n", " ", ""] # 确保分隔符设置
+    current_settings.kb_splitter_separators = ["\n\n", "\n", " ", ""]  # 确保分隔符设置
 
     try:
         # 从模拟的文件路径初始化 Pipeline
-        pipeline = Pipeline.from_file_path(Path(mock_markdown_document.metadata['source']))
+        pipeline = Pipeline.from_file_path(Path(mock_markdown_document.metadata["source"]))
         # 强制设置 splitter 模式为 'char' 以支持旧测试逻辑 (50字符)
         pipeline.splitter = RecursiveTextSplitter(mode="char")
 
@@ -68,14 +70,14 @@ def test_full_etl_pipeline_for_markdown(mock_markdown_document):
         # 断言结果
         assert isinstance(processed_docs, list), "处理结果应该是一个列表"
         assert len(processed_docs) > 1, "文档应该被切分成多个部分"
-        
+
         # 验证清洗效果：不应再有多余的两个以上连续空格或三个以上连续换行符
         for doc in processed_docs:
-            assert "  " not in doc.content, "不应存在连续的两个空格" # 直接检查清洗后的内容
+            assert "  " not in doc.content, "不应存在连续的两个空格"  # 直接检查清洗后的内容
             assert "\n\n\n" not in doc.content, "不应存在连续的三个换行符"
 
         # 验证元数据是否被正确继承
-        assert processed_docs[0].metadata['source'] == mock_markdown_document.metadata['source']
+        assert processed_docs[0].metadata["source"] == mock_markdown_document.metadata["source"]
 
         # 验证切分内容
         assert "Markdown 测试文档" in processed_docs[0].content
@@ -85,7 +87,8 @@ def test_full_etl_pipeline_for_markdown(mock_markdown_document):
         # 恢复原始配置，避免影响其他测试
         current_settings.kb_chunk_size = original_chunk_size
         current_settings.kb_chunk_overlap = original_chunk_overlap
-        current_settings.kb_splitter_separators = original_separators # 恢复分隔符
+        current_settings.kb_splitter_separators = original_separators  # 恢复分隔符
+
 
 def test_markdown_extractor(mock_markdown_document):
     """单独测试 MarkdownExtractor 的功能"""
@@ -96,6 +99,7 @@ def test_markdown_extractor(mock_markdown_document):
     assert len(extracted_docs) == 1
     # Markdown 提取器应该保留原始内容
     assert extracted_docs[0].content == SAMPLE_MARKDOWN
+
 
 def test_basic_cleaner():
     """单独测试 BasicCleaner 的文本清洗功能"""
@@ -109,18 +113,19 @@ def test_basic_cleaner():
     # 验证多余空格、换行符和末尾空格是否被处理
     assert cleaned_docs[0].content == "你好 世界 \n\n 再见."
 
+
 def test_recursive_text_splitter():
     """单独测试 RecursiveTextSplitter 的文本分割功能"""
     # 备份并临时修改全局配置
-    current_settings = get_settings() # 获取当前配置
+    current_settings = get_settings()  # 获取当前配置
     original_chunk_size = current_settings.kb_chunk_size
     original_chunk_overlap = current_settings.kb_chunk_overlap
     original_separators = current_settings.kb_splitter_separators
-    
+
     # 直接在测试中设置适合分割的参数
     test_chunk_size = 20
     test_chunk_overlap = 5
-    test_separators = ["\n\n", "\n", " "] # 明确分隔符
+    test_separators = ["\n\n", "\n", " "]  # 明确分隔符
 
     try:
         # 实例化 RecursiveTextSplitter 时，它会从 settings 读取配置
@@ -128,12 +133,12 @@ def test_recursive_text_splitter():
         current_settings.kb_chunk_overlap = test_chunk_overlap
         current_settings.kb_splitter_separators = test_separators
 
-        splitter = RecursiveTextSplitter(mode="char") # 实例化时强制用 char 模式
-        
+        splitter = RecursiveTextSplitter(mode="char")  # 实例化时强制用 char 模式
+
         # 使用一个更长的文本来测试分割和重叠
         # 调整文本内容，使其在 chunk_size=20, chunk_overlap=5 的情况下能被分割成两部分
         long_text = "这是一个非常长的句子，需要被正确地切分开来。\n\n这是第二部分。"
-        doc = Document(content=long_text, metadata={'source': 'test.txt'})
+        doc = Document(content=long_text, metadata={"source": "test.txt"})
 
         # split 方法期望 List[Document] 作为输入
         split_docs = splitter.split([doc])
@@ -144,7 +149,7 @@ def test_recursive_text_splitter():
         # 验证第二部分的内容
         assert split_docs[1].content == "这是第二部分。"
         # 验证元数据
-        assert split_docs[0].metadata['source'] == 'test.txt'
+        assert split_docs[0].metadata["source"] == "test.txt"
 
     finally:
         # 恢复原始配置

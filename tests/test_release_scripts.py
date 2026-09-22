@@ -39,7 +39,9 @@ def test_validate_bundle_uses_smoke_test(monkeypatch, tmp_path):
     def fake_run(command, **kwargs):
         recorded["command"] = command
         recorded["kwargs"] = kwargs
-        return subprocess.CompletedProcess(command, 0, stdout="PyRAG-Kit 1.4.0 smoke test ok\n", stderr="")
+        return subprocess.CompletedProcess(
+            command, 0, stdout="PyRAG-Kit 1.4.0 smoke test ok\n", stderr=""
+        )
 
     monkeypatch.setattr("scripts.build_binary_release.subprocess.run", fake_run)
 

@@ -39,8 +39,7 @@ class VectorStoreFactory:
             )
             if embedding_detail is None:
                 raise ValueError(
-                    "当前 embedding 配置缺少活动提供商: "
-                    f"{run_config.default_embedding_provider}"
+                    f"当前 embedding 配置缺少活动提供商: {run_config.default_embedding_provider}"
                 )
             if (
                 manifest.embedding_provider != run_config.default_embedding_provider
@@ -67,10 +66,14 @@ class VectorStoreFactory:
             snapshot_id=snapshot_id,
             store_type=run_config.default_vector_store,
             embedding_provider=run_config.default_embedding_provider,
-            embedding_model=run_config.embedding_configurations[run_config.default_embedding_provider].model_name,
+            embedding_model=run_config.embedding_configurations[
+                run_config.default_embedding_provider
+            ].model_name,
             chunk_mode="legacy-import",
             source_digest="legacy-import",
-            document_count=len({doc.get("metadata", {}).get("source") for doc in getattr(store, "documents", [])}),
+            document_count=len(
+                {doc.get("metadata", {}).get("source") for doc in getattr(store, "documents", [])}
+            ),
             chunk_count=len(getattr(store, "documents", [])),
         )
         snapshot_repository.write_manifest(temp_dir, manifest)

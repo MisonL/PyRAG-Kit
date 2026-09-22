@@ -349,8 +349,12 @@ def test_start_chat_session_async_reverts_llm_after_editor_mutation(monkeypatch)
                 score_threshold=0.4,
                 active_llm_configuration="old-model",
                 active_rerank_configuration="siliconflow",
-                llm_configurations={"old-model": ModelDetail(provider="openai", model_name="gpt-4o")},
-                rerank_configurations={"siliconflow": ModelDetail(provider="siliconflow", model_name="rerank")},
+                llm_configurations={
+                    "old-model": ModelDetail(provider="openai", model_name="gpt-4o")
+                },
+                rerank_configurations={
+                    "siliconflow": ModelDetail(provider="siliconflow", model_name="rerank")
+                },
                 chat_temperature=0.7,
             )
             self.chat_service = object()

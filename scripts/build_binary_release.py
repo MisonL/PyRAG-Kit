@@ -188,8 +188,7 @@ def prepare_runtime_layout(bundle_root: Path) -> None:
 
     placeholder = knowledge_base_dir / "README.md"
     placeholder.write_text(
-        "# 知识库目录\n\n"
-        "请将您的 Markdown 知识库文档放入当前目录，然后再执行知识库构建。\n",
+        "# 知识库目录\n\n请将您的 Markdown 知识库文档放入当前目录，然后再执行知识库构建。\n",
         encoding="utf-8",
     )
 

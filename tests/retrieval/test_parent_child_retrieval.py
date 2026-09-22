@@ -51,6 +51,7 @@ def test_hybrid_retrieval_starts_semantic_and_keyword_paths_in_parallel():
 
     async def run():
         task = asyncio.create_task(service._gather_hybrid_results("query", 3))
+
         async def wait_for_both_starts():
             while len(started) < 2:
                 await asyncio.sleep(0)
@@ -72,12 +73,16 @@ def test_rerank_provider_is_cached_per_configuration(monkeypatch):
 
     provider.arerank.side_effect = fake_arerank
     factory = MagicMock(return_value=provider)
-    monkeypatch.setattr("src.services.retrieval_service.ModelProviderFactory.get_rerank_provider", factory)
+    monkeypatch.setattr(
+        "src.services.retrieval_service.ModelProviderFactory.get_rerank_provider", factory
+    )
     session_config = SimpleNamespace(
         rerank_enabled=True,
         active_rerank_configuration="siliconflow",
         top_k=1,
-        rerank_configurations={"siliconflow": SimpleNamespace(provider="siliconflow", model_name="rerank")},
+        rerank_configurations={
+            "siliconflow": SimpleNamespace(provider="siliconflow", model_name="rerank")
+        },
     )
     documents = [{"page_content": "doc", "score": 0.5, "metadata": {}}]
 
@@ -99,7 +104,9 @@ def test_rerank_provider_cache_refreshes_when_options_change(monkeypatch):
     first_provider = MagicMock()
     second_provider = MagicMock()
     factory = MagicMock(side_effect=[first_provider, second_provider])
-    monkeypatch.setattr("src.services.retrieval_service.ModelProviderFactory.get_rerank_provider", factory)
+    monkeypatch.setattr(
+        "src.services.retrieval_service.ModelProviderFactory.get_rerank_provider", factory
+    )
     first_config = SimpleNamespace(
         provider="siliconflow",
         model_name="rerank",
@@ -111,8 +118,13 @@ def test_rerank_provider_cache_refreshes_when_options_change(monkeypatch):
         options={"timeout": 20},
     )
 
-    assert service._get_rerank_provider("siliconflow", {"siliconflow": first_config}) is first_provider
-    assert service._get_rerank_provider("siliconflow", {"siliconflow": second_config}) is second_provider
+    assert (
+        service._get_rerank_provider("siliconflow", {"siliconflow": first_config}) is first_provider
+    )
+    assert (
+        service._get_rerank_provider("siliconflow", {"siliconflow": second_config})
+        is second_provider
+    )
     assert factory.call_count == 2
 
 
@@ -179,7 +191,9 @@ def test_rerank_top_n_is_clamped_after_candidate_reduction(monkeypatch):
 def test_semantic_retrieve_uses_legacy_search_when_method_is_missing():
     class LegacyStore:
         def search(self, query, top_k, search_type="semantic"):
-            return [{"page_content": query, "score": top_k, "metadata": {"search_type": search_type}}]
+            return [
+                {"page_content": query, "score": top_k, "metadata": {"search_type": search_type}}
+            ]
 
     class UnusedEmbedding:
         async def embed_query(self, _query):
@@ -190,7 +204,9 @@ def test_semantic_retrieve_uses_legacy_search_when_method_is_missing():
 
     result = asyncio.run(service._semantic_retrieve("query", 3))
 
-    assert result == [{"page_content": "query", "score": 3, "metadata": {"search_type": "semantic"}}]
+    assert result == [
+        {"page_content": "query", "score": 3, "metadata": {"search_type": "semantic"}}
+    ]
 
 
 def test_semantic_retrieve_does_not_hide_embedding_attribute_errors():
@@ -317,7 +333,9 @@ def test_retrieve_documents_uses_parent_sidecar_and_overfetches_candidates(monke
     assert len(results) == 2
     assert {doc["metadata"]["parent_id"] for doc in results} == {"parent-1", "parent-2"}
     assert all(doc["page_content"].startswith("parent content") for doc in results)
-    assert all(doc["metadata"]["matched_chunk_content"].startswith("child content") for doc in results)
+    assert all(
+        doc["metadata"]["matched_chunk_content"].startswith("child content") for doc in results
+    )
 
 
 def test_retrieve_documents_collapses_multiple_children_from_same_parent(monkeypatch):

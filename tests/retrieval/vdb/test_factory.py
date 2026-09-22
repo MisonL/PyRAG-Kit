@@ -19,14 +19,22 @@ class MockFaissStore(VectorStoreBase):
     def add_documents(self, documents: list[dict[str, Any]]):
         self.documents.extend(documents)
 
-    def search(self, query: str, top_k: int = 5, search_type: str = "semantic") -> list[dict[str, Any]]:
-        return [{"page_content": f"mock_doc_{i}", "metadata": {"source": "mock"}} for i in range(top_k)]
+    def search(
+        self, query: str, top_k: int = 5, search_type: str = "semantic"
+    ) -> list[dict[str, Any]]:
+        return [
+            {"page_content": f"mock_doc_{i}", "metadata": {"source": "mock"}} for i in range(top_k)
+        ]
 
     async def aadd_documents(self, documents: list[dict[str, Any]]):
         self.documents.extend(documents)
 
-    async def asearch(self, query: str, top_k: int = 5, search_type: str = "semantic") -> list[dict[str, Any]]:
-        return [{"page_content": f"mock_doc_{i}", "metadata": {"source": "mock"}} for i in range(top_k)]
+    async def asearch(
+        self, query: str, top_k: int = 5, search_type: str = "semantic"
+    ) -> list[dict[str, Any]]:
+        return [
+            {"page_content": f"mock_doc_{i}", "metadata": {"source": "mock"}} for i in range(top_k)
+        ]
 
     def save(self, path: str):
         """模拟保存操作"""
@@ -40,7 +48,8 @@ class MockFaissStore(VectorStoreBase):
 
     def get_embedding_model(self) -> Any:
         """模拟获取嵌入模型"""
-        return MagicMock() # 返回一个模拟的嵌入模型
+        return MagicMock()  # 返回一个模拟的嵌入模型
+
 
 @pytest.fixture(scope="function", autouse=True)
 def patch_settings(monkeypatch, tmp_path):
@@ -67,26 +76,26 @@ def patch_settings(monkeypatch, tmp_path):
     mock_settings_instance.kb_child_chunk_size = 300
     mock_settings_instance.kb_child_chunk_overlap = 30
 
-    with patch('src.utils.config.get_settings', return_value=mock_settings_instance):
+    with patch("src.utils.config.get_settings", return_value=mock_settings_instance):
         # 清除 VectorStoreFactory 及其依赖模块的缓存
         modules_to_clear = [
-            'src.retrieval.vdb.factory',
-            'src.retrieval.vdb.faiss_store',
+            "src.retrieval.vdb.factory",
+            "src.retrieval.vdb.faiss_store",
         ]
         for module_name in modules_to_clear:
             if module_name in sys.modules:
                 del sys.modules[module_name]
-        
+
         # 模拟 FaissStore 类
         monkeypatch.setattr("src.retrieval.vdb.faiss_store.FaissStore", MockFaissStore)
 
         # 重新导入 VectorStoreFactory，确保它加载的是最新的版本
-        if 'src.retrieval.vdb.factory' in sys.modules:
-            del sys.modules['src.retrieval.vdb.factory']
+        if "src.retrieval.vdb.factory" in sys.modules:
+            del sys.modules["src.retrieval.vdb.factory"]
         from src.retrieval.vdb.factory import (
             VectorStoreFactory as ReloadedVectorStoreFactory,
         )
-        
+
         # 直接模拟 VectorStoreFactory.get_vector_store 方法
         def mock_get_vector_store(store_type: str, file_path: str | None = None) -> VectorStoreBase:
             if store_type.lower() == "faiss":
@@ -100,6 +109,7 @@ def patch_settings(monkeypatch, tmp_path):
         VectorStoreFactory = ReloadedVectorStoreFactory
         yield
 
+
 # 测试用例
 def test_get_vector_store_faiss_success():
     """测试成功获取 FaissStore 实例"""
@@ -107,10 +117,12 @@ def test_get_vector_store_faiss_success():
     assert isinstance(store, MockFaissStore)
     assert store.file_path == "/tmp/test_faiss.pkl"
 
+
 def test_get_vector_store_unsupported_type():
     """测试获取不支持的向量存储类型时抛出 ValueError"""
     with pytest.raises(ValueError, match="不支持的向量存储类型: unsupported"):
         VectorStoreFactory.get_vector_store("unsupported", "/tmp/test.pkl")
+
 
 def test_get_default_vector_store_success():
     """测试成功获取默认向量存储实例"""
@@ -124,6 +136,7 @@ def test_get_default_vector_store_without_loading_existing():
     store = VectorStoreFactory.get_default_vector_store(load_existing=False)
     assert isinstance(store, MockFaissStore)
     assert store.file_path is None
+
 
 def _write_snapshot(root, snapshot_id, provider, model):
     """按真实快照目录结构写入一个活动快照，供兼容性检测使用。"""

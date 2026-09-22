@@ -172,7 +172,9 @@ class Chatbot:
                         safe_exception_text(exc),
                     )
 
-    def apply_config_update(self, updated_config: SessionConfig | dict[str, Any], llm_needs_reload: bool) -> None:
+    def apply_config_update(
+        self, updated_config: SessionConfig | dict[str, Any], llm_needs_reload: bool
+    ) -> None:
         previous_config = deepcopy(self.session_config) if llm_needs_reload else None
         self.chat_config = updated_config
         if not llm_needs_reload:
@@ -199,9 +201,11 @@ class Chatbot:
         try:
             llm_key = self.session_config.active_llm_configuration
             configurations = getattr(self.session_config, "llm_configurations", None)
-            new_model = ModelProviderFactory.get_llm_provider(
-                llm_key, configurations
-            ) if configurations is not None else ModelProviderFactory.get_llm_provider(llm_key)
+            new_model = (
+                ModelProviderFactory.get_llm_provider(llm_key, configurations)
+                if configurations is not None
+                else ModelProviderFactory.get_llm_provider(llm_key)
+            )
             if self.retrieval_service is None:
                 raise RuntimeError("检索服务尚未初始化。")
             chat_service = ChatService(new_model, self.retrieval_service)
@@ -228,7 +232,9 @@ class Chatbot:
         retrieval_service = getattr(self, "retrieval_service", None)
         if retrieval_service is None:
             return []
-        return await retrieval_service.retrieve(retrieval_query, self.session_config, console=self.console)
+        return await retrieval_service.retrieve(
+            retrieval_query, self.session_config, console=self.console
+        )
 
     async def chat_async(self, user_input: str) -> AsyncGenerator[str, None]:
         intent = user_input
@@ -308,11 +314,13 @@ async def start_chat_session_async():
 
         if bot.llm_model:
             display_chat_config(console, bot.chat_config)
-            console.print(f"客服已就绪 ([bold green]{bot.chat_config['active_llm_configuration']}[/bold green])")
+            console.print(
+                f"客服已就绪 ([bold green]{bot.chat_config['active_llm_configuration']}[/bold green])"
+            )
 
             while True:
                 try:
-                    user_query = await session.prompt_async(HTML('<skyblue><b>你: </b></skyblue>'))
+                    user_query = await session.prompt_async(HTML("<skyblue><b>你: </b></skyblue>"))
                     if not user_query.strip():
                         continue
                     if user_query.lower() == "/quit":
@@ -348,7 +356,9 @@ async def start_chat_session_async():
                     with Live(response_panel, console=console, refresh_per_second=10) as live:
                         async for chunk in bot.chat_async(user_query):
                             full_response += chunk
-                            live.update(Panel(Text(full_response), title="客服", border_style="green"))
+                            live.update(
+                                Panel(Text(full_response), title="客服", border_style="green")
+                            )
 
                 except (KeyboardInterrupt, EOFError):
                     break

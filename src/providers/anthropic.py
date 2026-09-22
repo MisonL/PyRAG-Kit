@@ -43,6 +43,7 @@ from src.utils.security import (
 
 logger = get_module_logger(__name__)
 
+
 class AnthropicProvider(LargeLanguageModel):
     """
     Anthropic模型提供商，处理Claude系列模型。
@@ -51,8 +52,18 @@ class AnthropicProvider(LargeLanguageModel):
 
     capabilities = frozenset(
         {
-            "chat", "stream", "messages", "multimodal", "tools", "structured_output",
-            "usage", "token_count", "batches", "files", "models", "parse",
+            "chat",
+            "stream",
+            "messages",
+            "multimodal",
+            "tools",
+            "structured_output",
+            "usage",
+            "token_count",
+            "batches",
+            "files",
+            "models",
+            "parse",
         }
     )
 
@@ -89,11 +100,11 @@ class AnthropicProvider(LargeLanguageModel):
         self._options = validate_secret_free_options(options, "Anthropic")
         settings = get_settings()
         self._api_key = settings.anthropic_api_key
-        
+
         if not self._api_key:
             logger.error("Anthropic API Key 未设置。")
             raise ValueError("ANTHROPIC_API_KEY is required for AnthropicProvider")
-        
+
         self._client: anthropic.Anthropic | None = None
         self._aclient: anthropic.AsyncAnthropic | None = None
         logger.info(f"初始化 AnthropicProvider，模型: {model_name}")
@@ -187,9 +198,7 @@ class AnthropicProvider(LargeLanguageModel):
                 # backwards-compatible server value. Omitting either avoids a
                 # request field that modern Claude models no longer use.
                 return None
-            raise ValueError(
-                "当前 Claude 模型不支持该 temperature；请省略该字段或使用 1.0。"
-            )
+            raise ValueError("当前 Claude 模型不支持该 temperature；请省略该字段或使用 1.0。")
         if name == "top_p":
             try:
                 numeric = float(value)
@@ -261,17 +270,19 @@ class AnthropicProvider(LargeLanguageModel):
             # Anthropic 的 server_* 工具不是 function schema，原样传递其
             # 专属字段，避免统一 OpenAI schema 破坏服务端工具配置。
             if isinstance(tool_type, str) and (
-                tool_type.startswith("server_") or tool_type in {
-                "computer_20250124", "bash_20250124", "text_editor_20250124",
+                tool_type.startswith("server_")
+                or tool_type
+                in {
+                    "computer_20250124",
+                    "bash_20250124",
+                    "text_editor_20250124",
                 }
             ):
                 converted.append(dict(tool))
                 continue
             function = tool.get("function", tool)
             if not isinstance(function, Mapping):
-                raise ValueError(
-                    f"Anthropic 工具定义[{index}].function 必须是对象。"
-                )
+                raise ValueError(f"Anthropic 工具定义[{index}].function 必须是对象。")
             name = function.get("name")
             if not isinstance(name, str) or not name.strip():
                 raise ValueError(f"Anthropic 工具定义[{index}] 缺少 function.name。")
@@ -279,9 +290,7 @@ class AnthropicProvider(LargeLanguageModel):
             if description is None:
                 description = ""
             if not isinstance(description, str):
-                raise ValueError(
-                    f"Anthropic 工具定义[{index}].description 必须是字符串。"
-                )
+                raise ValueError(f"Anthropic 工具定义[{index}].description 必须是字符串。")
             input_schema = function.get(
                 "parameters",
                 function.get("input_schema", {"type": "object", "properties": {}}),
@@ -333,9 +342,7 @@ class AnthropicProvider(LargeLanguageModel):
             name = choice.get("name")
             if isinstance(name, str) and name.strip():
                 return {"type": "tool", "name": name}
-        raise ValueError(
-            "Anthropic tool_choice 必须是 auto、any、none、tool 或 function 对象。"
-        )
+        raise ValueError("Anthropic tool_choice 必须是 auto、any、none、tool 或 function 对象。")
 
     @staticmethod
     def _convert_content(content: Any) -> Any:
@@ -364,7 +371,11 @@ class AnthropicProvider(LargeLanguageModel):
                     header, data = image_url.split(",", 1)
                     header_parts = header.split(";", 1)
                     media_type = header_parts[0].removeprefix("data:")
-                    if not media_type or len(header_parts) == 1 or header_parts[1].lower() != "base64":
+                    if (
+                        not media_type
+                        or len(header_parts) == 1
+                        or header_parts[1].lower() != "base64"
+                    ):
                         raise ValueError(
                             "Anthropic 图片 data URI 必须包含 MIME 类型和 base64 标记。"
                         )
@@ -383,9 +394,7 @@ class AnthropicProvider(LargeLanguageModel):
                         }
                     )
                 else:
-                    converted.append(
-                        {"type": "image", "source": {"type": "url", "url": image_url}}
-                    )
+                    converted.append({"type": "image", "source": {"type": "url", "url": image_url}})
             elif part_type == "tool_result":
                 converted.append(part)
             else:
@@ -430,12 +439,14 @@ class AnthropicProvider(LargeLanguageModel):
             if role == "assistant" and message.get("tool_calls"):
                 blocks: list[Any] = []
                 if content:
-                    blocks.extend(cls._convert_content(content) if isinstance(content, list) else [{"type": "text", "text": content}])
+                    blocks.extend(
+                        cls._convert_content(content)
+                        if isinstance(content, list)
+                        else [{"type": "text", "text": content}]
+                    )
                 for index, call in enumerate(message.get("tool_calls", [])):
                     if not isinstance(call, Mapping):
-                        raise ValueError(
-                            f"Anthropic assistant tool_calls[{index}] 必须是对象。"
-                        )
+                        raise ValueError(f"Anthropic assistant tool_calls[{index}] 必须是对象。")
                     function = call.get("function", call)
                     if not isinstance(function, Mapping):
                         raise ValueError(
@@ -444,9 +455,7 @@ class AnthropicProvider(LargeLanguageModel):
                     call_id = call.get("id")
                     name = function.get("name")
                     if not isinstance(call_id, str) or not call_id.strip():
-                        raise ValueError(
-                            f"Anthropic assistant tool_calls[{index}] 缺少 id。"
-                        )
+                        raise ValueError(f"Anthropic assistant tool_calls[{index}] 缺少 id。")
                     if not isinstance(name, str) or not name.strip():
                         raise ValueError(
                             f"Anthropic assistant tool_calls[{index}] 缺少 function.name。"
@@ -463,14 +472,21 @@ class AnthropicProvider(LargeLanguageModel):
                         raise ValueError(
                             f"Anthropic assistant tool_calls[{index}] 的 arguments 必须是 JSON 对象。"
                         )
-                    blocks.append({
-                        "type": "tool_use",
-                        "id": call_id,
-                        "name": name,
-                        "input": dict(arguments),
-                    })
+                    blocks.append(
+                        {
+                            "type": "tool_use",
+                            "id": call_id,
+                            "name": name,
+                            "input": dict(arguments),
+                        }
+                    )
                 content = blocks
-            converted.append({"role": "assistant" if role == "assistant" else "user", "content": cls._convert_content(content)})
+            converted.append(
+                {
+                    "role": "assistant" if role == "assistant" else "user",
+                    "content": cls._convert_content(content),
+                }
+            )
         flush_tool_results()
         return converted
 
@@ -578,9 +594,7 @@ class AnthropicProvider(LargeLanguageModel):
             params["service_tier"] = service_tier
         if user is not None:
             if for_parse and not beta:
-                raise ValueError(
-                    "Anthropic Messages parse 不支持 user；请改用 beta_parse。"
-                )
+                raise ValueError("Anthropic Messages parse 不支持 user；请改用 beta_parse。")
             # The SDK translates this argument into the required header. Add
             # the beta opt-in explicitly because ordinary Messages calls do
             # not otherwise advertise user-profile support.
@@ -604,8 +618,12 @@ class AnthropicProvider(LargeLanguageModel):
         # after initialization. Normal construction rejects these fields at
         # the configuration boundary, but they must never reach messages.create.
         client_only = {
-            "base_url", "timeout", "max_retries", "default_headers",
-            "default_query", "http_client",
+            "base_url",
+            "timeout",
+            "max_retries",
+            "default_headers",
+            "default_query",
+            "http_client",
         }
         options = {
             key: value
@@ -663,8 +681,7 @@ class AnthropicProvider(LargeLanguageModel):
             raise ValueError(f"Anthropic extra_body 不允许覆盖配置字段: {', '.join(overlap)}")
 
         sampling_options = {
-            key: options.pop(key, None)
-            for key in ("temperature", "top_p", "top_k")
+            key: options.pop(key, None) for key in ("temperature", "top_p", "top_k")
         }
         sampling_values = {
             "temperature": (
@@ -694,10 +711,17 @@ class AnthropicProvider(LargeLanguageModel):
         if body:
             reserved = set(params).intersection(body)
             if reserved:
-                raise ValueError(f"Anthropic extra_body 不允许覆盖请求字段: {', '.join(sorted(reserved))}")
+                raise ValueError(
+                    f"Anthropic extra_body 不允许覆盖请求字段: {', '.join(sorted(reserved))}"
+                )
             params["extra_body"] = body
         for key in (
-            "model", "messages", "system", "max_tokens", "tool_choice", "tools",
+            "model",
+            "messages",
+            "system",
+            "max_tokens",
+            "tool_choice",
+            "tools",
         ):
             options.pop(key, None)
         options.pop("max_tokens", None)
@@ -706,15 +730,28 @@ class AnthropicProvider(LargeLanguageModel):
             "user": "user_profile_id",
         }
         allowed_options = {
-            "metadata", "cache_control", "container", "inference_geo", "thinking",
-            "service_tier", "extra_headers", "extra_query", "output_config",
-            "stop_sequences", "user_profile_id",
+            "metadata",
+            "cache_control",
+            "container",
+            "inference_geo",
+            "thinking",
+            "service_tier",
+            "extra_headers",
+            "extra_query",
+            "output_config",
+            "stop_sequences",
+            "user_profile_id",
         }
         if beta:
             allowed_options.update(
                 {
-                    "context_management", "mcp_servers", "speed", "betas",
-                    "diagnostics", "fallback_credit_token", "fallbacks",
+                    "context_management",
+                    "mcp_servers",
+                    "speed",
+                    "betas",
+                    "diagnostics",
+                    "fallback_credit_token",
+                    "fallbacks",
                 }
             )
         allowed_options.update(option_aliases)
@@ -729,7 +766,9 @@ class AnthropicProvider(LargeLanguageModel):
     @classmethod
     def _extract_result(cls, response: Any) -> CompletionResult:
         blocks = field(response, "content", []) or []
-        text = "".join(field(block, "text", "") for block in blocks if field(block, "type") == "text")
+        text = "".join(
+            field(block, "text", "") for block in blocks if field(block, "type") == "text"
+        )
         reasoning = "".join(
             field(block, "thinking", "")
             for block in blocks
@@ -756,7 +795,9 @@ class AnthropicProvider(LargeLanguageModel):
         )
         if not refusal:
             stop_reason = field(response, "stop_reason")
-            stop_details = field(response, "stop_details") or field(response, "refusal_stop_details")
+            stop_details = field(response, "stop_details") or field(
+                response, "refusal_stop_details"
+            )
             details_type = field(stop_details, "type")
             if stop_reason == "refusal" or details_type == "refusal":
                 explanation = field(stop_details, "explanation")
@@ -886,7 +927,11 @@ class AnthropicProvider(LargeLanguageModel):
             if block_type == "tool_use":
                 initial_input = field(block, "input", {})
                 if isinstance(initial_input, Mapping):
-                    initial_arguments = json.dumps(initial_input, ensure_ascii=False, separators=(",", ":")) if initial_input else ""
+                    initial_arguments = (
+                        json.dumps(initial_input, ensure_ascii=False, separators=(",", ":"))
+                        if initial_input
+                        else ""
+                    )
                 else:
                     initial_arguments = str(initial_input) if initial_input else ""
                 return StreamEvent(
@@ -913,9 +958,19 @@ class AnthropicProvider(LargeLanguageModel):
             delta = field(event, "delta")
             delta_type = field(delta, "type")
             if delta_type == "text_delta":
-                return StreamEvent(type="text_delta", text=field(delta, "text", ""), response_id=response_id, raw=event)
+                return StreamEvent(
+                    type="text_delta",
+                    text=field(delta, "text", ""),
+                    response_id=response_id,
+                    raw=event,
+                )
             if delta_type == "thinking_delta":
-                return StreamEvent(type="reasoning_delta", reasoning=field(delta, "thinking", ""), response_id=response_id, raw=event)
+                return StreamEvent(
+                    type="reasoning_delta",
+                    reasoning=field(delta, "thinking", ""),
+                    response_id=response_id,
+                    raw=event,
+                )
             if delta_type in {"refusal_delta", "refusal"}:
                 refusal = field(delta, "refusal") or field(delta, "text") or field(delta, "reason")
                 return StreamEvent(
@@ -998,24 +1053,58 @@ class AnthropicProvider(LargeLanguageModel):
                     pending.append(value)
         return "Anthropic Messages 流返回错误"
 
-    def stream_events(self, request: CompletionRequest | None = None, **kwargs: Any) -> Generator[StreamEvent, None, None]:
+    def stream_events(
+        self, request: CompletionRequest | None = None, **kwargs: Any
+    ) -> Generator[StreamEvent, None, None]:
         request = coerce_completion_request(request, kwargs, "Anthropic stream_events")
         request = request.copy_with(stream=True)
         params = self._build_message_params(**request.to_invoke_kwargs())
         if not request.stream:
             result = self.complete(request)
             if result.text:
-                yield StreamEvent(type="text_delta", text=result.text, response_id=result.response_id, raw=result.raw)
+                yield StreamEvent(
+                    type="text_delta",
+                    text=result.text,
+                    response_id=result.response_id,
+                    raw=result.raw,
+                )
             if result.reasoning:
-                yield StreamEvent(type="reasoning_delta", reasoning=result.reasoning, response_id=result.response_id, raw=result.raw)
+                yield StreamEvent(
+                    type="reasoning_delta",
+                    reasoning=result.reasoning,
+                    response_id=result.response_id,
+                    raw=result.raw,
+                )
             if result.refusal:
-                yield StreamEvent(type="refusal_delta", refusal=result.refusal, response_id=result.response_id, raw=result.raw)
+                yield StreamEvent(
+                    type="refusal_delta",
+                    refusal=result.refusal,
+                    response_id=result.response_id,
+                    raw=result.raw,
+                )
             for call in result.tool_calls:
-                yield StreamEvent(type="tool_call_delta", tool_call=call, response_id=result.response_id, raw=result.raw)
-                yield StreamEvent(type="tool_call_completed", tool_call=call, response_id=result.response_id, raw=result.raw)
+                yield StreamEvent(
+                    type="tool_call_delta",
+                    tool_call=call,
+                    response_id=result.response_id,
+                    raw=result.raw,
+                )
+                yield StreamEvent(
+                    type="tool_call_completed",
+                    tool_call=call,
+                    response_id=result.response_id,
+                    raw=result.raw,
+                )
             if result.usage:
-                yield StreamEvent(type="usage", usage=result.usage, response_id=result.response_id, raw=result.raw)
-            yield StreamEvent(type="finish", finish_reason=result.finish_reason, response_id=result.response_id, raw=result.raw)
+                yield StreamEvent(
+                    type="usage", usage=result.usage, response_id=result.response_id, raw=result.raw
+                )
+            yield StreamEvent(
+                type="finish",
+                finish_reason=result.finish_reason,
+                response_id=result.response_id,
+                raw=result.raw,
+            )
             return
         response_id: str | None = None
         finish_emitted = False
@@ -1051,24 +1140,58 @@ class AnthropicProvider(LargeLanguageModel):
             if not message_stop_seen:
                 raise RuntimeError("Anthropic Messages 流在 message_stop 之前结束。")
 
-    async def astream_events(self, request: CompletionRequest | None = None, **kwargs: Any) -> AsyncGenerator[StreamEvent, None]:
+    async def astream_events(
+        self, request: CompletionRequest | None = None, **kwargs: Any
+    ) -> AsyncGenerator[StreamEvent, None]:
         request = coerce_completion_request(request, kwargs, "Anthropic astream_events")
         request = request.copy_with(stream=True)
         params = self._build_message_params(**request.to_invoke_kwargs())
         if not request.stream:
             result = await self.acomplete(request)
             if result.text:
-                yield StreamEvent(type="text_delta", text=result.text, response_id=result.response_id, raw=result.raw)
+                yield StreamEvent(
+                    type="text_delta",
+                    text=result.text,
+                    response_id=result.response_id,
+                    raw=result.raw,
+                )
             if result.reasoning:
-                yield StreamEvent(type="reasoning_delta", reasoning=result.reasoning, response_id=result.response_id, raw=result.raw)
+                yield StreamEvent(
+                    type="reasoning_delta",
+                    reasoning=result.reasoning,
+                    response_id=result.response_id,
+                    raw=result.raw,
+                )
             if result.refusal:
-                yield StreamEvent(type="refusal_delta", refusal=result.refusal, response_id=result.response_id, raw=result.raw)
+                yield StreamEvent(
+                    type="refusal_delta",
+                    refusal=result.refusal,
+                    response_id=result.response_id,
+                    raw=result.raw,
+                )
             for call in result.tool_calls:
-                yield StreamEvent(type="tool_call_delta", tool_call=call, response_id=result.response_id, raw=result.raw)
-                yield StreamEvent(type="tool_call_completed", tool_call=call, response_id=result.response_id, raw=result.raw)
+                yield StreamEvent(
+                    type="tool_call_delta",
+                    tool_call=call,
+                    response_id=result.response_id,
+                    raw=result.raw,
+                )
+                yield StreamEvent(
+                    type="tool_call_completed",
+                    tool_call=call,
+                    response_id=result.response_id,
+                    raw=result.raw,
+                )
             if result.usage:
-                yield StreamEvent(type="usage", usage=result.usage, response_id=result.response_id, raw=result.raw)
-            yield StreamEvent(type="finish", finish_reason=result.finish_reason, response_id=result.response_id, raw=result.raw)
+                yield StreamEvent(
+                    type="usage", usage=result.usage, response_id=result.response_id, raw=result.raw
+                )
+            yield StreamEvent(
+                type="finish",
+                finish_reason=result.finish_reason,
+                response_id=result.response_id,
+                raw=result.raw,
+            )
             return
         response_id: str | None = None
         finish_emitted = False
@@ -1112,7 +1235,9 @@ class AnthropicProvider(LargeLanguageModel):
         response = retry_sync_call(lambda: self._get_client().messages.create(**params))
         return self._extract_result(response)
 
-    async def acomplete(self, request: CompletionRequest | None = None, **kwargs: Any) -> CompletionResult:
+    async def acomplete(
+        self, request: CompletionRequest | None = None, **kwargs: Any
+    ) -> CompletionResult:
         """使用 AsyncAnthropic 聚合完整结果，保留工具、thinking 和 usage。"""
         request = coerce_completion_request(request, kwargs, "Anthropic acomplete")
         values = request.to_invoke_kwargs()
@@ -1144,17 +1269,37 @@ class AnthropicProvider(LargeLanguageModel):
     def _parse_params(params: dict[str, Any], *, beta: bool) -> dict[str, Any]:
         """只保留当前 SDK 的 Messages.parse 参数。"""
         allowed = {
-            "model", "max_tokens", "messages", "metadata", "output_config",
-            "output_format", "service_tier", "stop_sequences", "system",
-            "thinking", "tool_choice", "tools",
-            "extra_headers", "extra_query", "extra_body", "timeout",
+            "model",
+            "max_tokens",
+            "messages",
+            "metadata",
+            "output_config",
+            "output_format",
+            "service_tier",
+            "stop_sequences",
+            "system",
+            "thinking",
+            "tool_choice",
+            "tools",
+            "extra_headers",
+            "extra_query",
+            "extra_body",
+            "timeout",
         }
         if beta:
             allowed.update(
                 {
-                    "cache_control", "container", "context_management", "diagnostics",
-                    "fallback_credit_token", "fallbacks", "inference_geo", "mcp_servers",
-                    "speed", "betas", "user_profile_id",
+                    "cache_control",
+                    "container",
+                    "context_management",
+                    "diagnostics",
+                    "fallback_credit_token",
+                    "fallbacks",
+                    "inference_geo",
+                    "mcp_servers",
+                    "speed",
+                    "betas",
+                    "user_profile_id",
                 }
             )
         reject_unsupported_kwargs(
@@ -1167,29 +1312,36 @@ class AnthropicProvider(LargeLanguageModel):
     def _validate_token_count_request(request: CompletionRequest, *, beta: bool) -> None:
         """拒绝不会被当前 Messages count_tokens SDK 使用的请求字段。"""
         allowed = {
-            "prompt", "system_prompt", "messages", "tools", "tool_choice",
-            "cache_control", "response_format", "output_config",
+            "prompt",
+            "system_prompt",
+            "messages",
+            "tools",
+            "tool_choice",
+            "cache_control",
+            "response_format",
+            "output_config",
             # CompletionRequest defaults temperature for generation. It has no
             # effect on token counting, so accept the shared default without
             # forwarding it to the count_tokens endpoint.
-            "thinking", "user", "extra_body", "extra_headers", "extra_query",
-            "timeout", "stream", "temperature",
+            "thinking",
+            "user",
+            "extra_body",
+            "extra_headers",
+            "extra_query",
+            "timeout",
+            "stream",
+            "temperature",
         }
         if request.output_format is not None:
             mode = "Beta " if beta else ""
             raise ValueError(
-                f"Anthropic {mode}Messages token count 不支持 output_format；"
-                "请使用 output_config。"
+                f"Anthropic {mode}Messages token count 不支持 output_format；请使用 output_config。"
             )
         if beta:
             allowed.update({"context_management", "mcp_servers", "speed", "betas"})
         reject_unsupported_kwargs(
             "Anthropic Beta Messages token count" if beta else "Anthropic Messages token count",
-            {
-                key: value
-                for key, value in request.to_invoke_kwargs().items()
-                if key not in allowed
-            },
+            {key: value for key, value in request.to_invoke_kwargs().items() if key not in allowed},
         )
 
     def count_tokens(self, request: CompletionRequest | None = None, **kwargs: Any) -> int:
@@ -1253,7 +1405,9 @@ class AnthropicProvider(LargeLanguageModel):
         params = self._build_message_params(**values, beta=True, stream=False)
         return self._get_client().beta.messages.create(**params)
 
-    def beta_parse(self, output_format: Any, request: CompletionRequest | None = None, **kwargs: Any) -> Any:
+    def beta_parse(
+        self, output_format: Any, request: CompletionRequest | None = None, **kwargs: Any
+    ) -> Any:
         if output_format is None:
             raise ValueError("Anthropic Beta parse 必须提供 output_format。")
         request = coerce_completion_request(request, kwargs, "Anthropic beta_parse")
@@ -1329,23 +1483,15 @@ class AnthropicProvider(LargeLanguageModel):
         values = request.to_invoke_kwargs()
         values.pop("stream", None)
         params = self._build_message_params(**values, beta=True, stream=True)
-        return retry_sync_stream_context(
-            lambda: self._get_client().beta.messages.stream(**params)
-        )
+        return retry_sync_stream_context(lambda: self._get_client().beta.messages.stream(**params))
 
     def beta_tool_runner(
         self, tools: Any, request: CompletionRequest | None = None, **kwargs: Any
     ) -> Any:
         """创建 Anthropic Beta 工具运行器，保留 SDK 原生 runner 对象。"""
         if "compaction_control" in kwargs:
-            raise ValueError(
-                "Anthropic Beta tool_runner 当前 SDK 不支持 compaction_control。"
-            )
-        runner_options = {
-            key: kwargs.pop(key)
-            for key in ("max_iterations",)
-            if key in kwargs
-        }
+            raise ValueError("Anthropic Beta tool_runner 当前 SDK 不支持 compaction_control。")
+        runner_options = {key: kwargs.pop(key) for key in ("max_iterations",) if key in kwargs}
         request = coerce_completion_request(request, kwargs, "Anthropic beta_tool_runner")
         values = request.to_invoke_kwargs()
         values.pop("stream", None)
@@ -1410,7 +1556,9 @@ class AnthropicProvider(LargeLanguageModel):
         kwargs = self._safe_resource_kwargs(kwargs, "模型")
         return self._get_client().models.retrieve(model_id, **kwargs)
 
-    async def async_count_tokens(self, request: CompletionRequest | None = None, **kwargs: Any) -> int:
+    async def async_count_tokens(
+        self, request: CompletionRequest | None = None, **kwargs: Any
+    ) -> int:
         request = coerce_completion_request(request, kwargs, "Anthropic async_count_tokens")
         self._validate_token_count_request(request, beta=False)
         normalized = normalize_messages(request.prompt, request.system_prompt, request.messages)
@@ -1452,13 +1600,17 @@ class AnthropicProvider(LargeLanguageModel):
             params["extra_query"] = request.extra_query
         if request.timeout is not None:
             params["timeout"] = request.timeout
-        response = await self._resolve_async_result(self._get_aclient().messages.count_tokens(**params))
+        response = await self._resolve_async_result(
+            self._get_aclient().messages.count_tokens(**params)
+        )
         value = field(response, "input_tokens")
         if value is None:
             raise RuntimeError("Anthropic token count 响应缺少 input_tokens。")
         return int(value)
 
-    async def async_beta_create(self, request: CompletionRequest | None = None, **kwargs: Any) -> Any:
+    async def async_beta_create(
+        self, request: CompletionRequest | None = None, **kwargs: Any
+    ) -> Any:
         request = coerce_completion_request(request, kwargs, "Anthropic async_beta_create")
         if request.output_format is not None:
             raise ValueError(
@@ -1469,7 +1621,9 @@ class AnthropicProvider(LargeLanguageModel):
         params = self._build_message_params(**values, beta=True, stream=False)
         return await self._resolve_async_result(self._get_aclient().beta.messages.create(**params))
 
-    async def async_beta_parse(self, output_format: Any, request: CompletionRequest | None = None, **kwargs: Any) -> Any:
+    async def async_beta_parse(
+        self, output_format: Any, request: CompletionRequest | None = None, **kwargs: Any
+    ) -> Any:
         if output_format is None:
             raise ValueError("Anthropic Beta parse 必须提供 output_format。")
         request = coerce_completion_request(request, kwargs, "Anthropic async_beta_parse")
@@ -1484,7 +1638,9 @@ class AnthropicProvider(LargeLanguageModel):
             self._get_aclient().beta.messages.parse(output_format=output_format, **params)
         )
 
-    async def async_beta_count_tokens(self, request: CompletionRequest | None = None, **kwargs: Any) -> int:
+    async def async_beta_count_tokens(
+        self, request: CompletionRequest | None = None, **kwargs: Any
+    ) -> int:
         request = coerce_completion_request(request, kwargs, "Anthropic async_beta_count_tokens")
         self._validate_token_count_request(request, beta=True)
         normalized = normalize_messages(request.prompt, request.system_prompt, request.messages)
@@ -1557,14 +1713,8 @@ class AnthropicProvider(LargeLanguageModel):
     ) -> Any:
         """创建 AsyncAnthropic Beta 工具运行器。"""
         if "compaction_control" in kwargs:
-            raise ValueError(
-                "Anthropic Beta tool_runner 当前 SDK 不支持 compaction_control。"
-            )
-        runner_options = {
-            key: kwargs.pop(key)
-            for key in ("max_iterations",)
-            if key in kwargs
-        }
+            raise ValueError("Anthropic Beta tool_runner 当前 SDK 不支持 compaction_control。")
+        runner_options = {key: kwargs.pop(key) for key in ("max_iterations",) if key in kwargs}
         request = coerce_completion_request(request, kwargs, "Anthropic async_beta_tool_runner")
         values = request.to_invoke_kwargs()
         values.pop("stream", None)
@@ -1653,15 +1803,21 @@ class AnthropicProvider(LargeLanguageModel):
 
     async def async_retrieve_batch(self, batch_id: str, **kwargs: Any) -> Any:
         kwargs = self._safe_resource_kwargs(kwargs, "批处理")
-        return await self._resolve_async_result(self._get_aclient().messages.batches.retrieve(batch_id, **kwargs))
+        return await self._resolve_async_result(
+            self._get_aclient().messages.batches.retrieve(batch_id, **kwargs)
+        )
 
     async def async_batch_results(self, batch_id: str, **kwargs: Any) -> Any:
         kwargs = self._safe_resource_kwargs(kwargs, "批处理")
-        return await self._resolve_async_result(self._get_aclient().messages.batches.results(batch_id, **kwargs))
+        return await self._resolve_async_result(
+            self._get_aclient().messages.batches.results(batch_id, **kwargs)
+        )
 
     async def async_cancel_batch(self, batch_id: str, **kwargs: Any) -> Any:
         kwargs = self._safe_resource_kwargs(kwargs, "批处理")
-        return await self._resolve_async_result(self._get_aclient().messages.batches.cancel(batch_id, **kwargs))
+        return await self._resolve_async_result(
+            self._get_aclient().messages.batches.cancel(batch_id, **kwargs)
+        )
 
     async def async_list_batches(self, **kwargs: Any) -> Any:
         kwargs = self._safe_resource_kwargs(kwargs, "批处理")
@@ -1669,11 +1825,15 @@ class AnthropicProvider(LargeLanguageModel):
 
     async def async_delete_batch(self, batch_id: str, **kwargs: Any) -> Any:
         kwargs = self._safe_resource_kwargs(kwargs, "批处理")
-        return await self._resolve_async_result(self._get_aclient().messages.batches.delete(batch_id, **kwargs))
+        return await self._resolve_async_result(
+            self._get_aclient().messages.batches.delete(batch_id, **kwargs)
+        )
 
     async def async_upload_file(self, file: Any, **kwargs: Any) -> Any:
         kwargs = self._safe_resource_kwargs(kwargs, "文件")
-        return await self._resolve_async_result(self._get_aclient().files.upload(file=file, **kwargs))
+        return await self._resolve_async_result(
+            self._get_aclient().files.upload(file=file, **kwargs)
+        )
 
     async def async_list_files(self, **kwargs: Any) -> Any:
         kwargs = self._safe_resource_kwargs(kwargs, "文件")
@@ -1681,11 +1841,15 @@ class AnthropicProvider(LargeLanguageModel):
 
     async def async_retrieve_file(self, file_id: str, **kwargs: Any) -> Any:
         kwargs = self._safe_resource_kwargs(kwargs, "文件")
-        return await self._resolve_async_result(self._get_aclient().files.retrieve_metadata(file_id, **kwargs))
+        return await self._resolve_async_result(
+            self._get_aclient().files.retrieve_metadata(file_id, **kwargs)
+        )
 
     async def async_download_file(self, file_id: str, **kwargs: Any) -> Any:
         kwargs = self._safe_resource_kwargs(kwargs, "文件")
-        return await self._resolve_async_result(self._get_aclient().files.download(file_id, **kwargs))
+        return await self._resolve_async_result(
+            self._get_aclient().files.download(file_id, **kwargs)
+        )
 
     async def async_delete_file(self, file_id: str, **kwargs: Any) -> Any:
         kwargs = self._safe_resource_kwargs(kwargs, "文件")
@@ -1697,7 +1861,9 @@ class AnthropicProvider(LargeLanguageModel):
 
     async def async_retrieve_model(self, model_id: str, **kwargs: Any) -> Any:
         kwargs = self._safe_resource_kwargs(kwargs, "模型")
-        return await self._resolve_async_result(self._get_aclient().models.retrieve(model_id, **kwargs))
+        return await self._resolve_async_result(
+            self._get_aclient().models.retrieve(model_id, **kwargs)
+        )
 
     def invoke(
         self,
@@ -1830,9 +1996,7 @@ class AnthropicProvider(LargeLanguageModel):
                     async for text in self._aiter_invoke_stream_text(response):
                         yield text
             else:
-                response = await retry_async_call(
-                    lambda: aclient.messages.create(**params)
-                )
+                response = await retry_async_call(lambda: aclient.messages.create(**params))
                 result = self._extract_result(response)
                 if result.refusal:
                     raise RuntimeError(f"Anthropic 请求被拒绝: {result.refusal}")

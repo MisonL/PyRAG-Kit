@@ -13,6 +13,7 @@ from .base import BaseSplitter
 
 logger = get_module_logger(__name__)
 
+
 class RecursiveTextSplitter(BaseSplitter):
     """
     递归文本分割器。
@@ -32,7 +33,7 @@ class RecursiveTextSplitter(BaseSplitter):
     ):
         """
         初始化 RecursiveTextSplitter。
-        
+
         Args:
             mode (str): 分割模式，可选 "char" 或 "token"。
             encoding_name (str): tiktoken 编码名称。
@@ -66,10 +67,12 @@ class RecursiveTextSplitter(BaseSplitter):
         current_settings = get_settings()
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=self.parent_chunk_size or current_settings.kb_chunk_size,
-            chunk_overlap=self.parent_chunk_overlap if self.parent_chunk_overlap is not None else current_settings.kb_chunk_overlap,
+            chunk_overlap=self.parent_chunk_overlap
+            if self.parent_chunk_overlap is not None
+            else current_settings.kb_chunk_overlap,
             separators=current_settings.kb_splitter_separators,
             length_function=self._get_length_function(),
-            is_separator_regex=False
+            is_separator_regex=False,
         )
         logger.info(
             "文本分割器已就绪: chunk_size=%s, mode=%s, structure=%s",
@@ -82,7 +85,9 @@ class RecursiveTextSplitter(BaseSplitter):
         """构建子分片器。"""
         current_settings = get_settings()
         return RecursiveCharacterTextSplitter(
-            chunk_size=self.child_chunk_size if self.child_chunk_size is not None else current_settings.kb_child_chunk_size,
+            chunk_size=self.child_chunk_size
+            if self.child_chunk_size is not None
+            else current_settings.kb_child_chunk_size,
             chunk_overlap=(
                 self.child_chunk_overlap
                 if self.child_chunk_overlap is not None
@@ -104,7 +109,9 @@ class RecursiveTextSplitter(BaseSplitter):
         for doc in documents:
             logger.debug(f"正在分割文档: {doc.metadata.get('source', '未知来源')}")
 
-            langchain_chunks = self.text_splitter.create_documents([doc.content], metadatas=[doc.metadata])
+            langchain_chunks = self.text_splitter.create_documents(
+                [doc.content], metadatas=[doc.metadata]
+            )
             for i, chunk in enumerate(langchain_chunks):
                 chunk_content = self._strip_leading_punctuation(chunk.page_content)
                 if not chunk_content:
@@ -133,7 +140,9 @@ class RecursiveTextSplitter(BaseSplitter):
 
         for doc in documents:
             logger.debug(f"正在层级分割文档: {doc.metadata.get('source', '未知来源')}")
-            parent_documents = self.text_splitter.create_documents([doc.content], metadatas=[doc.metadata])
+            parent_documents = self.text_splitter.create_documents(
+                [doc.content], metadatas=[doc.metadata]
+            )
             doc_chunk_count = 0
 
             for parent_index, parent_doc in enumerate(parent_documents):
@@ -149,7 +158,9 @@ class RecursiveTextSplitter(BaseSplitter):
                         "parent_chunk_index": parent_index,
                     },
                 }
-                child_documents = child_splitter.create_documents([parent_content], metadatas=[parent_doc.metadata])
+                child_documents = child_splitter.create_documents(
+                    [parent_content], metadatas=[parent_doc.metadata]
+                )
 
                 for child_index, child_doc in enumerate(child_documents):
                     child_content = self._strip_leading_punctuation(child_doc.page_content)

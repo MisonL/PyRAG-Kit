@@ -122,8 +122,11 @@ def test_openai_provider_async_failure_raises(monkeypatch):
     with pytest.raises(RuntimeError, match="boom-embed"):
         asyncio.run(provider.aembed_documents(["doc"]))
 
+
 def test_openai_compatible_provider_async_failure_raises(monkeypatch):
-    fake_settings = SimpleNamespace(deepseek_api_key="token", deepseek_base_url="http://example.com")
+    fake_settings = SimpleNamespace(
+        deepseek_api_key="token", deepseek_base_url="http://example.com"
+    )
     monkeypatch.setattr("src.providers.openai_compatible.get_settings", lambda: fake_settings)
 
     provider = OpenAICompatibleProvider("demo", "deepseek")
@@ -138,6 +141,7 @@ def test_openai_compatible_provider_async_failure_raises(monkeypatch):
 
     with pytest.raises(RuntimeError, match="boom-embed"):
         asyncio.run(provider.aembed_documents(["doc"]))
+
 
 def test_openai_provider_reuses_compatible_adapter(monkeypatch):
     fake_settings = SimpleNamespace(openai_api_key="token", openai_api_base="http://example.com")
@@ -173,7 +177,9 @@ def test_openai_compatible_provider_normalizes_hyphenated_settings(monkeypatch):
 
 
 def test_openai_compatible_provider_forwards_tools(monkeypatch):
-    fake_settings = SimpleNamespace(deepseek_api_key="token", deepseek_base_url="http://example.com")
+    fake_settings = SimpleNamespace(
+        deepseek_api_key="token", deepseek_base_url="http://example.com"
+    )
     monkeypatch.setattr("src.providers.openai_compatible.get_settings", lambda: fake_settings)
     provider = OpenAICompatibleProvider("demo", "deepseek")
 

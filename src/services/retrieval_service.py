@@ -23,7 +23,13 @@ DEFAULT_RRF_K = 60.0
 
 
 class HybridReranker:
-    def __init__(self, vector_weight: float, keyword_weight: float, fusion_strategy: str = "rrf", rrf_k: float = DEFAULT_RRF_K):
+    def __init__(
+        self,
+        vector_weight: float,
+        keyword_weight: float,
+        fusion_strategy: str = "rrf",
+        rrf_k: float = DEFAULT_RRF_K,
+    ):
         self.vector_weight = vector_weight
         self.keyword_weight = keyword_weight
         self.fusion_strategy = fusion_strategy.strip().lower()
@@ -61,7 +67,10 @@ class HybridReranker:
         normalized_keyword = self._normalize_scores(keyword_scores)
         normalized_semantic = self._normalize_scores(semantic_scores)
         for index, doc in enumerate(scored_documents):
-            doc["score"] = vector_weight * normalized_semantic[index] + keyword_weight * normalized_keyword[index]
+            doc["score"] = (
+                vector_weight * normalized_semantic[index]
+                + keyword_weight * normalized_keyword[index]
+            )
         return sorted(scored_documents, key=lambda item: item["score"], reverse=True)
 
     def _rrf_rerank(self, documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -88,7 +97,9 @@ def _document_key(document: dict[str, Any]) -> str:
     return f"{source}:{document.get('page_content', '')[:64]}"
 
 
-def _merge_hybrid_results(semantic_results: list[dict[str, Any]], keyword_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _merge_hybrid_results(
+    semantic_results: list[dict[str, Any]], keyword_results: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
     merged: dict[str, dict[str, Any]] = {}
     for rank, document in enumerate(semantic_results, start=1):
         merged_doc = copy.deepcopy(document)
@@ -110,7 +121,9 @@ def _merge_hybrid_results(semantic_results: list[dict[str, Any]], keyword_result
     return list(merged.values())
 
 
-def _promote_parent_context(documents: list[dict[str, Any]], resolver: Callable[[str | None], str | None] | None) -> list[dict[str, Any]]:
+def _promote_parent_context(
+    documents: list[dict[str, Any]], resolver: Callable[[str | None], str | None] | None
+) -> list[dict[str, Any]]:
     promoted_documents: list[dict[str, Any]] = []
     for document in documents:
         promoted_doc = copy.deepcopy(document)
@@ -131,7 +144,9 @@ def _deduplicate_parent_documents(documents: list[dict[str, Any]]) -> list[dict[
         parent_key = metadata.get("parent_id")
         key = str(parent_key) if parent_key else _document_key(document)
         existing = deduplicated.get(key)
-        if existing is None or float(document.get("score", 0) or 0) > float(existing.get("score", 0) or 0):
+        if existing is None or float(document.get("score", 0) or 0) > float(
+            existing.get("score", 0) or 0
+        ):
             deduplicated[key] = copy.deepcopy(document)
     return list(deduplicated.values())
 
@@ -142,33 +157,47 @@ class RetrievalService:
         self.embedding_service = embedding_service
         self._rerank_providers: dict[tuple[str, str, str, str], RerankModel] = {}
 
-    async def retrieve(self, query: str, session_config: SessionConfig, console: Console | None = None) -> list[dict[str, Any]]:
+    async def retrieve(
+        self, query: str, session_config: SessionConfig, console: Console | None = None
+    ) -> list[dict[str, Any]]:
         retrieval_method = session_config.retrieval_method
-        effective_top_k = max(1, session_config.top_k) * max(1, session_config.retrieval_candidate_multiplier)
+        effective_top_k = max(1, session_config.top_k) * max(
+            1, session_config.retrieval_candidate_multiplier
+        )
         parent_resolver = getattr(self.vector_store, "resolve_parent_content", None)
 
         if retrieval_method == RetrievalMethod.HYBRID_SEARCH:
-            semantic_results, keyword_results = await self._gather_hybrid_results(query, effective_top_k)
+            semantic_results, keyword_results = await self._gather_hybrid_results(
+                query, effective_top_k
+            )
             reranker = HybridReranker(
                 session_config.vector_weight,
                 session_config.keyword_weight,
                 fusion_strategy=session_config.hybrid_fusion_strategy,
             )
-            ranked_results = reranker.rerank(_merge_hybrid_results(semantic_results, keyword_results))
+            ranked_results = reranker.rerank(
+                _merge_hybrid_results(semantic_results, keyword_results)
+            )
         elif retrieval_method == RetrievalMethod.SEMANTIC_SEARCH:
             ranked_results = await self._semantic_retrieve(query, effective_top_k)
         else:
             ranked_results = await self._keyword_retrieve(query, effective_top_k)
 
         if self._should_apply_score_threshold(session_config):
-            ranked_results = [doc for doc in ranked_results if float(doc.get("score", 0) or 0) >= session_config.score_threshold]
+            ranked_results = [
+                doc
+                for doc in ranked_results
+                if float(doc.get("score", 0) or 0) >= session_config.score_threshold
+            ]
 
         ranked_results = _promote_parent_context(ranked_results, parent_resolver)
         ranked_results = _deduplicate_parent_documents(ranked_results)
         ranked_results = await self._rerank_if_needed(query, ranked_results, session_config)
         return ranked_results[: max(1, session_config.top_k)]
 
-    async def _gather_hybrid_results(self, query: str, top_k: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    async def _gather_hybrid_results(
+        self, query: str, top_k: int
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         semantic_results, keyword_results = await asyncio.gather(
             self._semantic_retrieve(query, top_k),
             self._keyword_retrieve(query, top_k),
@@ -207,7 +236,9 @@ class RetrievalService:
             raise NotImplementedError(f"向量存储未实现 {method_name} 接口。")
         return await asyncio.to_thread(method, *args)
 
-    async def _legacy_search(self, query: str, top_k: int, search_type: str) -> list[dict[str, Any]]:
+    async def _legacy_search(
+        self, query: str, top_k: int, search_type: str
+    ) -> list[dict[str, Any]]:
         async_search = getattr(self.vector_store, "asearch", None)
         if callable(async_search):
             return await async_search(query, top_k, search_type=search_type)
@@ -242,8 +273,7 @@ class RetrievalService:
             # its replacement so stale transports and credentials are not kept
             # alive indefinitely.
             stale_keys = [
-                key for key in self._rerank_providers
-                if key[0] == provider_key and key != cache_key
+                key for key in self._rerank_providers if key[0] == provider_key and key != cache_key
             ]
             for stale_key in stale_keys:
                 stale_provider = self._rerank_providers.pop(stale_key)
@@ -301,7 +331,9 @@ class RetrievalService:
             if inspect.isawaitable(result):
                 await result
 
-    async def _rerank_if_needed(self, query: str, ranked_results: list[dict[str, Any]], session_config: SessionConfig) -> list[dict[str, Any]]:
+    async def _rerank_if_needed(
+        self, query: str, ranked_results: list[dict[str, Any]], session_config: SessionConfig
+    ) -> list[dict[str, Any]]:
         if not session_config.rerank_enabled or not ranked_results:
             return ranked_results
 

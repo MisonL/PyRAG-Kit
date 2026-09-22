@@ -53,9 +53,7 @@ class LocalHashEmbeddingProvider(TextEmbeddingModel):
     def _validate_kwargs(kwargs: dict) -> None:
         if kwargs:
             unsupported = ", ".join(sorted(str(key) for key in kwargs))
-            raise ValueError(
-                "LocalHash Embedding 不支持请求参数: " + unsupported
-            )
+            raise ValueError("LocalHash Embedding 不支持请求参数: " + unsupported)
 
     def embed_documents(self, texts: list[str], **kwargs) -> list[list[float]]:
         self._validate_kwargs(kwargs)

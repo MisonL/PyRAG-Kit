@@ -72,7 +72,9 @@ class FaissStore(VectorStoreBase):
 
     def _rebuild_indices(self) -> None:
         if self.documents:
-            self._tokenized_docs_cache = [list(jieba.cut(self._build_index_text(doc))) for doc in self.documents]
+            self._tokenized_docs_cache = [
+                list(jieba.cut(self._build_index_text(doc))) for doc in self.documents
+            ]
             self.bm25_index = BM25Okapi(self._tokenized_docs_cache)
         else:
             self._tokenized_docs_cache = []
@@ -138,7 +140,9 @@ class FaissStore(VectorStoreBase):
         self._rebuild_indices()
 
     def add_documents(self, documents: list[dict[str, Any]]):
-        raise RuntimeError("FaissStore.add_documents 已废弃，请使用外部 EmbeddingService 后调用 upsert_embeddings。")
+        raise RuntimeError(
+            "FaissStore.add_documents 已废弃，请使用外部 EmbeddingService 后调用 upsert_embeddings。"
+        )
 
     async def aadd_documents(self, documents: list[dict[str, Any]]):
         raise RuntimeError("FaissStore.aadd_documents 已废弃，请使用 KnowledgeBuildService。")
@@ -189,11 +193,19 @@ class FaissStore(VectorStoreBase):
                 break
         return results
 
-    def search(self, query: str, top_k: int = 5, search_type: str = "semantic") -> list[dict[str, Any]]:
-        raise RuntimeError("FaissStore.search 已废弃，请通过 RetrievalService 调用语义检索或关键词检索。")
+    def search(
+        self, query: str, top_k: int = 5, search_type: str = "semantic"
+    ) -> list[dict[str, Any]]:
+        raise RuntimeError(
+            "FaissStore.search 已废弃，请通过 RetrievalService 调用语义检索或关键词检索。"
+        )
 
-    async def asearch(self, query: str, top_k: int = 5, search_type: str = "semantic") -> list[dict[str, Any]]:
-        raise RuntimeError("FaissStore.asearch 已废弃，请通过 RetrievalService 调用语义检索或关键词检索。")
+    async def asearch(
+        self, query: str, top_k: int = 5, search_type: str = "semantic"
+    ) -> list[dict[str, Any]]:
+        raise RuntimeError(
+            "FaissStore.asearch 已废弃，请通过 RetrievalService 调用语义检索或关键词检索。"
+        )
 
     def save(self, path: str):
         with open(path, "wb") as file:
@@ -233,10 +245,14 @@ class FaissStore(VectorStoreBase):
         np.save(snapshot_path / "embeddings.npy", self.embeddings)
         faiss.write_index(self.faiss_index, str(snapshot_path / "semantic.index"))
         stats = {
-            "document_count": len({doc.get("metadata", {}).get("source") for doc in self.documents}),
+            "document_count": len(
+                {doc.get("metadata", {}).get("source") for doc in self.documents}
+            ),
             "chunk_count": len(self.documents),
             "parent_count": len(self.parent_documents),
-            "embedding_dimension": int(self.embeddings.shape[1]) if self.embeddings is not None else 0,
+            "embedding_dimension": int(self.embeddings.shape[1])
+            if self.embeddings is not None
+            else 0,
         }
         (snapshot_path / "stats.json").write_text(
             json.dumps(stats, ensure_ascii=False, indent=2),
@@ -255,7 +271,9 @@ class FaissStore(VectorStoreBase):
         embeddings_path = snapshot_path / "embeddings.npy"
         self.embeddings = np.load(embeddings_path) if embeddings_path.exists() else None
         faiss_index_path = snapshot_path / "semantic.index"
-        self.faiss_index = faiss.read_index(str(faiss_index_path)) if faiss_index_path.exists() else None
+        self.faiss_index = (
+            faiss.read_index(str(faiss_index_path)) if faiss_index_path.exists() else None
+        )
         lexical_path = snapshot_path / "lexical.index"
         if lexical_path.exists():
             with lexical_path.open("rb") as file:

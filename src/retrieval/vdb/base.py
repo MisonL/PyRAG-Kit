@@ -21,11 +21,15 @@ class VectorStoreBase(ABC):
         """异步添加文档。"""
 
     @abstractmethod
-    def search(self, query: str, top_k: int = 5, search_type: str = "semantic") -> list[dict[str, Any]]:
+    def search(
+        self, query: str, top_k: int = 5, search_type: str = "semantic"
+    ) -> list[dict[str, Any]]:
         """同步搜索文档。"""
 
     @abstractmethod
-    async def asearch(self, query: str, top_k: int = 5, search_type: str = "semantic") -> list[dict[str, Any]]:
+    async def asearch(
+        self, query: str, top_k: int = 5, search_type: str = "semantic"
+    ) -> list[dict[str, Any]]:
         """异步搜索文档。"""
 
     @abstractmethod

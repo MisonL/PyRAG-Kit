@@ -94,12 +94,15 @@ def test_embedding_service_does_not_replay_model_options(monkeypatch):
 
 
 @pytest.mark.parametrize("method", ["embed_texts", "embed_query", "embed_in_batches"])
-@pytest.mark.parametrize("options", [
-    {"dimensions": 2},
-    {"encoding_format": "float"},
-    {"user": "embedding-test"},
-    {"extra_body": {"vendor_flag": True}},
-])
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"dimensions": 2},
+        {"encoding_format": "float"},
+        {"user": "embedding-test"},
+        {"extra_body": {"vendor_flag": True}},
+    ],
+)
 def test_embedding_service_model_options_reach_sdk_once(monkeypatch, method, options):
     requests = []
 
@@ -120,12 +123,19 @@ def test_embedding_service_model_options_reach_sdk_once(monkeypatch, method, opt
         "src.services.embedding_service.ModelProviderFactory.get_embedding_provider",
         lambda *_args: provider,
     )
-    service = EmbeddingService(SimpleNamespace(
-        default_embedding_provider="custom", kb_embedding_batch_size=1,
-        embedding_configurations={"custom": ModelDetail(
-            provider="openai", model_name="text-embedding-3-small", options=options,
-        )},
-    ))
+    service = EmbeddingService(
+        SimpleNamespace(
+            default_embedding_provider="custom",
+            kb_embedding_batch_size=1,
+            embedding_configurations={
+                "custom": ModelDetail(
+                    provider="openai",
+                    model_name="text-embedding-3-small",
+                    options=options,
+                )
+            },
+        )
+    )
     value = "one" if method == "embed_query" else ["one", "two"]
     result = asyncio.run(getattr(service, method)(value))
     assert result.dtype == np.float32

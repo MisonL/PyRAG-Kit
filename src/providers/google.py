@@ -61,11 +61,32 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
 
     capabilities = frozenset(
         {
-            "chat", "stream", "messages", "multimodal", "tools", "structured_output",
-            "usage", "token_count", "embedding", "files", "batches", "cache",
-            "models", "tuning", "images", "videos", "file_search",
-            "interactions", "agents", "webhooks", "environments", "triggers", "live",
-            "auth_tokens", "operations", "chats",
+            "chat",
+            "stream",
+            "messages",
+            "multimodal",
+            "tools",
+            "structured_output",
+            "usage",
+            "token_count",
+            "embedding",
+            "files",
+            "batches",
+            "cache",
+            "models",
+            "tuning",
+            "images",
+            "videos",
+            "file_search",
+            "interactions",
+            "agents",
+            "webhooks",
+            "environments",
+            "triggers",
+            "live",
+            "auth_tokens",
+            "operations",
+            "chats",
         }
     )
 
@@ -139,16 +160,45 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
 
     _HTTP_OPTIONS_SENSITIVE_EXACT = frozenset(
         {
-            "apikey", "xapikey", "accesskey", "secretkey", "token", "password",
-            "passwd", "authorization", "auth", "bearer", "accesstoken",
-            "xaccesstoken", "authtoken", "xauthtoken", "authkey", "credential",
-            "credentials", "cookie", "setcookie", "proxyauthorization", "secret",
-            "privatekey", "httpclient", "httpxclient", "httpxasyncclient",
-            "aiohttpclient", "clientargs", "asyncclientargs", "baseurl",
-            "baseurlresourcescope", "proxy", "proxies", "transport", "verify",
-            "cert", "mounts",
+            "apikey",
+            "xapikey",
+            "accesskey",
+            "secretkey",
+            "token",
+            "password",
+            "passwd",
+            "authorization",
+            "auth",
+            "bearer",
+            "accesstoken",
+            "xaccesstoken",
+            "authtoken",
+            "xauthtoken",
+            "authkey",
+            "credential",
+            "credentials",
+            "cookie",
+            "setcookie",
+            "proxyauthorization",
+            "secret",
+            "privatekey",
+            "httpclient",
+            "httpxclient",
+            "httpxasyncclient",
+            "aiohttpclient",
+            "clientargs",
+            "asyncclientargs",
+            "baseurl",
+            "baseurlresourcescope",
+            "proxy",
+            "proxies",
+            "transport",
+            "verify",
+            "cert",
+            "mounts",
         }
     )
+
     def __init__(self, model_name: str, options: dict[str, Any] | None = None):
         self._model_name = model_name
         if options is not None and not isinstance(options, Mapping):
@@ -198,7 +248,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                     "GOOGLE_API_KEY is required for GoogleProvider unless options.credentials is provided "
                     "or Vertex/Enterprise mode enables Application Default Credentials"
                 )
-            
+
             logger.debug("正在初始化 google-genai Client")
             client_options = {
                 key: value
@@ -211,13 +261,9 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             if "enterprise" not in client_options and "vertexai" not in client_options:
                 configured_flags = self._configured_environment_vertex_flags(settings)
                 if "GOOGLE_GENAI_USE_ENTERPRISE" in configured_flags:
-                    client_options["enterprise"] = configured_flags[
-                        "GOOGLE_GENAI_USE_ENTERPRISE"
-                    ]
+                    client_options["enterprise"] = configured_flags["GOOGLE_GENAI_USE_ENTERPRISE"]
                 elif "GOOGLE_GENAI_USE_VERTEXAI" in configured_flags:
-                    client_options["vertexai"] = configured_flags[
-                        "GOOGLE_GENAI_USE_VERTEXAI"
-                    ]
+                    client_options["vertexai"] = configured_flags["GOOGLE_GENAI_USE_VERTEXAI"]
             if "debug_config" in client_options:
                 client_options["debug_config"] = self._coerce_debug_config(
                     client_options["debug_config"]
@@ -225,7 +271,11 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             if credentials is not None:
                 if "credentials" not in client_options:
                     client_options["credentials"] = credentials
-                if vertexai is True and "enterprise" not in client_options and "vertexai" not in client_options:
+                if (
+                    vertexai is True
+                    and "enterprise" not in client_options
+                    and "vertexai" not in client_options
+                ):
                     # google-genai treats explicit credentials as Vertex ADC
                     # credentials only when the Vertex transport is selected.
                     # Make that implication explicit instead of letting the SDK
@@ -307,9 +357,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             raise ValueError("Google options 必须是对象。")
         unknown = sorted(set(options).difference(cls._OPTION_KEYS))
         if unknown:
-            raise ValueError(
-                "Google options 包含不支持的字段: " + ", ".join(unknown)
-            )
+            raise ValueError("Google options 包含不支持的字段: " + ", ".join(unknown))
         if "extra_body" in options:
             validate_secret_free_payload(
                 options["extra_body"],
@@ -411,9 +459,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                 or float(timeout) <= 0
                 or int(float(timeout)) != float(timeout)
             ):
-                raise ValueError(
-                    "Google options.http_options.timeout 必须是正整数毫秒。"
-                )
+                raise ValueError("Google options.http_options.timeout 必须是正整数毫秒。")
 
         found: list[str] = []
 
@@ -427,9 +473,16 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             return any(
                 normalized.endswith(marker)
                 for marker in (
-                    "apikey", "accesskey", "accesstoken", "authtoken",
-                    "secret", "secretkey", "clientsecret", "password",
-                    "credential", "cookie",
+                    "apikey",
+                    "accesskey",
+                    "accesstoken",
+                    "authtoken",
+                    "secret",
+                    "secretkey",
+                    "clientsecret",
+                    "password",
+                    "credential",
+                    "cookie",
                 )
             )
 
@@ -465,7 +518,9 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                     parsed = urlsplit(item)
                 except ValueError:
                     parsed = None
-                if parsed is not None and (parsed.username is not None or parsed.password is not None):
+                if parsed is not None and (
+                    parsed.username is not None or parsed.password is not None
+                ):
                     found.append(f"{path} userinfo")
 
         visit(payload)
@@ -502,9 +557,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         def visit(value: Any) -> None:
             if isinstance(value, Mapping):
                 for key, nested in value.items():
-                    normalized = "".join(
-                        char for char in str(key).lower() if char.isalnum()
-                    )
+                    normalized = "".join(char for char in str(key).lower() if char.isalnum())
                     if normalized == "httpoptions":
                         cls._validate_http_options(nested)
                         continue
@@ -527,9 +580,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         allowed = {"client_mode", "replays_directory", "replay_id"}
         unknown = sorted(set(value).difference(allowed))
         if unknown:
-            raise ValueError(
-                "Google debug_config 包含不支持的字段: " + ", ".join(unknown)
-            )
+            raise ValueError("Google debug_config 包含不支持的字段: " + ", ".join(unknown))
         try:
             from google.genai.client import DebugConfig
         except ImportError as exc:
@@ -607,9 +658,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
     def _vertex_embed_content_only(self) -> bool:
         """判断当前模型是否只能通过 Vertex 的单内容 embedContent 调用。"""
         model = self._model_name.lower()
-        return (
-            "gemini" in model
-        ) or "maas" in model
+        return ("gemini" in model) or "maas" in model
 
     @staticmethod
     def _validate_token_count_fields(request: CompletionRequest) -> None:
@@ -617,19 +666,58 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         unsupported = {
             key: value
             for key, value in request.to_invoke_kwargs().items()
-            if key in {
-                "max_tokens", "top_p", "top_k", "frequency_penalty",
-                "presence_penalty", "n", "logit_bias", "logprobs",
-                "top_logprobs", "modalities", "audio", "prediction",
-                "web_search_options", "seed", "stop", "response_format",
-                "tool_choice", "reasoning", "thinking", "store", "background",
-                "parallel_tool_calls", "max_tool_calls", "conversation", "session",
-                "context_management", "caching", "expire_at", "prompt_cache_options",
-                "safety_identifier", "moderation", "verbosity", "prompt_cache_key",
-                "prompt_cache_retention", "service_tier", "truncation", "stream_options",
-                "cache_control", "container", "inference_geo", "mcp_servers",
-                "output_config", "output_format", "speed", "betas", "diagnostics",
-                "fallback_credit_token", "fallbacks", "user", "personality",
+            if key
+            in {
+                "max_tokens",
+                "top_p",
+                "top_k",
+                "frequency_penalty",
+                "presence_penalty",
+                "n",
+                "logit_bias",
+                "logprobs",
+                "top_logprobs",
+                "modalities",
+                "audio",
+                "prediction",
+                "web_search_options",
+                "seed",
+                "stop",
+                "response_format",
+                "tool_choice",
+                "reasoning",
+                "thinking",
+                "store",
+                "background",
+                "parallel_tool_calls",
+                "max_tool_calls",
+                "conversation",
+                "session",
+                "context_management",
+                "caching",
+                "expire_at",
+                "prompt_cache_options",
+                "safety_identifier",
+                "moderation",
+                "verbosity",
+                "prompt_cache_key",
+                "prompt_cache_retention",
+                "service_tier",
+                "truncation",
+                "stream_options",
+                "cache_control",
+                "container",
+                "inference_geo",
+                "mcp_servers",
+                "output_config",
+                "output_format",
+                "speed",
+                "betas",
+                "diagnostics",
+                "fallback_credit_token",
+                "fallbacks",
+                "user",
+                "personality",
             }
             and value is not None
         }
@@ -641,18 +729,59 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         unsupported = {
             key: value
             for key, value in request.to_invoke_kwargs().items()
-            if key in {
-                "max_tokens", "top_p", "top_k", "frequency_penalty",
-                "presence_penalty", "n", "logit_bias", "logprobs", "top_logprobs",
-                "modalities", "audio", "prediction", "web_search_options", "seed",
-                "stop", "response_format", "tool_choice", "reasoning", "thinking",
-                "store", "background", "parallel_tool_calls", "max_tool_calls",
-                "conversation", "session", "context_management", "caching", "expire_at",
-                "prompt_cache_options", "safety_identifier", "moderation", "verbosity",
-                "prompt_cache_key", "prompt_cache_retention", "service_tier", "truncation",
-                "stream_options", "cache_control", "container", "inference_geo", "mcp_servers",
-                "output_config", "output_format", "speed", "betas", "diagnostics",
-                "fallback_credit_token", "fallbacks", "user", "personality", "tools",
+            if key
+            in {
+                "max_tokens",
+                "top_p",
+                "top_k",
+                "frequency_penalty",
+                "presence_penalty",
+                "n",
+                "logit_bias",
+                "logprobs",
+                "top_logprobs",
+                "modalities",
+                "audio",
+                "prediction",
+                "web_search_options",
+                "seed",
+                "stop",
+                "response_format",
+                "tool_choice",
+                "reasoning",
+                "thinking",
+                "store",
+                "background",
+                "parallel_tool_calls",
+                "max_tool_calls",
+                "conversation",
+                "session",
+                "context_management",
+                "caching",
+                "expire_at",
+                "prompt_cache_options",
+                "safety_identifier",
+                "moderation",
+                "verbosity",
+                "prompt_cache_key",
+                "prompt_cache_retention",
+                "service_tier",
+                "truncation",
+                "stream_options",
+                "cache_control",
+                "container",
+                "inference_geo",
+                "mcp_servers",
+                "output_config",
+                "output_format",
+                "speed",
+                "betas",
+                "diagnostics",
+                "fallback_credit_token",
+                "fallbacks",
+                "user",
+                "personality",
+                "tools",
             }
             and value is not None
         }
@@ -669,8 +798,13 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
 
     def _embedding_options(self) -> dict[str, Any]:
         supported = {
-            "task_type", "output_dimensionality", "title", "mime_type",
-            "auto_truncate", "document_ocr", "audio_track_extraction",
+            "task_type",
+            "output_dimensionality",
+            "title",
+            "mime_type",
+            "auto_truncate",
+            "document_ocr",
+            "audio_track_extraction",
         }
         return {key: value for key, value in self._options.items() if key in supported}
 
@@ -706,20 +840,46 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
     @staticmethod
     def _validate_embedding_kwargs(kwargs: dict[str, Any]) -> None:
         allowed = {
-            "task_type", "output_dimensionality", "title", "mime_type",
-            "auto_truncate", "document_ocr", "audio_track_extraction",
+            "task_type",
+            "output_dimensionality",
+            "title",
+            "mime_type",
+            "auto_truncate",
+            "document_ocr",
+            "audio_track_extraction",
         }
-        unsupported = sorted(key for key, value in kwargs.items() if value is not None and key not in allowed)
+        unsupported = sorted(
+            key for key, value in kwargs.items() if value is not None and key not in allowed
+        )
         if unsupported:
             raise ValueError(f"Google Embedding 不支持请求参数: {', '.join(unsupported)}")
 
     @staticmethod
     def _validate_request(request: CompletionRequest) -> None:
         supported = {
-            "prompt", "system_prompt", "messages", "tools", "stream", "temperature",
-            "max_tokens", "top_p", "top_k", "frequency_penalty", "presence_penalty",
-            "n", "seed", "modalities", "stop", "response_format", "tool_choice",
-            "extra_body", "extra_headers", "extra_query", "thinking", "service_tier", "timeout",
+            "prompt",
+            "system_prompt",
+            "messages",
+            "tools",
+            "stream",
+            "temperature",
+            "max_tokens",
+            "top_p",
+            "top_k",
+            "frequency_penalty",
+            "presence_penalty",
+            "n",
+            "seed",
+            "modalities",
+            "stop",
+            "response_format",
+            "tool_choice",
+            "extra_body",
+            "extra_headers",
+            "extra_query",
+            "thinking",
+            "service_tier",
+            "timeout",
         }
         reject_unsupported_kwargs(
             "Google SDK",
@@ -748,11 +908,15 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             raise ValueError(
                 "Google SDK 不支持请求级 extra_query；请在 options.http_options 中配置。"
             )
-        extra_body = validate_secret_free_payload(
-            extra_body,
-            "Google",
-            "extra_body",
-        ) if extra_body is not None else None
+        extra_body = (
+            validate_secret_free_payload(
+                extra_body,
+                "Google",
+                "extra_body",
+            )
+            if extra_body is not None
+            else None
+        )
         values: dict[str, Any] = {}
         if extra_headers is not None:
             values["headers"] = dict(extra_headers)
@@ -769,15 +933,37 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
 
     def _generation_options(self) -> dict[str, Any]:
         supported = {
-            "temperature", "top_p", "top_k", "candidate_count", "max_output_tokens",
-            "stop_sequences", "presence_penalty", "frequency_penalty", "seed",
-            "response_mime_type", "response_schema", "response_json_schema",
-            "safety_settings", "cached_content", "response_modalities", "thinking_config",
-            "automatic_function_calling", "speech_config", "image_config", "labels",
-            "routing_config", "model_selection_config", "media_resolution",
-            "enable_enhanced_civic_answers", "service_tier",
-            "logprobs", "response_logprobs", "audio_timestamp", "audio_transcription_config",
-            "model_armor_config", "should_return_http_response",
+            "temperature",
+            "top_p",
+            "top_k",
+            "candidate_count",
+            "max_output_tokens",
+            "stop_sequences",
+            "presence_penalty",
+            "frequency_penalty",
+            "seed",
+            "response_mime_type",
+            "response_schema",
+            "response_json_schema",
+            "safety_settings",
+            "cached_content",
+            "response_modalities",
+            "thinking_config",
+            "automatic_function_calling",
+            "speech_config",
+            "image_config",
+            "labels",
+            "routing_config",
+            "model_selection_config",
+            "media_resolution",
+            "enable_enhanced_civic_answers",
+            "service_tier",
+            "logprobs",
+            "response_logprobs",
+            "audio_timestamp",
+            "audio_transcription_config",
+            "model_armor_config",
+            "should_return_http_response",
         }
         return {key: value for key, value in self._options.items() if key in supported}
 
@@ -802,9 +988,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                 "response_mime_type": "application/json",
                 "response_json_schema": dict(payload),
             }
-        raise ValueError(
-            "Google response_format 仅支持 json_object 或 json_schema。"
-        )
+        raise ValueError("Google response_format 仅支持 json_object 或 json_schema。")
 
     def _generation_http_options(
         self,
@@ -813,7 +997,13 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         extra_headers: dict[str, str] | None,
         extra_query: dict[str, Any] | None,
         timeout: float | None,
-    ) -> tuple[dict[str, Any] | None, dict[str, str] | None, dict[str, Any] | None, float | None, Any | None]:
+    ) -> tuple[
+        dict[str, Any] | None,
+        dict[str, str] | None,
+        dict[str, Any] | None,
+        float | None,
+        Any | None,
+    ]:
         """合并模型级与调用级 HTTP 扩展，拒绝同名字段静默覆盖。"""
         options = getattr(self, "_options", {}) or {}
         configured_body = options.get("extra_body")
@@ -834,9 +1024,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         )
         overlap = sorted(set(configured_values).intersection(request_values))
         if overlap:
-            raise ValueError(
-                "Google extra_body 与模型 options 重复: " + ", ".join(overlap)
-            )
+            raise ValueError("Google extra_body 与模型 options 重复: " + ", ".join(overlap))
         merged_body = {**configured_values, **request_values} or None
         effective_timeout = timeout
         if effective_timeout is None:
@@ -902,9 +1090,18 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                 converted_tools.append(tool)
                 continue
             native_keys = {
-                "retrieval", "computer_use", "file_search", "google_search", "google_maps",
-                "code_execution", "enterprise_web_search", "google_search_retrieval",
-                "parallel_ai_search", "url_context", "mcp_servers", "exa_ai_search",
+                "retrieval",
+                "computer_use",
+                "file_search",
+                "google_search",
+                "google_maps",
+                "code_execution",
+                "enterprise_web_search",
+                "google_search_retrieval",
+                "parallel_ai_search",
+                "url_context",
+                "mcp_servers",
+                "exa_ai_search",
             }
             type_name = tool.get("type")
             type_aliases = {
@@ -999,17 +1196,13 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         configured_max_tokens = self._options.get("max_tokens")
         configured_max_output_tokens = values.get("max_output_tokens")
         if configured_max_tokens is not None and configured_max_output_tokens is not None:
-            raise ValueError(
-                "Google options.max_tokens 与 options.max_output_tokens 重复。"
-            )
+            raise ValueError("Google options.max_tokens 与 options.max_output_tokens 重复。")
         if configured_max_tokens is not None:
             values["max_output_tokens"] = configured_max_tokens
         configured_thinking = self._options.get("thinking")
         configured_thinking_config = values.get("thinking_config")
         if configured_thinking is not None and configured_thinking_config is not None:
-            raise ValueError(
-                "Google options.thinking 与 options.thinking_config 重复。"
-            )
+            raise ValueError("Google options.thinking 与 options.thinking_config 重复。")
         if configured_thinking is not None:
             values["thinking_config"] = configured_thinking
         configured_response_format = self._options.get("response_format")
@@ -1017,10 +1210,12 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             if response_format is not None:
                 raise ValueError("Google response_format 与模型 options 重复。")
             response_format = configured_response_format
-        values.update({
-            "system_instruction": system_prompt,
-            "tools": self._convert_tools(tools),
-        })
+        values.update(
+            {
+                "system_instruction": system_prompt,
+                "tools": self._convert_tools(tools),
+            }
+        )
         if temperature is not None or "temperature" not in values:
             values["temperature"] = 0.7 if temperature is None else temperature
         if max_tokens is not None:
@@ -1068,7 +1263,9 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             )
             if http_options is not None:
                 values["http_options"] = http_options
-        return types.GenerateContentConfig(**{key: value for key, value in values.items() if value is not None})
+        return types.GenerateContentConfig(
+            **{key: value for key, value in values.items() if value is not None}
+        )
 
     @staticmethod
     def _decode_data_uri(value: str, context: str) -> tuple[str, bytes]:
@@ -1238,19 +1435,17 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                 if not name and isinstance(tool_call_id, str):
                     name = tool_call_names.get(tool_call_id)
                 if not name:
-                    raise ValueError(
-                        "Google 工具结果缺少可关联的 tool_call_id/name。"
-                    )
+                    raise ValueError("Google 工具结果缺少可关联的 tool_call_id/name。")
                 raw_content = message.get("content", message.get("response", {}))
                 response_parts = raw_content if isinstance(raw_content, list) else [raw_content]
                 parts = []
                 for response_part in response_parts:
                     if isinstance(response_part, dict) and response_part.get("type") in {
-                        "tool_result", "function_result", "function_response"
+                        "tool_result",
+                        "function_result",
+                        "function_response",
                     }:
-                        response = response_part.get(
-                            "response", response_part.get("content", {})
-                        )
+                        response = response_part.get("response", response_part.get("content", {}))
                         part_name = response_part.get("name") or name
                         part_id = response_part.get("tool_call_id") or tool_call_id
                     else:
@@ -1324,9 +1519,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                         if isinstance(image_url, str) and image_url.startswith("data:"):
                             mime_type, data = GoogleProvider._decode_data_uri(image_url, "图片")
                             parts.append(
-                                types.Part(
-                                    inline_data=types.Blob(mime_type=mime_type, data=data)
-                                )
+                                types.Part(inline_data=types.Blob(mime_type=mime_type, data=data))
                             )
                         else:
                             parts.append(
@@ -1338,7 +1531,13 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                                     )
                                 )
                             )
-                    elif part_type in {"audio_url", "input_audio", "video_url", "input_video", "file"}:
+                    elif part_type in {
+                        "audio_url",
+                        "input_audio",
+                        "video_url",
+                        "input_video",
+                        "file",
+                    }:
                         media_value = part.get(
                             "audio_url",
                             part.get("video_url", part.get("url", part.get("file_uri"))),
@@ -1388,9 +1587,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                         if not part_name and isinstance(part_id, str):
                             part_name = tool_call_names.get(part_id)
                         if not isinstance(part_name, str) or not part_name.strip():
-                            raise ValueError(
-                                "Google 工具结果缺少可关联的 tool_call_id/name。"
-                            )
+                            raise ValueError("Google 工具结果缺少可关联的 tool_call_id/name。")
                         parts.append(
                             types.Part(
                                 function_response=types.FunctionResponse(
@@ -1419,9 +1616,13 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                                 ) from exc
                         if not isinstance(arguments, Mapping):
                             raise ValueError("Google function_call 的 arguments 必须是 JSON 对象。")
-                        parts.append(types.Part(function_call=types.FunctionCall(
-                            id=call_id, name=function_name, args=dict(arguments)
-                        )))
+                        parts.append(
+                            types.Part(
+                                function_call=types.FunctionCall(
+                                    id=call_id, name=function_name, args=dict(arguments)
+                                )
+                            )
+                        )
                     elif part_type == "function_response":
                         part_id = part.get("tool_call_id") or part.get("id")
                         part_name = part.get("name") or part.get("tool_name")
@@ -1431,15 +1632,17 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                             raise ValueError(
                                 "Google function_response 缺少可关联的 tool_call_id/name。"
                             )
-                        parts.append(types.Part(function_response=types.FunctionResponse(
-                            id=part_id,
-                            name=part_name,
-                            response=function_response_value(part.get("response", {})),
-                        )))
-                    else:
-                        raise ValueError(
-                            f"Google 不支持的消息内容块类型: {part_type!r}。"
+                        parts.append(
+                            types.Part(
+                                function_response=types.FunctionResponse(
+                                    id=part_id,
+                                    name=part_name,
+                                    response=function_response_value(part.get("response", {})),
+                                )
+                            )
                         )
+                    else:
+                        raise ValueError(f"Google 不支持的消息内容块类型: {part_type!r}。")
             else:
                 parts = [types.Part(text=str(raw_content))]
             for index, call in enumerate(message.get("tool_calls", []) or []):
@@ -1447,15 +1650,11 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                     raise ValueError(f"Google assistant tool_calls[{index}] 必须是对象。")
                 function = call.get("function", call)
                 if not isinstance(function, Mapping):
-                    raise ValueError(
-                        f"Google assistant tool_calls[{index}].function 必须是对象。"
-                    )
+                    raise ValueError(f"Google assistant tool_calls[{index}].function 必须是对象。")
                 call_id = call.get("id") or call.get("call_id")
                 function_name = function.get("name", "")
                 if not isinstance(function_name, str) or not function_name.strip():
-                    raise ValueError(
-                        f"Google assistant tool_calls[{index}] 缺少 function.name。"
-                    )
+                    raise ValueError(f"Google assistant tool_calls[{index}] 缺少 function.name。")
                 if call_id and function_name:
                     tool_call_names[call_id] = function_name
                 arguments = function.get("arguments", function.get("args", {}))
@@ -1471,8 +1670,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                 parts.append(
                     types.Part(
                         function_call=types.FunctionCall(
-                            id=call_id,
-                            name=function.get("name", ""), args=dict(arguments)
+                            id=call_id, name=function.get("name", ""), args=dict(arguments)
                         )
                     )
                 )
@@ -1612,21 +1810,19 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             dotted = re.match(r"^\.([A-Za-z_][A-Za-z0-9_]*)", rest)
             if dotted:
                 tokens.append(dotted.group(1))
-                rest = rest[dotted.end():]
+                rest = rest[dotted.end() :]
                 continue
             indexed = re.match(r"^\[(\d+)\]", rest)
             if indexed:
                 tokens.append(int(indexed.group(1)))
-                rest = rest[indexed.end():]
+                rest = rest[indexed.end() :]
                 continue
             quoted = re.match(r"^\[['\"]([^'\"]+)['\"]\]", rest)
             if quoted:
                 tokens.append(quoted.group(1))
-                rest = rest[quoted.end():]
+                rest = rest[quoted.end() :]
                 continue
-            raise ValueError(
-                f"Google FunctionCall.partial_args 不支持的 json_path: {json_path!r}"
-            )
+            raise ValueError(f"Google FunctionCall.partial_args 不支持的 json_path: {json_path!r}")
         return tokens
 
     @classmethod
@@ -1643,9 +1839,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             value = cls._partial_arg_value(partial)
             if not tokens:
                 if not isinstance(value, Mapping):
-                    raise ValueError(
-                        "Google FunctionCall.partial_args 的根值必须是 JSON 对象。"
-                    )
+                    raise ValueError("Google FunctionCall.partial_args 的根值必须是 JSON 对象。")
                 result.update(dict(value))
                 continue
             current: Any = result
@@ -1759,9 +1953,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             if candidate_key == target_key:
                 return target_key
             if target_key in accumulator:
-                raise RuntimeError(
-                    "Google Gemini 工具调用分片的 id/index 指向多个调用。"
-                )
+                raise RuntimeError("Google Gemini 工具调用分片的 id/index 指向多个调用。")
             accumulator[target_key] = accumulator.pop(candidate_key)
             return target_key
 
@@ -1778,9 +1970,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                 if candidate.get("index") == index and name_matches(candidate)
             ]
             if len(candidates) > 1:
-                raise RuntimeError(
-                    "Google Gemini 工具调用分片的 index 指向多个调用。"
-                )
+                raise RuntimeError("Google Gemini 工具调用分片的 index 指向多个调用。")
             if candidates:
                 key = candidates[0]
             else:
@@ -1793,9 +1983,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                     if candidate_matches_id(candidate)
                 ]
                 if len(id_candidates) > 1:
-                    raise RuntimeError(
-                        "Google Gemini 工具调用分片的 id 指向多个调用。"
-                    )
+                    raise RuntimeError("Google Gemini 工具调用分片的 id 指向多个调用。")
                 if id_candidates:
                     key = move_candidate(id_candidates[0], ("index", index))
                 else:
@@ -1820,9 +2008,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                 if candidate_matches_id(candidate)
             ]
             if len(id_candidates) > 1:
-                raise RuntimeError(
-                    "Google Gemini 工具调用分片的 id 指向多个调用。"
-                )
+                raise RuntimeError("Google Gemini 工具调用分片的 id 指向多个调用。")
             if id_candidates:
                 # Keep an existing explicit index as the accumulator key. This
                 # handles streams where the first fragment has both id/index
@@ -1884,19 +2070,13 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         )
         existing_id = merged.get("id") or merged.get("call_id")
         if call_id and existing_id and existing_id != call_id:
-            raise RuntimeError(
-                "Google Gemini 工具调用分片的 id 指向多个调用。"
-            )
+            raise RuntimeError("Google Gemini 工具调用分片的 id 指向多个调用。")
         existing_index = merged.get("index")
         if index is not None and existing_index is not None and existing_index != index:
-            raise RuntimeError(
-                "Google Gemini 工具调用分片的 index 指向多个调用。"
-            )
+            raise RuntimeError("Google Gemini 工具调用分片的 index 指向多个调用。")
         existing_name = merged.get("name")
         if name and existing_name and existing_name != name:
-            raise RuntimeError(
-                "Google Gemini 工具调用分片的 name 指向多个调用。"
-            )
+            raise RuntimeError("Google Gemini 工具调用分片的 name 指向多个调用。")
         for name in ("id", "call_id", "type", "name", "index", "will_continue"):
             value = tool_call.get(name)
             if value is not None and value != "":
@@ -2002,13 +2182,10 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                     # immediate completion event from a duplicate delta.  The
                     # stream accumulator emits the completed call at finish,
                     # where the same ambiguity is checked explicitly.
-                    if (
-                        field(function_call, "will_continue") is False
-                        and (
-                            field(function_call, "id")
-                            or field(function_call, "call_id")
-                            or cls._function_call_index(function_call) is not None
-                        )
+                    if field(function_call, "will_continue") is False and (
+                        field(function_call, "id")
+                        or field(function_call, "call_id")
+                        or cls._function_call_index(function_call) is not None
                     ):
                         events.append(
                             StreamEvent(
@@ -2104,9 +2281,8 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                     )
                 )
         top_level_finish_reason = field(chunk, "finish_reason")
-        if (
-            top_level_finish_reason is not None
-            and not any(event.type == "finish" for event in events)
+        if top_level_finish_reason is not None and not any(
+            event.type == "finish" for event in events
         ):
             events.append(
                 StreamEvent(
@@ -2118,7 +2294,9 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             )
         usage = normalize_usage(field(chunk, "usage_metadata") or field(chunk, "usage"))
         if usage:
-            events.append(StreamEvent(type="usage", usage=usage, response_id=response_id, raw=chunk))
+            events.append(
+                StreamEvent(type="usage", usage=usage, response_id=response_id, raw=chunk)
+            )
         return events
 
     @staticmethod
@@ -2162,19 +2340,23 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         )
         client = self._get_client()
         vertexai = self._effective_vertex_mode(client)
-        response = retry_sync_call(lambda: client.models.generate_content(
-            model=self._model_name,
-            contents=self._contents(
-                request.messages,
-                request.prompt,
-                request.system_prompt,
-                vertex_mode=vertexai,
-            ),
-            config=config,
-        ))
+        response = retry_sync_call(
+            lambda: client.models.generate_content(
+                model=self._model_name,
+                contents=self._contents(
+                    request.messages,
+                    request.prompt,
+                    request.system_prompt,
+                    vertex_mode=vertexai,
+                ),
+                config=config,
+            )
+        )
         return self._extract_result(response)
 
-    async def acomplete(self, request: CompletionRequest | None = None, **kwargs: Any) -> CompletionResult:
+    async def acomplete(
+        self, request: CompletionRequest | None = None, **kwargs: Any
+    ) -> CompletionResult:
         """使用 google-genai 异步模型接口聚合完整结果。"""
         request = coerce_completion_request(request, kwargs, "Google acomplete")
         self._validate_request(request)
@@ -2203,7 +2385,8 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         )
         client = self._get_client()
         vertexai = self._effective_vertex_mode(client)
-        response = await retry_async_call(lambda: client.aio.models.generate_content(
+        response = await retry_async_call(
+            lambda: client.aio.models.generate_content(
                 model=self._model_name,
                 contents=self._contents(
                     request.messages,
@@ -2212,7 +2395,8 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                     vertex_mode=vertexai,
                 ),
                 config=config,
-            ))
+            )
+        )
         return self._extract_result(response)
 
     def count_tokens(self, request: CompletionRequest | None = None, **kwargs: Any) -> int:
@@ -2255,11 +2439,13 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             None if vertexai is False else configured_system,
             vertex_mode=vertexai,
         )
-        response = retry_sync_call(lambda: client.models.count_tokens(
-            model=self._model_name,
-            contents=contents,
-            config=types.CountTokensConfig(**config_values) if config_values else None,
-        ))
+        response = retry_sync_call(
+            lambda: client.models.count_tokens(
+                model=self._model_name,
+                contents=contents,
+                config=types.CountTokensConfig(**config_values) if config_values else None,
+            )
+        )
         value = field(response, "total_tokens")
         if value is None:
             raise RuntimeError("Google token count 响应缺少 total_tokens。")
@@ -2290,18 +2476,24 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             extra_query=request.extra_query,
             timeout=request.timeout,
         )
-        config = types.ComputeTokensConfig(http_options=http_options) if http_options is not None else None
+        config = (
+            types.ComputeTokensConfig(http_options=http_options)
+            if http_options is not None
+            else None
+        )
         contents = self._contents(
             request.messages,
             request.prompt,
             None,
             vertex_mode=vertexai,
         )
-        return retry_sync_call(lambda: client.models.compute_tokens(
-            model=self._model_name,
-            contents=contents,
-            config=config,
-        ))
+        return retry_sync_call(
+            lambda: client.models.compute_tokens(
+                model=self._model_name,
+                contents=contents,
+                config=config,
+            )
+        )
 
     def upload_file(self, file: Any, config: Any = None, **kwargs: Any) -> Any:
         return self._get_client().files.upload(
@@ -2368,12 +2560,16 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         )
 
     async def async_upload_file(self, file: Any, config: Any = None, **kwargs: Any) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.files.upload(
-            file=file,
-            **self._resource_config_kwargs(types.UploadFileConfig, config, kwargs),
-        ))
+        return await self._resolve_async_result(
+            self._get_client().aio.files.upload(
+                file=file,
+                **self._resource_config_kwargs(types.UploadFileConfig, config, kwargs),
+            )
+        )
 
-    async def async_register_files(self, auth: Any, uris: list[str], config: Any = None, **kwargs: Any) -> Any:
+    async def async_register_files(
+        self, auth: Any, uris: list[str], config: Any = None, **kwargs: Any
+    ) -> Any:
         auth = self._validate_register_files_auth(auth)
         return await self._resolve_async_result(
             self._get_client().aio.files.register_files(
@@ -2384,29 +2580,39 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         )
 
     async def async_get_file(self, name: str, config: Any = None, **kwargs: Any) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.files.get(
-            name=name,
-            **self._resource_config_kwargs(types.GetFileConfig, config, kwargs),
-        ))
+        return await self._resolve_async_result(
+            self._get_client().aio.files.get(
+                name=name,
+                **self._resource_config_kwargs(types.GetFileConfig, config, kwargs),
+            )
+        )
 
     async def async_list_files(self, config: Any = None, **kwargs: Any) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.files.list(
-            **self._resource_config_kwargs(types.ListFilesConfig, config, kwargs),
-        ))
+        return await self._resolve_async_result(
+            self._get_client().aio.files.list(
+                **self._resource_config_kwargs(types.ListFilesConfig, config, kwargs),
+            )
+        )
 
     async def async_download_file(self, file: Any, config: Any = None, **kwargs: Any) -> bytes:
-        return await self._resolve_async_result(self._get_client().aio.files.download(
-            file=file,
-            **self._resource_config_kwargs(types.DownloadFileConfig, config, kwargs),
-        ))
+        return await self._resolve_async_result(
+            self._get_client().aio.files.download(
+                file=file,
+                **self._resource_config_kwargs(types.DownloadFileConfig, config, kwargs),
+            )
+        )
 
     async def async_delete_file(self, name: str, config: Any = None, **kwargs: Any) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.files.delete(
-            name=name,
-            **self._resource_config_kwargs(types.DeleteFileConfig, config, kwargs),
-        ))
+        return await self._resolve_async_result(
+            self._get_client().aio.files.delete(
+                name=name,
+                **self._resource_config_kwargs(types.DeleteFileConfig, config, kwargs),
+            )
+        )
 
-    async def async_list_file_search_documents(self, parent: str, config: Any = None, **kwargs: Any) -> Any:
+    async def async_list_file_search_documents(
+        self, parent: str, config: Any = None, **kwargs: Any
+    ) -> Any:
         return await self._resolve_async_result(
             self._get_client().aio.file_search_stores.documents.list(
                 parent=parent,
@@ -2414,7 +2620,9 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             )
         )
 
-    async def async_get_file_search_document(self, name: str, config: Any = None, **kwargs: Any) -> Any:
+    async def async_get_file_search_document(
+        self, name: str, config: Any = None, **kwargs: Any
+    ) -> Any:
         return await self._resolve_async_result(
             self._get_client().aio.file_search_stores.documents.get(
                 name=name,
@@ -2422,7 +2630,9 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             )
         )
 
-    async def async_delete_file_search_document(self, name: str, config: Any = None, **kwargs: Any) -> Any:
+    async def async_delete_file_search_document(
+        self, name: str, config: Any = None, **kwargs: Any
+    ) -> Any:
         return await self._resolve_async_result(
             self._get_client().aio.file_search_stores.documents.delete(
                 name=name,
@@ -2430,7 +2640,9 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             )
         )
 
-    async def async_count_tokens(self, request: CompletionRequest | None = None, **kwargs: Any) -> int:
+    async def async_count_tokens(
+        self, request: CompletionRequest | None = None, **kwargs: Any
+    ) -> int:
         request = coerce_completion_request(request, kwargs, "Google async_count_tokens")
         self._validate_token_count_fields(request)
         client = self._get_client()
@@ -2465,17 +2677,21 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             None if vertexai is False else configured_system,
             vertex_mode=vertexai,
         )
-        response = await retry_async_call(lambda: client.aio.models.count_tokens(
+        response = await retry_async_call(
+            lambda: client.aio.models.count_tokens(
                 model=self._model_name,
                 contents=contents,
                 config=types.CountTokensConfig(**config_values) if config_values else None,
-            ))
+            )
+        )
         value = field(response, "total_tokens")
         if value is None:
             raise RuntimeError("Google token count 响应缺少 total_tokens。")
         return int(value)
 
-    async def async_compute_tokens(self, request: CompletionRequest | None = None, **kwargs: Any) -> Any:
+    async def async_compute_tokens(
+        self, request: CompletionRequest | None = None, **kwargs: Any
+    ) -> Any:
         request = coerce_completion_request(request, kwargs, "Google async_compute_tokens")
         self._validate_compute_token_fields(request)
         client = self._get_client()
@@ -2500,20 +2716,28 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             extra_query=request.extra_query,
             timeout=request.timeout,
         )
-        config = types.ComputeTokensConfig(http_options=http_options) if http_options is not None else None
+        config = (
+            types.ComputeTokensConfig(http_options=http_options)
+            if http_options is not None
+            else None
+        )
         contents = self._contents(
             request.messages,
             request.prompt,
             None,
             vertex_mode=vertexai,
         )
-        return await retry_async_call(lambda: client.aio.models.compute_tokens(
+        return await retry_async_call(
+            lambda: client.aio.models.compute_tokens(
                 model=self._model_name,
                 contents=contents,
                 config=config,
-            ))
+            )
+        )
 
-    def stream_events(self, request: CompletionRequest | None = None, **kwargs: Any) -> Generator[StreamEvent, None, None]:
+    def stream_events(
+        self, request: CompletionRequest | None = None, **kwargs: Any
+    ) -> Generator[StreamEvent, None, None]:
         request = coerce_completion_request(request, kwargs, "Google stream_events")
         request = request.copy_with(stream=True)
         self._validate_request(request)
@@ -2602,19 +2826,40 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             return
         result = self.complete(request)
         if result.text:
-            yield StreamEvent(type="text_delta", text=result.text, response_id=result.response_id, raw=result.raw)
+            yield StreamEvent(
+                type="text_delta", text=result.text, response_id=result.response_id, raw=result.raw
+            )
         if result.reasoning:
             yield StreamEvent(type="reasoning_delta", reasoning=result.reasoning, raw=result.raw)
         if result.refusal:
-            yield StreamEvent(type="refusal_delta", refusal=result.refusal, response_id=result.response_id, raw=result.raw)
+            yield StreamEvent(
+                type="refusal_delta",
+                refusal=result.refusal,
+                response_id=result.response_id,
+                raw=result.raw,
+            )
         for call in result.tool_calls:
             yield StreamEvent(type="tool_call_delta", tool_call=call, raw=result.raw)
-            yield StreamEvent(type="tool_call_completed", tool_call=call, response_id=result.response_id, raw=result.raw)
+            yield StreamEvent(
+                type="tool_call_completed",
+                tool_call=call,
+                response_id=result.response_id,
+                raw=result.raw,
+            )
         if result.usage:
-            yield StreamEvent(type="usage", usage=result.usage, response_id=result.response_id, raw=result.raw)
-        yield StreamEvent(type="finish", finish_reason=result.finish_reason, response_id=result.response_id, raw=result.raw)
+            yield StreamEvent(
+                type="usage", usage=result.usage, response_id=result.response_id, raw=result.raw
+            )
+        yield StreamEvent(
+            type="finish",
+            finish_reason=result.finish_reason,
+            response_id=result.response_id,
+            raw=result.raw,
+        )
 
-    async def astream_events(self, request: CompletionRequest | None = None, **kwargs: Any) -> AsyncGenerator[StreamEvent, None]:
+    async def astream_events(
+        self, request: CompletionRequest | None = None, **kwargs: Any
+    ) -> AsyncGenerator[StreamEvent, None]:
         request = coerce_completion_request(request, kwargs, "Google astream_events")
         request = request.copy_with(stream=True)
         self._validate_request(request)
@@ -2704,17 +2949,36 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             return
         result = await self.acomplete(request)
         if result.text:
-            yield StreamEvent(type="text_delta", text=result.text, response_id=result.response_id, raw=result.raw)
+            yield StreamEvent(
+                type="text_delta", text=result.text, response_id=result.response_id, raw=result.raw
+            )
         if result.reasoning:
             yield StreamEvent(type="reasoning_delta", reasoning=result.reasoning, raw=result.raw)
         if result.refusal:
-            yield StreamEvent(type="refusal_delta", refusal=result.refusal, response_id=result.response_id, raw=result.raw)
+            yield StreamEvent(
+                type="refusal_delta",
+                refusal=result.refusal,
+                response_id=result.response_id,
+                raw=result.raw,
+            )
         for call in result.tool_calls:
             yield StreamEvent(type="tool_call_delta", tool_call=call, raw=result.raw)
-            yield StreamEvent(type="tool_call_completed", tool_call=call, response_id=result.response_id, raw=result.raw)
+            yield StreamEvent(
+                type="tool_call_completed",
+                tool_call=call,
+                response_id=result.response_id,
+                raw=result.raw,
+            )
         if result.usage:
-            yield StreamEvent(type="usage", usage=result.usage, response_id=result.response_id, raw=result.raw)
-        yield StreamEvent(type="finish", finish_reason=result.finish_reason, response_id=result.response_id, raw=result.raw)
+            yield StreamEvent(
+                type="usage", usage=result.usage, response_id=result.response_id, raw=result.raw
+            )
+        yield StreamEvent(
+            type="finish",
+            finish_reason=result.finish_reason,
+            response_id=result.response_id,
+            raw=result.raw,
+        )
 
     def create_cache(self, config: Any = None, **kwargs: Any) -> Any:
         return self._get_client().caches.create(
@@ -2734,49 +2998,66 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
 
     def update_cache(self, name: str, config: Any = None, **kwargs: Any) -> Any:
         return self._get_client().caches.update(
-            name=name, **self._resource_config_kwargs(types.UpdateCachedContentConfig, config, kwargs)
+            name=name,
+            **self._resource_config_kwargs(types.UpdateCachedContentConfig, config, kwargs),
         )
 
     def delete_cache(self, name: str, config: Any = None, **kwargs: Any) -> Any:
         return self._get_client().caches.delete(
-            name=name, **self._resource_config_kwargs(types.DeleteCachedContentConfig, config, kwargs)
+            name=name,
+            **self._resource_config_kwargs(types.DeleteCachedContentConfig, config, kwargs),
         )
 
     async def async_create_cache(self, config: Any = None, **kwargs: Any) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.caches.create(
-            model=kwargs.pop("model", self._model_name),
-            **self._resource_config_kwargs(types.CreateCachedContentConfig, config, kwargs),
-        ))
+        return await self._resolve_async_result(
+            self._get_client().aio.caches.create(
+                model=kwargs.pop("model", self._model_name),
+                **self._resource_config_kwargs(types.CreateCachedContentConfig, config, kwargs),
+            )
+        )
 
     async def async_get_cache(self, name: str, config: Any = None, **kwargs: Any) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.caches.get(
-            name=name, **self._resource_config_kwargs(types.GetCachedContentConfig, config, kwargs)
-        ))
+        return await self._resolve_async_result(
+            self._get_client().aio.caches.get(
+                name=name,
+                **self._resource_config_kwargs(types.GetCachedContentConfig, config, kwargs),
+            )
+        )
 
     async def async_list_caches(self, config: Any = None, **kwargs: Any) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.caches.list(
-            **self._resource_config_kwargs(types.ListCachedContentsConfig, config, kwargs)
-        ))
+        return await self._resolve_async_result(
+            self._get_client().aio.caches.list(
+                **self._resource_config_kwargs(types.ListCachedContentsConfig, config, kwargs)
+            )
+        )
 
     async def async_update_cache(self, name: str, config: Any = None, **kwargs: Any) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.caches.update(
-            name=name, **self._resource_config_kwargs(types.UpdateCachedContentConfig, config, kwargs)
-        ))
+        return await self._resolve_async_result(
+            self._get_client().aio.caches.update(
+                name=name,
+                **self._resource_config_kwargs(types.UpdateCachedContentConfig, config, kwargs),
+            )
+        )
 
     async def async_delete_cache(self, name: str, config: Any = None, **kwargs: Any) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.caches.delete(
-            name=name, **self._resource_config_kwargs(types.DeleteCachedContentConfig, config, kwargs)
-        ))
+        return await self._resolve_async_result(
+            self._get_client().aio.caches.delete(
+                name=name,
+                **self._resource_config_kwargs(types.DeleteCachedContentConfig, config, kwargs),
+            )
+        )
 
     def create_batch(self, src: Any, config: Any = None, **kwargs: Any) -> Any:
         return self._get_client().batches.create(
-            model=kwargs.pop("model", self._model_name), src=src,
+            model=kwargs.pop("model", self._model_name),
+            src=src,
             **self._resource_config_kwargs(types.CreateBatchJobConfig, config, kwargs),
         )
 
     def create_embedding_batch(self, src: Any, config: Any = None, **kwargs: Any) -> Any:
         return self._get_client().batches.create_embeddings(
-            model=kwargs.pop("model", self._model_name), src=src,
+            model=kwargs.pop("model", self._model_name),
+            src=src,
             **self._resource_config_kwargs(types.CreateEmbeddingsBatchJobConfig, config, kwargs),
         )
 
@@ -2801,36 +3082,56 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         )
 
     async def async_create_batch(self, src: Any, config: Any = None, **kwargs: Any) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.batches.create(
-            model=kwargs.pop("model", self._model_name), src=src,
-            **self._resource_config_kwargs(types.CreateBatchJobConfig, config, kwargs),
-        ))
+        return await self._resolve_async_result(
+            self._get_client().aio.batches.create(
+                model=kwargs.pop("model", self._model_name),
+                src=src,
+                **self._resource_config_kwargs(types.CreateBatchJobConfig, config, kwargs),
+            )
+        )
 
-    async def async_create_embedding_batch(self, src: Any, config: Any = None, **kwargs: Any) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.batches.create_embeddings(
-            model=kwargs.pop("model", self._model_name), src=src,
-            **self._resource_config_kwargs(types.CreateEmbeddingsBatchJobConfig, config, kwargs),
-        ))
+    async def async_create_embedding_batch(
+        self, src: Any, config: Any = None, **kwargs: Any
+    ) -> Any:
+        return await self._resolve_async_result(
+            self._get_client().aio.batches.create_embeddings(
+                model=kwargs.pop("model", self._model_name),
+                src=src,
+                **self._resource_config_kwargs(
+                    types.CreateEmbeddingsBatchJobConfig, config, kwargs
+                ),
+            )
+        )
 
     async def async_get_batch(self, name: str, config: Any = None, **kwargs: Any) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.batches.get(
-            name=name, **self._resource_config_kwargs(types.GetBatchJobConfig, config, kwargs)
-        ))
+        return await self._resolve_async_result(
+            self._get_client().aio.batches.get(
+                name=name, **self._resource_config_kwargs(types.GetBatchJobConfig, config, kwargs)
+            )
+        )
 
     async def async_list_batches(self, config: Any = None, **kwargs: Any) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.batches.list(
-            **self._resource_config_kwargs(types.ListBatchJobsConfig, config, kwargs)
-        ))
+        return await self._resolve_async_result(
+            self._get_client().aio.batches.list(
+                **self._resource_config_kwargs(types.ListBatchJobsConfig, config, kwargs)
+            )
+        )
 
     async def async_cancel_batch(self, name: str, config: Any = None, **kwargs: Any) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.batches.cancel(
-            name=name, **self._resource_config_kwargs(types.CancelBatchJobConfig, config, kwargs)
-        ))
+        return await self._resolve_async_result(
+            self._get_client().aio.batches.cancel(
+                name=name,
+                **self._resource_config_kwargs(types.CancelBatchJobConfig, config, kwargs),
+            )
+        )
 
     async def async_delete_batch(self, name: str, config: Any = None, **kwargs: Any) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.batches.delete(
-            name=name, **self._resource_config_kwargs(types.DeleteBatchJobConfig, config, kwargs)
-        ))
+        return await self._resolve_async_result(
+            self._get_client().aio.batches.delete(
+                name=name,
+                **self._resource_config_kwargs(types.DeleteBatchJobConfig, config, kwargs),
+            )
+        )
 
     def list_models(self, config: Any = None, **kwargs: Any) -> Any:
         return self._get_client().models.list(
@@ -2852,11 +3153,11 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             model=model, **self._resource_config_kwargs(types.UpdateModelConfig, config, kwargs)
         )
 
-    def tune(self, base_model: str, training_dataset: Any, config: Any = None, **kwargs: Any) -> Any:
+    def tune(
+        self, base_model: str, training_dataset: Any, config: Any = None, **kwargs: Any
+    ) -> Any:
         """创建 Google GenAI 调优任务。"""
-        tunings = self._require_resource(
-            self._get_client(), "tunings", "调优"
-        )
+        tunings = self._require_resource(self._get_client(), "tunings", "调优")
         return tunings.tune(
             base_model=base_model,
             training_dataset=training_dataset,
@@ -2912,57 +3213,77 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             **reward_kwargs,
         )
 
-    def recontext_image(self, source: Any, model: str | None = None, config: Any = None, **kwargs: Any) -> Any:
+    def recontext_image(
+        self, source: Any, model: str | None = None, config: Any = None, **kwargs: Any
+    ) -> Any:
         return self._get_client().models.recontext_image(
-            model=model or self._model_name, source=source,
+            model=model or self._model_name,
+            source=source,
             **self._resource_config_kwargs(types.RecontextImageConfig, config, kwargs),
         )
 
     async def async_list_models(self, config: Any = None, **kwargs: Any) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.models.list(
-            **self._resource_config_kwargs(types.ListModelsConfig, config, kwargs)
-        ))
+        return await self._resolve_async_result(
+            self._get_client().aio.models.list(
+                **self._resource_config_kwargs(types.ListModelsConfig, config, kwargs)
+            )
+        )
 
     async def async_get_model(self, model: str, config: Any = None, **kwargs: Any) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.models.get(
-            model=model, **self._resource_config_kwargs(types.GetModelConfig, config, kwargs)
-        ))
+        return await self._resolve_async_result(
+            self._get_client().aio.models.get(
+                model=model, **self._resource_config_kwargs(types.GetModelConfig, config, kwargs)
+            )
+        )
 
     async def async_delete_model(self, model: str, config: Any = None, **kwargs: Any) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.models.delete(
-            model=model, **self._resource_config_kwargs(types.DeleteModelConfig, config, kwargs)
-        ))
+        return await self._resolve_async_result(
+            self._get_client().aio.models.delete(
+                model=model, **self._resource_config_kwargs(types.DeleteModelConfig, config, kwargs)
+            )
+        )
 
     async def async_update_model(self, model: str, config: Any = None, **kwargs: Any) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.models.update(
-            model=model, **self._resource_config_kwargs(types.UpdateModelConfig, config, kwargs)
-        ))
+        return await self._resolve_async_result(
+            self._get_client().aio.models.update(
+                model=model, **self._resource_config_kwargs(types.UpdateModelConfig, config, kwargs)
+            )
+        )
 
-    async def async_tune(self, base_model: str, training_dataset: Any, config: Any = None, **kwargs: Any) -> Any:
+    async def async_tune(
+        self, base_model: str, training_dataset: Any, config: Any = None, **kwargs: Any
+    ) -> Any:
         tunings = self._require_resource(self._get_client().aio, "tunings", "异步调优")
-        return await self._resolve_async_result(tunings.tune(
-            base_model=base_model,
-            training_dataset=training_dataset,
-            **self._resource_config_kwargs(types.CreateTuningJobConfig, config, kwargs),
-        ))
+        return await self._resolve_async_result(
+            tunings.tune(
+                base_model=base_model,
+                training_dataset=training_dataset,
+                **self._resource_config_kwargs(types.CreateTuningJobConfig, config, kwargs),
+            )
+        )
 
     async def async_get_tuning(self, name: str, config: Any = None, **kwargs: Any) -> Any:
         tunings = self._require_resource(self._get_client().aio, "tunings", "异步调优")
-        return await self._resolve_async_result(tunings.get(
-            name=name, **self._resource_config_kwargs(types.GetTuningJobConfig, config, kwargs)
-        ))
+        return await self._resolve_async_result(
+            tunings.get(
+                name=name, **self._resource_config_kwargs(types.GetTuningJobConfig, config, kwargs)
+            )
+        )
 
     async def async_list_tunings(self, config: Any = None, **kwargs: Any) -> Any:
         tunings = self._require_resource(self._get_client().aio, "tunings", "异步调优")
-        return await self._resolve_async_result(tunings.list(
-            **self._resource_config_kwargs(types.ListTuningJobsConfig, config, kwargs)
-        ))
+        return await self._resolve_async_result(
+            tunings.list(**self._resource_config_kwargs(types.ListTuningJobsConfig, config, kwargs))
+        )
 
     async def async_cancel_tuning(self, name: str, config: Any = None, **kwargs: Any) -> Any:
         tunings = self._require_resource(self._get_client().aio, "tunings", "异步调优")
-        return await self._resolve_async_result(tunings.cancel(
-            name=name, **self._resource_config_kwargs(types.CancelTuningJobConfig, config, kwargs)
-        ))
+        return await self._resolve_async_result(
+            tunings.cancel(
+                name=name,
+                **self._resource_config_kwargs(types.CancelTuningJobConfig, config, kwargs),
+            )
+        )
 
     async def async_validate_tuning_reward(
         self,
@@ -2988,70 +3309,129 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         reward_kwargs.update(
             self._resource_config_kwargs(types.ValidateRewardConfig, config, kwargs)
         )
-        return await self._resolve_async_result(tunings.validate_reward(
-            parent=parent,
-            sample_response=sample_response,
-            example=example,
-            **reward_kwargs,
-        ))
+        return await self._resolve_async_result(
+            tunings.validate_reward(
+                parent=parent,
+                sample_response=sample_response,
+                example=example,
+                **reward_kwargs,
+            )
+        )
 
-    async def async_recontext_image(self, source: Any, model: str | None = None, config: Any = None, **kwargs: Any) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.models.recontext_image(
-            model=model or self._model_name, source=source,
-            **self._resource_config_kwargs(types.RecontextImageConfig, config, kwargs),
-        ))
+    async def async_recontext_image(
+        self, source: Any, model: str | None = None, config: Any = None, **kwargs: Any
+    ) -> Any:
+        return await self._resolve_async_result(
+            self._get_client().aio.models.recontext_image(
+                model=model or self._model_name,
+                source=source,
+                **self._resource_config_kwargs(types.RecontextImageConfig, config, kwargs),
+            )
+        )
 
-    def generate_images(self, prompt: str, model: str | None = None, config: Any = None, **kwargs: Any) -> Any:
+    def generate_images(
+        self, prompt: str, model: str | None = None, config: Any = None, **kwargs: Any
+    ) -> Any:
         return self._get_client().models.generate_images(
-            model=model or self._model_name, prompt=prompt,
+            model=model or self._model_name,
+            prompt=prompt,
             **self._resource_config_kwargs(types.GenerateImagesConfig, config, kwargs),
         )
 
-    def edit_image(self, prompt: str, reference_images: list[Any], model: str | None = None, config: Any = None, **kwargs: Any) -> Any:
+    def edit_image(
+        self,
+        prompt: str,
+        reference_images: list[Any],
+        model: str | None = None,
+        config: Any = None,
+        **kwargs: Any,
+    ) -> Any:
         return self._get_client().models.edit_image(
-            model=model or self._model_name, prompt=prompt, reference_images=reference_images,
-            **self._resource_config_kwargs(types.EditImageConfig, config, kwargs),
-        )
-
-    def upscale_image(self, image: Any, upscale_factor: str, model: str | None = None, config: Any = None, **kwargs: Any) -> Any:
-        return self._get_client().models.upscale_image(
-            model=model or self._model_name, image=image, upscale_factor=upscale_factor,
-            **self._resource_config_kwargs(types.UpscaleImageConfig, config, kwargs),
-        )
-
-    def segment_image(self, source: Any, model: str | None = None, config: Any = None, **kwargs: Any) -> Any:
-        return self._get_client().models.segment_image(
-            model=model or self._model_name, source=source,
-            **self._resource_config_kwargs(types.SegmentImageConfig, config, kwargs),
-        )
-
-    async def async_generate_images(self, prompt: str, model: str | None = None, config: Any = None, **kwargs: Any) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.models.generate_images(
-            model=model or self._model_name, prompt=prompt,
-            **self._resource_config_kwargs(types.GenerateImagesConfig, config, kwargs),
-        ))
-
-    async def async_edit_image(self, prompt: str, reference_images: list[Any], model: str | None = None, config: Any = None, **kwargs: Any) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.models.edit_image(
             model=model or self._model_name,
             prompt=prompt,
             reference_images=reference_images,
             **self._resource_config_kwargs(types.EditImageConfig, config, kwargs),
-        ))
+        )
 
-    async def async_upscale_image(self, image: Any, upscale_factor: str, model: str | None = None, config: Any = None, **kwargs: Any) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.models.upscale_image(
+    def upscale_image(
+        self,
+        image: Any,
+        upscale_factor: str,
+        model: str | None = None,
+        config: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        return self._get_client().models.upscale_image(
             model=model or self._model_name,
             image=image,
             upscale_factor=upscale_factor,
             **self._resource_config_kwargs(types.UpscaleImageConfig, config, kwargs),
-        ))
+        )
 
-    async def async_segment_image(self, source: Any, model: str | None = None, config: Any = None, **kwargs: Any) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.models.segment_image(
-            model=model or self._model_name, source=source,
+    def segment_image(
+        self, source: Any, model: str | None = None, config: Any = None, **kwargs: Any
+    ) -> Any:
+        return self._get_client().models.segment_image(
+            model=model or self._model_name,
+            source=source,
             **self._resource_config_kwargs(types.SegmentImageConfig, config, kwargs),
-        ))
+        )
+
+    async def async_generate_images(
+        self, prompt: str, model: str | None = None, config: Any = None, **kwargs: Any
+    ) -> Any:
+        return await self._resolve_async_result(
+            self._get_client().aio.models.generate_images(
+                model=model or self._model_name,
+                prompt=prompt,
+                **self._resource_config_kwargs(types.GenerateImagesConfig, config, kwargs),
+            )
+        )
+
+    async def async_edit_image(
+        self,
+        prompt: str,
+        reference_images: list[Any],
+        model: str | None = None,
+        config: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        return await self._resolve_async_result(
+            self._get_client().aio.models.edit_image(
+                model=model or self._model_name,
+                prompt=prompt,
+                reference_images=reference_images,
+                **self._resource_config_kwargs(types.EditImageConfig, config, kwargs),
+            )
+        )
+
+    async def async_upscale_image(
+        self,
+        image: Any,
+        upscale_factor: str,
+        model: str | None = None,
+        config: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        return await self._resolve_async_result(
+            self._get_client().aio.models.upscale_image(
+                model=model or self._model_name,
+                image=image,
+                upscale_factor=upscale_factor,
+                **self._resource_config_kwargs(types.UpscaleImageConfig, config, kwargs),
+            )
+        )
+
+    async def async_segment_image(
+        self, source: Any, model: str | None = None, config: Any = None, **kwargs: Any
+    ) -> Any:
+        return await self._resolve_async_result(
+            self._get_client().aio.models.segment_image(
+                model=model or self._model_name,
+                source=source,
+                **self._resource_config_kwargs(types.SegmentImageConfig, config, kwargs),
+            )
+        )
 
     def generate_videos(
         self,
@@ -3064,7 +3444,11 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         **kwargs: Any,
     ) -> Any:
         return self._get_client().models.generate_videos(
-            model=model or self._model_name, prompt=prompt, image=image, video=video, source=source,
+            model=model or self._model_name,
+            prompt=prompt,
+            image=image,
+            video=video,
+            source=source,
             **self._resource_config_kwargs(types.GenerateVideosConfig, config, kwargs),
         )
 
@@ -3083,15 +3467,23 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         config: Any = None,
         **kwargs: Any,
     ) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.models.generate_videos(
-            model=model or self._model_name, prompt=prompt, image=image, video=video, source=source,
-            **self._resource_config_kwargs(types.GenerateVideosConfig, config, kwargs),
-        ))
+        return await self._resolve_async_result(
+            self._get_client().aio.models.generate_videos(
+                model=model or self._model_name,
+                prompt=prompt,
+                image=image,
+                video=video,
+                source=source,
+                **self._resource_config_kwargs(types.GenerateVideosConfig, config, kwargs),
+            )
+        )
 
     async def async_get_operation(self, operation: Any, config: Any = None, **kwargs: Any) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.operations.get(
-            operation, **self._resource_config_kwargs(types.GetOperationConfig, config, kwargs)
-        ))
+        return await self._resolve_async_result(
+            self._get_client().aio.operations.get(
+                operation, **self._resource_config_kwargs(types.GetOperationConfig, config, kwargs)
+            )
+        )
 
     def create_chat(
         self,
@@ -3113,11 +3505,13 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
     ) -> Any:
         # google-genai returns an AsyncChat object synchronously; subsequent
         # send_message calls on that object are awaitable.
-        return await self._resolve_async_result(self._get_client().aio.chats.create(
-            model=kwargs.pop("model", self._model_name),
-            history=history,
-            **self._resource_config_kwargs(types.GenerateContentConfig, config, kwargs),
-        ))
+        return await self._resolve_async_result(
+            self._get_client().aio.chats.create(
+                model=kwargs.pop("model", self._model_name),
+                history=history,
+                **self._resource_config_kwargs(types.GenerateContentConfig, config, kwargs),
+            )
+        )
 
     def create_file_search_store(self, config: Any = None, **kwargs: Any) -> Any:
         return self._get_client().file_search_stores.create(
@@ -3256,15 +3650,11 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         try:
             aio = client.aio
         except (AttributeError, NotImplementedError) as exc:
-            raise NotImplementedError(
-                "当前 google-genai SDK 未提供异步 Live 资源。"
-            ) from exc
+            raise NotImplementedError("当前 google-genai SDK 未提供异步 Live 资源。") from exc
         live = self._require_resource(aio, "live", "Live")
         connect = self._require_resource(live, "connect", "Live 连接")
         if not callable(connect):
-            raise NotImplementedError(
-                "当前 google-genai SDK 未提供可调用的 Live 连接资源。"
-            )
+            raise NotImplementedError("当前 google-genai SDK 未提供可调用的 Live 连接资源。")
         return connect(model=model, config=config)
 
     def async_connect_live(self, *, model: str | None = None, config: Any = None) -> Any:
@@ -3274,7 +3664,8 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
 
     def get_file_search_store(self, name: str, config: Any = None, **kwargs: Any) -> Any:
         return self._get_client().file_search_stores.get(
-            name=name, **self._resource_config_kwargs(types.GetFileSearchStoreConfig, config, kwargs)
+            name=name,
+            **self._resource_config_kwargs(types.GetFileSearchStoreConfig, config, kwargs),
         )
 
     def list_file_search_stores(self, config: Any = None, **kwargs: Any) -> Any:
@@ -3284,7 +3675,8 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
 
     def delete_file_search_store(self, name: str, config: Any = None, **kwargs: Any) -> Any:
         return self._get_client().file_search_stores.delete(
-            name=name, **self._resource_config_kwargs(types.DeleteFileSearchStoreConfig, config, kwargs)
+            name=name,
+            **self._resource_config_kwargs(types.DeleteFileSearchStoreConfig, config, kwargs),
         )
 
     def import_file_to_file_search_store(
@@ -3300,44 +3692,60 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             **self._resource_config_kwargs(types.ImportFileConfig, config, kwargs),
         )
 
-    def upload_to_file_search_store(self, file_search_store_name: str, file: Any, config: Any = None, **kwargs: Any) -> Any:
+    def upload_to_file_search_store(
+        self, file_search_store_name: str, file: Any, config: Any = None, **kwargs: Any
+    ) -> Any:
         return self._get_client().file_search_stores.upload_to_file_search_store(
-            file_search_store_name=file_search_store_name, file=file,
+            file_search_store_name=file_search_store_name,
+            file=file,
             **self._resource_config_kwargs(types.UploadToFileSearchStoreConfig, config, kwargs),
         )
 
     def download_file_search_media(self, media_id: str, config: Any = None, **kwargs: Any) -> bytes:
         return self._get_client().file_search_stores.download_media(
-            media_id=media_id, **self._resource_config_kwargs(types.DownloadMediaConfig, config, kwargs)
+            media_id=media_id,
+            **self._resource_config_kwargs(types.DownloadMediaConfig, config, kwargs),
         )
 
     async def async_create_file_search_store(self, config: Any = None, **kwargs: Any) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.file_search_stores.create(
-            **self._resource_config_kwargs(types.CreateFileSearchStoreConfig, config, kwargs)
-        ))
+        return await self._resolve_async_result(
+            self._get_client().aio.file_search_stores.create(
+                **self._resource_config_kwargs(types.CreateFileSearchStoreConfig, config, kwargs)
+            )
+        )
 
     async def async_create_auth_token(self, config: Any = None, **kwargs: Any) -> Any:
         """异步创建 Google GenAI Auth Token。"""
         self._require_provider_resource("async_create_auth_token")
-        return await self._resolve_async_result(self._get_client().aio.auth_tokens.create(
-            **self._resource_config_kwargs(types.CreateAuthTokenConfig, config, kwargs)
-        ))
+        return await self._resolve_async_result(
+            self._get_client().aio.auth_tokens.create(
+                **self._resource_config_kwargs(types.CreateAuthTokenConfig, config, kwargs)
+            )
+        )
 
     async def async_create_interaction(self, **kwargs: Any) -> Any:
         self._require_provider_resource("async_create_interaction")
-        return await self._resolve_async_result(self._get_client().aio.interactions.create(**kwargs))
+        return await self._resolve_async_result(
+            self._get_client().aio.interactions.create(**kwargs)
+        )
 
     async def async_get_interaction(self, interaction_id: str, **kwargs: Any) -> Any:
         self._require_provider_resource("async_get_interaction")
-        return await self._resolve_async_result(self._get_client().aio.interactions.get(id=interaction_id, **kwargs))
+        return await self._resolve_async_result(
+            self._get_client().aio.interactions.get(id=interaction_id, **kwargs)
+        )
 
     async def async_cancel_interaction(self, interaction_id: str, **kwargs: Any) -> Any:
         self._require_provider_resource("async_cancel_interaction")
-        return await self._resolve_async_result(self._get_client().aio.interactions.cancel(id=interaction_id, **kwargs))
+        return await self._resolve_async_result(
+            self._get_client().aio.interactions.cancel(id=interaction_id, **kwargs)
+        )
 
     async def async_delete_interaction(self, interaction_id: str, **kwargs: Any) -> Any:
         self._require_provider_resource("async_delete_interaction")
-        return await self._resolve_async_result(self._get_client().aio.interactions.delete(id=interaction_id, **kwargs))
+        return await self._resolve_async_result(
+            self._get_client().aio.interactions.delete(id=interaction_id, **kwargs)
+        )
 
     async def async_create_agent(self, **kwargs: Any) -> Any:
         self._require_provider_resource("async_create_agent")
@@ -3345,7 +3753,9 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
 
     async def async_get_agent(self, agent_id: str, **kwargs: Any) -> Any:
         self._require_provider_resource("async_get_agent")
-        return await self._resolve_async_result(self._get_client().aio.agents.get(agent_id, **kwargs))
+        return await self._resolve_async_result(
+            self._get_client().aio.agents.get(agent_id, **kwargs)
+        )
 
     async def async_list_agents(self, **kwargs: Any) -> Any:
         self._require_provider_resource("async_list_agents")
@@ -3353,7 +3763,9 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
 
     async def async_delete_agent(self, agent_id: str, **kwargs: Any) -> Any:
         self._require_provider_resource("async_delete_agent")
-        return await self._resolve_async_result(self._get_client().aio.agents.delete(agent_id, **kwargs))
+        return await self._resolve_async_result(
+            self._get_client().aio.agents.delete(agent_id, **kwargs)
+        )
 
     async def async_create_webhook(self, **kwargs: Any) -> Any:
         self._require_provider_resource("async_create_webhook")
@@ -3361,7 +3773,9 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
 
     async def async_get_webhook(self, webhook_id: str, **kwargs: Any) -> Any:
         self._require_provider_resource("async_get_webhook")
-        return await self._resolve_async_result(self._get_client().aio.webhooks.get(webhook_id, **kwargs))
+        return await self._resolve_async_result(
+            self._get_client().aio.webhooks.get(webhook_id, **kwargs)
+        )
 
     async def async_list_webhooks(self, **kwargs: Any) -> Any:
         self._require_provider_resource("async_list_webhooks")
@@ -3369,15 +3783,21 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
 
     async def async_update_webhook(self, webhook_id: str, **kwargs: Any) -> Any:
         self._require_provider_resource("async_update_webhook")
-        return await self._resolve_async_result(self._get_client().aio.webhooks.update(webhook_id, **kwargs))
+        return await self._resolve_async_result(
+            self._get_client().aio.webhooks.update(webhook_id, **kwargs)
+        )
 
     async def async_delete_webhook(self, webhook_id: str, **kwargs: Any) -> Any:
         self._require_provider_resource("async_delete_webhook")
-        return await self._resolve_async_result(self._get_client().aio.webhooks.delete(webhook_id, **kwargs))
+        return await self._resolve_async_result(
+            self._get_client().aio.webhooks.delete(webhook_id, **kwargs)
+        )
 
     async def async_ping_webhook(self, webhook_id: str, **kwargs: Any) -> Any:
         self._require_provider_resource("async_ping_webhook")
-        return await self._resolve_async_result(self._get_client().aio.webhooks.ping(webhook_id, **kwargs))
+        return await self._resolve_async_result(
+            self._get_client().aio.webhooks.ping(webhook_id, **kwargs)
+        )
 
     async def async_rotate_webhook_signing_secret(self, webhook_id: str, **kwargs: Any) -> Any:
         self._require_provider_resource("async_rotate_webhook_signing_secret")
@@ -3424,7 +3844,9 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
 
     async def async_get_trigger(self, trigger_id: str, **kwargs: Any) -> Any:
         self._require_provider_resource("async_get_trigger")
-        return await self._resolve_async_result(self._get_client().aio.triggers.get(trigger_id, **kwargs))
+        return await self._resolve_async_result(
+            self._get_client().aio.triggers.get(trigger_id, **kwargs)
+        )
 
     async def async_list_triggers(self, **kwargs: Any) -> Any:
         self._require_provider_resource("async_list_triggers")
@@ -3432,15 +3854,21 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
 
     async def async_update_trigger(self, trigger_id: str, **kwargs: Any) -> Any:
         self._require_provider_resource("async_update_trigger")
-        return await self._resolve_async_result(self._get_client().aio.triggers.update(trigger_id, **kwargs))
+        return await self._resolve_async_result(
+            self._get_client().aio.triggers.update(trigger_id, **kwargs)
+        )
 
     async def async_delete_trigger(self, trigger_id: str, **kwargs: Any) -> Any:
         self._require_provider_resource("async_delete_trigger")
-        return await self._resolve_async_result(self._get_client().aio.triggers.delete(trigger_id, **kwargs))
+        return await self._resolve_async_result(
+            self._get_client().aio.triggers.delete(trigger_id, **kwargs)
+        )
 
     async def async_run_trigger(self, trigger_id: str, **kwargs: Any) -> Any:
         self._require_provider_resource("async_run_trigger")
-        return await self._resolve_async_result(self._get_client().aio.triggers.run(trigger_id, **kwargs))
+        return await self._resolve_async_result(
+            self._get_client().aio.triggers.run(trigger_id, **kwargs)
+        )
 
     async def async_list_trigger_executions(self, trigger_id: str, **kwargs: Any) -> Any:
         self._require_provider_resource("async_list_trigger_executions")
@@ -3448,20 +3876,32 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             self._get_client().aio.triggers.list_executions(trigger_id, **kwargs)
         )
 
-    async def async_get_file_search_store(self, name: str, config: Any = None, **kwargs: Any) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.file_search_stores.get(
-            name=name, **self._resource_config_kwargs(types.GetFileSearchStoreConfig, config, kwargs)
-        ))
+    async def async_get_file_search_store(
+        self, name: str, config: Any = None, **kwargs: Any
+    ) -> Any:
+        return await self._resolve_async_result(
+            self._get_client().aio.file_search_stores.get(
+                name=name,
+                **self._resource_config_kwargs(types.GetFileSearchStoreConfig, config, kwargs),
+            )
+        )
 
     async def async_list_file_search_stores(self, config: Any = None, **kwargs: Any) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.file_search_stores.list(
-            **self._resource_config_kwargs(types.ListFileSearchStoresConfig, config, kwargs)
-        ))
+        return await self._resolve_async_result(
+            self._get_client().aio.file_search_stores.list(
+                **self._resource_config_kwargs(types.ListFileSearchStoresConfig, config, kwargs)
+            )
+        )
 
-    async def async_delete_file_search_store(self, name: str, config: Any = None, **kwargs: Any) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.file_search_stores.delete(
-            name=name, **self._resource_config_kwargs(types.DeleteFileSearchStoreConfig, config, kwargs)
-        ))
+    async def async_delete_file_search_store(
+        self, name: str, config: Any = None, **kwargs: Any
+    ) -> Any:
+        return await self._resolve_async_result(
+            self._get_client().aio.file_search_stores.delete(
+                name=name,
+                **self._resource_config_kwargs(types.DeleteFileSearchStoreConfig, config, kwargs),
+            )
+        )
 
     async def async_import_file_to_file_search_store(
         self,
@@ -3470,23 +3910,34 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         config: Any = None,
         **kwargs: Any,
     ) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.file_search_stores.import_file(
-            file_search_store_name=file_search_store_name,
-            file_name=file_name,
-            **self._resource_config_kwargs(types.ImportFileConfig, config, kwargs),
-        ))
+        return await self._resolve_async_result(
+            self._get_client().aio.file_search_stores.import_file(
+                file_search_store_name=file_search_store_name,
+                file_name=file_name,
+                **self._resource_config_kwargs(types.ImportFileConfig, config, kwargs),
+            )
+        )
 
-    async def async_upload_to_file_search_store(self, file_search_store_name: str, file: Any, config: Any = None, **kwargs: Any) -> Any:
-        return await self._resolve_async_result(self._get_client().aio.file_search_stores.upload_to_file_search_store(
-            file_search_store_name=file_search_store_name, file=file,
-            **self._resource_config_kwargs(types.UploadToFileSearchStoreConfig, config, kwargs),
-        ))
+    async def async_upload_to_file_search_store(
+        self, file_search_store_name: str, file: Any, config: Any = None, **kwargs: Any
+    ) -> Any:
+        return await self._resolve_async_result(
+            self._get_client().aio.file_search_stores.upload_to_file_search_store(
+                file_search_store_name=file_search_store_name,
+                file=file,
+                **self._resource_config_kwargs(types.UploadToFileSearchStoreConfig, config, kwargs),
+            )
+        )
 
-    async def async_download_file_search_media(self, media_id: str, config: Any = None, **kwargs: Any) -> bytes:
-        return await self._resolve_async_result(self._get_client().aio.file_search_stores.download_media(
-            media_id=media_id,
-            **self._resource_config_kwargs(types.DownloadMediaConfig, config, kwargs),
-        ))
+    async def async_download_file_search_media(
+        self, media_id: str, config: Any = None, **kwargs: Any
+    ) -> bytes:
+        return await self._resolve_async_result(
+            self._get_client().aio.file_search_stores.download_media(
+                media_id=media_id,
+                **self._resource_config_kwargs(types.DownloadMediaConfig, config, kwargs),
+            )
+        )
 
     def invoke(
         self,
@@ -3520,15 +3971,28 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         client = self._get_client()
         start_time = time.perf_counter()
         effective_system_prompt = extract_system_prompt(messages) or system_prompt
-        config = self._build_generation_config(effective_system_prompt, tools, temperature, max_tokens=max_tokens,
-                                               top_p=top_p, top_k=top_k, candidate_count=n,
-                                               frequency_penalty=frequency_penalty,
-                                               presence_penalty=presence_penalty, seed=seed,
-                                               modalities=modalities, stop=stop, response_format=response_format,
-                                               tool_choice=tool_choice, extra_body=extra_body,
-                                               extra_headers=extra_headers, extra_query=extra_query,
-                                               timeout=timeout,
-                                               thinking=thinking, service_tier=service_tier)
+        config = self._build_generation_config(
+            effective_system_prompt,
+            tools,
+            temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            top_k=top_k,
+            candidate_count=n,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            seed=seed,
+            modalities=modalities,
+            stop=stop,
+            response_format=response_format,
+            tool_choice=tool_choice,
+            extra_body=extra_body,
+            extra_headers=extra_headers,
+            extra_query=extra_query,
+            timeout=timeout,
+            thinking=thinking,
+            service_tier=service_tier,
+        )
         contents = self._contents(
             messages,
             prompt,
@@ -3569,7 +4033,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                 text = self._response_text(response)
                 if text:
                     yield text
-            
+
             duration = time.perf_counter() - start_time
             logger.info(f"Google LLM ({self._model_name}) 调用完成，耗时: {duration:.2f}s")
         except Exception as e:
@@ -3613,15 +4077,28 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         client = self._get_client()
         start_time = time.perf_counter()
         effective_system_prompt = extract_system_prompt(messages) or system_prompt
-        config = self._build_generation_config(effective_system_prompt, tools, temperature, max_tokens=max_tokens,
-                                               top_p=top_p, top_k=top_k, candidate_count=n,
-                                               frequency_penalty=frequency_penalty,
-                                               presence_penalty=presence_penalty, seed=seed,
-                                               modalities=modalities, stop=stop, response_format=response_format,
-                                               tool_choice=tool_choice, extra_body=extra_body,
-                                               extra_headers=extra_headers, extra_query=extra_query,
-                                               timeout=timeout,
-                                               thinking=thinking, service_tier=service_tier)
+        config = self._build_generation_config(
+            effective_system_prompt,
+            tools,
+            temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            top_k=top_k,
+            candidate_count=n,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            seed=seed,
+            modalities=modalities,
+            stop=stop,
+            response_format=response_format,
+            tool_choice=tool_choice,
+            extra_body=extra_body,
+            extra_headers=extra_headers,
+            extra_query=extra_query,
+            timeout=timeout,
+            thinking=thinking,
+            service_tier=service_tier,
+        )
         contents = self._contents(
             messages,
             prompt,
@@ -3651,16 +4128,18 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                 if not terminal_seen:
                     raise RuntimeError("Google Gemini 异步流在终止事件之前结束。")
             else:
-                response = await retry_async_call(lambda: client.aio.models.generate_content(
+                response = await retry_async_call(
+                    lambda: client.aio.models.generate_content(
                         model=self._model_name, contents=contents, config=config
-                    ))
+                    )
+                )
                 refusal = self._extract_refusal(response)
                 if refusal:
                     raise RuntimeError(f"Google 请求被拒绝: {refusal}")
                 text = self._response_text(response)
                 if text:
                     yield text
-            
+
             duration = time.perf_counter() - start_time
             logger.info(f"Google LLM ({self._model_name}) 异步调用完成，耗时: {duration:.2f}s")
         except Exception as e:
@@ -3676,13 +4155,13 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
         retry=retry_if_exception(is_retryable_error),
-        reraise=True
+        reraise=True,
     )
     def embed_documents(self, texts: list[str], **kwargs: Any) -> list[list[float]]:
         """同步向量化文档。"""
         logger.info(f"调用 Google Embedding ({self._model_name})，数量: {len(texts)}")
         start_time = time.perf_counter()
-        
+
         try:
             config_values = self._embedding_options()
             overlap = sorted({"model", "contents", "config"}.intersection(kwargs))
@@ -3721,9 +4200,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                 )
                 values = list(field(response, "embeddings", []) or [])
                 if len(values) != len(texts):
-                    raise RuntimeError(
-                        "Google Embedding 返回数量与输入文本数量不一致。"
-                    )
+                    raise RuntimeError("Google Embedding 返回数量与输入文本数量不一致。")
                 embeddings = [normalize_embedding_vector(field(item, "values")) for item in values]
             duration = time.perf_counter() - start_time
             logger.info(f"Google Embedding ({self._model_name}) 完成，耗时: {duration:.2f}s")
@@ -3741,13 +4218,13 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
         retry=retry_if_exception(is_retryable_error),
-        reraise=True
+        reraise=True,
     )
     async def aembed_documents(self, texts: list[str], **kwargs: Any) -> list[list[float]]:
         """异步向量化文档。"""
         logger.info(f"异步调用 Google Embedding ({self._model_name})，数量: {len(texts)}")
         start_time = time.perf_counter()
-        
+
         try:
             config_values = self._embedding_options()
             overlap = sorted({"model", "contents", "config"}.intersection(kwargs))
@@ -3790,9 +4267,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                 )
                 values = list(field(response, "embeddings", []) or [])
                 if len(values) != len(texts):
-                    raise RuntimeError(
-                        "Google Embedding 返回数量与输入文本数量不一致。"
-                    )
+                    raise RuntimeError("Google Embedding 返回数量与输入文本数量不一致。")
                 embeddings = [normalize_embedding_vector(field(item, "values")) for item in values]
             duration = time.perf_counter() - start_time
             logger.info(f"Google Embedding ({self._model_name}) 异步完成，耗时: {duration:.2f}s")

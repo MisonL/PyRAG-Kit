@@ -43,23 +43,39 @@ def display_config_and_confirm(splitter_structure_mode: str):
     table.add_column(justify="right", style="cyan", no_wrap=True, width=28)
     table.add_column(style="bright_white")
     table.add_row("[bold green]知识库配置[/bold green]", "")
-    table.add_row("知识库目录", f"[bold cyan]{get_relative_path(str(run_config.knowledge_base_path))}[/bold cyan]")
-    table.add_row("快照根目录", f"[bold cyan]{get_relative_path(str(run_config.snapshot_root))}[/bold cyan]")
-    table.add_row("旧版 pkl 路径", f"[bold cyan]{get_relative_path(str(run_config.legacy_pkl_path))}[/bold cyan]")
+    table.add_row(
+        "知识库目录",
+        f"[bold cyan]{get_relative_path(str(run_config.knowledge_base_path))}[/bold cyan]",
+    )
+    table.add_row(
+        "快照根目录", f"[bold cyan]{get_relative_path(str(run_config.snapshot_root))}[/bold cyan]"
+    )
+    table.add_row(
+        "旧版 pkl 路径",
+        f"[bold cyan]{get_relative_path(str(run_config.legacy_pkl_path))}[/bold cyan]",
+    )
     table.add_row("索引模式", f"[bold magenta]{splitter_structure_mode}[/bold magenta]")
     table.add_row("文本切分块大小", f"[bold magenta]{run_config.kb_chunk_size}[/bold magenta]")
     table.add_row("切分重叠量", f"[bold magenta]{run_config.kb_chunk_overlap}[/bold magenta]")
     table.add_row("子分段块大小", f"[bold magenta]{run_config.kb_child_chunk_size}[/bold magenta]")
-    table.add_row("子分段重叠量", f"[bold magenta]{run_config.kb_child_chunk_overlap}[/bold magenta]")
-    table.add_row("嵌入批大小", f"[bold magenta]{run_config.kb_embedding_batch_size}[/bold magenta]")
+    table.add_row(
+        "子分段重叠量", f"[bold magenta]{run_config.kb_child_chunk_overlap}[/bold magenta]"
+    )
+    table.add_row(
+        "嵌入批大小", f"[bold magenta]{run_config.kb_embedding_batch_size}[/bold magenta]"
+    )
 
     embedding_key = run_config.default_embedding_provider
     embedding_detail = run_config.embedding_configurations[embedding_key]
     provider = embedding_detail.provider
     table.add_section()
     table.add_row("[bold green]模型与 API 配置[/bold green]", "")
-    table.add_row("激活嵌入提供商", f"[bold green]{embedding_key}[/bold green] ([dim]{provider}[/dim])")
-    table.add_row("模型名称", f"[bold bright_white]{embedding_detail.model_name}[/bold bright_white]")
+    table.add_row(
+        "激活嵌入提供商", f"[bold green]{embedding_key}[/bold green] ([dim]{provider}[/dim])"
+    )
+    table.add_row(
+        "模型名称", f"[bold bright_white]{embedding_detail.model_name}[/bold bright_white]"
+    )
     if provider == "local-hash":
         table.add_row("API Key", "[dim]本地模型，无需设置[/dim]")
     else:

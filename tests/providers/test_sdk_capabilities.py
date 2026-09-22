@@ -40,7 +40,11 @@ def test_model_detail_options_are_explicit_and_secret_free():
     with pytest.raises(ValueError, match="凭证"):
         ModelDetail(provider="openai", model_name="demo", options={"api_key": "secret"})
     with pytest.raises(ValueError, match="凭证"):
-        ModelDetail(provider="openai", model_name="demo", options={"nested": {"headers": {"Authorization": "x"}}})
+        ModelDetail(
+            provider="openai",
+            model_name="demo",
+            options={"nested": {"headers": {"Authorization": "x"}}},
+        )
     with pytest.raises(ValueError):
         ModelDetail(provider="openai", model_name="demo", unknown=True)
 
@@ -584,7 +588,10 @@ def test_openai_async_resource_creation_paths_reject_sensitive_overrides():
         cases = (
             (provider.async_create_vector_store, {"extra_headers": {"X-API-Key": "secret"}}),
             (provider.async_create_upload, {"extra_query": {"access_token": "secret"}}),
-            (provider.async_complete_upload, {"upload_id": "upload-1", "extra_body": {"token": "secret"}}),
+            (
+                provider.async_complete_upload,
+                {"upload_id": "upload-1", "extra_body": {"token": "secret"}},
+            ),
         )
         for operation, kwargs in cases:
             with pytest.raises(ValueError, match="凭证"):
@@ -649,7 +656,11 @@ def test_openai_async_resource_groups_validate_unknown_arguments_before_dispatch
 
     async def run() -> None:
         cases = (
-            (provider.async_upload_file, (b"data",), {"purpose": "assistants", "unknown_option": True}),
+            (
+                provider.async_upload_file,
+                (b"data",),
+                {"purpose": "assistants", "unknown_option": True},
+            ),
             (provider.async_create_batch, ("file-1",), {"unknown_option": True}),
             (provider.async_create_fine_tuning_job, (), {"unknown_option": True}),
         )
@@ -730,7 +741,10 @@ def test_openai_responses_extra_body_cannot_override_request_fields():
     provider._model_name = "demo"
     provider._provider = "qwen"
     provider._protocol = "responses"
-    provider._options = {"server_verified_protocols": ["responses"], "extra_body": {"input": "other"}}
+    provider._options = {
+        "server_verified_protocols": ["responses"],
+        "extra_body": {"input": "other"},
+    }
 
     with pytest.raises(ValueError, match="extra_body.*input"):
         provider._build_responses_request(prompt="hi", stream=False)
@@ -838,6 +852,7 @@ def test_openai_embedding_extra_body_conflicts_are_explicit(async_mode):
     provider._aclient = SimpleNamespace(embeddings=SimpleNamespace(create=lambda **_: None))
 
     if async_mode:
+
         async def run():
             await provider.aembed_documents(["text"], extra_body={"tenant": "request"})
 
@@ -869,6 +884,7 @@ def test_openai_embedding_request_overrides_reject_credentials(async_mode, field
 
     kwargs = {field_name: value}
     if async_mode:
+
         async def run():
             await provider.aembed_documents(["text"], **kwargs)
 
@@ -932,16 +948,26 @@ def test_openai_complete_preserves_chat_text_tool_calls_and_usage():
     provider._protocol = "chat_completions"
     provider._options = {}
     response = SimpleNamespace(
-        choices=[SimpleNamespace(
-            message=SimpleNamespace(
-                content="answer",
-                tool_calls=[SimpleNamespace(id="call-1", type="function", function=SimpleNamespace(name="lookup", arguments='{"id":1}'))],
-            ),
-            finish_reason="tool_calls",
-        )],
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content="answer",
+                    tool_calls=[
+                        SimpleNamespace(
+                            id="call-1",
+                            type="function",
+                            function=SimpleNamespace(name="lookup", arguments='{"id":1}'),
+                        )
+                    ],
+                ),
+                finish_reason="tool_calls",
+            )
+        ],
         usage=SimpleNamespace(prompt_tokens=3, completion_tokens=4, total_tokens=7),
     )
-    provider._get_client = lambda: SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **_: response)))
+    provider._get_client = lambda: SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **_: response))
+    )
     result = provider.complete(CompletionRequest(prompt="hi", stream=False))
     assert result.text == "answer"
     assert result.tool_calls[0]["name"] == "lookup"
@@ -1007,9 +1033,7 @@ def test_openai_responses_verbosity_uses_text_config():
     provider._protocol = "responses"
     provider._options = {}
 
-    request = provider._build_responses_request(
-        prompt="hi", stream=False, verbosity="low"
-    )
+    request = provider._build_responses_request(prompt="hi", stream=False, verbosity="low")
 
     assert request["text"] == {"verbosity": "low"}
     assert "verbosity" not in request
@@ -1210,9 +1234,9 @@ def test_factory_protocol_status_uses_runtime_verified_options():
     ],
 )
 def test_factory_protocol_status_normalizes_protocol_aliases(provider, alias, canonical):
-    assert ModelProviderFactory.protocol_status(provider, alias) == ModelProviderFactory.protocol_status(
-        provider, canonical
-    )
+    assert ModelProviderFactory.protocol_status(
+        provider, alias
+    ) == ModelProviderFactory.protocol_status(provider, canonical)
 
 
 def test_factory_google_protocol_status_accepts_safe_http_options():
@@ -1348,9 +1372,7 @@ def test_ark_responses_validates_session_mapping_and_conversation_conflicts():
         )
 
     request = provider._build_responses_request(
-        CompletionRequest(
-            prompt="hi", stream=False, conversation={"id": "conversation-id"}
-        )
+        CompletionRequest(prompt="hi", stream=False, conversation={"id": "conversation-id"})
     )
     assert request["session"] == {"id": "conversation-id"}
 
@@ -1372,9 +1394,7 @@ def test_ark_native_response_resource_requires_explicit_model_and_rejects_unknow
     with pytest.raises(ValueError, match="model"):
         provider.resources.create_response(input="raw")
     with pytest.raises(ValueError, match="unknown_option"):
-        provider.resources.create_response(
-            input="raw", model="caller-model", unknown_option=True
-        )
+        provider.resources.create_response(input="raw", model="caller-model", unknown_option=True)
 
     assert provider.resources.create_response(input="raw", model="caller-model") == "response"
     assert calls == [{"input": "raw", "model": "caller-model"}]
@@ -1436,9 +1456,7 @@ def test_security_allows_non_credential_header_descriptors():
 
 
 def test_security_scans_string_values_for_embedded_credentials():
-    found = find_sensitive_option_paths(
-        {"X-Trace": "Bearer secret-token", "tenant": "safe"}
-    )
+    found = find_sensitive_option_paths({"X-Trace": "Bearer secret-token", "tenant": "safe"})
     assert "X-Trace" in found
 
 
@@ -1566,10 +1584,12 @@ def test_google_async_invoke_stream_and_non_stream_issue_one_request_each():
     class AsyncModels:
         def generate_content_stream(self, **_kwargs):
             calls["stream"] += 1
-            return iter([
-                SimpleNamespace(text="流"),
-                SimpleNamespace(candidates=[SimpleNamespace(finish_reason="STOP")]),
-            ])
+            return iter(
+                [
+                    SimpleNamespace(text="流"),
+                    SimpleNamespace(candidates=[SimpleNamespace(finish_reason="STOP")]),
+                ]
+            )
 
         async def generate_content(self, **_kwargs):
             calls["complete"] += 1
@@ -1578,9 +1598,9 @@ def test_google_async_invoke_stream_and_non_stream_issue_one_request_each():
     provider._get_client = lambda: SimpleNamespace(aio=SimpleNamespace(models=AsyncModels()))
 
     async def collect(stream):
-        return [chunk async for chunk in provider.ainvoke(
-            prompt="hi", stream=stream, temperature=None
-        )]
+        return [
+            chunk async for chunk in provider.ainvoke(prompt="hi", stream=stream, temperature=None)
+        ]
 
     assert asyncio.run(collect(True)) == ["流"]
     assert calls == {"stream": 1, "complete": 0}
@@ -1604,7 +1624,9 @@ def test_google_http_extensions_map_to_sdk_http_options():
     provider._options = {}
 
     config = provider._build_generation_config(
-        "system", None, 0.2,
+        "system",
+        None,
+        0.2,
         extra_headers={"X-Trace": "trace-1"},
         extra_body={"tenant": "demo"},
         timeout=1.25,
@@ -1681,8 +1703,10 @@ def test_google_async_token_count_and_embedding_forward_http_options():
 
     provider._get_client = lambda: SimpleNamespace(aio=SimpleNamespace(models=AsyncModels()))
     request = CompletionRequest(
-        prompt="hi", extra_headers={"X-Trace": "trace-2"},
-        extra_body={"tenant": "demo"}, timeout=2,
+        prompt="hi",
+        extra_headers={"X-Trace": "trace-2"},
+        extra_body={"tenant": "demo"},
+        timeout=2,
     )
 
     assert asyncio.run(provider.async_count_tokens(request)) == 7
@@ -1691,9 +1715,13 @@ def test_google_async_token_count_and_embedding_forward_http_options():
     assert count_http.extra_body == {"tenant": "demo"}
     assert count_http.timeout == 2000
 
-    assert asyncio.run(provider.aembed_documents(
-        ["doc"], extra_headers={"X-Trace": "trace-3"}, timeout=3,
-    )) == [[0.1, 0.2]]
+    assert asyncio.run(
+        provider.aembed_documents(
+            ["doc"],
+            extra_headers={"X-Trace": "trace-3"},
+            timeout=3,
+        )
+    ) == [[0.1, 0.2]]
     embed_config = seen["embed"]["config"]
     assert embed_config.http_options.headers == {"X-Trace": "trace-3"}
     assert embed_config.http_options.timeout == 3000
@@ -1784,13 +1812,19 @@ def test_google_stream_events_cover_text_thought_tool_usage_and_finish():
                 finish_reason="STOP",
             )
         ],
-        usage_metadata=SimpleNamespace(prompt_token_count=2, candidates_token_count=3, total_token_count=5),
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=2, candidates_token_count=3, total_token_count=5
+        ),
     )
 
     events = GoogleProvider._stream_events_from_chunk(chunk)
 
     assert [event.type for event in events] == [
-        "reasoning_delta", "tool_call_delta", "text_delta", "finish", "usage"
+        "reasoning_delta",
+        "tool_call_delta",
+        "text_delta",
+        "finish",
+        "usage",
     ]
     assert events[1].tool_call["arguments"] == {"id": 1}
     assert events[-1].usage["total_tokens"] == 5
@@ -1917,7 +1951,11 @@ def test_google_sync_stream_merges_tool_call_when_id_arrives_after_first_chunk()
     provider._options = {}
 
     def chunk(function_call=None, finish_reason=None):
-        content = SimpleNamespace(parts=[SimpleNamespace(function_call=function_call)]) if function_call else None
+        content = (
+            SimpleNamespace(parts=[SimpleNamespace(function_call=function_call)])
+            if function_call
+            else None
+        )
         return SimpleNamespace(
             response_id="response-1",
             candidates=[SimpleNamespace(content=content, finish_reason=finish_reason)],
@@ -1955,7 +1993,11 @@ def test_google_sync_stream_defers_unidentified_tool_completion_until_finish():
     provider._options = {}
 
     def chunk(function_call=None, finish_reason=None):
-        content = SimpleNamespace(parts=[SimpleNamespace(function_call=function_call)]) if function_call else None
+        content = (
+            SimpleNamespace(parts=[SimpleNamespace(function_call=function_call)])
+            if function_call
+            else None
+        )
         return SimpleNamespace(
             response_id="response-1",
             candidates=[SimpleNamespace(content=content, finish_reason=finish_reason)],
@@ -2014,7 +2056,11 @@ def test_google_async_stream_merges_tool_call_when_id_arrives_after_first_chunk(
     provider._options = {}
 
     def chunk(function_call=None, finish_reason=None):
-        content = SimpleNamespace(parts=[SimpleNamespace(function_call=function_call)]) if function_call else None
+        content = (
+            SimpleNamespace(parts=[SimpleNamespace(function_call=function_call)])
+            if function_call
+            else None
+        )
         return SimpleNamespace(
             response_id="response-1",
             candidates=[SimpleNamespace(content=content, finish_reason=finish_reason)],
@@ -2088,7 +2134,11 @@ def test_google_sync_stream_keeps_parallel_tool_calls_separate_without_index():
     provider._options = {}
 
     def chunk(function_call=None, finish_reason=None):
-        content = SimpleNamespace(parts=[SimpleNamespace(function_call=function_call)]) if function_call else None
+        content = (
+            SimpleNamespace(parts=[SimpleNamespace(function_call=function_call)])
+            if function_call
+            else None
+        )
         return SimpleNamespace(
             response_id="response-1",
             candidates=[SimpleNamespace(content=content, finish_reason=finish_reason)],
@@ -2126,7 +2176,11 @@ def test_google_async_stream_keeps_parallel_tool_calls_separate_without_index():
     provider._options = {}
 
     def chunk(function_call=None, finish_reason=None):
-        content = SimpleNamespace(parts=[SimpleNamespace(function_call=function_call)]) if function_call else None
+        content = (
+            SimpleNamespace(parts=[SimpleNamespace(function_call=function_call)])
+            if function_call
+            else None
+        )
         return SimpleNamespace(
             response_id="response-1",
             candidates=[SimpleNamespace(content=content, finish_reason=finish_reason)],
@@ -2164,7 +2218,11 @@ def test_google_sync_stream_migrates_parallel_unidentified_calls_by_name():
     provider._options = {}
 
     def chunk(function_call=None, finish_reason=None):
-        content = SimpleNamespace(parts=[SimpleNamespace(function_call=function_call)]) if function_call else None
+        content = (
+            SimpleNamespace(parts=[SimpleNamespace(function_call=function_call)])
+            if function_call
+            else None
+        )
         return SimpleNamespace(
             response_id="response-1",
             candidates=[SimpleNamespace(content=content, finish_reason=finish_reason)],
@@ -2229,7 +2287,12 @@ def test_google_contents_links_function_call_content_to_followup_tool_result():
 def test_google_tool_result_numeric_prefix_that_is_not_json_stays_text(value):
     contents = GoogleProvider._contents(
         [
-            {"role": "assistant", "content": [{"type": "function_call", "id": "call-1", "name": "lookup", "arguments": {}}]},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "function_call", "id": "call-1", "name": "lookup", "arguments": {}}
+                ],
+            },
             {"role": "tool", "tool_call_id": "call-1", "content": value},
         ],
         None,
@@ -2243,7 +2306,12 @@ def test_google_tool_result_numeric_prefix_that_is_not_json_stays_text(value):
 def test_google_tool_result_complete_json_number_is_decoded(value):
     contents = GoogleProvider._contents(
         [
-            {"role": "assistant", "content": [{"type": "function_call", "id": "call-1", "name": "lookup", "arguments": {}}]},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "function_call", "id": "call-1", "name": "lookup", "arguments": {}}
+                ],
+            },
             {"role": "tool", "tool_call_id": "call-1", "content": value},
         ],
         None,
@@ -2256,11 +2324,16 @@ def test_google_tool_result_complete_json_number_is_decoded(value):
 def test_anthropic_stream_events_cover_text_thinking_tool_usage_and_finish():
     events = [
         AnthropicProvider._stream_event(
-            SimpleNamespace(type="content_block_delta", delta=SimpleNamespace(type="text_delta", text="答")),
+            SimpleNamespace(
+                type="content_block_delta", delta=SimpleNamespace(type="text_delta", text="答")
+            ),
             "msg-1",
         ),
         AnthropicProvider._stream_event(
-            SimpleNamespace(type="content_block_delta", delta=SimpleNamespace(type="thinking_delta", thinking="想")),
+            SimpleNamespace(
+                type="content_block_delta",
+                delta=SimpleNamespace(type="thinking_delta", thinking="想"),
+            ),
             "msg-1",
         ),
         AnthropicProvider._stream_event(
@@ -2282,7 +2355,10 @@ def test_anthropic_stream_events_cover_text_thinking_tool_usage_and_finish():
     ]
 
     assert [event.type for event in events if event] == [
-        "text_delta", "reasoning_delta", "tool_call_delta", "finish"
+        "text_delta",
+        "reasoning_delta",
+        "tool_call_delta",
+        "finish",
     ]
     assert events[3].finish_reason == "tool_use"
     assert events[3].usage["output_tokens"] == 3
@@ -2305,7 +2381,9 @@ def test_ark_stream_events_cover_chat_and_responses_terminal_metadata():
         SimpleNamespace(
             type="response.completed",
             response=SimpleNamespace(
-                id="ark-1", status="completed", usage=SimpleNamespace(input_tokens=1, output_tokens=2)
+                id="ark-1",
+                status="completed",
+                usage=SimpleNamespace(input_tokens=1, output_tokens=2),
             ),
         )
     )
@@ -2329,9 +2407,7 @@ def test_ark_invoke_non_stream_rejects_failed_response_status():
 
     class Responses:
         def create(self, **_kwargs):
-            return SimpleNamespace(
-                status="failed", error=SimpleNamespace(message="ark failed")
-            )
+            return SimpleNamespace(status="failed", error=SimpleNamespace(message="ark failed"))
 
     provider._get_client = lambda: SimpleNamespace(responses=Responses())
 
@@ -2607,7 +2683,9 @@ def test_anthropic_complete_extracts_tool_blocks_and_usage():
         usage=SimpleNamespace(input_tokens=4, output_tokens=5),
         stop_reason="tool_use",
     )
-    provider._get_client = lambda: SimpleNamespace(messages=SimpleNamespace(create=lambda **_: response))
+    provider._get_client = lambda: SimpleNamespace(
+        messages=SimpleNamespace(create=lambda **_: response)
+    )
     result = provider.complete(CompletionRequest(prompt="hi", stream=False))
     assert result.text == "answer"
     assert result.tool_calls[0]["arguments"] == {"id": 1}
@@ -2648,9 +2726,10 @@ def test_openai_parse_and_compact_facades_forward_native_methods():
     assert calls["parse"]["model"] == "demo"
     assert "stream" not in calls["parse"]
     provider._protocol = "responses"
-    assert provider.compact_responses(
-        input="hello", previous_response_id="resp-1", timeout=2
-    ) == "compacted"
+    assert (
+        provider.compact_responses(input="hello", previous_response_id="resp-1", timeout=2)
+        == "compacted"
+    )
     assert calls["compact"] == {
         "model": "demo",
         "input": "hello",
@@ -2736,7 +2815,8 @@ def test_openai_official_base_url_allows_responses_resource_contract():
     )
 
     assert provider.retrieve_response("resp-1", include=["output"]) == (
-        "resp-1", {"include": ["output"]}
+        "resp-1",
+        {"include": ["output"]},
     )
 
 
@@ -2753,9 +2833,13 @@ def test_openai_eval_output_item_retrieve_forwards_sync_and_async_resources():
     provider._get_client = lambda: SimpleNamespace(
         evals=SimpleNamespace(runs=SimpleNamespace(output_items=OutputItems()))
     )
-    assert provider.retrieve_eval_run_output_item("eval-1", "run-1", "item-1", limit=2) == "retrieved"
+    assert (
+        provider.retrieve_eval_run_output_item("eval-1", "run-1", "item-1", limit=2) == "retrieved"
+    )
     assert calls["sync"] == ("item-1", {"eval_id": "eval-1", "run_id": "run-1", "limit": 2})
-    assert provider.resources.retrieve_eval_run_output_item("eval-1", "run-1", "item-1") == "retrieved"
+    assert (
+        provider.resources.retrieve_eval_run_output_item("eval-1", "run-1", "item-1") == "retrieved"
+    )
 
     class AsyncOutputItems:
         async def retrieve(self, output_item_id, **kwargs):
@@ -2765,13 +2849,19 @@ def test_openai_eval_output_item_retrieve_forwards_sync_and_async_resources():
     provider._get_aclient = lambda: SimpleNamespace(
         evals=SimpleNamespace(runs=SimpleNamespace(output_items=AsyncOutputItems()))
     )
-    assert asyncio.run(
-        provider.async_retrieve_eval_run_output_item("eval-1", "run-1", "item-1", limit=3)
-    ) == "async-retrieved"
+    assert (
+        asyncio.run(
+            provider.async_retrieve_eval_run_output_item("eval-1", "run-1", "item-1", limit=3)
+        )
+        == "async-retrieved"
+    )
     assert calls["async"] == ("item-1", {"eval_id": "eval-1", "run_id": "run-1", "limit": 3})
-    assert asyncio.run(
-        provider.async_resources.retrieve_eval_run_output_item("eval-1", "run-1", "item-1")
-    ) == "async-retrieved"
+    assert (
+        asyncio.run(
+            provider.async_resources.retrieve_eval_run_output_item("eval-1", "run-1", "item-1")
+        )
+        == "async-retrieved"
+    )
 
 
 def test_resource_facade_exposes_native_sdk_clients():
@@ -2956,9 +3046,10 @@ def test_google_register_files_facade_allows_auth_business_parameter_sync_and_as
     )
 
     assert provider.resources.register_files(auth=auth, uris=["gs://bucket/file"]) == "registered"
-    assert asyncio.run(
-        provider.async_resources.register_files(auth=auth, uris=["gs://bucket/file"])
-    ) == "async-registered"
+    assert (
+        asyncio.run(provider.async_resources.register_files(auth=auth, uris=["gs://bucket/file"]))
+        == "async-registered"
+    )
     assert calls == {
         "sync": {"auth": auth, "uris": ["gs://bucket/file"]},
         "async": {"auth": auth, "uris": ["gs://bucket/file"]},
@@ -2993,9 +3084,20 @@ def test_anthropic_beta_resource_facade_forwards_current_sdk_tree():
     resources = {
         name: object()
         for name in (
-            "agents", "deployments", "deployment_runs", "dreams", "environments",
-            "files", "memory_stores", "models", "sessions", "skills", "tunnels",
-            "user_profiles", "vaults", "webhooks",
+            "agents",
+            "deployments",
+            "deployment_runs",
+            "dreams",
+            "environments",
+            "files",
+            "memory_stores",
+            "models",
+            "sessions",
+            "skills",
+            "tunnels",
+            "user_profiles",
+            "vaults",
+            "webhooks",
         )
     }
     provider._get_client = lambda: SimpleNamespace(beta=SimpleNamespace(**resources))
@@ -3044,7 +3146,9 @@ def test_google_resource_model_methods_forward_to_sdk():
 
     provider._get_client = lambda: SimpleNamespace(models=Models())
     assert provider.resources.delete_model("models/demo") == "deleted"
-    assert provider.resources.update_model("models/demo", config={"display_name": "demo"}) == "updated"
+    assert (
+        provider.resources.update_model("models/demo", config={"display_name": "demo"}) == "updated"
+    )
     assert calls["delete"] == {"model": "models/demo"}
     assert calls["update"] == {"model": "models/demo", "config": {"display_name": "demo"}}
 
@@ -3080,9 +3184,7 @@ def test_google_async_operation_uses_sdk_config_keyword():
             calls["operation"] = (operation, kwargs)
             return "operation"
 
-    provider._get_client = lambda: SimpleNamespace(
-        aio=SimpleNamespace(operations=Operations())
-    )
+    provider._get_client = lambda: SimpleNamespace(aio=SimpleNamespace(operations=Operations()))
 
     assert asyncio.run(provider.async_get_operation("operations/2", timeout=2)) == "operation"
     operation, kwargs = calls["operation"]
@@ -3103,9 +3205,12 @@ def test_google_chat_creation_wraps_generation_options_in_config():
 
     provider._get_client = lambda: SimpleNamespace(chats=Chats())
 
-    assert provider.create_chat(
-        history=[], temperature=0.2, max_output_tokens=64, extra_headers={"X-Trace": "1"}
-    ) == "chat"
+    assert (
+        provider.create_chat(
+            history=[], temperature=0.2, max_output_tokens=64, extra_headers={"X-Trace": "1"}
+        )
+        == "chat"
+    )
     assert calls["sync"]["model"] == "gemini-default"
     assert calls["sync"]["history"] == []
     assert calls["sync"]["config"].temperature == 0.2
@@ -3124,9 +3229,7 @@ def test_google_async_chat_creation_wraps_generation_options_in_config():
             calls["async"] = kwargs
             return ("chat", kwargs)
 
-    provider._get_client = lambda: SimpleNamespace(
-        aio=SimpleNamespace(chats=Chats())
-    )
+    provider._get_client = lambda: SimpleNamespace(aio=SimpleNamespace(chats=Chats()))
 
     result = asyncio.run(
         provider.async_create_chat(history=[], top_p=0.8, response_mime_type="application/json")
@@ -3245,19 +3348,21 @@ def test_openai_responses_token_count_forwards_full_request_extensions():
     )
 
     assert provider.count_input_tokens(request) == 11
-    assert calls == [{
-        "model": "demo",
-        "input": "hi",
-        "instructions": "You are a helpful assistant.",
-        "parallel_tool_calls": True,
-        "reasoning": {"effort": "low"},
-        "text": {"format": {"type": "json_object"}},
-        "truncation": "auto",
-        "extra_headers": {"X-Trace": "trace-1"},
-        "extra_query": {"tenant": "demo"},
-        "extra_body": {"vendor_flag": True},
-        "timeout": 3,
-    }]
+    assert calls == [
+        {
+            "model": "demo",
+            "input": "hi",
+            "instructions": "You are a helpful assistant.",
+            "parallel_tool_calls": True,
+            "reasoning": {"effort": "low"},
+            "text": {"format": {"type": "json_object"}},
+            "truncation": "auto",
+            "extra_headers": {"X-Trace": "trace-1"},
+            "extra_query": {"tenant": "demo"},
+            "extra_body": {"vendor_flag": True},
+            "timeout": 3,
+        }
+    ]
 
 
 def test_openai_responses_token_count_converts_chat_tool_choice():
@@ -3318,7 +3423,8 @@ def test_openai_compatible_verified_responses_resource_is_forwarded():
     )
 
     assert provider.retrieve_response("resp-1", include=["output"]) == (
-        "resp-1", {"include": ["output"]}
+        "resp-1",
+        {"include": ["output"]},
     )
 
 
@@ -3482,9 +3588,7 @@ def test_anthropic_async_beta_create_rejects_output_format_before_sdk_call():
             calls.append(kwargs)
             return "beta"
 
-    provider._get_aclient = lambda: SimpleNamespace(
-        beta=SimpleNamespace(messages=Messages())
-    )
+    provider._get_aclient = lambda: SimpleNamespace(beta=SimpleNamespace(messages=Messages()))
 
     with pytest.raises(ValueError, match="create 不支持 output_format"):
         asyncio.run(
@@ -3531,11 +3635,15 @@ def test_anthropic_request_keys_match_installed_sdk_create_signatures():
     provider._options = {}
     params = provider._build_message_params(prompt="hi")
 
-    create_keys = set(inspect.signature(anthropic.Anthropic(api_key="x").messages.create).parameters)
+    create_keys = set(
+        inspect.signature(anthropic.Anthropic(api_key="x").messages.create).parameters
+    )
     assert set(params).issubset(create_keys)
 
     beta_params = provider._build_message_params(prompt="hi", beta=True)
-    beta_keys = set(inspect.signature(anthropic.Anthropic(api_key="x").beta.messages.create).parameters)
+    beta_keys = set(
+        inspect.signature(anthropic.Anthropic(api_key="x").beta.messages.create).parameters
+    )
     assert set(beta_params).issubset(beta_keys)
 
 
@@ -3661,9 +3769,7 @@ def test_google_async_stream_and_chat_contracts_do_not_double_await():
     class AsyncModels:
         async def generate_content_stream(self, **_kwargs):
             async def chunks():
-                yield SimpleNamespace(
-                    candidates=[SimpleNamespace(finish_reason="STOP")]
-                )
+                yield SimpleNamespace(candidates=[SimpleNamespace(finish_reason="STOP")])
 
             return chunks()
 
@@ -3671,14 +3777,13 @@ def test_google_async_stream_and_chat_contracts_do_not_double_await():
         def create(self, **kwargs):
             return ("chat", kwargs)
 
-    client = SimpleNamespace(
-        aio=SimpleNamespace(models=AsyncModels(), chats=AsyncChats())
-    )
+    client = SimpleNamespace(aio=SimpleNamespace(models=AsyncModels(), chats=AsyncChats()))
     provider._get_client = lambda: client
     events = asyncio.run(_collect_google_async_events(provider))
     assert [event.type for event in events] == ["finish"]
     assert asyncio.run(provider.async_create_chat(history=[])) == (
-        "chat", {"model": "gemini", "history": []}
+        "chat",
+        {"model": "gemini", "history": []},
     )
 
 
@@ -3727,9 +3832,14 @@ def test_google_tuning_and_file_search_resources_forward_current_sdk_methods():
             calls.append(("import", kwargs))
             return "imported"
 
-    provider._get_client = lambda: SimpleNamespace(tunings=Tunings(), file_search_stores=FileSearchStores())
+    provider._get_client = lambda: SimpleNamespace(
+        tunings=Tunings(), file_search_stores=FileSearchStores()
+    )
     assert provider.resources.tune("gemini-base", {"examples": []}, config={}) == "tuning"
-    assert provider.resources.validate_tuning_reward("jobs/1", {"text": "ok"}, {"input": "x"}) == "reward"
+    assert (
+        provider.resources.validate_tuning_reward("jobs/1", {"text": "ok"}, {"input": "x"})
+        == "reward"
+    )
     assert provider.resources.import_file_to_file_search_store("stores/1", "files/1") == "imported"
     assert calls == [
         (
@@ -3740,7 +3850,10 @@ def test_google_tuning_and_file_search_resources_forward_current_sdk_methods():
                 "config": {},
             },
         ),
-        ("reward", {"parent": "jobs/1", "sample_response": {"text": "ok"}, "example": {"input": "x"}}),
+        (
+            "reward",
+            {"parent": "jobs/1", "sample_response": {"text": "ok"}, "example": {"input": "x"}},
+        ),
         ("import", {"file_search_store_name": "stores/1", "file_name": "files/1"}),
     ]
 
@@ -3796,9 +3909,7 @@ def test_dynamic_native_resource_proxy_validates_nested_calls_and_keeps_results(
     assert provider.resources.experimental.files.list(limit=2) == "page"
     assert calls == [{"limit": 2}]
     with pytest.raises(ValueError, match="凭证"):
-        provider.resources.experimental.files.list(
-            extra_query={"access_token": "secret"}
-        )
+        provider.resources.experimental.files.list(extra_query={"access_token": "secret"})
 
 
 def test_dynamic_native_resource_proxy_rejects_sensitive_positional_arguments():
@@ -3813,7 +3924,9 @@ def test_dynamic_native_resource_proxy_rejects_sensitive_positional_arguments():
     provider._provider = "openai"
     provider._get_client = lambda: SimpleNamespace(responses=Responses())
 
-    assert provider.resources.responses.connect({"tenant": "demo"}, {"X-Trace": "1"}) == "connection"
+    assert (
+        provider.resources.responses.connect({"tenant": "demo"}, {"X-Trace": "1"}) == "connection"
+    )
     assert calls == [
         (({"tenant": "demo"}, {"X-Trace": "1"}), {}),
     ]
@@ -3909,9 +4022,7 @@ def test_dynamic_native_vector_store_search_allows_business_query_but_scans_nest
     provider._provider = "openai"
     provider._get_client = lambda: SimpleNamespace(vector_stores=VectorStores())
 
-    assert provider.resources.vector_stores.search(
-        vector_store_id="vs_1", query="refund"
-    ) == "page"
+    assert provider.resources.vector_stores.search(vector_store_id="vs_1", query="refund") == "page"
     assert calls == [{"vector_store_id": "vs_1", "query": "refund"}]
 
     with pytest.raises(ValueError, match="凭证"):
@@ -4001,15 +4112,14 @@ def test_dynamic_async_native_resource_proxy_guards_nested_raw_and_streaming_res
     configured = provider.async_resources.with_options(timeout=2)
     copied = configured.copy(max_retries=1)
     assert asyncio.run(copied.responses.with_raw_response.create(model="demo")) == "raw-response"
-    assert asyncio.run(
-        copied.responses.with_streaming_response.create(model="demo")
-    ) == "streaming-response"
+    assert (
+        asyncio.run(copied.responses.with_streaming_response.create(model="demo"))
+        == "streaming-response"
+    )
     assert calls[:2] == [("with_options", {"timeout": 2}), ("copy", {"max_retries": 1})]
 
     with pytest.raises(ValueError, match="凭证"):
-        copied.responses.with_raw_response.create(
-            extra_headers={"Authorization": "Bearer secret"}
-        )
+        copied.responses.with_raw_response.create(extra_headers={"Authorization": "Bearer secret"})
     with pytest.raises(ValueError, match="凭证"):
         copied.responses.with_streaming_response.create(
             extra_body={"nested": {"access_token": "secret"}}
@@ -4033,14 +4143,18 @@ def test_google_tuning_facades_forward_additional_sdk_kwargs():
             return "async-tuning"
 
     provider = Provider()
-    assert GoogleResources(provider).tune(
-        "gemini-base", {"examples": []}, labels={"suite": "test"}
-    ) == "tuning"
-    assert asyncio.run(
-        AsyncGoogleResources(provider).tune(
-            "gemini-base", {"examples": []}, labels={"suite": "test"}
+    assert (
+        GoogleResources(provider).tune("gemini-base", {"examples": []}, labels={"suite": "test"})
+        == "tuning"
+    )
+    assert (
+        asyncio.run(
+            AsyncGoogleResources(provider).tune(
+                "gemini-base", {"examples": []}, labels={"suite": "test"}
+            )
         )
-    ) == "async-tuning"
+        == "async-tuning"
+    )
     assert calls == [
         ("sync", "gemini-base", {"examples": []}, None, {"labels": {"suite": "test"}}),
         ("async", "gemini-base", {"examples": []}, None, {"labels": {"suite": "test"}}),
@@ -4079,7 +4193,10 @@ def test_google_next_generation_resources_forward_sync_and_async_calls():
     assert provider.resources.create_interaction(input="hello") == "create-result"
     assert provider.resources.get_webhook("wh-1") == "get-result"
     assert provider.resources.run_trigger("tr-1", payload={"x": 1}) == "run-result"
-    assert provider.resources.connect_live(config={}) == ("live", {"model": "gemini-default", "config": {}})
+    assert provider.resources.connect_live(config={}) == (
+        "live",
+        {"model": "gemini-default", "config": {}},
+    )
 
     async def collect():
         return (
@@ -4128,11 +4245,16 @@ def test_provider_resource_facades_expose_beta_trees_without_copying_sdk_methods
     ark_provider._model_name = "ark-model"
     ark_provider._get_client = lambda: SimpleNamespace(
         beta=SimpleNamespace(chat=SimpleNamespace(completions=Completions())),
-        bot_chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kwargs: ("bot", kwargs))),
+        bot_chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **kwargs: ("bot", kwargs))
+        ),
     )
     assert ark_provider.resources.beta_chat_parse(messages=[], response_format={}) == "parsed"
     assert ark_provider.resources.beta_chat_stream(messages=[]) == "stream"
-    assert ark_provider.resources.bot_chat(messages=[]) == ("bot", {"messages": [], "model": "ark-model"})
+    assert ark_provider.resources.bot_chat(messages=[]) == (
+        "bot",
+        {"messages": [], "model": "ark-model"},
+    )
     assert ark_calls == [
         ("parse", {"messages": [], "response_format": {}, "model": "ark-model"}),
         ("stream", {"messages": [], "model": "ark-model"}),
@@ -4145,7 +4267,11 @@ def test_provider_resource_facades_expose_beta_trees_without_copying_sdk_methods
         ("upload_file", (b"data", "user_data"), {"extra_headers": {"X-API-Key": "secret"}}),
         ("list_files", (), {"extra_query": {"access_token": "secret"}}),
         ("retrieve_response", ("resp-1",), {"extra_body": {"token": "secret"}}),
-        ("create_content_generation_task", (), {"content": [], "extra_body": {"password": "secret"}}),
+        (
+            "create_content_generation_task",
+            (),
+            {"content": [], "extra_body": {"password": "secret"}},
+        ),
         ("beta_chat_parse", (), {"messages": [], "extra_query": {"api_key": "secret"}}),
         ("bot_chat", (), {"messages": [], "extra_headers": {"Authorization": "Bearer secret"}}),
         ("classify", ("query", ["label"]), {"extra_headers": {"X-Api-Key": "secret"}}),
@@ -4246,9 +4372,7 @@ def test_ark_async_input_items_use_top_level_resource():
         ("list_input_items", ("resp-1",), {"bogus": True}),
     ],
 )
-def test_ark_response_resources_reject_unknown_kwargs_before_sdk_call(
-    method_name, args, kwargs
-):
+def test_ark_response_resources_reject_unknown_kwargs_before_sdk_call(method_name, args, kwargs):
     provider = object.__new__(VolcengineProvider)
     provider._protocol = "responses"
     provider._server_verified_protocols = frozenset({"responses"})
@@ -4334,9 +4458,7 @@ def test_ark_async_chat_stream_rejects_incomplete_tool_call():
 
             return Stream()
 
-    provider._get_aclient = lambda: SimpleNamespace(
-        chat=SimpleNamespace(completions=Completions())
-    )
+    provider._get_aclient = lambda: SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
 
     async def collect():
         return [event async for event in provider.astream_events(CompletionRequest(prompt="hi"))]
@@ -4358,14 +4480,19 @@ def test_ark_responses_request_and_stream(monkeypatch):
         protocol="responses",
         options={"server_verified_protocols": ["responses"]},
     )
-    assert provider._build_responses_request(CompletionRequest(prompt="hi", stream=True))["input"] == "hi"
+    assert (
+        provider._build_responses_request(CompletionRequest(prompt="hi", stream=True))["input"]
+        == "hi"
+    )
 
     class Responses:
         def create(self, **_kwargs):
             return iter(
                 [
                     SimpleNamespace(type="response.output_text.delta", delta="ok"),
-                    SimpleNamespace(type="response.completed", response=SimpleNamespace(status="completed")),
+                    SimpleNamespace(
+                        type="response.completed", response=SimpleNamespace(status="completed")
+                    ),
                 ]
             )
 
@@ -4438,14 +4565,10 @@ def test_ark_ainvoke_preserves_explicit_none_system_prompt():
                 ]
             )
 
-    provider._get_aclient = lambda: SimpleNamespace(
-        chat=SimpleNamespace(completions=Completions())
-    )
+    provider._get_aclient = lambda: SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
 
     async def consume():
-        return [item async for item in provider.ainvoke(
-            "hello", system_prompt=None, stream=False
-        )]
+        return [item async for item in provider.ainvoke("hello", system_prompt=None, stream=False)]
 
     assert asyncio.run(consume()) == ["ok"]
     assert calls[0]["messages"] == [{"role": "user", "content": "hello"}]
@@ -4460,9 +4583,7 @@ def test_ark_responses_normalizes_model_options_to_native_shape():
         "reasoning_effort": "high",
     }
 
-    request = provider._build_responses_request(
-        CompletionRequest(prompt="hi", stream=False)
-    )
+    request = provider._build_responses_request(CompletionRequest(prompt="hi", stream=False))
 
     assert request["max_output_tokens"] == 1024
     assert request["text"] == {"format": {"type": "json_object"}}
@@ -4479,9 +4600,7 @@ def test_ark_responses_converts_configured_tool_choice_to_native_shape():
         "tool_choice": {"type": "function", "function": {"name": "lookup"}},
     }
 
-    request = provider._build_responses_request(
-        CompletionRequest(prompt="hi", stream=False)
-    )
+    request = provider._build_responses_request(CompletionRequest(prompt="hi", stream=False))
 
     assert request["tool_choice"] == {"type": "function", "name": "lookup"}
 
@@ -4523,13 +4642,18 @@ def test_ark_response_resource_create_uses_unified_request_and_native_defaults()
             return "response"
 
     provider._get_client = lambda: SimpleNamespace(responses=Responses())
-    assert provider.resources.create_response(CompletionRequest(prompt="hi", stream=False)) == "response"
-    assert calls == [{
-        "model": "ark-model",
-        "input": "hi",
-        "stream": False,
-        "instructions": "You are a helpful assistant.",
-    }]
+    assert (
+        provider.resources.create_response(CompletionRequest(prompt="hi", stream=False))
+        == "response"
+    )
+    assert calls == [
+        {
+            "model": "ark-model",
+            "input": "hi",
+            "stream": False,
+            "instructions": "You are a helpful assistant.",
+        }
+    ]
     with pytest.raises(ValueError, match="model"):
         provider.resources.create_response(input="raw")
     assert provider.resources.create_response(input="raw", model="caller-model") == "response"
@@ -4617,9 +4741,10 @@ def test_google_environment_resource_names_and_async_live_contracts():
     assert provider.resources.delete_environment("env-1") == "deleted"
     assert provider.resources.get_environment_files("env-1", "src", recursive=True) == "files"
     assert provider.async_resources.connect_live(config={}) == "live-manager"
-    assert asyncio.run(
-        provider.async_resources.get_environment_files("env-1", "src", recursive=True)
-    ) == "async-files"
+    assert (
+        asyncio.run(provider.async_resources.get_environment_files("env-1", "src", recursive=True))
+        == "async-files"
+    )
     assert calls == [
         ("create", (), {"network": {}}),
         ("get", (), {"id": "env-1"}),
@@ -4661,7 +4786,9 @@ def test_google_experimental_resources_fail_with_capability_error_when_sdk_missi
         "async_create_trigger",
     ],
 )
-def test_google_async_experimental_resources_fail_with_capability_error_when_sdk_missing(method_name):
+def test_google_async_experimental_resources_fail_with_capability_error_when_sdk_missing(
+    method_name,
+):
     provider = object.__new__(GoogleProvider)
     provider._get_client = lambda: SimpleNamespace(aio=SimpleNamespace())
 
@@ -4709,11 +4836,18 @@ def test_ark_content_generation_delete_uses_keyword_task_id_for_sync_and_async()
             calls.append(("async", task_id, kwargs))
             return "async-deleted"
 
-    provider._get_client = lambda: SimpleNamespace(content_generation=SimpleNamespace(tasks=Tasks()))
-    provider._get_aclient = lambda: SimpleNamespace(content_generation=SimpleNamespace(tasks=AsyncTasks()))
+    provider._get_client = lambda: SimpleNamespace(
+        content_generation=SimpleNamespace(tasks=Tasks())
+    )
+    provider._get_aclient = lambda: SimpleNamespace(
+        content_generation=SimpleNamespace(tasks=AsyncTasks())
+    )
 
     assert provider.resources.delete_content_generation_task("task-1", timeout=4) == "deleted"
-    assert asyncio.run(provider.async_resources.delete_content_generation_task("task-2", timeout=5)) == "async-deleted"
+    assert (
+        asyncio.run(provider.async_resources.delete_content_generation_task("task-2", timeout=5))
+        == "async-deleted"
+    )
     assert calls == [
         ("sync", "task-1", {"timeout": 4}),
         ("async", "task-2", {"timeout": 5}),
@@ -4752,9 +4886,9 @@ def test_ark_async_batch_chat_forwards_sdk_supported_user_argument():
         batch=SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
     )
 
-    assert asyncio.run(
-        provider.async_create_batch_chat(messages=[], user="user-1")
-    ) == "async-batch"
+    assert (
+        asyncio.run(provider.async_create_batch_chat(messages=[], user="user-1")) == "async-batch"
+    )
     assert calls == [{"messages": [], "model": "ark-model", "user": "user-1"}]
 
 
@@ -4781,7 +4915,10 @@ def test_ark_context_resources_validate_sdk_parameter_names_and_defaults():
     assert provider.context_complete(context_id="ctx-1", messages=[], stream=False) == "completion"
     assert calls == [
         ("create", {"messages": [], "mode": "session", "model": "ark-model"}),
-        ("complete", {"context_id": "ctx-1", "messages": [], "stream": False, "model": "ark-model"}),
+        (
+            "complete",
+            {"context_id": "ctx-1", "messages": [], "stream": False, "model": "ark-model"},
+        ),
     ]
 
     with pytest.raises(ValueError, match="Context.*temperature"):
@@ -4825,10 +4962,14 @@ def test_ark_batch_multimodal_embedding_rejects_sparse_embedding_before_sdk_call
         batch=SimpleNamespace(multimodal_embeddings=FailingResource())
     )
 
-    with pytest.raises(ValueError, match="Ark Batch Multimodal Embedding 不支持请求参数: sparse_embedding"):
+    with pytest.raises(
+        ValueError, match="Ark Batch Multimodal Embedding 不支持请求参数: sparse_embedding"
+    ):
         provider.create_batch_multimodal_embedding(input=[], sparse_embedding={"enabled": True})
 
-    with pytest.raises(ValueError, match="Ark Batch Multimodal Embedding 不支持请求参数: sparse_embedding"):
+    with pytest.raises(
+        ValueError, match="Ark Batch Multimodal Embedding 不支持请求参数: sparse_embedding"
+    ):
         asyncio.run(
             provider.async_create_batch_multimodal_embedding(
                 input=[], sparse_embedding={"enabled": True}
@@ -4890,23 +5031,30 @@ def test_openai_responses_stream_helper_matches_installed_sdk_contract_sync_and_
     provider._get_aclient = lambda: SimpleNamespace(responses=AsyncResponses())
 
     assert provider.stream_responses(CompletionRequest(prompt="hi", stream=True)) == "sync-stream"
-    assert provider.async_stream_responses(CompletionRequest(prompt="hi", stream=True)) == "async-stream"
+    assert (
+        provider.async_stream_responses(CompletionRequest(prompt="hi", stream=True))
+        == "async-stream"
+    )
     assert calls == [
-        ("sync", {
-            "model": "demo",
-            "input": "hi",
-            "instructions": "You are a helpful assistant.",
-        }),
-        ("async", {
-            "model": "demo",
-            "input": "hi",
-            "instructions": "You are a helpful assistant.",
-        }),
+        (
+            "sync",
+            {
+                "model": "demo",
+                "input": "hi",
+                "instructions": "You are a helpful assistant.",
+            },
+        ),
+        (
+            "async",
+            {
+                "model": "demo",
+                "input": "hi",
+                "instructions": "You are a helpful assistant.",
+            },
+        ),
     ]
 
-    assert provider.stream_responses(
-        input="hi", safety_identifier="user-1"
-    ) == "sync-stream"
+    assert provider.stream_responses(input="hi", safety_identifier="user-1") == "sync-stream"
     assert calls[-1] == (
         "sync",
         {"input": "hi", "model": "demo", "safety_identifier": "user-1"},
@@ -4945,24 +5093,17 @@ def test_openai_responses_stream_continuation_omits_model_sync_and_async():
 
     assert provider.stream_responses(response_id="resp-1") == "sync-stream"
     assert calls[-1] == ("sync", {"response_id": "resp-1"})
-    assert (
-        provider.stream_responses(response_id="resp-1", starting_after=2)
-        == "sync-stream"
-    )
+    assert provider.stream_responses(response_id="resp-1", starting_after=2) == "sync-stream"
     assert calls[-1] == (
         "sync",
         {"response_id": "resp-1", "starting_after": 2},
     )
 
-    assert (
-        provider.async_stream_responses(response_id="resp-1", starting_after=2)
-        == "async-stream"
-    )
+    assert provider.async_stream_responses(response_id="resp-1", starting_after=2) == "async-stream"
     assert calls[-1] == (
         "async",
         {"response_id": "resp-1", "starting_after": 2},
     )
-
 
 
 def test_openai_polling_helpers_match_installed_sdk_parameters_sync():
@@ -5001,23 +5142,41 @@ def test_openai_polling_helpers_match_installed_sdk_parameters_sync():
     )
 
     assert provider.wait_for_file("file-1", poll_interval=1.5, max_wait_seconds=20) == "file"
-    assert provider.poll_vector_store_file("store-1", "file-1", poll_interval_ms=250) == "vector-file"
-    assert provider.poll_vector_store_file_batch("store-1", "batch-1", poll_interval_ms=300) == "vector-batch"
-    assert provider.upload_vector_store_file_batch_and_poll(
-        "store-1", ["a"], max_concurrency=2, file_ids=["f-1"],
-        poll_interval_ms=400, chunking_strategy={"type": "auto"},
-    ) == "uploaded-batch"
+    assert (
+        provider.poll_vector_store_file("store-1", "file-1", poll_interval_ms=250) == "vector-file"
+    )
+    assert (
+        provider.poll_vector_store_file_batch("store-1", "batch-1", poll_interval_ms=300)
+        == "vector-batch"
+    )
+    assert (
+        provider.upload_vector_store_file_batch_and_poll(
+            "store-1",
+            ["a"],
+            max_concurrency=2,
+            file_ids=["f-1"],
+            poll_interval_ms=400,
+            chunking_strategy={"type": "auto"},
+        )
+        == "uploaded-batch"
+    )
     assert provider.poll_video("video-1", poll_interval_ms=500) == "video"
 
     assert calls == [
         ("wait", {"id": "file-1", "poll_interval": 1.5, "max_wait_seconds": 20}),
         ("vector_file", ("file-1",), {"vector_store_id": "store-1", "poll_interval_ms": 250}),
         ("vector_batch", ("batch-1",), {"vector_store_id": "store-1", "poll_interval_ms": 300}),
-        ("upload_batch", {
-            "vector_store_id": "store-1", "files": ["a"], "max_concurrency": 2,
-            "file_ids": ["f-1"], "poll_interval_ms": 400,
-            "chunking_strategy": {"type": "auto"},
-        }),
+        (
+            "upload_batch",
+            {
+                "vector_store_id": "store-1",
+                "files": ["a"],
+                "max_concurrency": 2,
+                "file_ids": ["f-1"],
+                "poll_interval_ms": 400,
+                "chunking_strategy": {"type": "auto"},
+            },
+        ),
         ("video", ("video-1",), {"poll_interval_ms": 500}),
     ]
 
@@ -5049,13 +5208,20 @@ def test_openai_vector_store_upload_and_container_file_match_sdk_parameters():
         vector_stores=SimpleNamespace(files=VectorFiles()),
         containers=SimpleNamespace(files=ContainerFiles()),
     )
-    assert provider.upload_vector_store_file("store-1", "file", chunking_strategy={"type": "auto"}) == "uploaded"
+    assert (
+        provider.upload_vector_store_file("store-1", "file", chunking_strategy={"type": "auto"})
+        == "uploaded"
+    )
     assert provider.create_container_file("container-1", file_id="file-1") == "container-file"
     assert calls == [
-        ("upload", {
-            "vector_store_id": "store-1", "file": "file",
-            "chunking_strategy": {"type": "auto"},
-        }),
+        (
+            "upload",
+            {
+                "vector_store_id": "store-1",
+                "file": "file",
+                "chunking_strategy": {"type": "auto"},
+            },
+        ),
         ("container", ("container-1",), {"file_id": "file-1"}),
     ]
     with pytest.raises(ValueError, match="向量库文件上传.*timeout"):
@@ -5075,13 +5241,16 @@ def test_openai_vector_store_upload_and_poll_matches_installed_sdk_parameters_sy
         vector_stores=SimpleNamespace(files=VectorFiles())
     )
 
-    assert provider.upload_vector_store_file_and_poll(
-        "store-1",
-        "file",
-        attributes={"source": "docs", "rank": 1},
-        poll_interval_ms=250,
-        chunking_strategy={"type": "auto"},
-    ) == "uploaded-and-polled"
+    assert (
+        provider.upload_vector_store_file_and_poll(
+            "store-1",
+            "file",
+            attributes={"source": "docs", "rank": 1},
+            poll_interval_ms=250,
+            chunking_strategy={"type": "auto"},
+        )
+        == "uploaded-and-polled"
+    )
     assert calls == [
         {
             "vector_store_id": "store-1",
@@ -5108,9 +5277,12 @@ def test_openai_vector_store_file_update_requires_sdk_attributes_parameter():
         vector_stores=SimpleNamespace(files=VectorFiles())
     )
 
-    assert provider.update_vector_store_file(
-        "store-1", "file-1", attributes={"source": "docs", "rank": 1}
-    ) == "updated"
+    assert (
+        provider.update_vector_store_file(
+            "store-1", "file-1", attributes={"source": "docs", "rank": 1}
+        )
+        == "updated"
+    )
     assert calls == [
         (
             ("file-1",),
@@ -5141,15 +5313,18 @@ def test_openai_upload_file_chunked_matches_installed_sdk_contract_sync_and_asyn
     provider._get_client = lambda: SimpleNamespace(uploads=Uploads())
     provider._get_aclient = lambda: SimpleNamespace(uploads=AsyncUploads())
 
-    assert provider.upload_file_chunked(
-        file=b"payload",
-        mime_type="text/plain",
-        purpose="assistants",
-        filename="notes.txt",
-        bytes=7,
-        part_size=4,
-        md5="md5-value",
-    ) == "uploaded"
+    assert (
+        provider.upload_file_chunked(
+            file=b"payload",
+            mime_type="text/plain",
+            purpose="assistants",
+            filename="notes.txt",
+            bytes=7,
+            part_size=4,
+            md5="md5-value",
+        )
+        == "uploaded"
+    )
 
     async def run():
         return await provider.async_upload_file_chunked(
@@ -5234,19 +5409,29 @@ def test_openai_vector_store_upload_and_container_file_match_sdk_parameters_asyn
     )
 
     async def run():
-        assert await provider.async_upload_vector_store_file(
-            "store-1", "file", chunking_strategy={"type": "auto"}
-        ) == "uploaded"
-        assert await provider.async_create_container_file("container-1", file_id="file-1") == "container-file"
+        assert (
+            await provider.async_upload_vector_store_file(
+                "store-1", "file", chunking_strategy={"type": "auto"}
+            )
+            == "uploaded"
+        )
+        assert (
+            await provider.async_create_container_file("container-1", file_id="file-1")
+            == "container-file"
+        )
         with pytest.raises(ValueError, match="向量库文件上传.*timeout"):
             await provider.async_upload_vector_store_file("store-1", "file", timeout=1)
 
     asyncio.run(run())
     assert calls == [
-        ("upload", {
-            "vector_store_id": "store-1", "file": "file",
-            "chunking_strategy": {"type": "auto"},
-        }),
+        (
+            "upload",
+            {
+                "vector_store_id": "store-1",
+                "file": "file",
+                "chunking_strategy": {"type": "auto"},
+            },
+        ),
         ("container", ("container-1",), {"file_id": "file-1"}),
     ]
 
@@ -5265,17 +5450,18 @@ def test_openai_vector_store_upload_and_poll_matches_installed_sdk_parameters_as
     )
 
     async def run():
-        assert await provider.async_upload_vector_store_file_and_poll(
-            "store-1",
-            "file",
-            attributes={"source": "docs", "rank": 1},
-            poll_interval_ms=250,
-            chunking_strategy={"type": "auto"},
-        ) == "uploaded-and-polled"
-        with pytest.raises(ValueError, match="向量库文件上传轮询.*timeout"):
+        assert (
             await provider.async_upload_vector_store_file_and_poll(
-                "store-1", "file", timeout=1
+                "store-1",
+                "file",
+                attributes={"source": "docs", "rank": 1},
+                poll_interval_ms=250,
+                chunking_strategy={"type": "auto"},
             )
+            == "uploaded-and-polled"
+        )
+        with pytest.raises(ValueError, match="向量库文件上传轮询.*timeout"):
+            await provider.async_upload_vector_store_file_and_poll("store-1", "file", timeout=1)
 
     asyncio.run(run())
     assert calls == [
@@ -5337,18 +5523,38 @@ def test_openai_polling_helpers_match_installed_sdk_parameters_async():
     )
 
     async def run():
-        assert await provider.async_wait_for_file("file-1", poll_interval=1.5, max_wait_seconds=20) == "file"
-        assert await provider.async_poll_vector_store_file("store-1", "file-1", poll_interval_ms=250) == "vector-file"
-        assert await provider.async_poll_vector_store_file_batch("store-1", "batch-1", poll_interval_ms=300) == "vector-batch"
-        assert await provider.async_upload_vector_store_file_batch_and_poll(
-            "store-1", ["a"], max_concurrency=2, file_ids=["f-1"],
-            poll_interval_ms=400, chunking_strategy={"type": "auto"},
-        ) == "uploaded-batch"
+        assert (
+            await provider.async_wait_for_file("file-1", poll_interval=1.5, max_wait_seconds=20)
+            == "file"
+        )
+        assert (
+            await provider.async_poll_vector_store_file("store-1", "file-1", poll_interval_ms=250)
+            == "vector-file"
+        )
+        assert (
+            await provider.async_poll_vector_store_file_batch(
+                "store-1", "batch-1", poll_interval_ms=300
+            )
+            == "vector-batch"
+        )
+        assert (
+            await provider.async_upload_vector_store_file_batch_and_poll(
+                "store-1",
+                ["a"],
+                max_concurrency=2,
+                file_ids=["f-1"],
+                poll_interval_ms=400,
+                chunking_strategy={"type": "auto"},
+            )
+            == "uploaded-batch"
+        )
         assert await provider.async_poll_video("video-1", poll_interval_ms=500) == "video"
         with pytest.raises(ValueError, match="文件等待.*timeout"):
             await provider.async_wait_for_file("file-1", timeout=1)
         with pytest.raises(ValueError, match="向量库文件轮询.*extra_headers"):
-            await provider.async_poll_vector_store_file("store-1", "file-1", extra_headers={"X-Test": "1"})
+            await provider.async_poll_vector_store_file(
+                "store-1", "file-1", extra_headers={"X-Test": "1"}
+            )
         with pytest.raises(ValueError, match="向量库文件批次上传轮询.*timeout"):
             await provider.async_upload_vector_store_file_batch_and_poll("store-1", [], timeout=1)
         with pytest.raises(ValueError, match="视频轮询.*extra_query"):
@@ -5359,11 +5565,17 @@ def test_openai_polling_helpers_match_installed_sdk_parameters_async():
         ("wait", {"id": "file-1", "poll_interval": 1.5, "max_wait_seconds": 20}),
         ("vector_file", ("file-1",), {"vector_store_id": "store-1", "poll_interval_ms": 250}),
         ("vector_batch", ("batch-1",), {"vector_store_id": "store-1", "poll_interval_ms": 300}),
-        ("upload_batch", {
-            "vector_store_id": "store-1", "files": ["a"], "max_concurrency": 2,
-            "file_ids": ["f-1"], "poll_interval_ms": 400,
-            "chunking_strategy": {"type": "auto"},
-        }),
+        (
+            "upload_batch",
+            {
+                "vector_store_id": "store-1",
+                "files": ["a"],
+                "max_concurrency": 2,
+                "file_ids": ["f-1"],
+                "poll_interval_ms": 400,
+                "chunking_strategy": {"type": "auto"},
+            },
+        ),
         ("video", ("video-1",), {"poll_interval_ms": 500}),
     ]
 
@@ -5386,9 +5598,10 @@ def test_ark_file_wait_helpers_match_installed_sdk_parameters_sync_and_async():
     provider._get_aclient = lambda: SimpleNamespace(files=AsyncFiles())
 
     assert provider.wait_for_file("file-1", poll_interval=2, max_wait_seconds=30) == "file"
-    assert asyncio.run(
-        provider.async_wait_for_file("file-2", poll_interval=1, max_wait_seconds=40)
-    ) == "async-file"
+    assert (
+        asyncio.run(provider.async_wait_for_file("file-2", poll_interval=1, max_wait_seconds=40))
+        == "async-file"
+    )
     assert calls == [
         ("sync", {"id": "file-1", "poll_interval": 2, "max_wait_seconds": 30}),
         ("async", {"id": "file-2", "poll_interval": 1, "max_wait_seconds": 40}),
@@ -5418,7 +5631,9 @@ def test_ark_file_wait_helpers_validate_identifiers_and_timeouts(
     provider._get_aclient = lambda: pytest.fail("无效轮询参数不应调用异步 SDK")
 
     with pytest.raises(ValueError, match=match):
-        provider.wait_for_file(file_id, poll_interval=poll_interval, max_wait_seconds=max_wait_seconds)
+        provider.wait_for_file(
+            file_id, poll_interval=poll_interval, max_wait_seconds=max_wait_seconds
+        )
 
     with pytest.raises(ValueError, match=match):
         asyncio.run(
@@ -5459,9 +5674,10 @@ def test_ark_classification_resource_forwards_sync_and_async_calls():
     provider._async_classification_resource = AsyncClassification()
 
     assert provider.resources.classify("refund", ["billing", "support"]) == "classified"
-    assert asyncio.run(
-        provider.async_resources.classify("refund", ["billing", "support"])
-    ) == "async-classified"
+    assert (
+        asyncio.run(provider.async_resources.classify("refund", ["billing", "support"]))
+        == "async-classified"
+    )
     assert calls == [
         ("sync", {"query": "refund", "model": "ark-model", "labels": ["billing", "support"]}),
         ("async", {"query": "refund", "model": "ark-model", "labels": ["billing", "support"]}),
@@ -5543,9 +5759,7 @@ def test_anthropic_token_count_rejects_output_format_before_sdk_call():
 
     async def run() -> None:
         with pytest.raises(ValueError, match="token count 不支持 output_format"):
-            await provider.async_count_tokens(
-                CompletionRequest(prompt="hi", output_format=dict)
-            )
+            await provider.async_count_tokens(CompletionRequest(prompt="hi", output_format=dict))
 
     asyncio.run(run())
 
@@ -5631,8 +5845,7 @@ def test_chat_completions_normalizes_flat_tool_calls_to_openai_shape():
     provider._protocol = "chat_completions"
     provider._options = {}
 
-    flat = {"id": "call-1", "type": "function", "name": "lookup",
-            "arguments": '{"id":1}'}
+    flat = {"id": "call-1", "type": "function", "name": "lookup", "arguments": '{"id":1}'}
     request = provider._build_chat_request(
         messages=[
             {"role": "user", "content": "查询"},
@@ -5643,11 +5856,13 @@ def test_chat_completions_normalizes_flat_tool_calls_to_openai_shape():
     )
 
     tool_calls = request["messages"][1]["tool_calls"]
-    assert tool_calls == [{
-        "id": "call-1",
-        "type": "function",
-        "function": {"name": "lookup", "arguments": '{"id":1}'},
-    }], "扁平 tool_calls 必须转换为 OpenAI 嵌套结构"
+    assert tool_calls == [
+        {
+            "id": "call-1",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": '{"id":1}'},
+        }
+    ], "扁平 tool_calls 必须转换为 OpenAI 嵌套结构"
 
 
 def test_chat_completions_preserves_native_tool_calls():
@@ -5658,8 +5873,11 @@ def test_chat_completions_preserves_native_tool_calls():
     provider._protocol = "chat_completions"
     provider._options = {}
 
-    native = {"id": "call-2", "type": "function",
-              "function": {"name": "lookup", "arguments": '{"id":2}'}}
+    native = {
+        "id": "call-2",
+        "type": "function",
+        "function": {"name": "lookup", "arguments": '{"id":2}'},
+    }
     request = provider._build_chat_request(
         messages=[
             {"role": "user", "content": "查询"},
@@ -5684,9 +5902,11 @@ def test_chat_completions_rejects_tool_call_without_function_name():
         provider._build_chat_request(
             messages=[
                 {"role": "user", "content": "查询"},
-                {"role": "assistant", "content": "",
-                 "tool_calls": [{"id": "call-3", "type": "function",
-                                 "arguments": "{}"}]},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"id": "call-3", "type": "function", "arguments": "{}"}],
+                },
             ],
             stream=False,
         )
@@ -5708,12 +5928,20 @@ def test_normalize_messages_accepts_id_less_tool_calls_for_non_chat_protocols():
                 "role": "assistant",
                 "content": "",
                 "tool_calls": [
-                    {"id": None, "type": "function", "name": "get_weather",
-                     "arguments": {"city": "BJ"}}
+                    {
+                        "id": None,
+                        "type": "function",
+                        "name": "get_weather",
+                        "arguments": {"city": "BJ"},
+                    }
                 ],
             },
-            {"role": "tool", "tool_call_id": "get_weather",
-             "name": "get_weather", "content": '{"t":20}'},
+            {
+                "role": "tool",
+                "tool_call_id": "get_weather",
+                "name": "get_weather",
+                "content": '{"t":20}',
+            },
         ],
     )
 
@@ -5738,12 +5966,20 @@ def test_google_multi_turn_replay_accepts_id_less_tool_calls():
                     "role": "assistant",
                     "content": "",
                     "tool_calls": [
-                        {"id": None, "type": "function", "name": "get_weather",
-                         "arguments": {"city": "BJ"}}
+                        {
+                            "id": None,
+                            "type": "function",
+                            "name": "get_weather",
+                            "arguments": {"city": "BJ"},
+                        }
                     ],
                 },
-                {"role": "tool", "tool_call_id": "get_weather",
-                 "name": "get_weather", "content": '{"t":20}'},
+                {
+                    "role": "tool",
+                    "tool_call_id": "get_weather",
+                    "name": "get_weather",
+                    "content": '{"t":20}',
+                },
             ],
         ),
         None,
@@ -5751,10 +5987,7 @@ def test_google_multi_turn_replay_accepts_id_less_tool_calls():
     )
 
     function_call = next(
-        part.function_call
-        for content in contents
-        for part in content.parts
-        if part.function_call
+        part.function_call for content in contents for part in content.parts if part.function_call
     )
     assert function_call.name == "get_weather"
 
@@ -5767,16 +6000,14 @@ def test_chat_tool_call_normalization_reads_input_alias():
                 "role": "assistant",
                 "content": "",
                 "tool_calls": [
-                    {"id": "c1", "type": "custom_tool_call", "name": "n",
-                     "input": '{"a":1}'}
+                    {"id": "c1", "type": "custom_tool_call", "name": "n", "input": '{"a":1}'}
                 ],
             }
         ]
     )
 
     assert normalized[0]["tool_calls"] == [
-        {"id": "c1", "type": "function",
-         "function": {"name": "n", "arguments": '{"a":1}'}}
+        {"id": "c1", "type": "function", "function": {"name": "n", "arguments": '{"a":1}'}}
     ]
 
 
@@ -5791,9 +6022,7 @@ def test_chat_tool_call_normalization_maps_type_to_function(tool_type):
             {
                 "role": "assistant",
                 "content": "",
-                "tool_calls": [
-                    {"id": "x", "type": tool_type, "name": "n", "arguments": "{}"}
-                ],
+                "tool_calls": [{"id": "x", "type": tool_type, "name": "n", "arguments": "{}"}],
             }
         ]
     )
@@ -5812,8 +6041,7 @@ def test_chat_completions_still_requires_tool_call_id():
                     "role": "assistant",
                     "content": "",
                     "tool_calls": [
-                        {"id": None, "type": "function", "name": "n",
-                         "arguments": "{}"}
+                        {"id": None, "type": "function", "name": "n", "arguments": "{}"}
                     ],
                 }
             ],
@@ -5832,13 +6060,11 @@ def test_responses_input_still_requires_tool_call_id():
                     "role": "assistant",
                     "content": "",
                     "tool_calls": [
-                        {"id": None, "type": "function", "name": "n",
-                         "arguments": "{}"}
+                        {"id": None, "type": "function", "name": "n", "arguments": "{}"}
                     ],
                 }
             ],
         )
-
 
 
 @pytest.mark.parametrize(
@@ -5866,8 +6092,13 @@ def test_anthropic_sampling_deprecation_covers_new_family_names(model_name):
 
 @pytest.mark.parametrize(
     "model_name",
-    ["claude-3-5-sonnet-20240620", "claude-3-haiku-20240307", "claude-2.1",
-     "claude-sonnet-4", "claude-opus-4"],
+    [
+        "claude-3-5-sonnet-20240620",
+        "claude-3-haiku-20240307",
+        "claude-2.1",
+        "claude-sonnet-4",
+        "claude-opus-4",
+    ],
 )
 def test_anthropic_sampling_deprecation_keeps_legacy_models_permissive(model_name):
     """4.5 之前的模型仍接受采样控制字段，不能被新家族规则误伤。"""
@@ -5930,9 +6161,7 @@ def test_ark_responses_non_stream_extracts_text_from_output_content():
                 "id": "msg_1",
                 "role": "assistant",
                 "status": "completed",
-                "content": [
-                    {"type": "output_text", "text": "这是真实回答。", "annotations": []}
-                ],
+                "content": [{"type": "output_text", "text": "这是真实回答。", "annotations": []}],
             }
         ]
     )
@@ -6082,9 +6311,7 @@ def test_ark_responses_rejects_instructions_with_enabled_caching_on_every_path(r
 
 def test_ark_responses_rejects_caching_enabled_via_model_options_extra_body():
     """模型级 options.extra_body 同样会被并入请求体。"""
-    provider = _ark_provider_for_request_build(
-        {"extra_body": {"caching": {"type": "enabled"}}}
-    )
+    provider = _ark_provider_for_request_build({"extra_body": {"caching": {"type": "enabled"}}})
 
     with pytest.raises(ValueError, match="互斥"):
         provider._build_responses_request(CompletionRequest(prompt="hi"))

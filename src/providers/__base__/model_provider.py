@@ -511,9 +511,7 @@ def _responses_provider_variant(provider: str) -> str:
 
 
 # Ark 专属的 Responses 内容块类型；OpenAI 兼容端点不接受这些块。
-_ARK_ONLY_RESPONSES_ITEM_TYPES = frozenset(
-    {"input_audio", "audio_url", "input_video", "video_url"}
-)
+_ARK_ONLY_RESPONSES_ITEM_TYPES = frozenset({"input_audio", "audio_url", "input_video", "video_url"})
 
 
 def _reject_unsupported_responses_item(
@@ -533,13 +531,9 @@ def _reject_unsupported_responses_item(
         return
     item_type = item.get("type")
     if item_type in _ARK_ONLY_RESPONSES_ITEM_TYPES:
-        raise ValueError(
-            f"{location} 的 {item_type} 内容块当前不受 Responses SDK 支持。"
-        )
+        raise ValueError(f"{location} 的 {item_type} 内容块当前不受 Responses SDK 支持。")
     if "image_pixel_limit" in item:
-        raise ValueError(
-            f"{location}.image_pixel_limit 不受 OpenAI Responses SDK 支持。"
-        )
+        raise ValueError(f"{location}.image_pixel_limit 不受 OpenAI Responses SDK 支持。")
 
 
 def _responses_content_part(
@@ -578,9 +572,7 @@ def _responses_content_part(
 
     if part_type in {"audio_url", "input_audio"}:
         if variant != "ark":
-            raise ValueError(
-                f"{location} 的 {part_type} 内容块当前不受 Responses SDK 支持。"
-            )
+            raise ValueError(f"{location} 的 {part_type} 内容块当前不受 Responses SDK 支持。")
         audio_value = source.get("audio_url")
         if isinstance(audio_value, Mapping):
             audio_url = audio_value.get("url") or audio_value.get("audio_url")
@@ -607,9 +599,7 @@ def _responses_content_part(
 
     if part_type in {"video_url", "input_video"}:
         if variant != "ark":
-            raise ValueError(
-                f"{location} 的 {part_type} 内容块当前不受 Responses SDK 支持。"
-            )
+            raise ValueError(f"{location} 的 {part_type} 内容块当前不受 Responses SDK 支持。")
         video_value = source.get("video_url")
         if isinstance(video_value, Mapping):
             video_url = video_value.get("url") or video_value.get("video_url")
@@ -756,9 +746,7 @@ def _responses_content_part(
         if "file_url" not in source and isinstance(source.get("url"), str):
             source["file_url"] = source["url"]
         if not any(source.get(key) for key in ("file_id", "file_data", "file_url")):
-            raise ValueError(
-                f"{location} 缺少 file_id、file_data 或 file_url。"
-            )
+            raise ValueError(f"{location} 缺少 file_id、file_data 或 file_url。")
         for key in ("file_id", "file_data", "file_url", "filename"):
             if source.get(key) is not None and not isinstance(source[key], str):
                 raise ValueError(f"{location}.{key} 必须是字符串。")
@@ -781,9 +769,7 @@ def _responses_content_part(
             if source.get(key) is not None and not isinstance(source[key], str):
                 raise ValueError(f"{location}.{key} 必须是字符串。")
         if not any(source.get(key) for key in ("file_id", "file_data", "file_url")):
-            raise ValueError(
-                f"{location} 缺少 file_id、file_data 或 file_url。"
-            )
+            raise ValueError(f"{location} 缺少 file_id、file_data 或 file_url。")
         converted = {"type": "input_file"}
         if source.get("detail") is not None:
             if variant != "openai" or source["detail"] not in {"auto", "low", "high"}:
@@ -800,9 +786,7 @@ def _responses_content_part(
 
     if not isinstance(part_type, str) or not part_type.strip():
         raise ValueError(f"{location}.type 必须是非空字符串。")
-    raise ValueError(
-        f"{location} 的内容类型 {part_type} 不受 Responses SDK 支持。"
-    )
+    raise ValueError(f"{location} 的内容类型 {part_type} 不受 Responses SDK 支持。")
 
 
 def _responses_message_content(
@@ -988,9 +972,8 @@ def normalize_responses_input(
         role = message.get("role")
         tool_calls = message.get("tool_calls")
         if role == "assistant" and tool_calls is not None:
-            if (
-                isinstance(tool_calls, (str, bytes, bytearray))
-                or not isinstance(tool_calls, Sequence)
+            if isinstance(tool_calls, (str, bytes, bytearray)) or not isinstance(
+                tool_calls, Sequence
             ):
                 raise ValueError(f"{location}.tool_calls 必须是工具调用序列。")
             content = message.get("content")
@@ -1009,9 +992,7 @@ def normalize_responses_input(
                 converted.append(assistant_message)
             for call_index, tool_call in enumerate(tool_calls):
                 if not isinstance(tool_call, Mapping):
-                    raise ValueError(
-                        f"{location}.tool_calls[{call_index}] 必须是对象。"
-                    )
+                    raise ValueError(f"{location}.tool_calls[{call_index}] 必须是对象。")
                 converted.append(
                     _responses_function_call_item(
                         tool_call,
@@ -1048,11 +1029,11 @@ def normalize_responses_input(
     return converted
 
 
-
 def normalize_usage(usage: Any) -> dict[str, Any]:
     """将常见供应商 usage 结构规范为统一 token 字段。"""
     if usage is None:
         return {}
+
     def usage_key(prefix: str) -> str:
         return f"{prefix}_tokens"
 
@@ -1072,10 +1053,16 @@ def normalize_usage(usage: Any) -> dict[str, Any]:
         if value is not None:
             result[target] = value
     for key in (
-        "prompt_tokens", "completion_tokens", "total_tokens", "input_tokens",
-        "output_tokens", "cached_tokens", "reasoning_tokens",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+        "cached_tokens",
+        "reasoning_tokens",
         "tool_use_prompt_tokens",
-        "cache_creation_input_tokens", "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
     ):
         value = field(usage, key)
         if value is not None:
@@ -1093,7 +1080,11 @@ def extract_system_prompt(messages: Sequence[Mapping[str, Any]] | None) -> str |
     """提取消息列表中的 system 内容，供无 system role 的 SDK 使用。"""
     if not messages:
         return None
-    values = [content_to_text(message.get("content", "")) for message in messages if message.get("role") == "system"]
+    values = [
+        content_to_text(message.get("content", ""))
+        for message in messages
+        if message.get("role") == "system"
+    ]
     value = "\n\n".join(item for item in values if item)
     return value or None
 
@@ -1137,9 +1128,7 @@ def validate_complete_tool_call(tool_call: Mapping[str, Any], provider: str) -> 
         try:
             json.loads(arguments)
         except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                f"{provider} 工具调用 {name} 的 arguments 不是完整 JSON。"
-            ) from exc
+            raise RuntimeError(f"{provider} 工具调用 {name} 的 arguments 不是完整 JSON。") from exc
     return dict(tool_call)
 
 
@@ -1190,7 +1179,10 @@ def is_retryable_error(error: BaseException) -> bool:
             numeric_status = int(status)
             return numeric_status == 429 or numeric_status >= 500
     name = error.__class__.__name__.lower()
-    return any(token in name for token in ("timeout", "connection", "ratelimit", "internalserver", "serviceunavailable"))
+    return any(
+        token in name
+        for token in ("timeout", "connection", "ratelimit", "internalserver", "serviceunavailable")
+    )
 
 
 def reject_unsupported_kwargs(provider: str, values: Mapping[str, Any]) -> None:
@@ -1302,7 +1294,9 @@ def raise_for_stream_error_event(event: Any, provider: str) -> None:
         if isinstance(current, Mapping):
             values = [current.get(key) for key in ("message", "detail", "reason", "error", "body")]
         else:
-            values = [field(current, key) for key in ("message", "detail", "reason", "error", "body")]
+            values = [
+                field(current, key) for key in ("message", "detail", "reason", "error", "body")
+            ]
         for value in values:
             if isinstance(value, str) and value.strip():
                 message = value.strip()
@@ -1361,6 +1355,7 @@ def retry_sync_stream(
     first_event_validator: Callable[[Any], None] | None = None,
 ) -> Generator[Any, None, None]:
     """只重试同步流在首个事件前的建立阶段，避免重复已输出内容。"""
+
     def open_and_peek() -> tuple[Any, Any]:
         iterator = iter(factory())
         try:
@@ -1392,6 +1387,7 @@ async def retry_async_stream(
     first_event_validator: Callable[[Any], None] | None = None,
 ) -> AsyncGenerator[Any, None]:
     """只重试异步流在首个事件前的建立阶段，避免重复已输出内容。"""
+
     async def open_and_peek() -> tuple[Any, Any]:
         response = factory()
         response = await response if inspect.isawaitable(response) else response
@@ -1428,6 +1424,7 @@ async def retry_async_stream(
 @contextmanager
 def retry_sync_stream_context(factory: Callable[[], Any]) -> Any:
     """重试同步流上下文的进入阶段，不重试已经开始的事件消费。"""
+
     def enter() -> tuple[Any, Any]:
         manager = factory()
         try:
@@ -1451,6 +1448,7 @@ def retry_sync_stream_context(factory: Callable[[], Any]) -> Any:
 @asynccontextmanager
 async def retry_async_stream_context(factory: Callable[[], Any]) -> Any:
     """重试异步流上下文的进入阶段，不重试已经开始的事件消费。"""
+
     async def enter() -> tuple[Any, Any]:
         manager = factory()
         try:
@@ -1520,9 +1518,7 @@ def _is_duplicate_argument_error(error: TypeError) -> bool:
     """识别 SDK 调用中由显式参数与 ``**kwargs`` 重复造成的 TypeError。"""
 
     message = str(error).lower()
-    return "multiple values for" in message and (
-        "argument" in message or "keyword" in message
-    )
+    return "multiple values for" in message and ("argument" in message or "keyword" in message)
 
 
 def _sanitize_resource_call(
@@ -1546,15 +1542,9 @@ def _sanitize_resource_call(
         return copied_args, _validate_secret_free_resource_kwargs(copied_kwargs, label)
 
     extension_names = {"extra_headers", "extra_query", "extra_body"}
-    explicit = {
-        name: bound.arguments[name]
-        for name in extension_names
-        if name in bound.arguments
-    }
+    explicit = {name: bound.arguments[name] for name in extension_names if name in bound.arguments}
     if explicit:
-        bound.arguments.update(
-            _validate_secret_free_resource_kwargs(explicit, label)
-        )
+        bound.arguments.update(_validate_secret_free_resource_kwargs(explicit, label))
     for name, parameter in signature.parameters.items():
         if parameter.kind is inspect.Parameter.VAR_KEYWORD and name in bound.arguments:
             bound.arguments[name] = _validate_secret_free_resource_kwargs(
@@ -1577,9 +1567,7 @@ def _guard_provider_resource_method(method: Callable[..., Any]) -> Callable[...,
         async def async_wrapper(provider: Any, *args: Any, **kwargs: Any) -> Any:
             # 凭证校验先行：它约束参数本身，与渠道是否具备该能力无关。
             # 顺序反了会让携带凭证的调用报出能力错误，把安全问题掩盖成配置问题。
-            safe_args, safe_kwargs = _sanitize_resource_call(
-                method, provider, args, kwargs
-            )
+            safe_args, safe_kwargs = _sanitize_resource_call(method, provider, args, kwargs)
             resource_guard = getattr(provider, "_require_provider_resource", None)
             if callable(resource_guard):
                 resource_guard(method.__name__)
@@ -1609,9 +1597,7 @@ def _guard_provider_resource_method(method: Callable[..., Any]) -> Callable[...,
     @wraps(method)
     def wrapper(provider: Any, *args: Any, **kwargs: Any) -> Any:
         # 与 async_wrapper 保持同一顺序：先凭证，后能力。
-        safe_args, safe_kwargs = _sanitize_resource_call(
-            method, provider, args, kwargs
-        )
+        safe_args, safe_kwargs = _sanitize_resource_call(method, provider, args, kwargs)
         resource_guard = getattr(provider, "_require_provider_resource", None)
         if callable(resource_guard):
             resource_guard(method.__name__)
@@ -1622,26 +1608,18 @@ def _guard_provider_resource_method(method: Callable[..., Any]) -> Callable[...,
             return method(provider, *safe_args, **safe_kwargs)
         except TypeError as exc:
             if "unexpected keyword argument" in str(exc):
-                raise ValueError(
-                    f"{_provider_label(provider)} 资源 SDK 参数不匹配: {exc}"
-                ) from exc
+                raise ValueError(f"{_provider_label(provider)} 资源 SDK 参数不匹配: {exc}") from exc
             if _is_duplicate_argument_error(exc):
-                raise ValueError(
-                    f"{_provider_label(provider)} 资源 SDK 参数重复: {exc}"
-                ) from exc
+                raise ValueError(f"{_provider_label(provider)} 资源 SDK 参数重复: {exc}") from exc
             if provider_call_is_valid and _is_missing_required_argument_error(exc):
-                raise ValueError(
-                    f"{_provider_label(provider)} 资源 SDK 参数不匹配: {exc}"
-                ) from exc
+                raise ValueError(f"{_provider_label(provider)} 资源 SDK 参数不匹配: {exc}") from exc
             raise
 
     setattr(wrapper, "_resource_guarded", True)  # noqa: B010
     return wrapper
 
 
-def _is_provider_resource_method(
-    name: str, method: Any
-) -> bool:
+def _is_provider_resource_method(name: str, method: Any) -> bool:
     if name.startswith("_") or name in _RESOURCE_GUARD_EXCLUDED:
         return False
     if not callable(method):
@@ -1684,6 +1662,7 @@ def close_resource_sync(resource: Any, label: str) -> None:
 async def _await_resource_close(result: Awaitable[Any]) -> None:
     """将任意可等待关闭结果包装为 asyncio.run 可接受的协程。"""
     await result
+
 
 class LargeLanguageModel(ABC):
     """语言模型抽象基类"""
@@ -1762,7 +1741,9 @@ class LargeLanguageModel(ABC):
         request = request.copy_with(stream=False)
         invoke_kwargs = request.to_invoke_kwargs()
         accepted = inspect.signature(self.invoke).parameters
-        if not any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in accepted.values()):
+        if not any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in accepted.values()
+        ):
             invoke_kwargs = {key: value for key, value in invoke_kwargs.items() if key in accepted}
         text = "".join(self.invoke(**invoke_kwargs))
         return CompletionResult(text=text)
@@ -1776,30 +1757,40 @@ class LargeLanguageModel(ABC):
         chunks: list[str] = []
         invoke_kwargs = request.to_invoke_kwargs()
         accepted = inspect.signature(self.ainvoke).parameters
-        if not any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in accepted.values()):
+        if not any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in accepted.values()
+        ):
             invoke_kwargs = {key: value for key, value in invoke_kwargs.items() if key in accepted}
         async for chunk in self.ainvoke(**invoke_kwargs):
             chunks.append(chunk)
         return CompletionResult(text="".join(chunks))
 
-    def stream_events(self, request: CompletionRequest | None = None, **kwargs: Any) -> Generator[StreamEvent, None, None]:
+    def stream_events(
+        self, request: CompletionRequest | None = None, **kwargs: Any
+    ) -> Generator[StreamEvent, None, None]:
         """以统一事件形式读取流；旧 Provider 默认包装文本流。"""
         request = coerce_completion_request(request, kwargs, "stream_events")
         request = request.copy_with(stream=True)
         invoke_kwargs = request.to_invoke_kwargs()
         accepted = inspect.signature(self.invoke).parameters
-        if not any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in accepted.values()):
+        if not any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in accepted.values()
+        ):
             invoke_kwargs = {key: value for key, value in invoke_kwargs.items() if key in accepted}
         for chunk in self.invoke(**invoke_kwargs):
             yield StreamEvent(type="text_delta", text=chunk)
 
-    async def astream_events(self, request: CompletionRequest | None = None, **kwargs: Any) -> AsyncGenerator[StreamEvent, None]:
+    async def astream_events(
+        self, request: CompletionRequest | None = None, **kwargs: Any
+    ) -> AsyncGenerator[StreamEvent, None]:
         """异步统一事件流；旧 Provider 默认包装文本流。"""
         request = coerce_completion_request(request, kwargs, "astream_events")
         request = request.copy_with(stream=True)
         invoke_kwargs = request.to_invoke_kwargs()
         accepted = inspect.signature(self.ainvoke).parameters
-        if not any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in accepted.values()):
+        if not any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in accepted.values()
+        ):
             invoke_kwargs = {key: value for key, value in invoke_kwargs.items() if key in accepted}
         async for chunk in self.ainvoke(**invoke_kwargs):
             yield StreamEvent(type="text_delta", text=chunk)
@@ -1811,6 +1802,7 @@ class LargeLanguageModel(ABC):
     async def aclose(self) -> None:
         """释放 Provider 持有的异步 SDK 客户端。"""
         return
+
 
 class TextEmbeddingModel(ABC):
     """文本向量化模型抽象基类"""
@@ -1844,6 +1836,7 @@ class TextEmbeddingModel(ABC):
         """释放向量模型持有的异步资源；默认实现为空操作。"""
         return
 
+
 class RerankModel(ABC):
     """Rerank模型抽象基类"""
 
@@ -1852,7 +1845,9 @@ class RerankModel(ABC):
         """同步对文档列表进行重排序。"""
 
     @abstractmethod
-    async def arerank(self, query: str, documents: list[str], top_n: int) -> tuple[list[int], list[float]]:
+    async def arerank(
+        self, query: str, documents: list[str], top_n: int
+    ) -> tuple[list[int], list[float]]:
         """异步对文档列表进行重排序。"""
 
     def close(self) -> None:

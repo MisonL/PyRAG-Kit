@@ -167,7 +167,10 @@ def test_settings_from_toml(tmp_path):
 
 
 def test_model_protocol_aliases_and_invalid_values():
-    assert ModelDetail(provider="openai", model_name="gpt-test", protocol="response").protocol == ModelProtocol.RESPONSES
+    assert (
+        ModelDetail(provider="openai", model_name="gpt-test", protocol="response").protocol
+        == ModelProtocol.RESPONSES
+    )
 
     with pytest.raises(ValidationError, match="不支持的模型协议"):
         ModelDetail(provider="openai", model_name="gpt-test", protocol="unknown")
@@ -189,9 +192,17 @@ def test_settings_rejects_protocol_on_non_llm_configuration(field_name):
         )
 
 
-@pytest.mark.parametrize("sensitive_key", [
-    "X-API-Key", "X-Auth-Token", "Authorization", "access_token", "api_key", "Bearer",
-])
+@pytest.mark.parametrize(
+    "sensitive_key",
+    [
+        "X-API-Key",
+        "X-Auth-Token",
+        "Authorization",
+        "access_token",
+        "api_key",
+        "Bearer",
+    ],
+)
 def test_model_options_reject_credentials_nested_in_headers_or_query(sensitive_key):
     with pytest.raises(ValueError, match="凭证"):
         ModelDetail(
@@ -208,11 +219,24 @@ def test_model_options_reject_credentials_nested_in_headers_or_query(sensitive_k
         )
 
 
-@pytest.mark.parametrize("container", [
-    "headers", "default_headers", "extra_headers",
-    "query", "default_query", "extra_query", "http_options", "header", "params",
-    "http_client", "httpx_client", "httpx_async_client", "aiohttp_client",
-])
+@pytest.mark.parametrize(
+    "container",
+    [
+        "headers",
+        "default_headers",
+        "extra_headers",
+        "query",
+        "default_query",
+        "extra_query",
+        "http_options",
+        "header",
+        "params",
+        "http_client",
+        "httpx_client",
+        "httpx_async_client",
+        "aiohttp_client",
+    ],
+)
 def test_model_options_reject_request_header_and_query_containers(container):
     with pytest.raises(ValueError, match="凭证或连接字段"):
         ModelDetail(
@@ -236,7 +260,7 @@ def test_settings_from_dotenv(tmp_path):
     dotenv_path = tmp_path / ".env"
     dotenv_path.write_text(
         'OPENAI_API_KEY="dotenv_key"\nCHAT_TOP_K=15\n'
-        'GOOGLE_GENAI_USE_VERTEXAI=true\n'
+        "GOOGLE_GENAI_USE_VERTEXAI=true\n"
         'GOOGLE_CLOUD_PROJECT="dotenv-project"\n'
         'GOOGLE_CLOUD_LOCATION="asia-east1"\n',
         encoding="utf-8",
@@ -320,7 +344,9 @@ def test_settings_path_resolution(monkeypatch):
 
 
 def test_resolve_app_root_source_mode(monkeypatch, tmp_path):
-    monkeypatch.setattr("src.utils.config.sys", type("FakeSys", (), {"frozen": False, "executable": ""})())
+    monkeypatch.setattr(
+        "src.utils.config.sys", type("FakeSys", (), {"frozen": False, "executable": ""})()
+    )
     monkeypatch.setattr("src.utils.config.__file__", str(tmp_path / "src" / "utils" / "config.py"))
 
     root = resolve_app_root()
