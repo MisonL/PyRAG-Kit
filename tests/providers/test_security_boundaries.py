@@ -397,13 +397,16 @@ def test_connection_only_keys_are_deliberately_excluded_from_text_redaction():
 @pytest.mark.parametrize(
     "value",
     [
+        # 值必须「短且纯字母」——那是本用例要覆盖的属性（此前长度/字符构成
+        # 约束会把这类值放过）。用明显合成的标记而非常见口令词：后者会触发
+        # 仓库的密钥扫描告警，把提交历史染上无法消除的误报。
         "password: FakePwOnly",
-        "api_key: abcdefgh",
-        "token: mytoken",
-        "secret: abcdefgh",
-        "client_secret: abcdefgh",
+        "api_key: FakeKeyOnly",
+        "token: FakeTokenOnly",
+        "secret: FakeSecretOnly",
+        "client_secret: FakeSecretOnly",
         "passwd: FakePwOnly",
-        "credential: abcdefgh",
+        "credential: FakeCredOnly",
     ],
 )
 def test_security_redacts_short_alphabetic_credential_values(value):
