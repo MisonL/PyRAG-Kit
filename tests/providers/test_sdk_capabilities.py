@@ -7009,3 +7009,50 @@ def test_responses_custom_tool_input_matches_assistant_path_encoding():
     )
 
     assert via_item["input"] == via_assistant[0]["input"]
+
+
+def test_ark_responses_output_text_supports_mapping_responses():
+    """``field()`` 同时支持属性访问与 Mapping。dict 形态响应（非标准网关或
+    中间层透传的 JSON）也要走同一条提取路径与类型过滤。
+    """
+    from src.providers.volcengine import _ark_responses_output_text
+
+    response = {
+        "output": [
+            {
+                "type": "message",
+                "content": [
+                    {"type": "output_text", "text": "正文"},
+                    {"type": "refusal", "refusal": "拒绝内容"},
+                ],
+            },
+            {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "思考"}]},
+        ]
+    }
+
+    # 只取 output_text 块：refusal 与 reasoning 不能混进正文。
+    assert _ark_responses_output_text(response) == "正文"
+
+
+def test_ark_responses_native_item_proxy_hides_implementation_slots():
+    """``__slots__`` 里的名字默认出现在 ``dir()`` 中，IDE 会把 ``_value``
+    提示成公共 API；而真正的出口是文档化的 ``.native``。
+    """
+    provider = object.__new__(VolcengineProvider)
+    provider._provider = "volcengine"
+    provider._model_name = "ark-model"
+    provider._protocol = "responses"
+    provider._server_verified_protocols = frozenset()
+    provider._options = {}
+    object.__setattr__(
+        provider,
+        "_client",
+        SimpleNamespace(responses=SimpleNamespace(create=lambda **_kwargs: "remote")),
+    )
+
+    proxy = provider.resources.responses
+
+    for internal in ("_value", "_path", "_provider", "_children"):
+        assert internal not in dir(proxy), internal
+    # 隐藏的是自动补全，不是访问能力。
+    assert proxy._value is provider._client.responses

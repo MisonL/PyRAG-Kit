@@ -39,9 +39,22 @@ class _NativeResourceProxy:
     `.native` 仍然返回官方客户端本身；只有通过 Facade 动态访问的资源节点
     使用此代理。这样既能兼容 SDK 新增资源，又不会让 `extra_headers`、
     `extra_query` 或 `extra_body` 绕过统一凭证边界。
+
+    绕过说明：``.native`` 是文档化的出口，按设计返回完整原生树，不经过
+    凭证扫描与能力门禁。本代理内部的 ``_value`` 指向同一个对象，因此它
+    不是独立的绕过路径——想绕过门禁的用户用 ``.native`` 即可，无需依赖
+    实现细节。``_value`` 只是内部持有者，不属于公共 API。
     """
 
     __slots__ = ("_children", "_path", "_provider", "_value")
+
+    def __dir__(self) -> list[str]:
+        """从自动补全中隐藏实现细节，避免被当成公共 API 使用。
+
+        ``__slots__`` 里的名字默认都会出现在 ``dir()`` 中，IDE 会把
+        ``_value`` 提示给用户；而它并不是出口（出口是 ``.native``）。
+        """
+        return [name for name in super().__dir__() if name not in self.__slots__]
 
     def __init__(self, value: Any, provider: Any, path: str):
         self._value = value
