@@ -36,14 +36,15 @@ def _allow_resource_business_parameters(*names: str) -> Callable[[_FacadeMethod]
 class _NativeResourceProxy:
     """为 SDK 原生资源树增加请求扩展校验，同时保持结果对象原样返回。
 
-    `.native` 仍然返回官方客户端本身；只有通过 Facade 动态访问的资源节点
-    使用此代理。这样既能兼容 SDK 新增资源，又不会让 `extra_headers`、
-    `extra_query` 或 `extra_body` 绕过统一凭证边界。
+    只有通过 Facade 动态访问的资源节点使用此代理，这样既能兼容 SDK 新增
+    资源，又不会让 `extra_headers`、`extra_query` 或 `extra_body` 绕过统一
+    凭证边界。
 
-    绕过说明：``.native`` 是文档化的出口，按设计返回完整原生树，不经过
-    凭证扫描与能力门禁。本代理内部的 ``_value`` 指向同一个对象，因此它
-    不是独立的绕过路径——想绕过门禁的用户用 ``.native`` 即可，无需依赖
-    实现细节。``_value`` 只是内部持有者，不属于公共 API。
+    绕过说明：``provider.resources.native`` 是文档化的出口，按设计返回完整
+    原生客户端，不经过凭证扫描与能力门禁。注意它挂在 **Facade 层**，代理
+    节点本身没有 ``native`` 属性。本代理内部的 ``_value`` 指向同一个对象，
+    因此它不是独立的绕过路径——想绕过门禁的用户用 ``resources.native``
+    即可，无需依赖实现细节。``_value`` 只是内部持有者，不属于公共 API。
     """
 
     __slots__ = ("_children", "_path", "_provider", "_value")
@@ -53,7 +54,7 @@ class _NativeResourceProxy:
 
         两处来源都要过滤：``__slots__`` 里的自有槽位，以及 ``__getattr__``
         转发来的底层 SDK 节点属性（其中含 ``_client`` 这类可直达原始客户端的
-        通路）。出口是文档化的 ``.native``。
+        通路）。出口是 Facade 层的 ``provider.resources.native``。
         """
         # ``super().__dir__()`` 对 ``__slots__`` 类只给出 dunder 与槽位名，
         # 真实资源名要经 ``__getattr__`` 从底层节点取（并缓存进 ``_children``）。
