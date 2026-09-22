@@ -141,14 +141,14 @@ def test_security_redacts_masked_credentials_after_bearer_prefix(value):
 def test_security_rejects_credential_hidden_behind_unparseable_url():
     """``urlsplit`` 对畸形 URL 抛 ValueError。若该分支直接 return，任何凭证
     都能随一个畸形前缀整体绕过边界校验（这是叶子值的唯一检查入口）。"""
-    unparseable = "https://[::1 token sk-abcdefghijklmnopqrstuvwxyz0123456789"
+    unparseable = "https://[::1 token sk-FAKE0000FAKE0000FAKE0000FAKE0000"
     with pytest.raises(ValueError, match="凭证"):
         validate_secret_free_options({"note": unparseable}, "Provider")
 
 
 def test_security_parseable_and_unparseable_urls_are_equally_strict():
     """同样藏凭证的两个值，只因 URL 可解析与否而一个被拒一个放行，即为漏洞。"""
-    secret = "token sk-abcdefghijklmnopqrstuvwxyz0123456789"
+    secret = "token sk-FAKE0000FAKE0000FAKE0000FAKE0000"
     with pytest.raises(ValueError, match="凭证"):
         validate_secret_free_options({"note": f"https://h/x {secret}"}, "Provider")
     with pytest.raises(ValueError, match="凭证"):
@@ -162,7 +162,7 @@ def test_safe_exception_text_redacts_credentials():
     """SDK 异常常回显请求头或 URL，终端与日志是凭证最容易泄漏的出口。"""
     from src.utils.security import safe_exception_text
 
-    secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789"
+    secret = "sk-FAKE0000FAKE0000FAKE0000FAKE0000"
     rendered = safe_exception_text(RuntimeError(f"auth failed for {secret}"))
 
     assert secret not in rendered

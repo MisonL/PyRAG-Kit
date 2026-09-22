@@ -407,7 +407,7 @@ def test_redacting_formatter_scrubs_cached_traceback_for_later_handlers():
     import sys
 
     try:
-        raise RuntimeError("Authorization: Bearer sk-cached-traceback-secret")
+        raise RuntimeError("Authorization: Bearer sk-FAKE0000TRACEBACK0000FAKE0000")
     except RuntimeError:
         exc_info = sys.exc_info()
 
@@ -422,5 +422,5 @@ def test_redacting_formatter_scrubs_cached_traceback_for_later_handlers():
     logger.setLevel(logging.ERROR)
     logger.error("request failed", exc_info=exc_info)
 
-    assert "sk-cached-traceback-secret" not in redacting.stream.getvalue()
-    assert "sk-cached-traceback-secret" not in plain.stream.getvalue()
+    assert "sk-FAKE0000TRACEBACK0000FAKE0000" not in redacting.stream.getvalue()
+    assert "sk-FAKE0000TRACEBACK0000FAKE0000" not in plain.stream.getvalue()
