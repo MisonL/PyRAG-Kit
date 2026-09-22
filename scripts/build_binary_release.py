@@ -167,11 +167,13 @@ def stage_bundle(target: str, version: str) -> Path:
 
     shutil.copytree(app_source, app_target)
     for relative_file in PACKAGE_FILES:
-        target = bundle_root / relative_file
+        # 不要复用 ``target``：它是本函数的参数（平台标识，如 "macos-arm64"），
+        # 被循环变量遮蔽后，循环之后再用它会拿到 Path 而不是平台名。
+        destination = bundle_root / relative_file
         # PACKAGE_FILES 含子目录路径（如 licenses/APACHE-2.0.txt），
         # copy2 不会自动创建父目录。
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(PROJECT_ROOT / relative_file, target)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(PROJECT_ROOT / relative_file, destination)
     prepare_runtime_layout(bundle_root)
 
     return bundle_root
