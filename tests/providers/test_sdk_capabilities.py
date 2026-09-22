@@ -6786,3 +6786,62 @@ def test_responses_function_call_item_does_not_duplicate_call_id_as_output_id():
 
     assert item["call_id"] == "call-1"
     assert "id" not in item
+
+
+def test_ark_responses_public_entrypoints_return_text_from_output_content():
+    """驱动公开入口，而不只是私有 ``_extract_result``。
+
+    缺陷原文是「complete / acomplete / invoke(stream=False) /
+    ainvoke(stream=False) 全部返回空文本」。只钉住私有助手的话，将来某个入口
+    绕开 ``_extract_result`` 或丢弃其返回值，测试不会发现。
+    """
+    import asyncio
+
+    response = _ark_response(
+        [
+            {
+                "type": "message",
+                "id": "msg_1",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "这是真实回答。", "annotations": []}],
+            }
+        ]
+    )
+
+    def make_provider():
+        provider = object.__new__(VolcengineProvider)
+        provider._provider = "volcengine"
+        provider._model_name = "ark-model"
+        provider._protocol = "responses"
+        provider._server_verified_protocols = frozenset({"responses"})
+        provider._options = {}
+
+        async def _acreate(**_kwargs):
+            return response
+
+        object.__setattr__(
+            provider,
+            "_client",
+            SimpleNamespace(responses=SimpleNamespace(create=lambda **_kwargs: response)),
+        )
+        object.__setattr__(
+            provider,
+            "_aclient",
+            SimpleNamespace(responses=SimpleNamespace(create=_acreate)),
+        )
+        return provider
+
+    # 四个非流式公开入口。``invoke``/``ainvoke`` 的 ``stream=False`` 走
+    # ``_extract_result`` 分支，正是此前返回空文本的那条路径。
+    assert make_provider().complete(CompletionRequest(prompt="hi")).text == "这是真实回答。"
+    assert list(make_provider().invoke(prompt="hi", stream=False)) == ["这是真实回答。"]
+
+    async def _collect_ainvoke():
+        return [chunk async for chunk in make_provider().ainvoke(prompt="hi", stream=False)]
+
+    assert (
+        asyncio.run(make_provider().acomplete(CompletionRequest(prompt="hi"))).text
+        == "这是真实回答。"
+    )
+    assert asyncio.run(_collect_ainvoke()) == ["这是真实回答。"]

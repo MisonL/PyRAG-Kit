@@ -342,3 +342,50 @@ def test_safe_exception_text_redacts_secrets_adjacent_to_cjk(secret):
 def test_security_cjk_boundary_change_does_not_flag_ordinary_text(text):
     """放宽词边界不能把普通连字符单词误判成凭证。"""
     assert redact_sensitive_text(text) == text
+
+
+# ── 不变量：文本脱敏词表与配置边界词表的差异必须是有意为之 ──
+
+
+# 这些键在配置边界被禁止，是因为它们会覆盖请求边界（连接类），本身不是凭证。
+# 纳入文本识别会让普通配置值被误判为凭证，因此有意排除。
+_CONNECTION_ONLY_KEYS = frozenset(
+    {
+        "aiohttpclient",
+        "asyncclientargs",
+        "baseurl",
+        "clientargs",
+        "httpclient",
+        "httpxasyncclient",
+        "httpxclient",
+        "websocketbaseurl",
+    }
+)
+
+
+def test_text_redaction_covers_every_credential_key_except_connection_only():
+    """配置边界判为敏感的键名，在文本里也必须脱敏——除有意排除的连接类键名。
+
+    这条不变量此前无人看守：往 ``SENSITIVE_OPTION_KEYS`` 加真凭证键时，
+    文本词表不会自动跟上，日志就会明文输出该键的值。
+    """
+    from src.utils.security import SENSITIVE_OPTION_KEYS
+
+    secret = "SUPERSECRETVALUE12345"
+    missing = {
+        key
+        for key in SENSITIVE_OPTION_KEYS
+        if key not in _CONNECTION_ONLY_KEYS and secret in redact_sensitive_text(f"{key}={secret}")
+    }
+
+    assert missing == set()
+
+
+def test_connection_only_keys_are_deliberately_excluded_from_text_redaction():
+    """锁定有意排除的那一侧：这些键名出现时不能被误判为凭证。"""
+    from src.utils.security import SENSITIVE_OPTION_KEYS
+
+    for key in _CONNECTION_ONLY_KEYS:
+        assert key in SENSITIVE_OPTION_KEYS, key
+        text = f"{key}=https://example.invalid/v1"
+        assert redact_sensitive_text(text) == text, key
