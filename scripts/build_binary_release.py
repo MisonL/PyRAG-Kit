@@ -22,6 +22,9 @@ PACKAGE_FILES = [
     "README.md",
     "LICENSE",
     "DIFY_LICENSE",
+    # Dify 衍生代码遵循修改后的 Apache 2.0，该许可证第 4(a) 条要求随分发
+    # 提供许可证副本；DIFY_LICENSE 只是引用它的摘要，不能替代全文。
+    "licenses/APACHE-2.0.txt",
     "config.toml.example",
     ".env.example",
 ]
@@ -164,7 +167,11 @@ def stage_bundle(target: str, version: str) -> Path:
 
     shutil.copytree(app_source, app_target)
     for relative_file in PACKAGE_FILES:
-        shutil.copy2(PROJECT_ROOT / relative_file, bundle_root / relative_file)
+        target = bundle_root / relative_file
+        # PACKAGE_FILES 含子目录路径（如 licenses/APACHE-2.0.txt），
+        # copy2 不会自动创建父目录。
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(PROJECT_ROOT / relative_file, target)
     prepare_runtime_layout(bundle_root)
 
     return bundle_root

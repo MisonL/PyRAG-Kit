@@ -23,6 +23,8 @@ htmlcov/
 *wheels/
 *.egg
 *instance/
+# PyInstaller 构建产物（scripts/build_binary_release.py 生成后即删除，不应入库）
+*.spec
 # 虚拟环境
 /.env*
 !/.env.example

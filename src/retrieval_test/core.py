@@ -1,5 +1,7 @@
 import asyncio
+import inspect
 import os
+from typing import Any
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import HTML
@@ -42,6 +44,20 @@ def display_results(query: str, documents: list[dict]):
     console.print(table)
 
 
+
+async def _aclose_quietly(service: Any) -> None:
+    """释放服务持有的资源，失败只记录警告，不打断退出流程。"""
+    close = getattr(service, "aclose", None) or getattr(service, "close", None)
+    if not callable(close):
+        return
+    try:
+        result = close()
+        if inspect.isawaitable(result):
+            await result
+    except Exception as exc:  # noqa: BLE001 - teardown must not mask the main flow
+        logger.warning("释放检索服务失败: %s", safe_exception_text(exc))
+
+
 async def run_retrieval_test_async():
     console.print(Panel("进入异步召回测试模式。输入 '/quit' 退出。", border_style="yellow"))
     session = PromptSession()
@@ -61,24 +77,30 @@ async def run_retrieval_test_async():
         console.print(f"[red]数据库加载失败: {safe_exception_text(exc)}[/red]")
         return
 
-    while True:
-        try:
-            query = await session.prompt_async(HTML('<deepskyblue><b>测试查询: </b></deepskyblue>'))
-            if query.lower() == "/quit":
-                break
-            if not query:
-                continue
+    try:
+        while True:
+            try:
+                query = await session.prompt_async(HTML('<deepskyblue><b>测试查询: </b></deepskyblue>'))
+                if query.lower() == "/quit":
+                    break
+                if not query:
+                    continue
 
-            with console.status("[bold green]正在异步检索...[/bold green]"):
-                documents = await retrieval_service.retrieve(query, session_config, console=console)
-            display_results(query, documents)
-            if excel_logger:
-                excel_logger.log_results(query, documents)
-        except (KeyboardInterrupt, EOFError):
-            break
-        except Exception as exc:  # noqa: BLE001 - interactive loop remains usable
-            console.print(f"[red]召回测试出错: {safe_exception_text(exc)}[/red]")
-            logger.error("召回测试出错: %s", safe_exception_text(exc))
+                with console.status("[bold green]正在异步检索...[/bold green]"):
+                    documents = await retrieval_service.retrieve(query, session_config, console=console)
+                display_results(query, documents)
+                if excel_logger:
+                    excel_logger.log_results(query, documents)
+            except (KeyboardInterrupt, EOFError):
+                break
+            except Exception as exc:  # noqa: BLE001 - interactive loop remains usable
+                console.print(f"[red]召回测试出错: {safe_exception_text(exc)}[/red]")
+                logger.error("召回测试出错: %s", safe_exception_text(exc))
+    finally:
+        # 与 chat 路径保持一致：Embedding provider 与向量存储持有 SDK 客户端和
+        # 连接池，退出时不释放会留下未关闭的资源。释放失败不掩盖主流程结果，
+        # 只记录警告。
+        await _aclose_quietly(retrieval_service)
 
 
 def run_retrieval_test():
