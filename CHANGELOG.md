@@ -17,7 +17,9 @@
 - 收紧动态资源树的能力门禁：此前按路径分段判断时只认复数 `responses`，而 `input_items`（实际请求 `/responses/{id}/input_items`）不含该分段，在未登记 `server_verified_protocols` 的渠道上也能把请求发到远端；同时动态路径只做能力检查、不执行 Facade 的参数校验，可带着互斥参数直接发出。现在两条路径共用同一套校验，`extra_body` 里的 `instructions`/`caching` 同样参与互斥检查。
 - 顶层 Responses item 形态（`{"type": "input_audio", ...}`）补齐变体校验：此前只在缺少 `content` 键时检查，加一个无关的 `content` 键即可改走消息分支绕过全部校验；现在按 `type` 分流并复用同一套内容块实现。
 - 修复 Responses 流式工具调用的 `id` 语义：`id` 此前在 delta 事件取输出项 ID、在 done 事件取调用 ID、合并时又互相覆盖，同一轮工具调用在 delta 与 completed 事件里得到不同的值，调用方按 `tool_call["id"]` 回填 `role=tool` 时会配不上。现在与非流式路径统一取调用标识符。
-- 放宽 Ark Responses 的失败判定：内置工具调用项（`web_search_call`、`mcp_call`、`mcp_list_tools`、空摘要的 `reasoning`）都是 SDK 输出项联合的正式成员，属正常中间态，此前被误判为「响应结构与预期不符」而无法处理。
+- 放宽 Ark Responses 的失败判定：内置工具调用项（`web_search_call`、`mcp_call`、`mcp_list_tools`、`image_process`、`agent_tool_call` 等）都是 SDK 输出项联合的正式成员，且都是需要后续轮次的中间态，此前被误判为「响应结构与预期不符」而无法处理。空摘要的 `reasoning` 不在豁免之列——它不是工具调用，豁免会让「completed 但什么都没有」静默返回空成功。
+- 动态资源路径的能力门禁补齐：兼容渠道的路径映射此前只覆盖 responses/files，其余资源树（batches、vector_stores、images 等）拿到空能力直接放行，而显式 Facade 名会被拦；Ark 的动态路径按动词白名单决定是否做参数校验，漏掉 `async_create` 这类写法。两者都改为按资源分段与参数内容判断。
+- 资源代理不再经私有名转发到底层 SDK：`proxy.__dict__["_client"]` 此前能拿到未包装的原始客户端，绕开全部凭证扫描与能力门禁；`dir()` 也把这些通路提示给使用者。出口只保留文档化的 `.native`。
 - Embedding 区分文档与查询任务类型：Google 使用 `RETRIEVAL_DOCUMENT` 与 `RETRIEVAL_QUERY`。
 
 ### 安全
@@ -28,6 +30,8 @@
 - 修复脱敏日志 formatter 的缓存泄漏：`logging.Formatter` 会把格式化后的 traceback 缓存在 `record.exc_text` 上供后续 handler 复用，先格式化后脱敏会让同一 logger 上的非脱敏 handler 输出原始凭证；现在脱敏结果会写回缓存。
 - 文本脱敏的键名识别与配置边界对齐：此前词表更窄，且键名前要求非字母数字字符，`dbPassword`、`myApiKey` 这类驼峰键在配置边界被拒绝、在日志里却明文输出。同时给值加上形态约束，避免 `auth: none`、`cookie: enabled` 这类普通文本被误判为凭证而让合法 options 在边界被拒。
 - 词边界改用「非 ASCII 字母数字」而非 `\b`：中文属 `\w`，`\b` 在 `密钥sk-...` 两侧都不成立，国产网关（SiliconFlow、Ark、DashScope）的中文错误消息此前会让密钥整串落进终端与日志。
+- 键名识别改用「非字母数字或 camelCase 边界」：既让 `dbPassword`、`myApiKey` 这类驼峰键脱敏，又不把 `topsecret`、`sessiontoken` 从词中间切开（配置边界按 camelCase 切词判它们非敏感，切开会导致合法配置被误拒）。排除误判源改用非凭证字面量枚举，而不是值的长度/字符构成——后者会把 `password: FakePwOnly` 这类短纯字母凭证一并放过。
+- 修复掩码规则的二次回溯：尾部前瞻逐字符重复扫描剩余串，在尾部无冒号时退化成 O(n²)（4000 字符的掩码密钥前缀加长 token 耗时 1.4 秒）。该函数挂在每条日志的 formatter 上，一个回显错误体的网关响应即可拖住进程。
 - 配置校验失败不再把凭证交给解释器默认 handler：`Settings()` 在 import 期就被调用（`log_manager.get_module_logger`），早于任何入口的 `try`，pydantic 默认渲染会把 `input_value` 明文打印。现在在 `get_settings` 边界重抛已脱敏的消息，并给 `run_cli` 补上覆盖整个启动阶段的异常边界。
 - 兼容渠道不再被当作官方 OpenAI 端点放行 SDK 专属资源；仅精确匹配 `https://api.openai.com/v1` 时按 SDK 契约放行。
 - 收紧失败语义：凭证、SDK 或远端调用失败时显式报错，不再以空 embedding、零分 rerank 或占位回答掩盖失败。
@@ -44,7 +48,7 @@
 
 ### 测试与文档
 
-- 新增 Provider 协议适配、SDK 能力、凭证边界、Rerank 契约与失败语义回归测试；测试总数增至 958。新增断言均经红绿验证（回退源码后对应测试变红），并替换了两处无区分度的旧断言：URL query 脱敏断言此前用的长值由另一条规则满足，Ark 响应夹具此前伪造了 SDK 不存在的 `output_text` 字段。
+- 新增 Provider 协议适配、SDK 能力、凭证边界、Rerank 契约与失败语义回归测试；测试总数增至 1005。新增断言均经红绿验证（回退源码后对应测试变红），并替换了两处无区分度的旧断言：URL query 脱敏断言此前用的长值由另一条规则满足，Ark 响应夹具此前伪造了 SDK 不存在的 `output_text` 字段。
 - 为活动快照的 embedding 兼容性检测补充回归测试：快照记录的 embedding provider 或模型名与当前运行配置不一致时必须显式失败，避免用错向量空间后静默产出错误检索结果。
 - 引入 Ruff、Bandit 与 MyPy 到开发依赖，并补齐对应配置；新增 `.github/workflows/quality.yml`，在 PR 与 `main` 推送时执行格式化检查、lint、类型检查、安全扫描与完整测试，此前这些工具只在本地手动运行。
 - 全仓库应用 `ruff format`（行宽 100、双引号、4 空格），此前未配置 formatter，`main.py`、`src/`、`scripts/`、`tests/` 中存在混用单引号、行尾空白和手工对齐等不一致；格式化只改表示不改语义，已用 AST 比对确认语法树等价，`AGENTS.md` 的质量检查与风格段落同步更新。
