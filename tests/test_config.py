@@ -402,3 +402,38 @@ def test_settings_accepts_current_and_custom_base_urls():
             warnings_module.simplefilter("always")
             Settings.model_validate({"qwen_base_url": qwen, "volc_base_url": volc})
         assert not [w for w in caught if "base_url" in str(w.message)]
+
+
+# ── 回归：配置校验失败不能把凭证交给解释器默认 handler ──
+
+
+def test_get_settings_redacts_credential_in_validation_error(isolated_config):
+    """``Settings()`` 在 import 期就被调用（``log_manager.get_module_logger``），
+    早于任何入口的 ``try``。pydantic 的默认渲染会把 ``input_value`` 明文交给
+    解释器默认 handler，而 ``options`` 是文档指定的扩展入口——把 ``api_key``
+    放进去恰好就是被校验拒绝的那类错误，即校验越严格越容易走到这条路径。
+    """
+    secret = "sk-proj-FAKE0000FAKE0000FAKE0000FAKE0000"
+    (isolated_config / "config.toml").write_text(
+        MOCK_TOML_CONTENT + f'\n[llm_configurations.leaky]\nprovider = "openai"\nmodel_name = "m"\n'
+        f'options = {{ api_key = "{secret}" }}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        get_settings()
+
+    message = str(excinfo.value)
+    assert secret not in message
+    assert "llm_configurations.leaky.options" in message
+    assert "REDACTED" in message
+
+
+def test_get_settings_reports_non_credential_validation_errors(isolated_config):
+    """脱敏边界不能把普通配置错误也变成不可读的嵌套报告。"""
+    (isolated_config / "config.toml").write_text(
+        MOCK_TOML_CONTENT + "\nchat_top_k = 0\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="chat_top_k"):
+        get_settings()

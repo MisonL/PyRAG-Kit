@@ -2455,18 +2455,27 @@ def test_ark_non_stream_result_preserves_chat_reasoning_content():
 
 
 def test_ark_responses_result_does_not_replace_answer_with_reasoning_text():
-    response = SimpleNamespace(
-        output_text="最终答案",
-        output=[
-            SimpleNamespace(
-                type="reasoning",
-                summary=[SimpleNamespace(type="summary_text", text="思考过程")],
-            )
-        ],
-        choices=[],
-        usage=None,
-        status="completed",
-        id="resp-1",
+    """正文与 reasoning 必须分开取。
+
+    此前这里用 ``SimpleNamespace(output_text=...)`` 伪造响应，但 Ark 的
+    ``Response`` 没有该字段——夹具替被测代码补上了它，掩盖了「非流式入口
+    读不到正文」的缺陷。改用真实 SDK 模型构造。
+    """
+    response = _ark_response(
+        [
+            {
+                "type": "message",
+                "id": "msg_1",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "最终答案", "annotations": []}],
+            },
+            {
+                "type": "reasoning",
+                "id": "r1",
+                "summary": [{"type": "summary_text", "text": "思考过程"}],
+            },
+        ]
     )
 
     result = VolcengineProvider._extract_result(response)
@@ -6522,3 +6531,258 @@ def test_responses_function_call_output_pairs_with_preserved_call_id():
     )
 
     assert converted[0]["call_id"] == converted[1]["call_id"] == "call_abc"
+
+
+# ── 回归：动态资源路径的门禁与参数校验 ──
+
+
+def _ark_provider_with_recording_client(protocol="chat_completions", verified=()):
+    """构造带记录型客户端的 Ark 资源 Facade，返回 (resources, 捕获列表)。
+
+    用 ``object.__new__`` 绕过 ``__init__``：本组测试只关心门禁与参数校验的
+    路径判断，不需要真实凭证，也不该依赖环境变量。
+    """
+    from src.providers.volcengine import ArkResources
+
+    captured: list[tuple[str, dict]] = []
+    provider = object.__new__(VolcengineProvider)
+    provider._provider = "volcengine"
+    provider._model_name = "ark-model"
+    provider._protocol = protocol
+    provider._server_verified_protocols = frozenset(verified)
+    provider._options = {}
+    object.__setattr__(
+        provider,
+        "_client",
+        SimpleNamespace(
+            responses=SimpleNamespace(
+                create=lambda **kwargs: captured.append(("responses.create", kwargs)) or "remote",
+            ),
+            input_items=SimpleNamespace(
+                list=lambda *args, **kwargs: captured.append(("input_items.list", kwargs)) or [],
+            ),
+            files=SimpleNamespace(
+                create=lambda **kwargs: captured.append(("files.create", kwargs)) or "local"
+            ),
+        ),
+    )
+    return ArkResources(provider), captured
+
+
+def test_ark_dynamic_input_items_resource_enforces_responses_gate():
+    """``input_items`` 是 Responses 的子资源，路径分段不含 ``responses``
+    （``volcengine.input_items.list`` 打的是 ``/responses/{id}/input_items``）。
+    只看分段会让它在未验证 responses 的渠道上把请求发出去。
+    """
+    resources, captured = _ark_provider_with_recording_client(protocol="chat_completions")
+
+    with pytest.raises(ValueError, match="responses 协议"):
+        resources.input_items.list("resp_1")
+
+    assert captured == []
+
+
+def test_ark_dynamic_files_resource_is_not_gated_as_responses():
+    """门禁不能误伤同名无关的资源：``files.create`` 与 Responses 无关。"""
+    resources, captured = _ark_provider_with_recording_client(protocol="chat_completions")
+
+    resources.files.create(file=("a.txt", b"x"), purpose="assistants")
+
+    assert [name for name, _ in captured] == ["files.create"]
+
+
+def test_ark_dynamic_responses_create_enforces_parameter_validation():
+    """动态路径不经过 Facade，Facade 上的参数校验必须同等执行，否则
+    ``resources.responses.create(...)`` 会带着互斥参数直接发出。"""
+    resources, captured = _ark_provider_with_recording_client(
+        protocol="responses", verified=["responses"]
+    )
+
+    with pytest.raises(ValueError, match="互斥"):
+        resources.responses.create(
+            model="ark-model", input="x", instructions="sys", caching={"type": "enabled"}
+        )
+
+    assert captured == []
+
+
+def test_ark_dynamic_responses_create_requires_model():
+    """原生调用必须显式提供 model，动态路径同样要拦。"""
+    resources, captured = _ark_provider_with_recording_client(
+        protocol="responses", verified=["responses"]
+    )
+
+    with pytest.raises(ValueError, match="model"):
+        resources.responses.create(input="x")
+
+    assert captured == []
+
+
+def test_ark_dynamic_responses_create_allows_valid_request():
+    """补了参数校验后，合法调用不能被误拦。"""
+    resources, captured = _ark_provider_with_recording_client(
+        protocol="responses", verified=["responses"]
+    )
+
+    resources.responses.create(model="ark-model", input="x")
+
+    assert [name for name, _ in captured] == ["responses.create"]
+
+
+# ── 回归：内置工具调用项是合法中间态，不能被 fail-closed 判为结构不符 ──
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {
+            "type": "web_search_call",
+            "id": "w1",
+            "action": {"type": "search", "query": "q"},
+            "status": "completed",
+        },
+        {"type": "mcp_call", "id": "c1", "name": "n", "arguments": "{}", "server_label": "s"},
+        {"type": "mcp_list_tools", "id": "m1", "server_label": "s", "tools": []},
+        {"type": "reasoning", "id": "r1", "summary": []},
+    ],
+)
+def test_ark_builtin_tool_items_are_not_treated_as_malformed(item):
+    """内置工具（web_search_call、mcp_call 等）的调用项既无正文也不是
+    function_call，但都是 SDK 输出项联合的正式成员，属正常中间态——没有工具
+    调用就不可能有后续轮次。判为「结构不符」会让这类响应无法处理。
+    """
+    response = _ark_response([item])
+
+    result = VolcengineProvider._extract_result(response)
+
+    assert result.text == ""
+
+
+def test_ark_empty_completed_response_still_fails_loudly():
+    """放宽内置工具项后，真正空白的 completed 响应仍必须显式失败。"""
+    response = _ark_response([])
+
+    with pytest.raises(RuntimeError, match="未包含任何正文"):
+        VolcengineProvider._extract_result(response)
+
+
+# ── 回归：非字符串 tool type 不能把「类型不合法」变成崩溃 ──
+
+
+@pytest.mark.parametrize("bad_type", [["function"], {"a": 1}, ["custom_tool_call"]])
+def test_chat_tool_call_item_accepts_non_string_type_without_crashing(bad_type):
+    """``source_type in _CHAT_TOOL_CALL_TYPES`` 对 unhashable 值抛
+    ``TypeError: unhashable type``，把可诊断的类型错误变成崩溃。"""
+    from src.providers.__base__.model_provider import _chat_tool_call_item
+
+    item = _chat_tool_call_item(
+        {"id": "c1", "type": bad_type, "name": "n", "arguments": "{}"}, "loc"
+    )
+
+    assert item["type"] == "function"
+
+
+# ── 回归：内部标记不能随请求体发出 ──
+
+
+@pytest.mark.parametrize("role", [None, "user", "system", "developer"])
+def test_responses_input_strips_internal_markers_for_non_assistant_roles(role):
+    """``_responses_tool_call_type`` 是内部判定用的标记。assistant.tool_calls
+    分支会消费它，但兜底分支原样复制消息，标记会随请求体发给服务端。
+    """
+    message = {
+        "content": "go",
+        "tool_calls": [{"id": "c1", "type": "custom_tool_call", "name": "n", "input": "raw"}],
+    }
+    if role is not None:
+        message["role"] = role
+
+    converted = normalize_responses_input(None, None, [message], provider="ark")
+
+    assert "_responses_tool_call_type" not in json.dumps(converted)
+
+
+def test_responses_input_keeps_custom_tool_semantics_for_assistant():
+    """剥离内部标记不能影响 assistant 路径的 custom_tool_call 语义。"""
+    converted = normalize_responses_input(
+        None,
+        None,
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "c1", "type": "custom_tool_call", "name": "n", "input": "raw text"}
+                ],
+            }
+        ],
+        provider="ark",
+    )
+
+    assert converted[0]["type"] == "custom_tool_call"
+    assert converted[0]["input"] == "raw text"
+    assert "_responses_tool_call_type" not in json.dumps(converted)
+
+
+# ── 回归：流式工具调用的 id 语义必须与非流式路径一致 ──
+
+
+def test_responses_stream_tool_call_id_is_stable_across_delta_and_done():
+    """``id`` 必须是调用标识符，与非流式路径（``call_id or id``）一致。
+
+    取 ``item_id``（输出项 ID）会让同一轮工具调用在 delta 与 done 事件里得到
+    不同的 id，调用方按 ``tool_call["id"]`` 回填 ``role=tool`` 时就会配不上。
+    """
+    metadata: dict = {}
+    OpenAICompatibleProvider._responses_stream_event(
+        SimpleNamespace(
+            type="response.output_item.added",
+            output_index=1,
+            item=SimpleNamespace(
+                type="custom_tool_call", id="item-1", call_id="call-1", name="run", input=""
+            ),
+        ),
+        metadata,
+    )
+
+    delta = OpenAICompatibleProvider._responses_stream_event(
+        SimpleNamespace(
+            type="response.custom_tool_call_input.delta",
+            item_id="item-1",
+            output_index=1,
+            delta="echo ",
+        ),
+        metadata,
+    )
+    done = OpenAICompatibleProvider._responses_stream_event(
+        SimpleNamespace(
+            type="response.custom_tool_call_input.done",
+            item_id="item-1",
+            output_index=1,
+            input="hello world",
+        ),
+        metadata,
+    )
+
+    assert delta is not None and done is not None
+    assert delta.tool_call["id"] == done.tool_call["id"] == "call-1"
+
+
+def test_responses_function_call_item_does_not_duplicate_call_id_as_output_id():
+    """归一化后的流式形状里 ``id == call_id``。把它当输出项 ID 发出，等于把
+    调用标识符填进了 SDK 期望输出项标识符的位置。"""
+    from src.providers.__base__.model_provider import _responses_function_call_item
+
+    item = _responses_function_call_item(
+        {
+            "id": "call-1",
+            "call_id": "call-1",
+            "type": "function_call",
+            "name": "n",
+            "arguments": "{}",
+        },
+        "loc",
+    )
+
+    assert item["call_id"] == "call-1"
+    assert "id" not in item

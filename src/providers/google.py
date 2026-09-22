@@ -397,7 +397,9 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             )
         return resource
 
-    def _require_provider_resource(self, method_name: str) -> None:
+    def _require_provider_resource(
+        self, method_name: str, kwargs: Mapping[str, Any] | None = None
+    ) -> None:
         """把实验性资源的版本差异转换成明确的能力错误。"""
         name = method_name.removeprefix("async_")
         resource_name: str | None = None

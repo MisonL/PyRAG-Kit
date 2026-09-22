@@ -325,6 +325,10 @@ def merge_tool_call_fragment(
 
 
 _CHAT_TOOL_CALL_TYPES = frozenset({"function"})
+# 归一化过程中挂在消息/工具调用上的内部标记。它们只服务于本模块的分支判断，
+# 必须在交给 SDK 之前剥离：Responses 的兜底分支会原样复制消息，标记会随请求
+# 体发给服务端。
+_INTERNAL_MESSAGE_KEYS = frozenset({"_responses_tool_call_type"})
 
 
 def _chat_tool_call_item(
@@ -378,7 +382,15 @@ def _chat_tool_call_item(
     # Chat Completions 的 ``tool_calls[].type`` 只接受 ``function``；Responses 的
     # ``function_call``/``custom_tool_call`` 与流式片段都要映射回该取值。
     source_type = normalized.get("type")
-    tool_type = source_type if source_type in _CHAT_TOOL_CALL_TYPES else "function"
+    # 非字符串的 ``type``（例如 ``["function"]``）直接做集合查找会抛
+    # ``TypeError: unhashable type``，把「类型不合法」变成崩溃。此处与
+    # ``_reject_unsupported_responses_item`` 的守卫保持同一口径：先做
+    # isinstance 短路，再按取值映射。
+    tool_type = (
+        source_type
+        if isinstance(source_type, str) and source_type in _CHAT_TOOL_CALL_TYPES
+        else "function"
+    )
 
     item: dict[str, Any] = {
         "type": tool_type,
@@ -860,10 +872,14 @@ def _responses_function_call_item(
             "arguments": _responses_json_text(raw_arguments, f"{location}.arguments"),
         }
     # A Chat Completions ``id`` is the call identifier, not the Responses
-    # output-item identifier. Do not duplicate it as ``id`` unless the caller
-    # supplied a distinct Responses-style ``call_id`` explicitly.
-    if explicit_call_id is not None and tool_call.get("id") is not None:
-        item["id"] = tool_call["id"]
+    # output-item identifier. Only emit ``id`` when it is a genuinely distinct
+    # output-item identifier: the caller must have supplied an explicit
+    # ``call_id``, and ``id`` must differ from it. Providers normalize streamed
+    # tool calls so that ``id == call_id``, and duplicating it here would send
+    # the call identifier where the SDK expects the output-item identifier.
+    explicit_id = tool_call.get("id")
+    if explicit_call_id is not None and explicit_id is not None and explicit_id != explicit_call_id:
+        item["id"] = explicit_id
     if tool_call.get("status") is not None:
         item["status"] = tool_call["status"]
     return item
@@ -1013,6 +1029,26 @@ def normalize_responses_input(
             raise ValueError(f"{location} 的 function 消息缺少 tool_call_id。")
 
         normalized_message = dict(message)
+        # 归一化时会在工具调用项上挂仅用于内部判定的标记
+        # （``_responses_tool_call_type``）。走 assistant.tool_calls 分支时它们
+        # 被消费掉，但本兜底分支原样复制消息，标记会随请求体发给服务端。
+        # 消息级与工具调用项级都要剥离。
+        for internal_key in _INTERNAL_MESSAGE_KEYS:
+            normalized_message.pop(internal_key, None)
+        fallback_tool_calls = normalized_message.get("tool_calls")
+        if isinstance(fallback_tool_calls, Sequence) and not isinstance(
+            fallback_tool_calls, (str, bytes, bytearray)
+        ):
+            normalized_message["tool_calls"] = [
+                {
+                    key: value
+                    for key, value in tool_call.items()
+                    if key not in _INTERNAL_MESSAGE_KEYS
+                }
+                if isinstance(tool_call, Mapping)
+                else tool_call
+                for tool_call in fallback_tool_calls
+            ]
         if "content" in normalized_message:
             normalized_message["content"] = _responses_message_content(
                 normalized_message["content"],
@@ -1681,8 +1717,15 @@ class LargeLanguageModel(ABC):
     def supports(cls, capability: str) -> bool:
         return capability in cls.capabilities
 
-    def _require_provider_resource(self, method_name: str) -> None:
-        """为 Provider 原生资源入口提供可选的能力门禁。"""
+    def _require_provider_resource(
+        self, method_name: str, kwargs: Mapping[str, Any] | None = None
+    ) -> None:
+        """为 Provider 原生资源入口提供可选的能力门禁。
+
+        ``kwargs`` 是即将交给原生方法的调用参数。动态资源路径不经过 Facade，
+        因此 Provider 若在 Facade 上做了参数校验，需要在这里对同一组参数
+        再校验一次，否则动态路径成为绕过参数约束的旁路。
+        """
         return
 
     @property

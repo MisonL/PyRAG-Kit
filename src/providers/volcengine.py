@@ -56,6 +56,32 @@ def _load_ark_clients() -> tuple[type[Any], type[Any]]:
     return Ark, AsyncArk
 
 
+# Responses 的 output 里，除 message 与 function_call 外还有内置工具的调用项。
+# 这些项既无正文也不是 function_call，但都是 SDK ``ResponseOutputItem`` 联合的
+# 正式成员，属正常中间态而非「结构不符」。
+_ARK_BUILTIN_TOOL_ITEM_TYPES = frozenset(
+    {
+        "web_search_call",
+        "mcp_call",
+        "mcp_list_tools",
+        "mcp_approval_request",
+        "knowledge_search_call",
+        "doubao_app_call",
+        # reasoning 项在模型本轮无推理摘要时 ``summary`` 为空列表，但项本身
+        # 合法（SDK 已把它作为独立 item 类型返回）。
+        "reasoning",
+    }
+)
+
+
+def _ark_responses_has_builtin_tool_items(response: Any) -> bool:
+    """判断响应里是否含 Ark 内置工具的调用项。"""
+    for item in field(response, "output", []) or []:
+        if field(item, "type") in _ARK_BUILTIN_TOOL_ITEM_TYPES:
+            return True
+    return False
+
+
 def _ark_responses_output_text(response: Any) -> str:
     """从 Responses 的 ``output[].content[]`` 提取助手正文。
 
@@ -607,16 +633,41 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             normalized.add(protocol)
         return frozenset(normalized)
 
-    def _require_provider_resource(self, method_name: str) -> None:
-        """在原生资源方法触达 SDK 前校验 Ark 渠道能力。
+    # Responses 资源树下的子资源。它们的路径不含 ``responses`` 分段
+    # （``volcengine.input_items.list`` 打的是 ``/responses/{id}/input_items``），
+    # 只看分段会把它们漏掉；但 ``files.create`` 这类同名无关调用必须放行，
+    # 因此用精确集合而不是子串匹配。
+    _ARK_RESPONSES_SUBRESOURCES = frozenset(
+        {
+            "input_items",
+            "input_tokens",
+            "output_items",
+        }
+    )
+
+    def _require_provider_resource(
+        self, method_name: str, kwargs: Mapping[str, Any] | None = None
+    ) -> None:
+        """在原生资源方法触达 SDK 前校验 Ark 渠道能力与参数约束。
 
         ``method_name`` 可能是显式方法名（``create_response``），也可能是动态
         资源树路径（``volcengine.responses.create``）。按路径分段判断，避免把
         ``files.create`` 这类同名但无关的调用一并拦下。
+
+        动态路径不经过 Facade，因此 Facade 上的参数校验必须在这里对同一组
+        ``kwargs`` 再执行一次，否则 ``resources.responses.create(...)`` 可以
+        带着 ``instructions`` 与 ``caching={"type": "enabled"}`` 直接发出。
         """
         segments = method_name.split(".")
-        if "responses" in segments or method_name.endswith("_response") or "response" in segments:
+        if (
+            "responses" in segments
+            or method_name.endswith("_response")
+            or "response" in segments
+            or any(segment in self._ARK_RESPONSES_SUBRESOURCES for segment in segments)
+        ):
             self._require_responses_resource(method_name)
+            if kwargs and segments[-1] in {"create", "generate"}:
+                self._validate_native_response_kwargs(kwargs)
 
     def _require_responses_resource(self, operation: str) -> None:
         """阻止未验证的 Ark Responses 请求到达远端。"""
@@ -1436,11 +1487,17 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             and not refusal
             and not reasoning
             and field(response, "status") == "completed"
+            and not _ark_responses_has_builtin_tool_items(response)
         ):
             # 项目规则禁止用占位结果掩盖失败。Responses 响应标记为 completed
             # 却既无正文、无工具调用、也无拒答与推理，说明响应结构与预期不符
             # （例如 SDK 改了字段形状）。此时静默返回空文本会让上层拿到空串后
             # 继续，最终表现为难以定位的「空结果」错误，因此在边界显式失败。
+            #
+            # 但内置工具（web_search_call、mcp_call、mcp_list_tools 等）的
+            # 调用项既不是 function_call 也没有正文，而它们是 Ark 内置工具
+            # 的正常中间态——没有工具调用就不可能有后续轮次，调用方需要读
+            # output 才能继续。把它们判为「结构不符」会让这类响应无法处理。
             raise RuntimeError(
                 "Ark Responses 响应已完成但未包含任何正文、工具调用或拒答内容；"
                 "请检查响应结构与 SDK 版本是否匹配。"

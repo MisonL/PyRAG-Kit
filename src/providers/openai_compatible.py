@@ -593,9 +593,31 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 return capability
         return None
 
-    def _require_provider_resource(self, method_name: str) -> None:
+    # 动态资源树路径（``OpenAIProvider.responses.create``）的末段是方法名，
+    # 与显式 Facade 名（``create_response``）不同形。只看显式名会让动态路径
+    # 拿到 capability=None 直接放行，正是 server_verified_protocols 门禁要堵的
+    # 旁路。这里按路径分段识别资源树。
+    _RESPONSES_RESOURCE_SEGMENTS = frozenset({"responses", "input_items", "input_tokens"})
+    _FILES_RESOURCE_SEGMENTS = frozenset({"files", "uploads"})
+
+    @classmethod
+    def _resource_capability_for_path(cls, method_name: str) -> str | None:
+        """从动态资源树路径推断能力名称。"""
+        segments = method_name.split(".")
+        if any(segment in cls._RESPONSES_RESOURCE_SEGMENTS for segment in segments):
+            return "responses"
+        if any(segment in cls._FILES_RESOURCE_SEGMENTS for segment in segments):
+            return "files"
+        return None
+
+    def _require_provider_resource(
+        self, method_name: str, kwargs: Mapping[str, Any] | None = None
+    ) -> None:
         """在原生资源方法真正触达 SDK 前校验渠道能力。"""
         capability = self._resource_capability_for_method(method_name)
+        if capability is None:
+            # 显式 Facade 名匹配不上时，再按动态资源树路径判断。
+            capability = self._resource_capability_for_path(method_name)
         if capability is None:
             return
         if capability == "responses":
@@ -700,7 +722,10 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
 
     def _require_responses_resource(self, operation: str) -> None:
         """阻止兼容渠道把本地 SDK 资源误当成远端 Responses 能力。"""
-        if self._protocol != "responses":
+        # ``object.__new__`` 构造的实例没有 ``_protocol``；此时没有协议可校验，
+        # 交给下面的服务端验证门禁判断（与 ``_provider`` 缺失时的处理一致）。
+        protocol = getattr(self, "_protocol", None)
+        if protocol is not None and protocol != "responses":
             raise ValueError(f"{operation} 仅适用于 responses 协议。")
         # 官方端点由其 SDK 契约覆盖；代理、自建网关和其它兼容渠道必须
         # 显式声明已验证的服务端协议，避免本地 SDK 资源导致远端 404/405。
@@ -1883,7 +1908,12 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             return StreamEvent(
                 type="tool_call_delta",
                 tool_call={
-                    "id": item_id or cls._field(event, "call_id") or metadata.get("id"),
+                    # ``id`` 在流式路径上必须与 ``output_item.done`` 及非流式
+                    # 路径取同一语义（call_id）。取 ``item_id`` 会让同一轮工具
+                    # 调用在 delta 与 done 两个事件里得到不同的 id，且是否一致
+                    # 取决于事件到达顺序；调用方按 ``tool_call["id"]`` 回填
+                    # ``role=tool`` 时就会配不上。
+                    "id": call_id or item_id or metadata.get("id"),
                     "call_id": call_id,
                     "index": output_index
                     if output_index is not None
@@ -1928,7 +1958,13 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 if argument_value is None:
                     argument_value = metadata.get("arguments", "")
                 tool_call: dict[str, Any] = {
-                    "id": cls._field(item, "call_id")
+                    # 与非流式路径（``call_id or id``）和 delta 事件保持同一
+                    # 语义：``id`` 是调用标识符，不是 Responses 输出项标识符。
+                    # 取 ``item.id`` 或 ``item_id`` 会让同一轮工具调用在 delta
+                    # 与 done 事件里得到不同的 id，调用方按 ``tool_call["id"]``
+                    # 回填 ``role=tool`` 时就会配不上。上面解析出的 ``call_id``
+                    # 才是权威来源。
+                    "id": call_id
                     or cls._field(item, "id")
                     or cls._field(event, "item_id")
                     or metadata.get("id"),
@@ -1996,6 +2032,12 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             value = tool_call.get(name)
             if value is not None and value != "":
                 merged[name] = value
+        # ``id`` 必须与调用标识符一致（非流式路径用 ``call_id or id``，delta
+        # 事件也用 call_id）。``output_item.done`` 带的 ``id`` 是输出项 ID，
+        # 按上面顺序会覆盖 delta 事件写入的 call_id，使同一轮工具调用在
+        # delta 与 completed 两个事件里得到不同的 id。这里统一回 call_id。
+        if merged.get("call_id"):
+            merged["id"] = merged["call_id"]
         arguments = tool_call.get("arguments")
         if arguments is not None and arguments != "":
             merged["arguments"] = normalize_tool_arguments(arguments)

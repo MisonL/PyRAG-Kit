@@ -3,7 +3,9 @@ import subprocess
 import pytest
 
 from scripts.build_binary_release import (
+    PACKAGE_FILES,
     prepare_runtime_layout,
+    stage_bundle,
     validate_bundle,
     validate_target_environment,
 )
@@ -68,3 +70,31 @@ def test_validate_target_environment_accepts_matching_host(target, system, machi
 def test_validate_target_environment_rejects_cross_architecture():
     with pytest.raises(RuntimeError, match="不执行跨平台交叉编译"):
         validate_target_environment("macos-arm64", system="Darwin", machine="x86_64")
+
+
+def test_stage_bundle_copies_package_files_including_subdirectories(monkeypatch, tmp_path):
+    """PACKAGE_FILES 含子目录路径（licenses/APACHE-2.0.txt）。
+
+    ``shutil.copy2`` 不会创建父目录，缺了 mkdir 会在打包时抛
+    FileNotFoundError；而这一步只在发布时才跑到，本地测试很容易漏掉。
+    """
+    dist_root = tmp_path / "dist" / "PyRAG-Kit"
+    dist_root.mkdir(parents=True)
+    (dist_root / "PyRAG-Kit").write_bytes(b"binary")
+    artifact_root = tmp_path / "release_artifacts"
+
+    monkeypatch.setattr("scripts.build_binary_release.DIST_ROOT", tmp_path / "dist")
+    monkeypatch.setattr("scripts.build_binary_release.ARTIFACT_ROOT", artifact_root)
+    monkeypatch.setattr("scripts.build_binary_release.PROJECT_ROOT", tmp_path)
+    for relative in PACKAGE_FILES:
+        source = tmp_path / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("content", encoding="utf-8")
+
+    bundle_root = stage_bundle("linux-x64", "1.4.0")
+
+    assert bundle_root.name == "PyRAG-Kit-1.4.0-linux-x64"
+    for relative in PACKAGE_FILES:
+        assert (bundle_root / relative).is_file(), relative
+    # 子目录路径必须真的落在子目录里，而不是被拍平。
+    assert (bundle_root / "licenses" / "APACHE-2.0.txt").parent.name == "licenses"

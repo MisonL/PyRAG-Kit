@@ -100,9 +100,16 @@ def test_security_redacts_every_sensitive_key_name_in_text(key):
 
 @pytest.mark.parametrize("key", _TEXT_REDACTION_KEYS)
 def test_security_redacts_sensitive_key_names_in_url_query(key):
-    """URL query 形态同样要覆盖，不能只处理 key=value。"""
-    secret = "SUPERSECRETVALUE12345"
-    assert secret not in redact_sensitive_text(f"https://example.invalid/x?{key}={secret}")
+    """URL query 形态同样要覆盖，不能只处理 key=value。
+
+    值必须**短到只有 ``_URL_QUERY_SECRET_RE`` 能覆盖**：``_KEY_VALUE_TEXT_RE``
+    的空白/标点形态要求值至少 12 字符且含数字或符号，用一个长值会让这条断言
+    由另一条规则满足——删掉 URL query 规则测试照样通过，即测错了对象。
+    """
+    for secret in ("x", "0", "none"):
+        redacted = redact_sensitive_text(f"https://example.invalid/x?{key}={secret}")
+        # 断言精确形式：值必须被替换掉，且替换位置就在 ``?key=`` 之后。
+        assert redacted == f"https://example.invalid/x?{key}=[REDACTED]", (key, secret, redacted)
 
 
 @pytest.mark.parametrize(
@@ -177,16 +184,18 @@ def test_safe_exception_text_handles_empty_and_long_messages():
 
 
 def test_user_facing_error_paths_do_not_print_raw_exceptions():
-    """``retrieval_test`` 与顶层入口曾把裸异常交给 console/logger，凭证会
-    原样落到终端与日志；``chat`` 路径已做脱敏，三者必须一致。"""
+    """面向用户的错误出口必须经 ``safe_exception_text``。
+
+    这里只做「是否引用」的存在性检查，作为粗筛；真正的行为断言在
+    ``tests/retrieval_test/test_retrieval_cli.py``——读源码做子串匹配拦不住
+    回归（``str(exc)``、f-string 拼接等写法都能绕过），也覆盖不到新出口。
+    """
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parents[2]
     for relative in ("src/retrieval_test/core.py", "main.py", "src/chat/core.py"):
         source = (root / relative).read_text(encoding="utf-8")
         assert "safe_exception_text" in source, relative
-        assert 'console.print(f"[red]召回测试出错: {exc}' not in source, relative
-        assert '{e}")' not in source, relative
 
 
 # ── 回归：文本键名口径必须与 is_sensitive_option_key 一致 ──
@@ -292,3 +301,44 @@ def test_security_accepts_benign_unparseable_url():
     assert validate_secret_free_options({"endpoint": "https://[::1/v1/models"}, "Provider") == {
         "endpoint": "https://[::1/v1/models"
     }
+
+
+# ── 回归：CJK 紧邻时词边界失效导致密钥整体漏检 ──
+
+
+# 项目主对接 SiliconFlow、Ark/火山、DashScope，这些网关的错误体是中文；
+# 而中文属 ``\w``，``\b`` 在 ``密钥sk-...`` 两侧都不成立。
+_CJK_ADJACENT_SECRETS = [
+    "sk-proj-FAKE0000FAKE0000FAKE0000FAKE0000",
+    "AIzaFAKE0000FAKE0000FAKE0000FAKE0000",
+]
+
+
+@pytest.mark.parametrize("secret", _CJK_ADJACENT_SECRETS)
+@pytest.mark.parametrize(
+    "template",
+    ["请求失败，密钥{secret}无效", "鉴权失败，请检查{secret}是否正确", "无效的令牌{secret}"],
+)
+def test_security_redacts_secrets_adjacent_to_cjk(template, secret):
+    """中文错误消息紧贴密钥时必须照常脱敏。"""
+    redacted = redact_sensitive_text(template.format(secret=secret))
+    assert secret not in redacted
+    assert "[REDACTED]" in redacted
+
+
+@pytest.mark.parametrize("secret", _CJK_ADJACENT_SECRETS)
+def test_safe_exception_text_redacts_secrets_adjacent_to_cjk(secret):
+    """面向用户的异常出口同样要覆盖中文消息。"""
+    from src.utils.security import safe_exception_text
+
+    rendered = safe_exception_text(RuntimeError(f"服务端返回错误密钥为{secret}。"))
+    assert secret not in rendered
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["disk-abcdefghijklmnop", "risk-analysis-report", "task = value", "mask=none"],
+)
+def test_security_cjk_boundary_change_does_not_flag_ordinary_text(text):
+    """放宽词边界不能把普通连字符单词误判成凭证。"""
+    assert redact_sensitive_text(text) == text

@@ -80,8 +80,10 @@ class _NativeResourceProxy:
         if callable(resource_guard):
             # 传完整路径（``volcengine.responses.create``）而不是末段方法名：
             # ``files.create`` 与 ``responses.create`` 末段相同，只看方法名无法
-            # 区分该走哪条能力门禁。
-            resource_guard(self._path)
+            # 区分该走哪条能力门禁。同时把调用参数一并传入：动态路径不经过
+            # Facade，Provider 在 Facade 上做的参数校验（例如 Ark 的
+            # instructions × caching 互斥）必须在这里得到同等执行。
+            resource_guard(self._path, safe_kwargs)
         # Call results are deliberately not wrapped.  They are response models,
         # pagers, streams, or context managers rather than mutable resource
         # trees; preserving their SDK identity keeps normal client code intact.

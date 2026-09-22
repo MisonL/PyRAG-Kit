@@ -7,7 +7,14 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, ClassVar, cast
 
-from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 from pydantic.fields import FieldInfo
 from pydantic_settings import (
     BaseSettings,
@@ -15,7 +22,7 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
-from src.utils.security import validate_secret_free_options
+from src.utils.security import redact_sensitive_text, validate_secret_free_options
 
 # =================================================================
 # 1. 基础定义 (DEFINITIONS)
@@ -644,8 +651,32 @@ def get_settings() -> Settings:
     """
     获取 Settings 实例的单例。
     加载顺序由 settings_customise_sources 定义。
+
+    配置校验失败时重抛一个已脱敏的异常。``Settings()`` 在 import 期就会被调用
+    （``log_manager.get_module_logger``），早于任何入口的 ``try``，pydantic 的
+    默认渲染会把 ``input_value`` 明文交给解释器默认 handler——而 ``options`` 是
+    文档指定的扩展入口，把 ``api_key`` 放进去恰好就是被校验拒绝的那类错误。
     """
-    return Settings()
+    try:
+        return Settings()
+    except ValidationError as exc:
+        raise ValueError(_redacted_settings_error(exc)) from None
+
+
+def _redacted_settings_error(exc: ValidationError) -> str:
+    """把配置校验失败整理成一行脱敏消息。
+
+    直接重抛 ``ValidationError`` 会让 pydantic 再包一层，原始报告的
+    ``input_value`` 会以嵌套形式重复出现；这里逐条取 ``loc`` 与 ``msg``
+    重建，只保留定位信息和校验原因，并把值整体交给 ``redact_sensitive_text``。
+    """
+    lines = []
+    for error in exc.errors():
+        location = ".".join(str(part) for part in error.get("loc", ()))
+        message = str(error.get("msg", "校验失败"))
+        value = redact_sensitive_text(str(error.get("input")))
+        lines.append(f"{location}: {message} (input={value})" if location else f"{message}")
+    return "配置校验失败 - " + "; ".join(lines) if lines else "配置校验失败"
 
 
 # 导出 get_settings 函数，供其他模块在需要时调用

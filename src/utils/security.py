@@ -90,7 +90,10 @@ _RESOURCE_EXTENSION_KEYS = frozenset({"extraheaders", "extraquery", "extrabody"}
 # subject to credential scanning.
 _SAFE_RESOURCE_PARAMETER_CONTAINERS = frozenset({"query", "params"})
 
-_BEARER_TEXT_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
+# 用「非 ASCII 字母数字」而不是 ``\b`` 作边界：中文属 ``\w``，``\b`` 在
+# ``密钥sk-...`` 两侧都不成立，而国产网关（SiliconFlow、Ark、DashScope）的
+# 错误消息正是中文，密钥会整串落进日志。
+_BEARER_TEXT_RE = re.compile(r"(?i)(?<![A-Za-z0-9])bearer\s+[A-Za-z0-9._~+/=-]+")
 # A punctuation separator is unambiguous.  Whitespace-only forms are useful
 # for redacting messages such as ``token sk-...``, but treating every following
 # word as a credential causes ordinary text (``token usage``) to be rejected by
@@ -179,7 +182,9 @@ _SHORT_CREDENTIAL_KEY_RE = re.compile(
     r"""(\s*[:=]\s*)"""
     r"""(?:"[^"]*"|'[^']*'|[^\s,;}']+)"""
 )
-_OPENAI_KEY_RE = re.compile(r"\b(?:sk|rk|sess)-[A-Za-z0-9_-]{8,}\b", re.IGNORECASE)
+_OPENAI_KEY_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:sk|rk|sess)-[A-Za-z0-9_-]{8,}(?![A-Za-z0-9])", re.IGNORECASE
+)
 # 服务端返回的错误信息常带「首尾可见、中间掩码」的凭证形态，例如
 # ``sk-abc***...***xyz``。``_OPENAI_KEY_RE`` 要求 ``sk-`` 后连续 8 个以上
 # 字母数字，星号会中断匹配，于是整串原样落进日志。这里单独覆盖掩码形态。
@@ -190,10 +195,10 @@ _MASKED_CREDENTIAL_RE = re.compile(
     # 但尾部每消费一个字符都要确认它不是紧邻键名的开头：``sk-abc***token=<secret>``
     # 里的 ``token`` 若被吞进掩码匹配，后面的 ``token=<secret>`` 就失去锚点，
     # 值会从脱敏变成明文（净漏检）。断言在键名之前停下，让键值规则处理它。
-    r"(?i)\b(?:sk|rk|sess)-[A-Za-z0-9_.-]{2,}[*\u2026.]{2,}"
+    r"(?i)(?<![A-Za-z0-9])(?:sk|rk|sess)-[A-Za-z0-9_.-]{2,}[*\u2026.]{2,}"
     r"(?:[A-Za-z0-9_.*-](?![A-Za-z0-9_-]*\s*[:=]))*"
 )
-_GOOGLE_API_KEY_RE = re.compile(r"\bAIza[0-9A-Za-z_-]{20,}\b")
+_GOOGLE_API_KEY_RE = re.compile(r"(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{20,}(?![A-Za-z0-9])")
 
 
 def redact_sensitive_text(value: Any) -> str:

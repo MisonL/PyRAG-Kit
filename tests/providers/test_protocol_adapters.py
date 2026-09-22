@@ -1906,8 +1906,12 @@ def test_openai_responses_custom_tool_stream_keeps_added_metadata_and_raw_input(
         metadata,
     )
 
+    # ``id`` 统一取调用标识符（call_id），与非流式路径及合并结果一致：
+    # ``item_id`` 是 Responses 的输出项 ID，取它会让同一轮工具调用在 delta 与
+    # completed 事件里得到不同的 id，调用方按 ``tool_call["id"]`` 回填
+    # ``role=tool`` 时就会配不上。
     assert delta is not None and delta.tool_call == {
-        "id": "item-1",
+        "id": "call-1",
         "call_id": "call-1",
         "index": 1,
         "type": "custom_tool_call",
@@ -1915,7 +1919,7 @@ def test_openai_responses_custom_tool_stream_keeps_added_metadata_and_raw_input(
         "arguments": "echo ",
     }
     assert completed is not None and completed.tool_call == {
-        "id": "item-1",
+        "id": "call-1",
         "index": 1,
         "type": "custom_tool_call",
         "name": "run_command",
