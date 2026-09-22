@@ -187,13 +187,6 @@ _NON_CREDENTIAL_VALUE = (
 
 _ANY_VALUE_SHAPE = r"""(?:"[^"]*"|'[^']*'|[^\s,;}']+)"""
 
-_BARE_CREDENTIAL_KEYWORD_PATTERN = "|".join(
-    key for key in _TEXT_CREDENTIAL_KEYS if re.fullmatch(r"[a-z]+", key)
-)
-_QUALIFIED_CREDENTIAL_KEY_PATTERN = "|".join(
-    key for key in _TEXT_CREDENTIAL_KEYS if not re.fullmatch(r"[a-z]+", key)
-)
-
 
 # 键名候选：以凭证词开头、后接任意标识符字符。用「宽泛捕获 + 回调判定」
 # 而不是把每个完整键名写进正则：``passwordHash``/``tokenCount`` 这类
@@ -212,7 +205,7 @@ _CREDENTIAL_KEY_VALUE_RE = re.compile(
     + _CREDENTIAL_KEY_CANDIDATE
     + r")([\"']?)"
     + r"""(\s*[:=]\s*|\s+(?=["']|"""
-    r"""(?=[A-Za-z0-9._~+/=-]{12,}(?:[\s,;}']|$))[A-Za-z0-9._~+/=-]*[0-9._~+/=-]))"""
+    + r"""(?=[A-Za-z0-9._~+/=-]{12,}(?:[\s,;}']|$))[A-Za-z0-9._~+/=-]*[0-9._~+/=-]))"""
     + r"("
     + _ANY_VALUE_SHAPE
     + r")"

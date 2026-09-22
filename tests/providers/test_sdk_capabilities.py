@@ -6371,8 +6371,12 @@ def test_ark_native_response_kwargs_allow_non_conflicting_combinations(kwargs):
 )
 def test_openai_responses_rejects_ark_only_blocks_as_top_level_items(item):
     """同一个 Ark 专属块写成 content 会被拒、写成顶层 item 却直通请求体，
-    等于绕过了 variant 守卫。两种形态必须一致拒绝。"""
-    with pytest.raises(ValueError):
+    等于绕过了 variant 守卫。两种形态必须一致拒绝。
+
+    断言带上 ``match``：只查异常类型的话，被测代码因别的原因抛 ``ValueError``
+    也会让测试通过。
+    """
+    with pytest.raises(ValueError, match="不受|缺少|必须"):
         normalize_responses_input(None, None, [dict(item)], provider="openai")
 
 
@@ -6934,8 +6938,12 @@ def test_openai_responses_rejects_ark_only_blocks_with_or_without_content_key(me
     ],
 )
 def test_ark_responses_validates_native_item_required_fields(message):
-    """顶层 item 形态也要做必填字段与取值范围校验，不能只查类型。"""
-    with pytest.raises(ValueError):
+    """顶层 item 形态也要做必填字段与取值范围校验，不能只查类型。
+
+    断言带上 ``match``，把「必填字段/取值校验报的错」与「其它 ValueError」
+    区分开。
+    """
+    with pytest.raises(ValueError, match="缺少|必须|不受"):
         normalize_responses_input(None, None, [message], provider="ark")
 
 
