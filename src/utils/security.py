@@ -145,11 +145,27 @@ _TEXT_CREDENTIAL_KEYS = (
 )
 _TEXT_CREDENTIAL_KEY_PATTERN = "|".join(_TEXT_CREDENTIAL_KEYS)
 
+# 值的形态约束：凭证值要么被引号包裹，要么含数字或符号，要么足够长。
+# 缺了它，``auth: none``、``cookie: enabled``、``secret: false`` 这类普通文本
+# 会被判为凭证——而 find_sensitive_option_paths 用
+# ``redact_sensitive_text(value) != value`` 判断值里有没有凭证，于是合法配置
+# （例如 vector_stores.search(query="...") 的检索词、extra_body 里的提示词或
+# JSON schema）会在边界被误拒。
+_CREDENTIAL_VALUE_SHAPE = (
+    r"""(?:"[^"]*"|'[^']*'"""
+    r"""|(?=[A-Za-z0-9._~+/=-]*[0-9._~+/=-])[A-Za-z0-9._~+/=-]{2,}"""
+    r"""|[A-Za-z0-9._~+/=-]{12,})"""
+)
+
 _KEY_VALUE_TEXT_RE = re.compile(
-    r"(?i)(?<![A-Za-z0-9])(" + _TEXT_CREDENTIAL_KEY_PATTERN + r")[\"']?"
+    # 不加「键名前必须是非字母数字」的前视断言：is_sensitive_option_key 按
+    # camelCase 边界切词，``myApiKey``/``dbPassword``/``userToken`` 都判为敏感；
+    # 若文本正则要求键名前是非字母数字，这些键名会在日志里明文输出，
+    # 正是本文件要消灭的那类「配置边界敏感、文本明文」不一致。
+    r"(?i)(" + _TEXT_CREDENTIAL_KEY_PATTERN + r")[\"']?"
     r"""(\s*[:=]\s*|\s+(?=["']|"""
     r"""(?=[A-Za-z0-9._~+/=-]{12,}(?:[\s,;}']|$))[A-Za-z0-9._~+/=-]*[0-9._~+/=-]))"""
-    r"""(?:"[^"]*"|'[^']*'|[^\s,;}']+)"""
+    + _CREDENTIAL_VALUE_SHAPE
 )
 _URL_USERINFO_RE = re.compile(r"(?i)(https?://)([^\s/@:]+):([^\s/@]+)@")
 _URL_QUERY_SECRET_RE = re.compile(
@@ -168,9 +184,14 @@ _OPENAI_KEY_RE = re.compile(r"\b(?:sk|rk|sess)-[A-Za-z0-9_-]{8,}\b", re.IGNORECA
 # ``sk-abc***...***xyz``。``_OPENAI_KEY_RE`` 要求 ``sk-`` 后连续 8 个以上
 # 字母数字，星号会中断匹配，于是整串原样落进日志。这里单独覆盖掩码形态。
 _MASKED_CREDENTIAL_RE = re.compile(
-    # 掩码段可含 ``*``、``.``、``…`` 等占位字符，且尾部可能还有可见片段，
-    # 因此尾部字符类要一并覆盖，否则 ``sk-abc***...***xyz`` 只吃掉前半段。
-    r"(?i)\b(?:sk|rk|sess)-[A-Za-z0-9_.-]{2,}[*\u2026.]{2,}[A-Za-z0-9_.*-]*"
+    # 掩码段可含 ``*``、``.``、``…`` 等占位字符，尾部可能还有可见片段，
+    # 因此尾部字符类要覆盖字母数字，否则 ``sk-abc***...***xyz`` 只吃掉前半段。
+    #
+    # 但尾部每消费一个字符都要确认它不是紧邻键名的开头：``sk-abc***token=<secret>``
+    # 里的 ``token`` 若被吞进掩码匹配，后面的 ``token=<secret>`` 就失去锚点，
+    # 值会从脱敏变成明文（净漏检）。断言在键名之前停下，让键值规则处理它。
+    r"(?i)\b(?:sk|rk|sess)-[A-Za-z0-9_.-]{2,}[*\u2026.]{2,}"
+    r"(?:[A-Za-z0-9_.*-](?![A-Za-z0-9_-]*\s*[:=]))*"
 )
 _GOOGLE_API_KEY_RE = re.compile(r"\bAIza[0-9A-Za-z_-]{20,}\b")
 
@@ -324,8 +345,17 @@ def _url_credential_paths(value: Any, path: str) -> list[str]:
         # urlsplit 对畸形 URL（例如 ``https://[::1``）抛 ValueError。这不是
         # 「值不是 URL」而是「无法解析」，不能就此放弃检查：该分支是叶子值的
         # 唯一入口，直接 return 会让任意凭证随一个畸形前缀整体绕过边界校验。
-        # 退回文本脱敏判定，保持与正常 URL 路径一致的严格度。
-        return [path or "value"] if redact_sensitive_text(value) != value else []
+        # 退回手工解析，保持与正常 URL 路径一致的严格度：既要看值里有没有
+        # 凭证，也要看 query 的键名（``?myApiKey=`` 这种空值键在正常路径下会被
+        # ``is_sensitive_option_key`` 拦下，只做值脱敏会漏掉它）。
+        fallback = [path or "value"] if redact_sensitive_text(value) != value else []
+        marker = value.find("?")
+        if marker != -1:
+            for pair in value[marker + 1 :].split("&"):
+                key = pair.partition("=")[0]
+                if key and is_sensitive_option_key(key):
+                    fallback.append(f"{path}?{key}")
+        return fallback
     found: list[str] = []
     if redact_sensitive_text(value) != value:
         found.append(path or "value")

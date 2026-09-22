@@ -187,3 +187,108 @@ def test_user_facing_error_paths_do_not_print_raw_exceptions():
         assert "safe_exception_text" in source, relative
         assert 'console.print(f"[red]召回测试出错: {exc}' not in source, relative
         assert '{e}")' not in source, relative
+
+
+# ── 回归：文本键名口径必须与 is_sensitive_option_key 一致 ──
+
+
+# 键名识别按 camelCase 边界切词，因此这些驼峰键在配置边界判为敏感。
+# 文本正则若要求键名前是非字母数字字符，它们会在日志里明文输出——即
+# 「配置边界拦住、文本边界放过」的不一致，正是本文件要消灭的形态。
+_CAMEL_CASE_REDACTION_KEYS = [
+    "dbPassword",
+    "myApiKey",
+    "userToken",
+    "myAccessKey",
+    "clientSecret",
+]
+
+
+@pytest.mark.parametrize("key", _CAMEL_CASE_REDACTION_KEYS)
+def test_security_redacts_camel_case_sensitive_key_names(key):
+    """驼峰键名在文本与配置两个边界上必须同口径。"""
+    secret = "SUPERSECRETVALUE12345"
+    assert is_sensitive_option_key(key) is True
+    assert secret not in redact_sensitive_text(f"{key}={secret}")
+
+
+def test_security_rejects_camel_case_credential_hidden_in_ordinary_option():
+    """驼峰键藏进普通选项值时也必须被拦下，不能因前缀是字母而漏检。"""
+    with pytest.raises(ValueError, match="凭证"):
+        validate_secret_free_options({"note": "myApiKey=SUPERSECRETVALUE12345"}, "Provider")
+
+
+# ── 回归：裸关键词加标点不能把普通文本判成凭证 ──
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Set auth: none to disable",
+        "cookie: enabled",
+        "secret: false",
+        "token: 0",
+        "The bearer: standard",
+    ],
+)
+def test_security_keeps_benign_keyword_assignments_intact(text):
+    """``auth``/``cookie``/``secret`` 等裸关键词后接普通词，是文档与提示词里的
+    常见写法。判为凭证会让合法配置在边界被误拒。"""
+    assert redact_sensitive_text(text) == text
+
+
+def test_security_accepts_benign_keyword_text_in_options():
+    """误判不止影响日志：``find_sensitive_option_paths`` 用值是否被改写来判断
+    值里有没有凭证，误脱敏会让合法 options 直接被拒。"""
+    assert validate_secret_free_options(
+        {"instructions": "Set auth: none to disable"}, "Provider"
+    ) == {"instructions": "Set auth: none to disable"}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Authorization: Bearer sk-FAKE0000SHORT0000FAKE0000",
+        '{"api_key": "secret-value-xyz"}',
+        "token: sk-FAKE0000FAKE0000FAKE0000FAKE0000",
+    ],
+)
+def test_security_still_redacts_real_credentials_after_value_shape_check(value):
+    """加了值的形态约束后，真凭证不能跟着一起放过。"""
+    assert "[REDACTED]" in redact_sensitive_text(value)
+
+
+# ── 回归：掩码尾部不能吞掉紧邻的键名 ──
+
+
+def test_security_masked_credential_does_not_swallow_adjacent_key_name():
+    """``sk-abc***token=<secret>`` 里的 ``token`` 若被掩码规则吞进匹配，
+    后面的键值对就失去锚点，值会从脱敏变成明文——净漏检。"""
+    secret = "SECRETVALUE1234567890"
+    redacted = redact_sensitive_text(f"sk-abc***token={secret}")
+    assert secret not in redacted
+    # 键名保留是预期行为（脱敏的是值），关键是掩码规则没有把 ``token`` 吞掉
+    # 而让后续的 ``=<secret>`` 失去锚点。
+    assert redacted.count("[REDACTED]") == 2
+
+
+# ── 回归：urlsplit 回退分支也要检查 query 键名 ──
+
+
+def test_security_unparseable_url_still_checks_query_key_names():
+    """回退分支若只做值脱敏，``?myApiKey=`` 这类空值敏感键会在畸形 URL 下漏检，
+    而同样的值在可解析 URL 下会被拦下。"""
+    with pytest.raises(ValueError, match="凭证"):
+        validate_secret_free_options({"endpoint": "https://[::1?myApiKey="}, "Provider")
+
+
+def test_security_parseable_and_unparseable_urls_check_query_keys_equally():
+    with pytest.raises(ValueError, match="凭证"):
+        validate_secret_free_options({"endpoint": "https://host/v1?myApiKey="}, "Provider")
+
+
+def test_security_accepts_benign_unparseable_url():
+    """严格度提升不能把无害的畸形 URL 也一并拒掉。"""
+    assert validate_secret_free_options({"endpoint": "https://[::1/v1/models"}, "Provider") == {
+        "endpoint": "https://[::1/v1/models"
+    }
