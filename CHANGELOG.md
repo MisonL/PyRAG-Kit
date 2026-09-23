@@ -58,7 +58,7 @@
 
 ### 测试与文档
 
-- 新增 Provider 协议适配、SDK 能力、凭证边界、Rerank 契约与失败语义回归测试；测试总数增至 1088。新增断言经红绿验证（回退对应源码后测试变红）；其中一部分是**反向守卫**——回退源码不会变红，需要定向变异（例如「让守卫连 Ark 一起拒」）才能验证，这类断言守的是「不能过度收紧」，同样有区分度。
+- 新增 Provider 协议适配、SDK 能力、凭证边界、Rerank 契约与失败语义回归测试；测试总数增至 1119。新增断言经红绿验证（回退对应源码后测试变红）；其中一部分是**反向守卫**——回退源码不会变红，需要定向变异（例如「让守卫连 Ark 一起拒」）才能验证，这类断言守的是「不能过度收紧」，同样有区分度。
 - 修复三处测试有效性缺陷：掩码尾部可见片段的断言用 `startswith("[REDACTED]")`，而掩码前缀在任何实现下都会被替换成 `[REDACTED]`，该断言恒真——尾部片段原样泄漏时也能通过，改为全文相等；短纯字母凭证的 7 个用例里有 4 个取值 ≥12 字符，旧规则本就能命中、对被测属性零区分度，改为真正短于 12 字符的值并断言值本身被替换；掩码线性度用例用单次采样配 100ms 阈值，实测本机 p99.9 即到 100ms、满载时更高，会间歇误报，改为放大规模到线性与二次相差三个数量级、取多轮最小值。
 - 为活动快照的 embedding 兼容性检测补充回归测试：快照记录的 embedding provider 或模型名与当前运行配置不一致时必须显式失败，避免用错向量空间后静默产出错误检索结果。
 - 引入 Ruff、Bandit 与 MyPy 到开发依赖，并补齐对应配置；新增 `.github/workflows/quality.yml`，在 PR 与 `main` 推送时执行格式化检查、lint、类型检查、安全扫描与完整测试，此前这些工具只在本地手动运行。
@@ -77,6 +77,10 @@
 - 补充重排乱序路径与重排契约的回归测试：既有替身恒返回 `[0]`（恒等置换），`_rerank_if_needed` 的重排与按分数降序排序从未被执行，`_validate_rerank_output` 的布尔混入与越界 index 分支也无覆盖。
 - 修复无断言测试：`test_rerank_accepts_top_n_larger_than_document_count` 只调用 `_validate_inputs` 而无断言，即使行为变更也不会失败；现补断言并新增 `top_n` 非法值（含 `bool` 混入）的参数化用例。
 - 文档校正：`REFACTORING_PLAN.md` 标注为 v1.2.0 历史归档并修正三处与现状不符的表述（`PipelineManager` 实为 `Pipeline`、依赖应声明在 `pyproject.toml`、当时配置格式为 `config.ini`）；`README.md` 移除已退役的模型举例、修正 `/config` 可调项描述、补全 `src/` 目录树、把许可说明指向实际存在的许可证文件；`getting-started.md` 移除不存在的 `exit` 退出方式；`developer-guide.md` 补全目录树。
+- 修复 Anthropic 响应解析在字段为 `None` 时崩溃：`field()` 只在键不存在时返回默认值，而 SDK 的 `thinking`/`redacted_thinking` 块会给出 `None`，此时 `"".join(...)` 抛 `TypeError: expected str instance, NoneType found`。非流式的正文与推理拼接、流式的 `text_delta`/`thinking_delta`/`input_json_delta` 三处一并加兜底。同类拼接在 Google 与 Volcengine 已有 `isinstance` 守卫，仅 Anthropic 缺。
+- Google `tool_choice` 不再静默接受未知模式：`FunctionCallingConfigMode` 是大小写不敏感枚举，未命中时会合成一个同名成员、只发 `UserWarning`，随后被静默发往服务端；OpenAI 风格的 `{"type": "tool"}` 正会落到这里。现按已知模式显式映射，未知值报 `ValueError`，并给出可选值。`ToolConfig` 的未知键也从裸 pydantic `ValidationError` 归一为本项目的 `ValueError`。
+- Responses `json_schema` 缺 `schema` 时显式报错：此前会回退成 `schema` 本身，伪造出 `{"type": "json_schema"}` 的 schema 发给服务端，调用方以为拿到了结构化输出约束而实际没有；同时 `strict` 不再被硬编码的 `True` 覆盖调用方取值。
+- 补充流式重试助手的回归测试：`retry_sync_stream`/`retry_async_stream` 的建立阶段重试此前零覆盖，现覆盖「建立失败重试」「首事件后不再重试（避免重复输出）」「空流不算失败」「校验器只作用于首事件」「消费方提前退出时关闭迭代器」以及异步等价场景。
 
 ## [1.3.0] - 2026-03-20
 

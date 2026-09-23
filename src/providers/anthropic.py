@@ -766,11 +766,14 @@ class AnthropicProvider(LargeLanguageModel):
     @classmethod
     def _extract_result(cls, response: Any) -> CompletionResult:
         blocks = field(response, "content", []) or []
+        # ``field`` 只在键不存在时返回默认值；键存在而值为 None 时仍返回 None，
+        # 而 SDK 的部分块（如 thinking / redacted_thinking）确实会给出 None。
+        # 直接 join 会抛 ``TypeError: expected str instance, NoneType found``。
         text = "".join(
-            field(block, "text", "") for block in blocks if field(block, "type") == "text"
+            field(block, "text", "") or "" for block in blocks if field(block, "type") == "text"
         )
         reasoning = "".join(
-            field(block, "thinking", "")
+            field(block, "thinking", "") or ""
             for block in blocks
             if field(block, "type") in {"thinking", "redacted_thinking"}
         )
@@ -960,14 +963,14 @@ class AnthropicProvider(LargeLanguageModel):
             if delta_type == "text_delta":
                 return StreamEvent(
                     type="text_delta",
-                    text=field(delta, "text", ""),
+                    text=field(delta, "text", "") or "",
                     response_id=response_id,
                     raw=event,
                 )
             if delta_type == "thinking_delta":
                 return StreamEvent(
                     type="reasoning_delta",
-                    reasoning=field(delta, "thinking", ""),
+                    reasoning=field(delta, "thinking", "") or "",
                     response_id=response_id,
                     raw=event,
                 )
@@ -984,7 +987,7 @@ class AnthropicProvider(LargeLanguageModel):
                     type="tool_call_delta",
                     tool_call={
                         "index": field(event, "index"),
-                        "arguments": field(delta, "partial_json", ""),
+                        "arguments": field(delta, "partial_json", "") or "",
                     },
                     response_id=response_id,
                     raw=event,

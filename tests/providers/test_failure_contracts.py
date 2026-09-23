@@ -10,6 +10,9 @@ from src.providers.__base__.model_provider import (
     CompletionRequest,
     LargeLanguageModel,
     iterate_async,
+    raise_for_stream_error_event,
+    retry_async_stream,
+    retry_sync_stream,
 )
 from src.providers.anthropic import AnthropicProvider
 from src.providers.factory import ModelProviderFactory
@@ -290,3 +293,185 @@ def test_responses_error_path_reports_status_without_message(status):
 def test_responses_error_path_passes_through_when_not_terminal_failure(status):
     """非失败状态不是错误，不得抛异常。"""
     assert OpenAICompatibleProvider._raise_for_response_error({"status": status}) is None
+
+
+# ── 流式重试助手：只重试「首事件之前」的建立阶段 ──
+# 这段逻辑是生产流式路径的重试入口，此前完全没有覆盖。
+
+
+def test_retry_sync_stream_retries_establishment_failure():
+    """建立阶段抛错应重试，且只重试一次即可成功。"""
+    calls = []
+
+    def factory():
+        calls.append(1)
+        if len(calls) == 1:
+            raise ConnectionError("建立失败")
+        return iter(["a", "b"])
+
+    assert list(retry_sync_stream(factory)) == ["a", "b"]
+    assert len(calls) == 2
+
+
+def test_retry_sync_stream_does_not_retry_after_first_event():
+    """首事件已产出后不得重试，否则会重复已输出的内容。"""
+    calls = []
+
+    def factory():
+        calls.append(1)
+
+        def gen():
+            yield "first"
+            raise ConnectionError("消费阶段失败")
+
+        return gen()
+
+    with pytest.raises(ConnectionError):
+        for _ in retry_sync_stream(factory):
+            pass
+
+    assert len(calls) == 1
+
+
+def test_retry_sync_stream_first_event_validator_sees_first_event():
+    """首事件必须先过校验器，且校验通过后原样产出。"""
+    seen = []
+
+    def validate(event):
+        seen.append(event)
+
+    assert list(retry_sync_stream(lambda: iter([{"ok": 1}, {"ok": 2}]), validate)) == [
+        {"ok": 1},
+        {"ok": 2},
+    ]
+    assert seen == [{"ok": 1}]
+
+
+def test_retry_sync_stream_retries_when_first_event_validator_raises_retryable():
+    """首事件是 5xx/429 错误事件时，重试发生在消费之前，不会重复输出内容。"""
+    calls = []
+
+    def factory():
+        calls.append(1)
+        if len(calls) == 1:
+            return iter([{"type": "error", "error": {"message": "overloaded", "status_code": 503}}])
+        return iter([{"ok": 1}])
+
+    def validate(event):
+        raise_for_stream_error_event(event, "Test")
+
+    assert list(retry_sync_stream(factory, validate)) == [{"ok": 1}]
+    assert len(calls) == 2
+
+
+def test_retry_sync_stream_does_not_retry_non_retryable_validator_error():
+    """校验器抛不可重试错误（如参数错误）时不得重试。"""
+    calls = []
+
+    def factory():
+        calls.append(1)
+        return iter([{"bad": True}])
+
+    def validate(event):
+        raise ValueError("不可重试")
+
+    with pytest.raises(ValueError, match="不可重试"):
+        list(retry_sync_stream(factory, validate))
+
+    assert len(calls) == 1
+
+
+def test_retry_sync_stream_empty_stream_is_not_an_error():
+    """空流不是失败，不得重试也不得抛错。"""
+    calls = []
+
+    def factory():
+        calls.append(1)
+        return iter([])
+
+    assert list(retry_sync_stream(factory)) == []
+    assert len(calls) == 1
+
+
+def test_retry_sync_stream_closes_iterator_on_consumer_abort():
+    """消费方提前退出时须关闭底层迭代器，避免连接泄漏。"""
+    closed = []
+
+    class ClosingIterator:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return "item"
+
+        def close(self):
+            closed.append(True)
+
+    assert next(iter(retry_sync_stream(lambda: ClosingIterator()))) == "item"
+
+    assert closed == [True]
+
+
+def test_retry_async_stream_retries_establishment_failure():
+    calls = []
+
+    async def factory():
+        calls.append(1)
+        if len(calls) == 1:
+            raise ConnectionError("建立失败")
+
+        async def gen():
+            yield "a"
+            yield "b"
+
+        return gen()
+
+    async def collect():
+        return [item async for item in retry_async_stream(factory)]
+
+    assert asyncio.run(collect()) == ["a", "b"]
+    assert len(calls) == 2
+
+
+def test_retry_async_stream_does_not_retry_after_first_event():
+    calls = []
+
+    async def factory():
+        calls.append(1)
+
+        async def gen():
+            yield "first"
+            raise ConnectionError("消费阶段失败")
+
+        return gen()
+
+    async def consume():
+        async for _ in retry_async_stream(factory):
+            pass
+
+    with pytest.raises(ConnectionError):
+        asyncio.run(consume())
+
+    assert len(calls) == 1
+
+
+def test_retry_async_stream_closes_iterator_on_consumer_abort():
+    closed = []
+
+    class ClosingAsyncIterator:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            return "item"
+
+        async def aclose(self):
+            closed.append(True)
+
+    async def consume_one():
+        async for _ in retry_async_stream(lambda: ClosingAsyncIterator()):
+            return
+
+    asyncio.run(consume_one())
+
+    assert closed == [True]

@@ -1159,7 +1159,12 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         if tool_choice is None:
             return None
         if isinstance(tool_choice, dict) and "function_calling_config" in tool_choice:
-            return types.ToolConfig(**tool_choice)
+            # 直传 SDK 会让未知键冒泡为 pydantic ValidationError，调用方拿到的
+            # 是与本项目其它配置错误不一致的异常类型；这里显式归一。
+            try:
+                return types.ToolConfig(**tool_choice)
+            except Exception as exc:  # pydantic ValidationError
+                raise ValueError(f"Google tool_choice 无效: {exc}") from exc
         if isinstance(tool_choice, dict):
             if tool_choice.get("type") == "function":
                 function = tool_choice.get("function", {})
@@ -1176,9 +1181,17 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                 )
             tool_choice = tool_choice.get("type", tool_choice.get("mode", "AUTO"))
         if isinstance(tool_choice, str):
-            mode = {"auto": "AUTO", "required": "ANY", "any": "ANY", "none": "NONE"}.get(
-                tool_choice.lower(), tool_choice.upper()
-            )
+            # ``FunctionCallingConfigMode`` 是大小写不敏感枚举，但未命中时
+            # 会合成一个同名字符串枚举成员并只发 UserWarning，随后被静默发往
+            # 服务端。OpenAI 风格的 ``{"type": "tool"}`` 正会落到这里，因此
+            # 必须先按已知模式映射，未知值显式报错。
+            normalized = tool_choice.strip().lower()
+            mode = {"auto": "AUTO", "required": "ANY", "any": "ANY", "none": "NONE"}.get(normalized)
+            if mode is None:
+                raise ValueError(
+                    f"Google tool_choice 不支持的模式: {tool_choice!r}；"
+                    "可选值: auto、required、any、none，或 {'type': 'function', ...}。"
+                )
             return types.ToolConfig(
                 function_calling_config=types.FunctionCallingConfig(
                     mode=types.FunctionCallingConfigMode(mode)

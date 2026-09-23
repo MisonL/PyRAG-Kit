@@ -3096,3 +3096,143 @@ def test_deepseek_chat_uses_max_tokens_for_explicit_and_configured_limits():
     request = provider._build_chat_request(prompt="hi", stream=False)
     assert request["max_tokens"] == 256
     assert "max_completion_tokens" not in request
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        [SimpleNamespace(type="text", text=None)],
+        [SimpleNamespace(type="thinking", thinking=None)],
+        [
+            SimpleNamespace(type="thinking", thinking=None),
+            SimpleNamespace(type="text", text=None),
+        ],
+        [SimpleNamespace(type="redacted_thinking", thinking=None)],
+    ],
+)
+def test_anthropic_extract_result_tolerates_null_block_fields(content):
+    """块字段存在但值为 None 时不得崩。
+
+    ``field()`` 只在键不存在时返回默认值；键存在而值为 None 时仍返回 None，
+    直接 ``"".join(...)`` 会抛 ``TypeError: expected str instance``。
+    SDK 的 thinking / redacted_thinking 块确实会给出 None。
+    """
+    result = AnthropicProvider._extract_result(SimpleNamespace(content=content, usage=None))
+
+    assert isinstance(result.text, str)
+    assert isinstance(result.reasoning, str)
+
+
+def test_anthropic_extract_result_preserves_real_text():
+    """守卫不能把正常内容一起吞掉。"""
+    result = AnthropicProvider._extract_result(
+        SimpleNamespace(
+            content=[
+                SimpleNamespace(type="thinking", thinking="推理"),
+                SimpleNamespace(type="text", text="正文"),
+            ],
+            usage=None,
+        )
+    )
+
+    assert result.text == "正文"
+    assert result.reasoning == "推理"
+
+
+@pytest.mark.parametrize(
+    ("delta", "expected_type", "expected_value"),
+    [
+        (SimpleNamespace(type="text_delta", text=None), "text_delta", "text"),
+        (SimpleNamespace(type="thinking_delta", thinking=None), "reasoning_delta", "reasoning"),
+        (
+            SimpleNamespace(type="input_json_delta", partial_json=None),
+            "tool_call_delta",
+            "tool_call",
+        ),
+    ],
+)
+def test_anthropic_stream_delta_tolerates_null_fields(delta, expected_type, expected_value):
+    """流式 delta 的同一处缺陷：None 会让事件构造出非字符串或直接崩。"""
+    event = AnthropicProvider._stream_event(
+        SimpleNamespace(type="content_block_delta", index=0, delta=delta), "resp-1"
+    )
+
+    assert event.type == expected_type
+    value = getattr(event, expected_value)
+    if expected_value == "tool_call":
+        assert value["arguments"] == ""
+    else:
+        assert value == ""
+
+
+@pytest.mark.parametrize("tool_choice", [{"type": "tool"}, {"type": "TOOL"}, {"mode": "bogus"}])
+def test_google_tool_choice_rejects_unknown_mode_instead_of_silent_enum(tool_choice):
+    """未知模式必须显式报错。
+
+    ``FunctionCallingConfigMode`` 是大小写不敏感枚举，未命中时会合成一个同名
+    字符串枚举成员、只发 UserWarning，随后被静默发往服务端。OpenAI 风格的
+    ``{"type": "tool"}`` 正会落到这里。
+    """
+    with pytest.raises(ValueError, match="tool_choice"):
+        GoogleProvider._convert_tool_choice(tool_choice)
+
+
+@pytest.mark.parametrize(
+    ("tool_choice", "expected"),
+    [("auto", "AUTO"), ("required", "ANY"), ("any", "ANY"), ("ANY", "ANY"), ("none", "NONE")],
+)
+def test_google_tool_choice_maps_known_modes(tool_choice, expected):
+    """已知模式仍须正常映射，收紧不能把合法输入一起拒掉。"""
+    config = GoogleProvider._convert_tool_choice(tool_choice)
+
+    assert config.function_calling_config.mode.name == expected
+
+
+def test_google_tool_choice_normalizes_tool_config_errors():
+    """未知键应归一为本项目的 ValueError，而不是裸的 pydantic ValidationError。"""
+    with pytest.raises(ValueError, match="tool_choice 无效"):
+        GoogleProvider._convert_tool_choice(
+            {"function_calling_config": {"mode": "AUTO"}, "bogus": 1}
+        )
+
+
+@pytest.mark.parametrize(
+    "response_format",
+    [{"type": "json_schema"}, {"type": "json_schema", "json_schema": {"name": "r"}}],
+)
+def test_responses_json_schema_requires_schema(response_format):
+    """缺 schema 不能回退成 schema 本身。
+
+    那样会伪造出 ``{"type": "json_schema"}`` 的 schema 发给服务端，客户端以为
+    拿到了结构化输出约束，实际没有。
+    """
+    with pytest.raises(ValueError, match="缺少 schema"):
+        OpenAICompatibleProvider._convert_responses_format(response_format)
+
+
+def test_responses_json_schema_preserves_caller_strict():
+    """strict 必须透传，不能被硬编码的 True 覆盖。"""
+    converted = OpenAICompatibleProvider._convert_responses_format(
+        {
+            "type": "json_schema",
+            "json_schema": {"name": "out", "schema": {"type": "object"}, "strict": False},
+        }
+    )
+
+    assert converted["format"]["strict"] is False
+    assert converted["format"]["name"] == "out"
+    assert converted["format"]["schema"] == {"type": "object"}
+
+
+def test_responses_json_schema_accepts_flat_shape():
+    """扁平形态（schema/strict 与 type 同级）仍须支持。"""
+    converted = OpenAICompatibleProvider._convert_responses_format(
+        {"type": "json_schema", "name": "flat", "schema": {"type": "object"}}
+    )
+
+    assert converted["format"] == {
+        "type": "json_schema",
+        "name": "flat",
+        "schema": {"type": "object"},
+        "strict": True,
+    }

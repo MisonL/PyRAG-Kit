@@ -1464,15 +1464,23 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     def _convert_responses_format(response_format: dict[str, Any]) -> dict[str, Any]:
         if response_format.get("type") == "json_schema":
             schema = response_format.get("json_schema", response_format)
-            json_schema = schema.get("schema", {}) if isinstance(schema, Mapping) else {}
+            if not isinstance(schema, Mapping):
+                raise ValueError("Responses json_schema 必须是对象。")
+            # 无 schema 时不能回退成 ``schema`` 本身：那会伪造出一个
+            # ``{"type": "json_schema"}`` 的 schema 发给服务端，客户端以为
+            # 拿到了结构化输出约束，实际没有。缺 schema 属调用方错误。
+            json_schema = schema.get("schema")
+            if not isinstance(json_schema, Mapping) or not json_schema:
+                raise ValueError(
+                    "Responses json_schema 缺少 schema 字段；"
+                    "请提供 {'type': 'json_schema', 'json_schema': {'name': ..., 'schema': {...}}}。"
+                )
             return {
                 "format": {
                     "type": "json_schema",
-                    "name": schema.get("name", "response")
-                    if isinstance(schema, Mapping)
-                    else "response",
-                    "schema": json_schema or response_format.get("schema", schema),
-                    "strict": schema.get("strict", True) if isinstance(schema, Mapping) else True,
+                    "name": schema.get("name", "response"),
+                    "schema": json_schema,
+                    "strict": schema.get("strict", True),
                 }
             }
         if response_format.get("type") == "json_object":
