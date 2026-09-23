@@ -12,7 +12,9 @@ PyRAG-Kit 采用了清晰、模块化的项目结构，旨在实现高内聚、�
 │   ├── chat/            # 聊天核心逻辑 (core.py)
 │   ├── etl/             # 数据处理流水线 (提取、清洗、分割)
 │   ├── providers/       # 所有模型提供商的实现
-│   ├── retrieval/       # 检索逻辑 (retriever.py, vdb/)
+│   ├── models/          # 领域模型 (document.py)
+│   ├── retrieval/       # 检索逻辑 (retriever.py, vdb/, snapshot_repository.py)
+│   ├── retrieval_test/  # 召回测试入口与 Excel 记录
 │   ├── runtime/         # 运行期配置对象与快照契约
 │   ├── services/        # 应用服务层 (构建、检索、聊天)
 │   ├── ui/              # 用户界面 (config_menu.py, display_utils.py)

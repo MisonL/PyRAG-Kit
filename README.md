@@ -27,11 +27,11 @@
 ## ✨ 核心能力
 
 - **🏗️ 异步 RAG 架构**: 基于 `asyncio` 构建的非阻塞检索流水线，支持高并发处理与流式响应输出。
-- **🔌 模块化扩展 (`ProviderFactory`)**: 无缝集成 Google Gemini (采用最新 `google-genai` SDK)、OpenAI GPT-4o、Anthropic Claude 3.5、DeepSeek 以及国产闭源/开源模型（豆包、通义千问等）。
+- **🔌 模块化扩展 (`ProviderFactory`)**: 无缝集成 Google Gemini (采用最新 `google-genai` SDK)、OpenAI、Anthropic Claude、DeepSeek 以及国产闭源/开源模型（豆包、通义千问等）。示例配置见 [`config.toml.example`](./config.toml.example)。
 - **🚀 混合检索策略 (Hybrid Search)**: 深度复现 Dify 混合检索逻辑，支持语义向量检索、全文检索（BM25）及其加权分值融合。
 - **🎯 语义精排 (Rerank)**: 支持集成 Jina AI、SiliconFlow 等 Rerank 模型，对海量召回结果进行二次精排，解决 RAG 系统中的“召回精度不足”问题。
 - **🧱 本地可复现默认链路**: 默认使用 `local-hash` 嵌入模型，本地无需额外 Embedding API 即可完成知识库构建、召回测试和聊天验证。
-- **⚙️ 交互式配置控制**: 通过 `/config` 命令在运行时动态调整全局参数，包括检索 Top-K、权重配比及重试策略。
+- **⚙️ 交互式配置控制**: 通过 `/config` 命令在运行时动态调整全局参数，包括检索模式、Top-K、Rerank 开关、混合权重、融合策略与候选倍率，并可切换当前 LLM / Rerank 模型。
 - **🧪 架构级验证工具**: 内置 `AGENTS.md` 指导原则与全面的 `pytest` 测试套件，确保每一行核心逻辑的可重复性验证。
 
 说明：
@@ -47,11 +47,15 @@
 ├── src/
 │   ├── chat/           # 会话控制中心：响应流管理与 RAG 循环逻辑
 │   ├── providers/      # 供应商适配层：标准化 SDK 调用与异常隔离
-│   ├── retrieval/      # 检索引擎：向量存储与混合搜索算法
+│   ├── retrieval/      # 检索引擎：向量存储、快照与混合搜索算法
+│   ├── retrieval_test/ # 召回测试入口与 Excel 记录
 │   ├── etl/            # 数据管道：文档结构化、清洗与分块向量化
+│   ├── models/         # 领域模型：文档与元数据
+│   ├── runtime/        # 运行期契约：配置对象与快照清单
+│   ├── services/       # 应用服务层：知识库构建、检索、聊天
 │   ├── ui/             # 交互界面：动态配置菜单与 Rich 渲染
 │   └── utils/          # 基础设施：强类型配置 (Pydantic) 与日志系统
-├── scripts/            # 工具脚本：大规模知识库离线构建
+├── scripts/            # 工具脚本：知识库构建、发布打包与说明提取
 ├── tests/              # 验证矩阵：覆盖核心组件的单元测试
 └── data/               # 持久化层：向量索引文件与审计日志
 ```
@@ -150,7 +154,7 @@ uv run python scripts/build_binary_release.py --target macos-x64 --validate
 - [用户指南](./docs/user_guide/introduction.md)
 - [核心概念](./docs/user_guide/core-concepts.md)
 - [开发者指南](./docs/developer_docs/developer-guide.md)
-- [重构路线图](./docs/developer_docs/REFACTORING_PLAN.md)
+- [重构路线图（v1.2.0 历史归档）](./docs/developer_docs/REFACTORING_PLAN.md)
 
 ---
 
@@ -161,7 +165,7 @@ uv run python scripts/build_binary_release.py --target macos-x64 --validate
 - **Dify 移植板块**: 本项目在 `src/etl/` 和 `src/retrieval/` 等目录中使用了 Dify 核心代码。这些部分遵循 [Dify Modified Apache License 2.0](DIFY_LICENSE)。禁止通过此部分代码构建多租户商业服务，且必须保留原始作者版权。
 - **项目框架层**: 本项目自身的工程化架构、Provider 适配层及测试链路采用 [MIT 许可证](LICENSE)。
 
-详细移植列表与版权说明请参阅 [`AGENTS.md`](AGENTS.md)。
+许可证全文见 [`DIFY_LICENSE`](DIFY_LICENSE) 与 [`licenses/APACHE-2.0.txt`](licenses/APACHE-2.0.txt)；移植与合规约定见 [`AGENTS.md`](AGENTS.md)。
 
 ---
 <div align="center">

@@ -30,6 +30,7 @@ uv run python scripts/build_binary_release.py --target macos-arm64 --validate
 开发依赖包含 Ruff、Bandit 和 MyPy。提交前可运行：
 
 ```bash
+uv run ruff format --check main.py src scripts tests
 uv run ruff check main.py src scripts tests
 uv run bandit -r main.py src scripts -ll
 uv run mypy --cache-dir /tmp/pyrag-kit-mypy main.py src
@@ -40,9 +41,11 @@ git diff --check
 
 MyPy 使用任务专用缓存目录，避免多个进程共享 `.mypy_cache` 造成锁等待；优先修复本次改动引入的问题，并记录未覆盖的历史基线告警。
 
+以上检查由 `.github/workflows/quality.yml` 在每次 PR 与 `main` 推送时执行；本地通过后再提交，避免 CI 往返。
+
 ## Coding Style & Naming Conventions
 
-使用 4 个空格缩进、明确的公开函数类型标注和简短客观的 docstring。函数、变量和模块使用 `snake_case`，类使用 `PascalCase`，常量使用 `UPPER_CASE`。项目使用 Ruff 做 lint 检查，未配置独立 formatter；修改时遵循相邻代码风格并运行 `git diff --check`。保持服务、provider、检索和快照边界，不用静默回退或占位结果掩盖失败。
+使用 4 个空格缩进、明确的公开函数类型标注和简短客观的 docstring。函数、变量和模块使用 `snake_case`，类使用 `PascalCase`，常量使用 `UPPER_CASE`。项目使用 Ruff 同时做 lint 与格式化，配置见 `pyproject.toml` 的 `[tool.ruff]`（行宽 100、双引号、4 空格）；提交前运行 `uv run ruff format main.py src scripts tests`，不要手工对齐或调整引号。保持服务、provider、检索和快照边界，不用静默回退或占位结果掩盖失败。
 
 ## Testing Guidelines
 

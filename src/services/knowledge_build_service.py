@@ -34,13 +34,17 @@ class KnowledgeBuildService:
     async def build(self, splitter_structure_mode: str) -> dict[str, object]:
         markdown_files = sorted(self.run_config.knowledge_base_path.glob("*.md"))
         if not markdown_files:
-            raise FileNotFoundError(f"知识库目录 '{self.run_config.knowledge_base_path}' 中未找到 Markdown 文件。")
+            raise FileNotFoundError(
+                f"知识库目录 '{self.run_config.knowledge_base_path}' 中未找到 Markdown 文件。"
+            )
 
         snapshot_id = self.snapshot_repository.generate_snapshot_id()
         temp_dir = self.snapshot_repository.create_temp_snapshot_dir(snapshot_id)
         finalized = False
         try:
-            pipeline = Pipeline.from_file_path(markdown_files[0], splitter_structure_mode=splitter_structure_mode)
+            pipeline = Pipeline.from_file_path(
+                markdown_files[0], splitter_structure_mode=splitter_structure_mode
+            )
 
             chunk_count = 0
             pending_documents: list[dict[str, Any]] = []
@@ -48,7 +52,9 @@ class KnowledgeBuildService:
             pending_parent_documents: dict[str, dict[str, Any]] = {}
             for file_path in markdown_files:
                 chunks = self._process_file(pipeline, file_path)
-                if splitter_structure_mode == "hierarchical" and hasattr(pipeline.splitter, "parent_documents"):
+                if splitter_structure_mode == "hierarchical" and hasattr(
+                    pipeline.splitter, "parent_documents"
+                ):
                     parent_documents = getattr(pipeline.splitter, "parent_documents", {})
                     if isinstance(parent_documents, dict):
                         pending_parent_documents.update(parent_documents)

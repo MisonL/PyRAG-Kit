@@ -1,6 +1,18 @@
 # PyRAG-Kit 重构与演进路线图
 
-> **注意**: 本文档记录了项目从早期版本 (v1.0.0) 演进至现代化架构 (v1.2.0) 的核心重构计划与思考过程。
+> **历史归档（2025-07-03 定稿，不再维护）**：本文档记录 v1.0.0 → v1.2.0 的重构蓝图与
+> 已完成的实施过程，不含任何未结任务。当前架构与用法请见 [开发者指南](./developer-guide.md)
+> 与 [CHANGELOG](../../CHANGELOG.md)（当前版本 1.4.0）。
+>
+> 阅读时注意三处已过时的表述：
+> 1. 文中的 `PipelineManager` 已重命名为 `Pipeline`（`src/etl/pipeline.py`），
+>    调用方是 `src/services/knowledge_build_service.py`，而非 `main.py`。
+> 2. 依赖已在 `pyproject.toml` 声明、由 `uv` 管理；`requirements.txt` 是
+>    `uv export --locked` 的生成产物，不应手工编辑。
+> 3. 配置格式当时为 `config.ini`，现已迁移到 `config.toml`。
+>
+> `src/etl/`、`src/retrieval/` 为 Dify 衍生代码，遵循
+> [DIFY_LICENSE](../../DIFY_LICENSE) 并保留上游版权声明。
 
 ## 1. 愿景与目标
 
@@ -64,8 +76,9 @@ graph TD
 
 *   **目标**: 统一并强化配置管理，为后续的工厂模式提供更可靠的配置源。
 *   **核心任务**:
-    1.  **引入 Pydantic**: 在`requirements.txt`中添加`pydantic`。
-    2.  **创建配置模型**: 在`src/utils/config.py`中，使用Pydantic模型来定义强类型的配置结构，替代现有的 `config.toml` 分散读取方式。
+    1.  **引入 Pydantic**: 声明 `pydantic` 依赖（当时记录为编辑 `requirements.txt`；
+       该文件现为 `uv export` 生成产物，依赖应改在 `pyproject.toml` 中声明）。
+    2.  **创建配置模型**: 在`src/utils/config.py`中，使用Pydantic模型来定义强类型的配置结构，替代当时分散读取的 `config.ini`。
     3.  **提供全局配置实例**: 提供一个全局可访问的、经过验证的配置对象。
 
 #### 第二阶段：向量存储系统解耦 (实施重构支柱二)
@@ -84,8 +97,8 @@ graph TD
     1.  **创建ETL模块**: 在`src/`下创建`etl/`目录，用于存放所有数据处理逻辑。
     2.  **定义处理器基类**: 在`etl/`下创建`extractors`, `cleaners`, `splitters`子目录，并为每种处理器定义抽象基类。
     3.  **实现具体处理器**: 提供针对Markdown的抽取器、基础的文本清洗器和递归文本分割器的具体实现。
-    4.  **创建流水线管理器**: 在`etl/pipeline.py`中创建一个`PipelineManager`，它可以根据文件类型和配置，动态地组合这些处理器来处理文档。
-    5.  **整合**: 改造`main.py`中的向量化选项，使其调用`PipelineManager`来执行处理。
+    4.  **创建流水线管理器**: 在`etl/pipeline.py`中创建一个流水线管理器（当时记作 `PipelineManager`，实际落地为 `Pipeline`），它可以根据文件类型和配置，动态地组合这些处理器来处理文档。
+    5.  **整合**: 由 `main.py` 经服务层调用该流水线执行处理（实际路径：`main.py` → `src/services/knowledge_build_service.py` → `Pipeline.from_file_path`）。
 
 #### 第四阶段：提升健壮性与开发者体验 (DX)
 

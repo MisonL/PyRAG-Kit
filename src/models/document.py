@@ -12,6 +12,7 @@ class Document(BaseModel):
     表示一个文档块的Pydantic模型。
     用于在ETL流水线和检索过程中传递文本内容及其相关元数据。
     """
+
     content: str
     metadata: dict[str, Any] = Field(default_factory=dict)
 

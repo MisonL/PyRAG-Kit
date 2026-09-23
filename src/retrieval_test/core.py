@@ -27,7 +27,9 @@ logger = get_module_logger(__name__)
 
 def display_results(query: str, documents: list[dict]):
     if not documents:
-        console.print(Panel(f"对查询 “[bold yellow]{query}[/bold yellow]” 无结果。", border_style="red"))
+        console.print(
+            Panel(f"对查询 “[bold yellow]{query}[/bold yellow]” 无结果。", border_style="red")
+        )
         return
 
     table = Table(title=f"“{query}” 召回测试", show_header=True)
@@ -42,7 +44,6 @@ def display_results(query: str, documents: list[dict]):
         score = doc.get("score", 0.0)
         table.add_row(str(index + 1), content, source, f"{score:.4f}")
     console.print(table)
-
 
 
 async def _aclose_quietly(service: Any) -> None:
@@ -80,14 +81,18 @@ async def run_retrieval_test_async():
     try:
         while True:
             try:
-                query = await session.prompt_async(HTML('<deepskyblue><b>测试查询: </b></deepskyblue>'))
+                query = await session.prompt_async(
+                    HTML("<deepskyblue><b>测试查询: </b></deepskyblue>")
+                )
                 if query.lower() == "/quit":
                     break
                 if not query:
                     continue
 
                 with console.status("[bold green]正在异步检索...[/bold green]"):
-                    documents = await retrieval_service.retrieve(query, session_config, console=console)
+                    documents = await retrieval_service.retrieve(
+                        query, session_config, console=console
+                    )
                 display_results(query, documents)
                 if excel_logger:
                     excel_logger.log_results(query, documents)

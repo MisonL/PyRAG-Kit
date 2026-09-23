@@ -1,13 +1,20 @@
 from __future__ import annotations
 
-from collections.abc import Iterator, MutableMapping
+import math
+from collections.abc import Callable, Iterator, MutableMapping
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
-from src.utils.config import ModelDetail, RetrievalMethod, Settings
+from src.utils.config import (
+    _MAX_RETRIEVAL_MULTIPLIER,
+    _MAX_RETRIEVAL_TOP_K,
+    ModelDetail,
+    RetrievalMethod,
+    Settings,
+)
 
 SCHEMA_VERSION = "2"
 
@@ -69,11 +76,99 @@ class SessionConfig(MutableMapping[str, Any]):
         self.rerank_configurations = rerank_configurations
         self.chat_temperature = chat_temperature
 
+    # 可经 ``__setitem__`` 写入的字段及其校验器。``__init__`` 信任调用方
+    # （``build_session_config`` 从已校验的 ``Settings`` 取值，合法），
+    # 但 UI 与库调用方走 ``__setitem__``，必须逐字段校验。
+    #
+    # 这里不是重复 `Settings` 的工作：`Settings` 只在启动时校验一次，而
+    # `SessionConfig` 是运行期可变的独立入口。修 `top_k` 上界之前实测
+    # `chat_config["top_k"] = 10**9` 能一路走到 `faiss_index.search()`，
+    # FAISS 既不报错也不截断，按 10 亿条分配。注册表在类体外填充（类体内直接
+    # 引用 `cls._validate_x` 会在定义期拿不到绑定方法）。
+    _VALIDATORS: ClassVar[dict[str, Callable[[Any], Any]]] = {}
+
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)
 
     def __setitem__(self, key: str, value: Any) -> None:
-        setattr(self, key, value)
+        if key not in self.to_dict():
+            raise KeyError(f"SessionConfig 没有字段 {key!r}。")
+        validator = self._VALIDATORS.get(key)
+        setattr(self, key, validator(value) if validator is not None else value)
+
+    @staticmethod
+    def _require_bounded_int(value: Any, label: str, upper: int) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{label} 必须是整数，但得到 {value!r}。")
+        if not 1 <= value <= upper:
+            raise ValueError(f"{label} 必须是 1 到 {upper} 之间的整数，但得到 {value}。")
+        return value
+
+    @classmethod
+    def _validate_top_k(cls, value: Any) -> int:
+        return cls._require_bounded_int(value, "top_k", _MAX_RETRIEVAL_TOP_K)
+
+    @classmethod
+    def _validate_candidate_multiplier(cls, value: Any) -> int:
+        return cls._require_bounded_int(
+            value, "retrieval_candidate_multiplier", _MAX_RETRIEVAL_MULTIPLIER
+        )
+
+    @staticmethod
+    def _validate_unit_weight(value: Any, label: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{label} 必须是数值，但得到 {value!r}。")
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError(f"{label} 必须是有限数值，但得到 {value!r}。")
+        if not 0.0 <= number <= 1.0:
+            raise ValueError(f"{label} 必须在 0.0 到 1.0 之间，但得到 {value!r}。")
+        return number
+
+    @classmethod
+    def _validate_vector_weight(cls, value: Any) -> float:
+        return cls._validate_unit_weight(value, "vector_weight")
+
+    @classmethod
+    def _validate_keyword_weight(cls, value: Any) -> float:
+        return cls._validate_unit_weight(value, "keyword_weight")
+
+    @classmethod
+    def _validate_score_threshold(cls, value: Any) -> float:
+        return cls._validate_unit_weight(value, "score_threshold")
+
+    @classmethod
+    def _validate_retrieval_method(cls, value: Any) -> RetrievalMethod:
+        if isinstance(value, RetrievalMethod):
+            return value
+        try:
+            return RetrievalMethod(value)
+        except ValueError as exc:
+            allowed = ", ".join(member.value for member in RetrievalMethod)
+            raise ValueError(f"retrieval_method 必须是 {allowed} 之一，但得到 {value!r}。") from exc
+
+    @staticmethod
+    def _validate_fusion_strategy(value: Any) -> str:
+        if value not in {"rrf", "weighted"}:
+            raise ValueError(
+                f"hybrid_fusion_strategy 必须是 'rrf' 或 'weighted'，但得到 {value!r}。"
+            )
+        return str(value)
+
+    @staticmethod
+    def _validate_rerank_enabled(value: Any) -> bool:
+        if not isinstance(value, bool):
+            raise ValueError(f"rerank_enabled 必须是布尔值，但得到 {value!r}。")
+        return value
+
+    @staticmethod
+    def _validate_chat_temperature(value: Any) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"chat_temperature 必须是数值，但得到 {value!r}。")
+        number = float(value)
+        if not math.isfinite(number) or number < 0.0:
+            raise ValueError(f"chat_temperature 必须是非负有限数值，但得到 {value!r}。")
+        return number
 
     def __delitem__(self, key: str) -> None:
         raise TypeError("SessionConfig 不支持删除字段。")
@@ -100,6 +195,21 @@ class SessionConfig(MutableMapping[str, Any]):
             "rerank_configurations": self.rerank_configurations,
             "chat_temperature": self.chat_temperature,
         }
+
+
+# 每个可经 ``__setitem__`` 写入的字段都要在这里登记；未登记的字段（模型配置字典
+# 等）按原样写入，由使用方负责其内部结构。
+SessionConfig._VALIDATORS = {
+    "retrieval_method": SessionConfig._validate_retrieval_method,
+    "vector_weight": SessionConfig._validate_vector_weight,
+    "keyword_weight": SessionConfig._validate_keyword_weight,
+    "hybrid_fusion_strategy": SessionConfig._validate_fusion_strategy,
+    "retrieval_candidate_multiplier": SessionConfig._validate_candidate_multiplier,
+    "rerank_enabled": SessionConfig._validate_rerank_enabled,
+    "top_k": SessionConfig._validate_top_k,
+    "score_threshold": SessionConfig._validate_score_threshold,
+    "chat_temperature": SessionConfig._validate_chat_temperature,
+}
 
 
 @dataclass(frozen=True)

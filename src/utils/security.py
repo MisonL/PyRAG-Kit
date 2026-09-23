@@ -1,9 +1,11 @@
 """配置、请求和日志边界的安全校验工具。"""
 
 import copy
+import os
 import re
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from itertools import pairwise
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
@@ -90,7 +92,10 @@ _RESOURCE_EXTENSION_KEYS = frozenset({"extraheaders", "extraquery", "extrabody"}
 # subject to credential scanning.
 _SAFE_RESOURCE_PARAMETER_CONTAINERS = frozenset({"query", "params"})
 
-_BEARER_TEXT_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
+# 用「非 ASCII 字母数字」而不是 ``\b`` 作边界：中文属 ``\w``，``\b`` 在
+# ``密钥sk-...`` 两侧都不成立，而国产网关（SiliconFlow、Ark、DashScope）的
+# 错误消息正是中文，密钥会整串落进日志。
+_BEARER_TEXT_RE = re.compile(r"(?i)(?<![A-Za-z0-9])bearer\s+[A-Za-z0-9._~+/=-]+")
 # A punctuation separator is unambiguous.  Whitespace-only forms are useful
 # for redacting messages such as ``token sk-...``, but treating every following
 # word as a credential causes ordinary text (``token usage``) to be rejected by
@@ -145,34 +150,176 @@ _TEXT_CREDENTIAL_KEYS = (
 )
 _TEXT_CREDENTIAL_KEY_PATTERN = "|".join(_TEXT_CREDENTIAL_KEYS)
 
-_KEY_VALUE_TEXT_RE = re.compile(
-    r"(?i)(?<![A-Za-z0-9])(" + _TEXT_CREDENTIAL_KEY_PATTERN + r")[\"']?"
-    r'''(\s*[:=]\s*|\s+(?=["']|'''
-    r'''(?=[A-Za-z0-9._~+/=-]{12,}(?:[\s,;}']|$))[A-Za-z0-9._~+/=-]*[0-9._~+/=-]))'''
-    r'''(?:"[^"]*"|'[^']*'|[^\s,;}']+)'''
+# 键名前的界断言。这里必须比 ``\b`` 宽、比「任意位置」窄：
+#
+# - 不要 ``(?<![A-Za-z0-9])``：``is_sensitive_option_key`` 按 camelCase 边界
+#   切词，``dbPassword``/``myApiKey``/``userToken`` 都判为敏感；要求键名前是
+#   非字母数字，这些键名会在日志里明文输出。
+# - 也不能完全不要断言：那样 ``oauth``、``topsecret``、``sessiontoken`` 会从
+#   词中间匹配到 ``auth``/``secret``/``token``，而配置边界判它们是**非敏感**
+#   （切词后是单个词，不命中）。因 find_sensitive_option_paths 用
+#   「值是否被改写」判断值里有没有凭证，这会误拒合法配置。
+#
+# 因此界断言取「非字母数字**或** camelCase 边界」：
+# ``dbPassword`` 的 ``Password`` 前是小写字母接大写，属驼峰边界，命中；
+# ``topsecret`` 里的 ``secret`` 前是小写字母接小写，不是边界，不命中——
+# 与 ``is_sensitive_option_key`` 的切词口径一致。
+#
+# 注意断言必须保持大小写敏感，因此 ``(?i)`` 不能写在最前面——否则
+# ``(?<=[a-z0-9])(?=[A-Z])`` 的 ``[A-Z]`` 会匹配任意大小写字母，``oauth``
+# 里的 ``auth``（前一个字符是 ``o``）会被当成驼峰边界。忽略大小写只作用于
+# 键名本身（``(?i:...)`` 局部开启）。
+_CREDENTIAL_KEY_HEAD = r"(?:(?<![A-Za-z0-9])|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z]))"
+#
+# 非凭证字面量：``auth: none``、``cookie: enabled``、``secret: false``、
+# ``token: 0`` 是文档与提示词里的常见写法，判为凭证会让合法配置在边界被误拒
+# （find_sensitive_option_paths 用「值是否被改写」判断值里有没有凭证）。
+#
+# 这里用**枚举字面量**而不是「值的长度/字符构成」来排除：形态启发式无法区分
+# ``password: FakePwOnly`` 与 ``auth: none``——两者都是 12 字符以下的纯字母值，
+# 加长度下限会把前者这类真凭证一并放过（净漏检），加字符类型要求同理。
+# 误判源是有限的几个状态字面量，枚举它们更精确。
+_NON_CREDENTIAL_VALUE = (
+    r"(?:none|true|false|null|nil|enabled|disabled|on|off|auto|yes|no"
+    # ``bearer`` 的值是 token 本身而不是状态，但 ``The bearer: standard``
+    # 这类描述里 ``standard`` 是普通词，与 ``auth: none`` 同属误判源。
+    r"|standard|required|optional|default|basic|empty|unset"
+    r"|\d+)"
 )
+
+_ANY_VALUE_SHAPE = r"""(?:"[^"]*"|'[^']*'|[^\s,;}']+)"""
+
+
+# 键名候选：以凭证词开头、后接任意标识符字符。用「宽泛捕获 + 回调判定」
+# 而不是把每个完整键名写进正则：``passwordHash``/``tokenCount`` 这类
+# 「凭证词 + 另一个词」的键，在配置边界按切词判为敏感，正则里却列不全。
+# 候选只负责圈出可能的键名，是否敏感由 ``_is_credential_key`` 决定——与配置
+# 边界同一个函数，一致性由构造保证。
+#
+# 前缀 ``_CREDENTIAL_KEY_HEAD`` 保持大小写敏感：``topsecret``/``oauth`` 里的
+# ``secret``/``auth`` 前面是小写字母接小写，不是驼峰边界，不会从词中间切开。
+_CREDENTIAL_KEY_CANDIDATE = r"(?i:(?:" + "|".join(_TEXT_CREDENTIAL_KEYS) + r")[A-Za-z0-9_\-]*)"
+_CREDENTIAL_KEY_VALUE_RE = re.compile(
+    _CREDENTIAL_KEY_HEAD
+    # 尾随引号单独成组，替换时原样保留：``{"password": "x"}`` 里若把 ``"``
+    # 一起吃掉，会输出 ``{"password: [REDACTED]}`` 破坏 JSON 结构。
+    + r"("
+    + _CREDENTIAL_KEY_CANDIDATE
+    + r")([\"']?)"
+    + r"""(\s*[:=]\s*|\s+(?=["']|"""
+    + r"""(?=[A-Za-z0-9._~+/=-]{12,}(?:[\s,;}']|$))[A-Za-z0-9._~+/=-]*[0-9._~+/=-]))"""
+    + r"("
+    + _ANY_VALUE_SHAPE
+    + r")"
+)
+
+# 裸关键词：值可能只是状态字面量（``auth: none``/``password: none``），
+# 需要形态约束。从 ``_TEXT_CREDENTIAL_KEYS`` 派生而不是手写，否则词表扩充
+# 时两处会失步——此前手写漏掉 ``password``/``credential`` 等五个，使
+# ``password: none`` 从「不脱敏」变成「脱敏」。
+_BARE_KEYWORD_KEYS = frozenset(key for key in _TEXT_CREDENTIAL_KEYS if re.fullmatch(r"[a-z]+", key))
+
+
+def _redact_credential_pair(match: re.Match[str]) -> str:
+    """键名判定为凭证时替换其值，否则原样返回。
+
+    键名交给 ``_is_credential_key`` 判定，与配置边界用的是同一个函数。
+    此前文本层用正则的字符断言去逼近切词逻辑，``passwordHash``/``tokenCount``
+    这类键在配置边界判敏感、在文本里却明文输出（而它们的合法配置值又会被
+    边界误拒），两个方向都不一致。
+    """
+    key, quote = match.group(1), match.group(2)
+    if not _is_credential_key(key):
+        return match.group(0)
+    value = match.group(4).strip("\"'")
+    # 裸关键词后接状态字面量时是普通文本（``auth: none``），不是凭证赋值。
+    # 显式凭证键名（``password``/``api_key``…）的值一律脱敏。
+    if normalize_option_key(key) in _BARE_KEYWORD_KEYS and re.fullmatch(
+        _NON_CREDENTIAL_VALUE, value, re.IGNORECASE
+    ):
+        return match.group(0)
+    return f"{key}{quote}{match.group(3)}[REDACTED]"
+
+
 _URL_USERINFO_RE = re.compile(r"(?i)(https?://)([^\s/@:]+):([^\s/@]+)@")
 _URL_QUERY_SECRET_RE = re.compile(
     r"(?i)([?&](?:" + _TEXT_CREDENTIAL_KEY_PATTERN + r"|ak|sk)=)[^&#\s]+"
 )
 # ``ak``/``sk`` 是火山引擎凭证键名，``account_key`` 是 Azure 存储凭证键名。
 # 这些键很短，必须用词边界约束，否则 ``task = value`` 里的 ``sk`` 会被误脱敏。
+#
+# 值同样要排除状态字面量：``sk``/``ak`` 在配置里常作开关（``sk: off``），
+# 与裸关键词（``auth: none``）是同一类误判源。此前只给裸关键词加了约束，
+# 这两个短键没有，口径不一致。
 _SHORT_CREDENTIAL_KEY_RE = re.compile(
-    r'''(?i)(?<![A-Za-z0-9])'''
-    r'''(ak|sk|account[_-]?key|secret[_-]?access[_-]?key)["']?'''
-    r'''(\s*[:=]\s*)'''
-    r'''(?:"[^"]*"|'[^']*'|[^\s,;}']+)'''
+    r"""(?i)(?<![A-Za-z0-9])"""
+    r"""((?:ak|sk|account[_-]?key|secret[_-]?access[_-]?key))["']?"""
+    r"""(\s*[:=]\s*)"""
+    r"""(?!""" + _NON_CREDENTIAL_VALUE + r"""(?![A-Za-z0-9._~+/=-]))"""
+    r"""(?:"[^"]*"|'[^']*'|[^\s,;}']+)"""
 )
-_OPENAI_KEY_RE = re.compile(r"\b(?:sk|rk|sess)-[A-Za-z0-9_-]{8,}\b", re.IGNORECASE)
+_OPENAI_KEY_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:sk|rk|sess)-[A-Za-z0-9_-]{8,}(?![A-Za-z0-9])", re.IGNORECASE
+)
 # 服务端返回的错误信息常带「首尾可见、中间掩码」的凭证形态，例如
 # ``sk-abc***...***xyz``。``_OPENAI_KEY_RE`` 要求 ``sk-`` 后连续 8 个以上
 # 字母数字，星号会中断匹配，于是整串原样落进日志。这里单独覆盖掩码形态。
 _MASKED_CREDENTIAL_RE = re.compile(
-    # 掩码段可含 ``*``、``.``、``…`` 等占位字符，且尾部可能还有可见片段，
-    # 因此尾部字符类要一并覆盖，否则 ``sk-abc***...***xyz`` 只吃掉前半段。
-    r"(?i)\b(?:sk|rk|sess)-[A-Za-z0-9_.-]{2,}[*\u2026.]{2,}[A-Za-z0-9_.*-]*"
+    # 掩码段可含 ``*``、``.``、``…`` 等占位字符，尾部可能还有可见片段，
+    # 因此尾部字符类要覆盖字母数字，否则 ``sk-abc***...***xyz`` 只吃掉前半段。
+    #
+    # 但尾部不能吞掉紧邻的键名：``sk-abc***token=<secret>`` 里的 ``token``
+    # 若被吞进掩码匹配，后面的 ``token=<secret>`` 就失去锚点，值会从脱敏变成
+    # 明文（净漏检）。
+    #
+    # 尾部用单字符类贪婪匹配（无前瞻、无回溯），裁剪交给替换函数
+    # ``_redact_masked_credential``：正则里加断言会让引擎在游程的每个起点
+    # 重复扫描剩余串，尾部无冒号时退化成 O(n²)——``"sk-abc***" + "deadbeef"*500``
+    # 从 0.01ms 涨到 11ms，4000 字符时 1.4 秒。而 redact_sensitive_text 挂在
+    # 每条日志的 formatter 上，一个回显掩码密钥前缀加长 token 的错误体就能
+    # 拖住进程。
+    r"(?i)(?<![A-Za-z0-9])(?:sk|rk|sess)-[A-Za-z0-9_.-]{2,}[*\u2026.]{2,}"
+    r"([A-Za-z0-9_.*-]*)"
+    # 尾部游程后紧跟 ``=`` 时它是键值对的键名：``sk-abc***xxxtoken=<secret>``。
+    # 键名本身可能不是敏感键（``xxxtoken`` 按 camelCase 切词判非敏感），
+    # 键值规则不会接手，值就会明文落进日志。这里把键值尾部一并纳入匹配，
+    # 由替换函数决定如何脱敏——掩码前缀已表明它是凭证的可见尾部。
+    # 尾随可选组不引入回溯：``=`` 不在前一个字符类里，引擎无需回退。
+    r"(?:(=)" + _ANY_VALUE_SHAPE + r")?"
 )
-_GOOGLE_API_KEY_RE = re.compile(r"\bAIza[0-9A-Za-z_-]{20,}\b")
+
+
+def _redact_masked_credential(match: re.Match[str]) -> str:
+    """替换掩码凭证，并处理混进尾部的键名与值。
+
+    尾部游程后跟 ``=`` 时（``sk-abc***xxxtoken=<secret>``），游程是键值对的
+    键名、后面是它的值；键名可能不是敏感键，键值规则不会接手，因此这里把
+    值一并脱敏，只保留键名作为可读上下文。
+
+    没有分隔符时，游程可能是凭证的可见片段（``sk-abc***xyz``），不能整段
+    留下；但敏感键名（``token``/``myApiKey``）要保留，让
+    ``_KEY_VALUE_TEXT_RE`` 接续处理 ``sk-abc***token: <secret>`` 这类写法。
+    """
+    # 键名游程由正则的 ``([A-Za-z0-9_.*-]*)`` 捕获（``*``/``.``/``…`` 等掩码
+    # 占位符不在其中），整段判断是否为敏感键：``token``/``myApiKey`` 命中并保留，
+    # ``defghijkl``/``xyz`` 这类可见片段不命中，随掩码一起吃掉。
+    # 不用「从某处截断取后缀」：``sk`` 本身就是火山凭证键名，从 ``s`` 起算会
+    # 把 ``sk-abc***`` 切碎。
+    run = match.group(1)
+    # 键值尾部：游程是键名，后面的值同样属于凭证的可见尾部，一并脱敏。
+    # 这里不能只保留键名交给 ``_KEY_VALUE_TEXT_RE``——键名可能不是敏感键
+    # （``xxxtoken``/``oauth``），那条规则不会接手，值就明文落进日志。
+    if match.group(2) is not None:
+        return "[REDACTED]" + run + "=[REDACTED]"
+    # 没有分隔符时游程可能是凭证的可见片段（``sk-abc***xyz``），不能整段留下；
+    # 但敏感键名（``token``/``myApiKey``）要保留，让键值规则接续处理
+    # ``sk-abc***token: <secret>`` 这类冒号分隔的写法。
+    if run and is_sensitive_option_key(run):
+        return "[REDACTED]" + run
+    return "[REDACTED]"
+
+
+_GOOGLE_API_KEY_RE = re.compile(r"(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{20,}(?![A-Za-z0-9])")
 
 
 def redact_sensitive_text(value: Any) -> str:
@@ -181,15 +328,14 @@ def redact_sensitive_text(value: Any) -> str:
         value = str(value)
     # 掩码形态必须最先处理：``_BEARER_TEXT_RE`` 会先吃掉 ``Bearer sk-abc``
     # 的可见前缀，使后续的 ``sk-`` 锚点失效，尾部掩码片段就会残留。
-    redacted = _MASKED_CREDENTIAL_RE.sub("[REDACTED]", value)
+    redacted = _MASKED_CREDENTIAL_RE.sub(_redact_masked_credential, value)
     redacted = _BEARER_TEXT_RE.sub("Bearer [REDACTED]", redacted)
-    redacted = _KEY_VALUE_TEXT_RE.sub(r"\1=[REDACTED]", redacted)
+    redacted = _CREDENTIAL_KEY_VALUE_RE.sub(_redact_credential_pair, redacted)
     redacted = _SHORT_CREDENTIAL_KEY_RE.sub(r"\1=[REDACTED]", redacted)
     redacted = _URL_USERINFO_RE.sub(r"\1[REDACTED]:[REDACTED]@", redacted)
     redacted = _URL_QUERY_SECRET_RE.sub(r"\1[REDACTED]", redacted)
     redacted = _OPENAI_KEY_RE.sub("[REDACTED]", redacted)
     return _GOOGLE_API_KEY_RE.sub("[REDACTED]", redacted)
-
 
 
 def safe_exception_text(exc: BaseException) -> str:
@@ -260,10 +406,15 @@ def normalize_option_key(key: Any) -> str:
     return "".join(char for char in str(key).lower() if char.isalnum())
 
 
-def is_sensitive_option_key(key: Any) -> bool:
-    """识别凭证键，避免把普通单词的 ``secret`` 子串误判为凭证。"""
+def _is_credential_key(key: Any) -> bool:
+    """判定键名是否为凭证键（不含连接类容器键）。
+
+    连接类容器键（``query``/``headers``/``params``）在配置边界同样被禁止，
+    但原因是会覆盖请求边界、本身不是凭证。文本脱敏只关心凭证，把它们一并
+    纳入会让普通配置值（``query: foo``）被误判为凭证。
+    """
     normalized = normalize_option_key(key)
-    if normalized in FORBIDDEN_OPTION_CONTAINERS or normalized in SENSITIVE_OPTION_KEYS:
+    if normalized in SENSITIVE_OPTION_KEYS:
         return True
 
     # 只对明确的词边界进行组合键识别；例如 ``secretary`` 不会命中，
@@ -277,9 +428,16 @@ def is_sensitive_option_key(key: Any) -> bool:
         if part
     ]
     if any(
-        word in {
-            "apikey", "accesstoken", "authtoken", "apitoken", "bearer",
-            "password", "cookie", "token",
+        word
+        in {
+            "apikey",
+            "accesstoken",
+            "authtoken",
+            "apitoken",
+            "bearer",
+            "password",
+            "cookie",
+            "token",
         }
         for word in words
     ):
@@ -287,16 +445,33 @@ def is_sensitive_option_key(key: Any) -> bool:
     if any(word == "secret" for word in words):
         return True
     if any(
-        left in {
-            "api", "access", "auth", "client", "secret", "private", "ssh",
-            "signing", "encryption", "goog", "google",
+        left
+        in {
+            "api",
+            "access",
+            "auth",
+            "client",
+            "secret",
+            "private",
+            "ssh",
+            "signing",
+            "encryption",
+            "goog",
+            "google",
         }
         and right in {"key", "token", "secret", "credential"}
         for left, right in pairwise(words)
     ):
         return True
     compact = "".join(words)
-    return compact in SENSITIVE_OPTION_KEYS or compact in FORBIDDEN_OPTION_CONTAINERS
+    return compact in SENSITIVE_OPTION_KEYS
+
+
+def is_sensitive_option_key(key: Any) -> bool:
+    """识别凭证键与连接覆盖键，避免把普通单词的 ``secret`` 子串误判为凭证。"""
+    if normalize_option_key(key) in FORBIDDEN_OPTION_CONTAINERS:
+        return True
+    return _is_credential_key(key)
 
 
 def _url_credential_paths(value: Any, path: str) -> list[str]:
@@ -308,8 +483,17 @@ def _url_credential_paths(value: Any, path: str) -> list[str]:
         # urlsplit 对畸形 URL（例如 ``https://[::1``）抛 ValueError。这不是
         # 「值不是 URL」而是「无法解析」，不能就此放弃检查：该分支是叶子值的
         # 唯一入口，直接 return 会让任意凭证随一个畸形前缀整体绕过边界校验。
-        # 退回文本脱敏判定，保持与正常 URL 路径一致的严格度。
-        return [path or "value"] if redact_sensitive_text(value) != value else []
+        # 退回手工解析，保持与正常 URL 路径一致的严格度：既要看值里有没有
+        # 凭证，也要看 query 的键名（``?myApiKey=`` 这种空值键在正常路径下会被
+        # ``is_sensitive_option_key`` 拦下，只做值脱敏会漏掉它）。
+        fallback = [path or "value"] if redact_sensitive_text(value) != value else []
+        marker = value.find("?")
+        if marker != -1:
+            for pair in value[marker + 1 :].split("&"):
+                key = pair.partition("=")[0]
+                if key and is_sensitive_option_key(key):
+                    fallback.append(f"{path}?{key}")
+        return fallback
     found: list[str] = []
     if redact_sensitive_text(value) != value:
         found.append(path or "value")
@@ -375,8 +559,7 @@ def validate_secret_free_options(
     found = find_sensitive_option_paths(options, allowed_containers=allowed_containers)
     if found:
         raise ValueError(
-            f"{provider} options 不允许包含凭证或请求头/query 配置: "
-            + ", ".join(found)
+            f"{provider} options 不允许包含凭证或请求头/query 配置: " + ", ".join(found)
         )
     # 不能只复制最外层：模型配置通常包含 ``extra_body``、嵌套路由或
     # SDK 配置对象。递归复制可以防止调用方在 Provider 初始化后修改
@@ -409,8 +592,7 @@ def validate_secret_free_request_overrides(
         found = find_sensitive_option_paths(value)
         if found:
             raise ValueError(
-                f"{provider} 请求头/query 不允许包含凭证: "
-                f"{field_name}." + ", ".join(found)
+                f"{provider} 请求头/query 不允许包含凭证: {field_name}." + ", ".join(found)
             )
         copies[field_name] = _copy_nested(dict(value))
     return copies["extra_headers"], copies["extra_query"]
@@ -429,10 +611,7 @@ def validate_secret_free_payload(
         raise ValueError(f"{provider} {field_name} 必须是对象。")
     found = find_sensitive_option_paths(value)
     if found:
-        raise ValueError(
-            f"{provider} {field_name} 不允许包含凭证或连接字段: "
-            + ", ".join(found)
-        )
+        raise ValueError(f"{provider} {field_name} 不允许包含凭证或连接字段: " + ", ".join(found))
     return _copy_nested(dict(value))
 
 
@@ -467,8 +646,7 @@ def validate_secret_free_resource_kwargs(
     )
     if found:
         raise ValueError(
-            f"{provider} 资源参数不允许包含凭证或请求头/query 配置: "
-            + ", ".join(found)
+            f"{provider} 资源参数不允许包含凭证或请求头/query 配置: " + ", ".join(found)
         )
 
     normalized_keys: dict[str, Any] = {}
@@ -483,8 +661,7 @@ def validate_secret_free_resource_kwargs(
         normalized_keys[normalized] = key
     if duplicate_extension_keys:
         raise ValueError(
-            f"{provider} 资源参数包含重复的扩展字段: "
-            + ", ".join(duplicate_extension_keys)
+            f"{provider} 资源参数包含重复的扩展字段: " + ", ".join(duplicate_extension_keys)
         )
     headers_key = normalized_keys.get("extraheaders")
     query_key = normalized_keys.get("extraquery")
@@ -540,3 +717,60 @@ def validate_secret_free_resource_args(
             + ", ".join(sorted(set(found)))
         )
     return sanitized
+
+
+def resolve_within(
+    candidate: str | os.PathLike[str],
+    root: str | os.PathLike[str],
+    *,
+    label: str,
+) -> Path:
+    """把一个路径解析到 ``root`` 之内，越界即拒绝。
+
+    用于 pickle 一类「解析即执行」的加载入口：``AGENTS.md`` 要求知识快照只从
+    本项目生成的本地快照或明确受信的 legacy 文件加载，但路径本身并不能证明
+    来源，所以调用方必须给出信任根，由这里判断归属。
+
+    两个路径都先 ``resolve()`` 再比较，因此符号链接指向根外时会被拦下
+    （``root/link -> /etc`` 这类逃逸）。``resolve()`` 用默认的
+    ``strict=False``：目标可以尚不存在，此处只判断归属，存在性由调用方另行校验。
+    """
+    resolved_root = Path(root).resolve()
+    resolved_candidate = Path(candidate).resolve()
+    if resolved_candidate != resolved_root and not resolved_candidate.is_relative_to(resolved_root):
+        raise ValueError(
+            f"{label} 必须位于受信根目录内。"
+            f" 路径={resolved_candidate}，受信根={resolved_root}。"
+            " 请只加载本项目生成的快照；如需导入外部文件，请显式把它放入受信目录。"
+        )
+    return resolved_candidate
+
+
+def ensure_trusted_source(
+    candidate: str | os.PathLike[str],
+    trusted_roots: Iterable[str | os.PathLike[str]] | None,
+    *,
+    label: str,
+) -> Path:
+    """要求 ``candidate`` 命中给定的受信根之一，否则拒绝加载。
+
+    ``trusted_roots`` 为 ``None`` 或空集合时一律拒绝——调用方没有声明任何
+    信任来源时，不能退化成「任意路径都可加载」，否则这个边界等于不存在。
+    """
+    roots = [Path(root) for root in trusted_roots] if trusted_roots else []
+    if not roots:
+        raise ValueError(
+            f"缺少 {label} 的受信来源声明，已拒绝加载。"
+            " 请在调用处显式传入 trusted_paths/trusted_roots（通常来自 RunConfig 的"
+            " snapshot_root 或 legacy_pkl_path）。"
+        )
+    errors: list[str] = []
+    for root in roots:
+        try:
+            return resolve_within(candidate, root, label=label)
+        except ValueError as exc:
+            errors.append(str(exc))
+    raise ValueError(
+        f"{label} 不在任何受信路径内。路径={Path(candidate)}。"
+        f" 受信路径={[str(root) for root in roots]}。"
+    )

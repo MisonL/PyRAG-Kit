@@ -39,9 +39,7 @@ TOOLS = [
 def test_anthropic_converts_openai_tool_schema():
     provider = object.__new__(AnthropicProvider)
     provider._model_name = "claude-test"
-    params = AnthropicProvider._build_message_params(
-        provider, "hello", "system", TOOLS, 0.2
-    )
+    params = AnthropicProvider._build_message_params(provider, "hello", "system", TOOLS, 0.2)
 
     assert params["tools"] == [
         {
@@ -67,9 +65,7 @@ def test_anthropic_parse_rejects_user_profile_on_non_beta_sdk_path():
 
 def test_anthropic_rejects_unlinked_tool_result():
     with pytest.raises(ValueError, match="tool_call_id"):
-        AnthropicProvider._convert_messages(
-            [{"role": "tool", "content": "{}"}]
-        )
+        AnthropicProvider._convert_messages([{"role": "tool", "content": "{}"}])
 
 
 def test_anthropic_rejects_malformed_tool_call_arguments():
@@ -91,9 +87,7 @@ def test_anthropic_rejects_malformed_tool_call_arguments():
 
 def test_anthropic_rejects_image_content_without_url():
     with pytest.raises(ValueError, match="图片内容缺少有效 image_url"):
-        AnthropicProvider._convert_content(
-            [{"type": "image_url", "image_url": {}}]
-        )
+        AnthropicProvider._convert_content([{"type": "image_url", "image_url": {}}])
 
 
 def test_anthropic_rejects_invalid_image_data_uri():
@@ -342,7 +336,9 @@ def test_google_vertex_accepts_cloud_storage_and_public_https_media():
     )
 
     assert contents[0].parts[0].file_data.file_uri == "gs://bucket/image.png"
-    assert contents[0].parts[1].file_data.file_uri == "https://cdn.example.com/document.pdf?version=1"
+    assert (
+        contents[0].parts[1].file_data.file_uri == "https://cdn.example.com/document.pdf?version=1"
+    )
 
 
 @pytest.mark.parametrize("file_id", ["", " ", "files/", "file/id"])
@@ -375,9 +371,7 @@ def test_google_rejects_malformed_tool_arguments_and_results():
 
     with pytest.raises(ValueError, match="content.*有效 JSON"):
         GoogleProvider._contents(
-            [
-                {"role": "tool", "tool_call_id": "call-1", "name": "lookup", "content": "{"}
-            ],
+            [{"role": "tool", "tool_call_id": "call-1", "name": "lookup", "content": "{"}],
             None,
             None,
         )
@@ -422,9 +416,7 @@ def test_google_decodes_media_data_uri_exactly_once():
         [
             {
                 "role": "user",
-                "content": [
-                    {"type": "audio_url", "audio_url": "data:audio/wav;base64,YWJj"}
-                ],
+                "content": [{"type": "audio_url", "audio_url": "data:audio/wav;base64,YWJj"}],
             }
         ],
         None,
@@ -460,9 +452,7 @@ def test_google_tool_call_message_with_null_content_does_not_emit_text():
 
 def test_google_rejects_malformed_function_tool_choice():
     with pytest.raises(ValueError, match="function.name"):
-        GoogleProvider._convert_tool_choice(
-            {"type": "function", "function": {}}
-        )
+        GoogleProvider._convert_tool_choice({"type": "function", "function": {}})
 
 
 def test_anthropic_merges_parallel_tool_results_into_one_user_turn():
@@ -795,7 +785,12 @@ def test_responses_input_rejects_unsupported_or_incomplete_content_blocks(conten
     [
         [{"role": "tool", "content": "missing id"}],
         [{"role": "assistant", "tool_calls": [{"function": {"arguments": "{}"}}]}],
-        [{"role": "assistant", "tool_calls": [{"id": "call-1", "function": {"name": "lookup", "arguments": "{"}}]}],
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "call-1", "function": {"name": "lookup", "arguments": "{"}}],
+            }
+        ],
         [{"type": "function_call", "id": "item-1", "name": "lookup", "arguments": "{}"}],
     ],
 )
@@ -902,9 +897,7 @@ def test_ark_responses_request_omits_implicit_temperature():
     provider._model_name = "ark-model"
     provider._options = {"server_verified_protocols": ["responses"]}
 
-    request = provider._build_responses_request(
-        CompletionRequest(prompt="hello", stream=False)
-    )
+    request = provider._build_responses_request(CompletionRequest(prompt="hello", stream=False))
 
     assert "temperature" not in request
 
@@ -917,9 +910,7 @@ def test_ark_responses_request_preserves_configured_temperature():
         "temperature": 0.2,
     }
 
-    request = provider._build_responses_request(
-        CompletionRequest(prompt="hello", stream=False)
-    )
+    request = provider._build_responses_request(CompletionRequest(prompt="hello", stream=False))
 
     assert request["temperature"] == 0.2
 
@@ -1038,9 +1029,7 @@ def test_openai_responses_rejects_ark_only_multimodal_content():
             [
                 {
                     "role": "user",
-                    "content": [
-                        {"type": "input_audio", "audio_url": "https://example.com/a.wav"}
-                    ],
+                    "content": [{"type": "input_audio", "audio_url": "https://example.com/a.wav"}],
                 }
             ],
         )
@@ -1062,9 +1051,12 @@ def test_responses_request_converts_chat_tool_choice_to_flat_function_shape():
 def test_responses_request_preserves_native_tool_choice_forms():
     provider = _responses_provider()
 
-    assert provider._build_responses_request("hello", tool_choice="required", stream=False)[
-        "tool_choice"
-    ] == "required"
+    assert (
+        provider._build_responses_request("hello", tool_choice="required", stream=False)[
+            "tool_choice"
+        ]
+        == "required"
+    )
     assert provider._build_responses_request(
         "hello", tool_choice={"type": "allowed_tools", "mode": "auto"}, stream=False
     )["tool_choice"] == {"type": "allowed_tools", "mode": "auto"}
@@ -1113,9 +1105,7 @@ def test_ark_responses_rejects_conflicting_model_length_aliases():
     }
 
     with pytest.raises(ValueError, match="max_tokens.*max_completion_tokens"):
-        provider._build_responses_request(
-            CompletionRequest(prompt="hello", stream=False)
-        )
+        provider._build_responses_request(CompletionRequest(prompt="hello", stream=False))
 
 
 def test_ark_extra_body_sampling_conflicts_are_explicit():
@@ -1123,9 +1113,7 @@ def test_ark_extra_body_sampling_conflicts_are_explicit():
     provider._model_name = "ark-model"
     provider._options = {"extra_body": {"seed": 1}}
     with pytest.raises(ValueError, match="seed.*重复"):
-        provider._build_responses_request(
-            CompletionRequest(prompt="hello", stream=False, seed=2)
-        )
+        provider._build_responses_request(CompletionRequest(prompt="hello", stream=False, seed=2))
 
 
 def test_responses_sync_non_stream_extracts_output_text():
@@ -1139,7 +1127,9 @@ def test_responses_sync_non_stream_extracts_output_text():
 
     provider._get_client = lambda: SimpleNamespace(responses=Responses())
 
-    assert list(provider._invoke_responses({"model": "responses-model", "input": "hello", "stream": False})) == ["答复"]
+    assert list(
+        provider._invoke_responses({"model": "responses-model", "input": "hello", "stream": False})
+    ) == ["答复"]
     assert calls == [{"model": "responses-model", "input": "hello", "stream": False}]
 
 
@@ -1186,9 +1176,7 @@ def test_openai_responses_complete_and_stream_paths_convert_tool_history():
 
     provider._get_client = lambda: SimpleNamespace(responses=Responses())
 
-    assert provider.complete(
-        CompletionRequest(messages=history, system_prompt=None)
-    ).text == "答复"
+    assert provider.complete(CompletionRequest(messages=history, system_prompt=None)).text == "答复"
     list(provider.stream_events(CompletionRequest(messages=history, system_prompt=None)))
 
     assert calls[0]["input"][2]["type"] == "function_call"
@@ -1205,6 +1193,7 @@ def test_openai_responses_async_complete_and_stream_paths_convert_tool_history()
         async def create(self, **request):
             calls.append(request)
             if request["stream"]:
+
                 class Stream:
                     def __aiter__(self):
                         self._events = iter(
@@ -1229,9 +1218,7 @@ def test_openai_responses_async_complete_and_stream_paths_convert_tool_history()
     provider._get_aclient = lambda: SimpleNamespace(responses=Responses())
 
     async def collect():
-        result = await provider.acomplete(
-            CompletionRequest(messages=history, system_prompt=None)
-        )
+        result = await provider.acomplete(CompletionRequest(messages=history, system_prompt=None))
         events = [
             event
             async for event in provider.astream_events(
@@ -1288,12 +1275,7 @@ def test_openai_responses_async_stream_drains_after_completion():
     provider._get_aclient = lambda: SimpleNamespace(responses=Responses())
 
     async def collect():
-        return [
-            event
-            async for event in provider.astream_events(
-                CompletionRequest(prompt="hello")
-            )
-        ]
+        return [event async for event in provider.astream_events(CompletionRequest(prompt="hello"))]
 
     events = asyncio.run(collect())
 
@@ -1326,9 +1308,7 @@ def test_ark_responses_complete_and_stream_paths_convert_tool_history():
 
     provider._get_client = lambda: SimpleNamespace(responses=Responses())
 
-    assert provider.complete(
-        CompletionRequest(messages=history, system_prompt=None)
-    ).text == "答复"
+    assert provider.complete(CompletionRequest(messages=history, system_prompt=None)).text == "答复"
     list(provider.stream_events(CompletionRequest(messages=history, system_prompt=None)))
 
     assert calls[0]["input"][2]["type"] == "function_call"
@@ -1347,6 +1327,7 @@ def test_ark_responses_async_complete_and_stream_paths_convert_tool_history():
         async def create(self, **request):
             calls.append(request)
             if request["stream"]:
+
                 class Stream:
                     def __aiter__(self):
                         self._events = iter(
@@ -1371,9 +1352,7 @@ def test_ark_responses_async_complete_and_stream_paths_convert_tool_history():
     provider._get_aclient = lambda: SimpleNamespace(responses=Responses())
 
     async def collect():
-        result = await provider.acomplete(
-            CompletionRequest(messages=history, system_prompt=None)
-        )
+        result = await provider.acomplete(CompletionRequest(messages=history, system_prompt=None))
         events = [
             event
             async for event in provider.astream_events(
@@ -1417,7 +1396,9 @@ def test_openai_chat_stream_events_include_tool_usage_and_finish():
                                         SimpleNamespace(
                                             id="call-1",
                                             index=0,
-                                            function=SimpleNamespace(name="lookup", arguments='{"id":'),
+                                            function=SimpleNamespace(
+                                                name="lookup", arguments='{"id":'
+                                            ),
                                         )
                                     ],
                                 ),
@@ -1434,7 +1415,7 @@ def test_openai_chat_stream_events_include_tool_usage_and_finish():
                                         SimpleNamespace(
                                             id=None,
                                             index=0,
-                                            function=SimpleNamespace(name=None, arguments='1}'),
+                                            function=SimpleNamespace(name=None, arguments="1}"),
                                         )
                                     ],
                                 ),
@@ -1443,7 +1424,11 @@ def test_openai_chat_stream_events_include_tool_usage_and_finish():
                         ]
                     ),
                     SimpleNamespace(
-                        choices=[SimpleNamespace(delta=SimpleNamespace(content=None), finish_reason="tool_calls")],
+                        choices=[
+                            SimpleNamespace(
+                                delta=SimpleNamespace(content=None), finish_reason="tool_calls"
+                            )
+                        ],
                         usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5),
                     ),
                 ]
@@ -1453,7 +1438,11 @@ def test_openai_chat_stream_events_include_tool_usage_and_finish():
     events = list(provider.stream_events(CompletionRequest(prompt="hello")))
 
     assert [event.type for event in events] == [
-        "text_delta", "tool_call_delta", "tool_call_delta", "tool_call_completed", "finish"
+        "text_delta",
+        "tool_call_delta",
+        "tool_call_delta",
+        "tool_call_completed",
+        "finish",
     ]
     assert events[1].tool_call["name"] == "lookup"
     assert events[3].tool_call["arguments"] == '{"id":1}'
@@ -1467,7 +1456,9 @@ def test_openai_chat_stream_events_preserve_text_and_finish_from_same_chunk():
             id="chat-1",
             choices=[
                 SimpleNamespace(
-                    delta=SimpleNamespace(content="答", reasoning_content=None, refusal=None, tool_calls=None),
+                    delta=SimpleNamespace(
+                        content="答", reasoning_content=None, refusal=None, tool_calls=None
+                    ),
                     finish_reason="stop",
                 )
             ],
@@ -1552,7 +1543,9 @@ def test_openai_async_chat_stream_error_event_is_explicit():
                         [
                             SimpleNamespace(
                                 type="error",
-                                error=SimpleNamespace(message="async chat upstream failed", status=400),
+                                error=SimpleNamespace(
+                                    message="async chat upstream failed", status=400
+                                ),
                             )
                         ]
                     )
@@ -1566,9 +1559,7 @@ def test_openai_async_chat_stream_error_event_is_explicit():
 
             return Stream()
 
-    provider._get_aclient = lambda: SimpleNamespace(
-        chat=SimpleNamespace(completions=Completions())
-    )
+    provider._get_aclient = lambda: SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
 
     async def collect():
         return [event async for event in provider.astream_events(CompletionRequest(prompt="hello"))]
@@ -1591,7 +1582,9 @@ def test_ark_async_chat_stream_error_event_is_explicit():
                         [
                             SimpleNamespace(
                                 type="error",
-                                error=SimpleNamespace(message="async ark upstream failed", status=400),
+                                error=SimpleNamespace(
+                                    message="async ark upstream failed", status=400
+                                ),
                             )
                         ]
                     )
@@ -1605,9 +1598,7 @@ def test_ark_async_chat_stream_error_event_is_explicit():
 
             return Stream()
 
-    provider._get_aclient = lambda: SimpleNamespace(
-        chat=SimpleNamespace(completions=Completions())
-    )
+    provider._get_aclient = lambda: SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
 
     async def collect():
         return [event async for event in provider.astream_events(CompletionRequest(prompt="hello"))]
@@ -1658,11 +1649,13 @@ def test_openai_chat_stream_events_preserve_parallel_tool_calls():
                     content=None,
                     tool_calls=[
                         SimpleNamespace(
-                            id="call-1", index=0,
+                            id="call-1",
+                            index=0,
                             function=SimpleNamespace(name="lookup", arguments='{"id":'),
                         ),
                         SimpleNamespace(
-                            id="call-2", index=1,
+                            id="call-2",
+                            index=1,
                             function=SimpleNamespace(name="refund", arguments='{"order":'),
                         ),
                     ],
@@ -1680,12 +1673,15 @@ def test_openai_chat_stream_events_preserve_parallel_tool_calls():
 
 
 def test_openai_responses_stream_exposes_tool_delta_and_completed_events():
-    assert OpenAICompatibleProvider._responses_stream_event(
-        SimpleNamespace(
-            type="response.output_item.added",
-            item=SimpleNamespace(type="function_call", call_id="call-1", name="lookup"),
+    assert (
+        OpenAICompatibleProvider._responses_stream_event(
+            SimpleNamespace(
+                type="response.output_item.added",
+                item=SimpleNamespace(type="function_call", call_id="call-1", name="lookup"),
+            )
         )
-    ) is None
+        is None
+    )
 
     delta = OpenAICompatibleProvider._responses_stream_event(
         SimpleNamespace(
@@ -1910,8 +1906,12 @@ def test_openai_responses_custom_tool_stream_keeps_added_metadata_and_raw_input(
         metadata,
     )
 
+    # ``id`` 统一取调用标识符（call_id），与非流式路径及合并结果一致：
+    # ``item_id`` 是 Responses 的输出项 ID，取它会让同一轮工具调用在 delta 与
+    # completed 事件里得到不同的 id，调用方按 ``tool_call["id"]`` 回填
+    # ``role=tool`` 时就会配不上。
     assert delta is not None and delta.tool_call == {
-        "id": "item-1",
+        "id": "call-1",
         "call_id": "call-1",
         "index": 1,
         "type": "custom_tool_call",
@@ -1919,7 +1919,7 @@ def test_openai_responses_custom_tool_stream_keeps_added_metadata_and_raw_input(
         "arguments": "echo ",
     }
     assert completed is not None and completed.tool_call == {
-        "id": "item-1",
+        "id": "call-1",
         "index": 1,
         "type": "custom_tool_call",
         "name": "run_command",
@@ -2400,7 +2400,10 @@ def test_openai_responses_non_stream_reasoning_summary_list_is_preserved():
         output=[
             SimpleNamespace(
                 type="reasoning",
-                summary=[SimpleNamespace(type="summary_text", text="先分析"), SimpleNamespace(text="后结论")],
+                summary=[
+                    SimpleNamespace(type="summary_text", text="先分析"),
+                    SimpleNamespace(text="后结论"),
+                ],
             )
         ]
     )
@@ -2510,9 +2513,7 @@ def test_chat_invoke_accepts_mapping_shaped_sdk_response():
     provider._options = {}
     response = {"choices": [{"message": {"content": "字典答复"}}]}
     provider._get_client = lambda: SimpleNamespace(
-        chat=SimpleNamespace(
-            completions=SimpleNamespace(create=lambda **_kwargs: response)
-        )
+        chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **_kwargs: response))
     )
 
     assert list(provider.invoke("hello", stream=False)) == ["字典答复"]
@@ -2530,9 +2531,7 @@ def test_chat_ainvoke_accepts_mapping_shaped_sdk_response():
         async def create(self, **_kwargs):
             return response
 
-    provider._get_aclient = lambda: SimpleNamespace(
-        chat=SimpleNamespace(completions=Completions())
-    )
+    provider._get_aclient = lambda: SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
 
     async def consume():
         return [chunk async for chunk in provider.ainvoke("hello", stream=False)]
@@ -2548,9 +2547,7 @@ def test_openai_chat_business_error_is_explicit_for_complete_and_invoke():
     provider._options = {}
     response = SimpleNamespace(status="435", msg="Model not support", choices=None)
     provider._get_client = lambda: SimpleNamespace(
-        chat=SimpleNamespace(
-            completions=SimpleNamespace(create=lambda **_kwargs: response)
-        )
+        chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **_kwargs: response))
     )
 
     with pytest.raises(RuntimeError, match="435.*Model not support"):
@@ -2571,9 +2568,7 @@ def test_openai_chat_business_error_is_explicit_for_async_complete_and_invoke():
         async def create(self, **_kwargs):
             return response
 
-    provider._get_aclient = lambda: SimpleNamespace(
-        chat=SimpleNamespace(completions=Completions())
-    )
+    provider._get_aclient = lambda: SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
 
     with pytest.raises(RuntimeError, match="435.*Model not support"):
         asyncio.run(provider.acomplete(CompletionRequest(prompt="hello")))
@@ -2593,9 +2588,7 @@ def test_openai_chat_business_error_is_explicit_for_sync_and_async_streams():
     provider._options = {}
     response = SimpleNamespace(status="435", msg="Model not support", choices=None)
     provider._get_client = lambda: SimpleNamespace(
-        chat=SimpleNamespace(
-            completions=SimpleNamespace(create=lambda **_kwargs: iter([response]))
-        )
+        chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **_kwargs: iter([response])))
     )
 
     with pytest.raises(RuntimeError, match="435.*Model not support"):
@@ -2844,9 +2837,7 @@ def test_openai_and_ark_embedding_base64_is_decoded_to_float_vectors():
     openai_provider._client = None
     openai_provider._get_client = lambda: SimpleNamespace(
         embeddings=SimpleNamespace(
-            create=lambda **_kwargs: SimpleNamespace(
-                data=[SimpleNamespace(embedding=encoded)]
-            )
+            create=lambda **_kwargs: SimpleNamespace(data=[SimpleNamespace(embedding=encoded)])
         )
     )
     assert openai_provider.embed_documents(["text"], encoding_format="base64") == [[1.25, -2.5]]
@@ -2856,9 +2847,7 @@ def test_openai_and_ark_embedding_base64_is_decoded_to_float_vectors():
     ark_provider._options = {}
     ark_provider._get_client = lambda: SimpleNamespace(
         embeddings=SimpleNamespace(
-            create=lambda **_kwargs: SimpleNamespace(
-                data=[SimpleNamespace(embedding=encoded)]
-            )
+            create=lambda **_kwargs: SimpleNamespace(data=[SimpleNamespace(embedding=encoded)])
         )
     )
     assert ark_provider.embed_documents(["text"], encoding_format="base64") == [[1.25, -2.5]]
@@ -2876,7 +2865,12 @@ def test_responses_async_non_stream_extracts_output_text():
     provider._get_aclient = lambda: SimpleNamespace(responses=Responses())
 
     async def collect():
-        return [chunk async for chunk in provider._ainvoke_responses({"model": "responses-model", "input": "hello", "stream": False})]
+        return [
+            chunk
+            async for chunk in provider._ainvoke_responses(
+                {"model": "responses-model", "input": "hello", "stream": False}
+            )
+        ]
 
     assert asyncio.run(collect()) == ["异步答复"]
     assert calls == [{"model": "responses-model", "input": "hello", "stream": False}]
@@ -2899,7 +2893,11 @@ def test_responses_sync_stream_yields_text_and_refusal_deltas():
     provider._get_client = lambda: SimpleNamespace(responses=Responses())
 
     with pytest.raises(RuntimeError, match="拒答"):
-        list(provider._invoke_responses({"model": "responses-model", "input": "hello", "stream": True}))
+        list(
+            provider._invoke_responses(
+                {"model": "responses-model", "input": "hello", "stream": True}
+            )
+        )
 
 
 def test_responses_sync_non_stream_refusal_is_explicit_error():
@@ -2920,7 +2918,11 @@ def test_responses_sync_non_stream_refusal_is_explicit_error():
     provider._get_client = lambda: SimpleNamespace(responses=Responses())
 
     with pytest.raises(RuntimeError, match="拒答"):
-        list(provider._invoke_responses({"model": "responses-model", "input": "hello", "stream": False}))
+        list(
+            provider._invoke_responses(
+                {"model": "responses-model", "input": "hello", "stream": False}
+            )
+        )
 
 
 def test_responses_async_stream_yields_text_deltas():
@@ -2952,7 +2954,12 @@ def test_responses_async_stream_yields_text_deltas():
     provider._get_aclient = lambda: SimpleNamespace(responses=Responses())
 
     async def collect():
-        return [chunk async for chunk in provider._ainvoke_responses({"model": "responses-model", "input": "hello", "stream": True})]
+        return [
+            chunk
+            async for chunk in provider._ainvoke_responses(
+                {"model": "responses-model", "input": "hello", "stream": True}
+            )
+        ]
 
     assert asyncio.run(collect()) == ["异", "步"]
 
@@ -3002,7 +3009,11 @@ def test_responses_stream_failed_event_is_explicit_error():
     provider._get_client = lambda: SimpleNamespace(responses=Responses())
 
     with pytest.raises(RuntimeError, match="upstream failed"):
-        list(provider._invoke_responses({"model": "responses-model", "input": "hello", "stream": True}))
+        list(
+            provider._invoke_responses(
+                {"model": "responses-model", "input": "hello", "stream": True}
+            )
+        )
 
 
 def test_responses_stream_incomplete_event_is_explicit_error():
@@ -3025,14 +3036,16 @@ def test_responses_stream_incomplete_event_is_explicit_error():
     provider._get_client = lambda: SimpleNamespace(responses=Responses())
 
     with pytest.raises(RuntimeError, match="content_filter"):
-        list(provider._invoke_responses({"model": "responses-model", "input": "hello", "stream": True}))
+        list(
+            provider._invoke_responses(
+                {"model": "responses-model", "input": "hello", "stream": True}
+            )
+        )
 
 
 def test_responses_stream_error_event_is_explicit_error():
     with pytest.raises(RuntimeError, match="rate limit"):
-        OpenAICompatibleProvider._stream_delta(
-            SimpleNamespace(type="error", message="rate limit")
-        )
+        OpenAICompatibleProvider._stream_delta(SimpleNamespace(type="error", message="rate limit"))
 
 
 def test_responses_cancelled_events_are_explicit_errors():
@@ -3045,9 +3058,7 @@ def test_responses_cancelled_events_are_explicit_errors():
         )
 
     with pytest.raises(RuntimeError, match="cancelled|取消"):
-        OpenAICompatibleProvider._stream_delta(
-            SimpleNamespace(type="response.cancelled")
-        )
+        OpenAICompatibleProvider._stream_delta(SimpleNamespace(type="response.cancelled"))
 
 
 def test_openai_responses_non_stream_extracts_refusal_output():
@@ -3085,3 +3096,143 @@ def test_deepseek_chat_uses_max_tokens_for_explicit_and_configured_limits():
     request = provider._build_chat_request(prompt="hi", stream=False)
     assert request["max_tokens"] == 256
     assert "max_completion_tokens" not in request
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        [SimpleNamespace(type="text", text=None)],
+        [SimpleNamespace(type="thinking", thinking=None)],
+        [
+            SimpleNamespace(type="thinking", thinking=None),
+            SimpleNamespace(type="text", text=None),
+        ],
+        [SimpleNamespace(type="redacted_thinking", thinking=None)],
+    ],
+)
+def test_anthropic_extract_result_tolerates_null_block_fields(content):
+    """块字段存在但值为 None 时不得崩。
+
+    ``field()`` 只在键不存在时返回默认值；键存在而值为 None 时仍返回 None，
+    直接 ``"".join(...)`` 会抛 ``TypeError: expected str instance``。
+    SDK 的 thinking / redacted_thinking 块确实会给出 None。
+    """
+    result = AnthropicProvider._extract_result(SimpleNamespace(content=content, usage=None))
+
+    assert isinstance(result.text, str)
+    assert isinstance(result.reasoning, str)
+
+
+def test_anthropic_extract_result_preserves_real_text():
+    """守卫不能把正常内容一起吞掉。"""
+    result = AnthropicProvider._extract_result(
+        SimpleNamespace(
+            content=[
+                SimpleNamespace(type="thinking", thinking="推理"),
+                SimpleNamespace(type="text", text="正文"),
+            ],
+            usage=None,
+        )
+    )
+
+    assert result.text == "正文"
+    assert result.reasoning == "推理"
+
+
+@pytest.mark.parametrize(
+    ("delta", "expected_type", "expected_value"),
+    [
+        (SimpleNamespace(type="text_delta", text=None), "text_delta", "text"),
+        (SimpleNamespace(type="thinking_delta", thinking=None), "reasoning_delta", "reasoning"),
+        (
+            SimpleNamespace(type="input_json_delta", partial_json=None),
+            "tool_call_delta",
+            "tool_call",
+        ),
+    ],
+)
+def test_anthropic_stream_delta_tolerates_null_fields(delta, expected_type, expected_value):
+    """流式 delta 的同一处缺陷：None 会让事件构造出非字符串或直接崩。"""
+    event = AnthropicProvider._stream_event(
+        SimpleNamespace(type="content_block_delta", index=0, delta=delta), "resp-1"
+    )
+
+    assert event.type == expected_type
+    value = getattr(event, expected_value)
+    if expected_value == "tool_call":
+        assert value["arguments"] == ""
+    else:
+        assert value == ""
+
+
+@pytest.mark.parametrize("tool_choice", [{"type": "tool"}, {"type": "TOOL"}, {"mode": "bogus"}])
+def test_google_tool_choice_rejects_unknown_mode_instead_of_silent_enum(tool_choice):
+    """未知模式必须显式报错。
+
+    ``FunctionCallingConfigMode`` 是大小写不敏感枚举，未命中时会合成一个同名
+    字符串枚举成员、只发 UserWarning，随后被静默发往服务端。OpenAI 风格的
+    ``{"type": "tool"}`` 正会落到这里。
+    """
+    with pytest.raises(ValueError, match="tool_choice"):
+        GoogleProvider._convert_tool_choice(tool_choice)
+
+
+@pytest.mark.parametrize(
+    ("tool_choice", "expected"),
+    [("auto", "AUTO"), ("required", "ANY"), ("any", "ANY"), ("ANY", "ANY"), ("none", "NONE")],
+)
+def test_google_tool_choice_maps_known_modes(tool_choice, expected):
+    """已知模式仍须正常映射，收紧不能把合法输入一起拒掉。"""
+    config = GoogleProvider._convert_tool_choice(tool_choice)
+
+    assert config.function_calling_config.mode.name == expected
+
+
+def test_google_tool_choice_normalizes_tool_config_errors():
+    """未知键应归一为本项目的 ValueError，而不是裸的 pydantic ValidationError。"""
+    with pytest.raises(ValueError, match="tool_choice 无效"):
+        GoogleProvider._convert_tool_choice(
+            {"function_calling_config": {"mode": "AUTO"}, "bogus": 1}
+        )
+
+
+@pytest.mark.parametrize(
+    "response_format",
+    [{"type": "json_schema"}, {"type": "json_schema", "json_schema": {"name": "r"}}],
+)
+def test_responses_json_schema_requires_schema(response_format):
+    """缺 schema 不能回退成 schema 本身。
+
+    那样会伪造出 ``{"type": "json_schema"}`` 的 schema 发给服务端，客户端以为
+    拿到了结构化输出约束，实际没有。
+    """
+    with pytest.raises(ValueError, match="缺少 schema"):
+        OpenAICompatibleProvider._convert_responses_format(response_format)
+
+
+def test_responses_json_schema_preserves_caller_strict():
+    """strict 必须透传，不能被硬编码的 True 覆盖。"""
+    converted = OpenAICompatibleProvider._convert_responses_format(
+        {
+            "type": "json_schema",
+            "json_schema": {"name": "out", "schema": {"type": "object"}, "strict": False},
+        }
+    )
+
+    assert converted["format"]["strict"] is False
+    assert converted["format"]["name"] == "out"
+    assert converted["format"]["schema"] == {"type": "object"}
+
+
+def test_responses_json_schema_accepts_flat_shape():
+    """扁平形态（schema/strict 与 type 同级）仍须支持。"""
+    converted = OpenAICompatibleProvider._convert_responses_format(
+        {"type": "json_schema", "name": "flat", "schema": {"type": "object"}}
+    )
+
+    assert converted["format"] == {
+        "type": "json_schema",
+        "name": "flat",
+        "schema": {"type": "object"},
+        "strict": True,
+    }

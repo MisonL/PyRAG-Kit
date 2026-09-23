@@ -21,19 +21,34 @@ class MockLLMProvider(LargeLanguageModel):
     def __init__(self, model_name: str):
         self.model_name = model_name
 
-    def invoke(self, prompt: str, system_prompt: str | None = "You are a helpful assistant.", tools: list[dict[str, Any]] | None = None, stream: bool = True, temperature: float = 0.7) -> Generator[str, None, None]:
+    def invoke(
+        self,
+        prompt: str,
+        system_prompt: str | None = "You are a helpful assistant.",
+        tools: list[dict[str, Any]] | None = None,
+        stream: bool = True,
+        temperature: float = 0.7,
+    ) -> Generator[str, None, None]:
         """模拟 LLM 聊天响应"""
         if stream:
             yield f"Mock LLM stream response for {self.model_name}"
         else:
             yield f"Mock LLM response for {self.model_name}"
 
-    async def ainvoke(self, prompt: str, system_prompt: str | None = "You are a helpful assistant.", tools: list[dict[str, Any]] | None = None, stream: bool = True, temperature: float = 0.7) -> AsyncGenerator[str, None]:
+    async def ainvoke(
+        self,
+        prompt: str,
+        system_prompt: str | None = "You are a helpful assistant.",
+        tools: list[dict[str, Any]] | None = None,
+        stream: bool = True,
+        temperature: float = 0.7,
+    ) -> AsyncGenerator[str, None]:
         """模拟异步 LLM 聊天响应"""
         if stream:
             yield f"Mock Async LLM stream response for {self.model_name}"
         else:
             yield f"Mock Async LLM response for {self.model_name}"
+
 
 class MockEmbeddingProvider(TextEmbeddingModel):
     def __init__(self, model_name: str):
@@ -51,6 +66,7 @@ class MockEmbeddingProvider(TextEmbeddingModel):
         """模拟异步文档嵌入"""
         return [[0.1] * 10 for _ in texts]
 
+
 class MockRerankProvider(RerankModel):
     def __init__(self, model_name: str):
         self.model_name = model_name
@@ -61,19 +77,26 @@ class MockRerankProvider(RerankModel):
         scores = [1.0 - i * 0.1 for i in range(len(documents))]
         return indices[:top_n], scores[:top_n]
 
-    async def arerank(self, query: str, documents: list[str], top_n: int) -> tuple[list[int], list[float]]:
+    async def arerank(
+        self, query: str, documents: list[str], top_n: int
+    ) -> tuple[list[int], list[float]]:
         """模拟异步重排"""
         indices = list(range(len(documents)))
         scores = [1.0 - i * 0.1 for i in range(len(documents))]
         return indices[:top_n], scores[:top_n]
 
+
 @pytest.fixture(scope="module")
 def mock_settings():
     """模拟全局设置对象"""
     mock_llm_config = ModelDetail(provider="mock_llm", model_name="mock-llm-model")
-    mock_embedding_config = ModelDetail(provider="mock_embedding", model_name="mock-embedding-model")
+    mock_embedding_config = ModelDetail(
+        provider="mock_embedding", model_name="mock-embedding-model"
+    )
     mock_rerank_config = ModelDetail(provider="mock_rerank", model_name="mock-rerank-model")
-    mock_siliconflow_rerank_config = ModelDetail(provider="siliconflow", model_name="mock-siliconflow-rerank-model")
+    mock_siliconflow_rerank_config = ModelDetail(
+        provider="siliconflow", model_name="mock-siliconflow-rerank-model"
+    )
     mock_qwen_rerank_config = ModelDetail(provider="qwen", model_name="qwen-rerank-model")
 
     mock_settings_instance = MagicMock(spec=Settings)
@@ -90,26 +113,27 @@ def mock_settings():
 
     return mock_settings_instance
 
+
 @pytest.fixture(scope="function", autouse=True)
 def patch_settings(mock_settings, monkeypatch):
     """在测试期间替换全局 get_settings 函数，使其返回模拟的 settings 对象，并修改 _provider_map"""
-    with patch('src.utils.config.get_settings', return_value=mock_settings):
+    with patch("src.utils.config.get_settings", return_value=mock_settings):
         # 清除 ModelProviderFactory 及其依赖模块的缓存
         # 这确保了 ModelProviderFactory 在每次测试时都使用最新的模拟配置
         modules_to_clear = [
-            'src.providers.factory',
-            'src.providers.google',
-            'src.providers.openai',
-            'src.providers.anthropic',
-            'src.providers.qwen',
-            'src.providers.volcengine',
-            'src.providers.siliconflow',
-            'src.providers.ollama',
-            'src.providers.lm_studio',
-            'src.providers.deepseek',
-            'src.providers.grok',
-            'src.providers.jina',
-            'src.providers.siliconflow_rerank',
+            "src.providers.factory",
+            "src.providers.google",
+            "src.providers.openai",
+            "src.providers.anthropic",
+            "src.providers.qwen",
+            "src.providers.volcengine",
+            "src.providers.siliconflow",
+            "src.providers.ollama",
+            "src.providers.lm_studio",
+            "src.providers.deepseek",
+            "src.providers.grok",
+            "src.providers.jina",
+            "src.providers.siliconflow_rerank",
         ]
         for module_name in modules_to_clear:
             if module_name in sys.modules:
@@ -119,7 +143,7 @@ def patch_settings(mock_settings, monkeypatch):
         from src.providers.factory import (
             ModelProviderFactory as ReloadedModelProviderFactory,
         )
-        
+
         # 直接模拟 _get_provider_class 方法
         def mock_get_provider_class(provider_name: str):
             if provider_name == "mock_llm":
@@ -133,12 +157,15 @@ def patch_settings(mock_settings, monkeypatch):
             else:
                 raise ValueError(f"不支持的模型提供商: {provider_name}")
 
-        monkeypatch.setattr(ReloadedModelProviderFactory, "_get_provider_class", mock_get_provider_class)
+        monkeypatch.setattr(
+            ReloadedModelProviderFactory, "_get_provider_class", mock_get_provider_class
+        )
 
         # 将重新导入的 ModelProviderFactory 赋值给全局 ModelProviderFactory，以便测试函数使用
         global ModelProviderFactory
         ModelProviderFactory = ReloadedModelProviderFactory
         yield
+
 
 # 测试用例
 def test_get_llm_provider_success():
@@ -146,6 +173,7 @@ def test_get_llm_provider_success():
     llm_provider = ModelProviderFactory.get_llm_provider("default_llm")
     assert isinstance(llm_provider, MockLLMProvider)
     assert llm_provider.model_name == "mock-llm-model"
+
 
 def test_get_llm_provider_not_found():
     """测试获取不存在的 LLM 提供商时抛出 ValueError"""
@@ -196,11 +224,13 @@ def test_factory_rejects_options_for_provider_without_options_parameter():
             options={"dimensions": 2},
         )
 
+
 def test_get_embedding_provider_success():
     """测试成功获取 Embedding 提供商"""
     embedding_provider = ModelProviderFactory.get_embedding_provider("default_embedding")
     assert isinstance(embedding_provider, MockEmbeddingProvider)
     assert embedding_provider.model_name == "mock-embedding-model"
+
 
 def test_get_embedding_provider_not_found():
     """测试获取不存在的 Embedding 提供商时抛出 ValueError"""
@@ -236,17 +266,20 @@ def test_get_rerank_provider_rejects_protocol_configuration():
     with pytest.raises(ValueError, match="Rerank 配置不支持 protocol"):
         ModelProviderFactory.get_rerank_provider("rerank", configurations)
 
+
 def test_get_rerank_provider_success():
     """测试成功获取 Rerank 提供商"""
     rerank_provider = ModelProviderFactory.get_rerank_provider("default_rerank")
     assert isinstance(rerank_provider, MockRerankProvider)
     assert rerank_provider.model_name == "mock-rerank-model"
 
+
 def test_get_rerank_provider_siliconflow_mapping():
     """测试 Siliconflow Rerank 提供商的特殊映射"""
     rerank_provider = ModelProviderFactory.get_rerank_provider("siliconflow_rerank_key")
     assert isinstance(rerank_provider, MockRerankProvider)
     assert rerank_provider.model_name == "mock-siliconflow-rerank-model"
+
 
 def test_get_rerank_provider_not_found():
     """测试获取不存在的 Rerank 提供商时抛出 ValueError"""
@@ -257,6 +290,7 @@ def test_get_rerank_provider_not_found():
 def test_get_rerank_provider_rejects_provider_without_rerank_capability():
     with pytest.raises(TypeError, match="提供商 qwen 不支持 rerank 能力"):
         ModelProviderFactory.get_rerank_provider("qwen_rerank_key")
+
 
 def test_unsupported_provider_type():
     """测试 _get_provider_class 方法处理不支持的提供商名称"""

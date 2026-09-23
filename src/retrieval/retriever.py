@@ -122,6 +122,8 @@ async def aretrieve_documents(
         embedding_service=EmbeddingService(run_config),
     )
     try:
-        return await retrieval_service.retrieve(query=query, session_config=session_config, console=console)
+        return await retrieval_service.retrieve(
+            query=query, session_config=session_config, console=console
+        )
     finally:
         await retrieval_service.aclose()

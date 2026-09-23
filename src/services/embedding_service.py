@@ -93,4 +93,13 @@ class EmbeddingService:
                 "EmbeddingService 收到的向量数量与输入文本数量不一致。"
                 f" 输入 {expected_rows} 条，返回 {matrix.shape[0]} 条。"
             )
+        # 有限性是硬要求，不是洁癖：FAISS 会把 NaN 向量照单收下（ntotal 正常增加），
+        # 直到查询时才以 3.4e38 的哨兵距离暴露出来，而那时「哪个文档坏了」已经无法
+        # 定位；inf 同理。另外 ``np.array(..., dtype=np.float32)`` 对超出 float32
+        # 范围的值只发 RuntimeWarning 并静默溢出成 inf，所以在 cast 之后检查。
+        if not np.isfinite(matrix).all():
+            raise ValueError(
+                "EmbeddingService 收到的向量包含非有限值（NaN 或无穷大）；"
+                "请检查 embedding provider 的返回内容。"
+            )
         return matrix

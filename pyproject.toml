@@ -12,8 +12,6 @@ dependencies = [
     "google-genai>=2.22.0",
     "httpx>=0.28.1",
     "jieba>=0.42.1",
-    "langchain>=1.4.0",
-    "langchain-community>=0.4.2",
     "langchain-core>=1.6.2",
     "langchain-text-splitters>=1.1.2",
     "numpy>=2.4.6",
@@ -40,6 +38,16 @@ dev = [
     "pytest>=9.1.1",
     "ruff>=0.16.6",
 ]
+
+[tool.ruff]
+# 代码按约 100 列书写；88 列会让大量既有行被无意义折行。
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
 
 [tool.ruff.lint]
 # Provider and configuration boundaries intentionally expose ValueError for
