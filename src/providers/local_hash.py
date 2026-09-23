@@ -1,11 +1,9 @@
-# -*- coding: utf-8 -*-
 import asyncio
 import hashlib
 import math
 import re
-from typing import List
 
-import jieba
+import jieba  # type: ignore[import-untyped]
 
 from src.providers.__base__.model_provider import TextEmbeddingModel
 
@@ -20,12 +18,12 @@ def _parse_dimension(model_name: str) -> int:
     return int(suffix) if suffix.isdigit() and int(suffix) > 0 else DEFAULT_DIMENSION
 
 
-def _tokenize(text: str) -> List[str]:
+def _tokenize(text: str) -> list[str]:
     tokens = [token.strip() for token in jieba.lcut(text) if token.strip()]
     return tokens if tokens else TOKEN_PATTERN.findall(text)
 
 
-def _normalize(vector: List[float]) -> List[float]:
+def _normalize(vector: list[float]) -> list[float]:
     norm = math.sqrt(sum(value * value for value in vector))
     if norm == 0:
         return vector
@@ -39,7 +37,7 @@ class LocalHashEmbeddingProvider(TextEmbeddingModel):
         self.model_name = model_name
         self.dimension = _parse_dimension(model_name)
 
-    def _embed_text(self, text: str) -> List[float]:
+    def _embed_text(self, text: str) -> list[float]:
         vector = [0.0] * self.dimension
         for token in _tokenize(text):
             digest = hashlib.blake2b(token.encode("utf-8"), digest_size=16).digest()
@@ -51,8 +49,18 @@ class LocalHashEmbeddingProvider(TextEmbeddingModel):
             vector[secondary_index] += secondary_sign
         return _normalize(vector)
 
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+    @staticmethod
+    def _validate_kwargs(kwargs: dict) -> None:
+        if kwargs:
+            unsupported = ", ".join(sorted(str(key) for key in kwargs))
+            raise ValueError(
+                "LocalHash Embedding 不支持请求参数: " + unsupported
+            )
+
+    def embed_documents(self, texts: list[str], **kwargs) -> list[list[float]]:
+        self._validate_kwargs(kwargs)
         return [self._embed_text(text) for text in texts]
 
-    async def aembed_documents(self, texts: List[str]) -> List[List[float]]:
+    async def aembed_documents(self, texts: list[str], **kwargs) -> list[list[float]]:
+        self._validate_kwargs(kwargs)
         return await asyncio.to_thread(self.embed_documents, texts)

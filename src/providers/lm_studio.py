@@ -1,4 +1,5 @@
-# -*- coding: utf-8 -*-
+from typing import Any
+
 from src.providers.openai_compatible import OpenAICompatibleProvider
 
 
@@ -8,5 +9,5 @@ class LMStudioProvider(OpenAICompatibleProvider):
     通过继承OpenAICompatibleProvider来复用与OpenAI API兼容的逻辑。
     """
 
-    def __init__(self, model_name: str):
-        super().__init__(model_name=model_name, provider="lm-studio")
+    def __init__(self, model_name: str, protocol: str = "chat_completions", options: dict[str, Any] | None = None):
+        super().__init__(model_name=model_name, provider="lm-studio", protocol=protocol, options=options)

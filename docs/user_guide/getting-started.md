@@ -62,8 +62,8 @@ uv sync
 4.  打开 `.env` 文件，填入您要使用的聊天模型 API Key。例如，如果您使用 OpenAI 兼容渠道：
     ```dotenv
     OPENAI_API_KEY="sk-..."
-    OPENAI_API_BASE="https://apis.iflow.cn/v1"
-    DEFAULT_LLM_PROVIDER="iflow-qwen3-max"
+    OPENAI_API_BASE="https://api.openai.com/v1"
+    DEFAULT_LLM_PROVIDER="openai"
     ```
 5.  如需调整默认路径、base url 或检索参数，请编辑 `config.toml`。
 

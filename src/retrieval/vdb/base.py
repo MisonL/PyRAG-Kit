@@ -3,7 +3,8 @@
 # 遵循修改后的 Apache License 2.0 许可证。详情请参阅项目根目录下的 DIFY_LICENSE 文件。
 
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any
+from typing import Any
+
 
 class VectorStoreBase(ABC):
     """
@@ -12,49 +13,42 @@ class VectorStoreBase(ABC):
     """
 
     @abstractmethod
-    def add_documents(self, documents: List[Dict[str, Any]]):
+    def add_documents(self, documents: list[dict[str, Any]]):
         """同步添加文档。"""
-        pass
 
     @abstractmethod
-    async def aadd_documents(self, documents: List[Dict[str, Any]]):
+    async def aadd_documents(self, documents: list[dict[str, Any]]):
         """异步添加文档。"""
-        pass
 
     @abstractmethod
-    def search(self, query: str, top_k: int = 5, search_type: str = "semantic") -> List[Dict[str, Any]]:
+    def search(self, query: str, top_k: int = 5, search_type: str = "semantic") -> list[dict[str, Any]]:
         """同步搜索文档。"""
-        pass
 
     @abstractmethod
-    async def asearch(self, query: str, top_k: int = 5, search_type: str = "semantic") -> List[Dict[str, Any]]:
+    async def asearch(self, query: str, top_k: int = 5, search_type: str = "semantic") -> list[dict[str, Any]]:
         """异步搜索文档。"""
-        pass
 
     @abstractmethod
     def save(self, path: str):
         """保存向量存储。"""
-        pass
 
     @abstractmethod
     def load(self, path: str):
         """加载向量存储。"""
-        pass
 
     @abstractmethod
     def get_embedding_model(self) -> Any:
         """获取嵌入模型。"""
-        pass
 
-    def upsert_embeddings(self, documents: List[Dict[str, Any]], embeddings: Any):
+    def upsert_embeddings(self, documents: list[dict[str, Any]], embeddings: Any):
         """根据外部已生成的向量写入文档。默认未实现。"""
         raise NotImplementedError("当前向量存储未实现 upsert_embeddings。")
 
-    def semantic_search(self, query_embedding: Any, top_k: int = 5) -> List[Dict[str, Any]]:
+    def semantic_search(self, query_embedding: Any, top_k: int = 5) -> list[dict[str, Any]]:
         """使用查询向量执行语义检索。默认未实现。"""
         raise NotImplementedError("当前向量存储未实现 semantic_search。")
 
-    def keyword_search(self, query_text: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    def keyword_search(self, query_text: str, top_k: int = 5) -> list[dict[str, Any]]:
         """使用原始文本执行关键词检索。默认退回 search。"""
         return self.search(query_text, top_k=top_k, search_type="keyword")
 
@@ -66,9 +60,9 @@ class VectorStoreBase(ABC):
         """从快照目录加载状态。默认未实现。"""
         raise NotImplementedError("当前向量存储未实现 load_snapshot。")
 
-    def register_parent_documents(self, parent_documents: Dict[str, Dict[str, Any]]):
+    def register_parent_documents(self, parent_documents: dict[str, dict[str, Any]]):
         """注册父分段侧车数据。"""
-        return None
+        return
 
     def resolve_parent_content(self, parent_id: str | None) -> str | None:
         """根据父分段 ID 解析父内容。"""

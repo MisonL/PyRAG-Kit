@@ -1,12 +1,12 @@
-# -*- coding: utf-8 -*-
 import os
-from typing import Optional, Dict, Any
+from typing import Any
+
 from rich.console import Console, Group
 from rich.panel import Panel
 from rich.table import Table
 
-from ..utils.config import get_settings, ROOT_DIR # 导入 get_settings 函数
-from ..utils.log_manager import get_module_logger # 导入日志管理器
+from ..utils.config import ROOT_DIR, get_settings  # 导入 get_settings 函数
+from ..utils.log_manager import get_module_logger  # 导入日志管理器
 
 logger = get_module_logger(__name__) # 获取当前模块的日志器
 
@@ -25,15 +25,15 @@ def get_relative_path(absolute_path: str) -> str:
         logger.warning(f"无法将路径 '{absolute_path}' 转换为相对路径，返回原始路径。")
         return str(absolute_path)
 
-def display_chat_config(console: Console, chat_config: Dict[str, Any]):
+def display_chat_config(console: Console, chat_config: dict[str, Any]):
     """显示从传入的chat_config字典中获取的聊天机器人配置。"""
     logger.info("正在显示聊天机器人配置。")
-    def mask_api_key(key: Optional[str]) -> str:
+    def mask_api_key(key: str | None) -> str:
         if not key:
             logger.debug("API Key 未设置，显示为 '[dim]未设置[/dim]'。")
             return "[dim]未设置[/dim]"
-        logger.debug("API Key 已设置，显示部分掩码。")
-        return f"{key[:10]}..."
+        logger.debug("API Key 已设置，隐藏全部值。")
+        return "[dim]已设置（值已隐藏）[/dim]"
 
     # --- 聊天配置 ---
     chat_table = Table(title="[bold green]聊天机器人配置[/bold green]", show_header=False, box=None, padding=(0, 1))

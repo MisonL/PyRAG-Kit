@@ -4,11 +4,11 @@
 
 from pathlib import Path
 
-from .base import VectorStoreBase
-from .faiss_store import FaissStore
-from ..snapshot_repository import SnapshotRepository
 from ...runtime.contracts import KnowledgeSnapshotManifest, build_run_config
 from ...utils.config import get_settings
+from ..snapshot_repository import SnapshotRepository
+from .base import VectorStoreBase
+from .faiss_store import FaissStore
 
 
 class VectorStoreFactory:
@@ -33,6 +33,25 @@ class VectorStoreFactory:
         active_snapshot_dir = snapshot_repository.get_active_snapshot_dir()
         if active_snapshot_dir is not None:
             snapshot_repository.validate_snapshot_dir(active_snapshot_dir)
+            manifest = snapshot_repository.load_manifest(active_snapshot_dir)
+            embedding_detail = run_config.embedding_configurations.get(
+                run_config.default_embedding_provider
+            )
+            if embedding_detail is None:
+                raise ValueError(
+                    "当前 embedding 配置缺少活动提供商: "
+                    f"{run_config.default_embedding_provider}"
+                )
+            if (
+                manifest.embedding_provider != run_config.default_embedding_provider
+                or manifest.embedding_model != embedding_detail.model_name
+            ):
+                raise RuntimeError(
+                    "活动知识快照的 embedding 配置与当前运行配置不一致: "
+                    f"快照={manifest.embedding_provider}/{manifest.embedding_model}，"
+                    f"当前={run_config.default_embedding_provider}/{embedding_detail.model_name}。"
+                    "请重建知识快照或切换回原 embedding 配置。"
+                )
             store.load_snapshot(str(active_snapshot_dir))
             return
 

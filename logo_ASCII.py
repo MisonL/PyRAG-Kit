@@ -1,12 +1,13 @@
-# -*- coding: utf-8 -*-
+import pyfiglet
 from rich.console import Console
 from rich.text import Text
-import pyfiglet
-from typing import Tuple
 
 console = Console()
 
-def create_gradient(text: str, start_color: Tuple[int, int, int], end_color: Tuple[int, int, int]) -> Text:
+
+def create_gradient(
+    text: str, start_color: tuple[int, int, int], end_color: tuple[int, int, int]
+) -> Text:
     """为文本创建从左到右的水平颜色渐变效果。"""
     text_obj = Text()
     total_length = len(text)

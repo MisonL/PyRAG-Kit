@@ -1,9 +1,7 @@
-# -*- coding: utf-8 -*-
 import argparse
 import asyncio
 import sys
 from pathlib import Path
-from typing import Optional
 
 from rich import box
 from rich.console import Console
@@ -30,12 +28,10 @@ def display_config_and_confirm(splitter_structure_mode: str):
     settings = get_settings()
     run_config = build_run_config(settings)
 
-    def mask_api_key(key: Optional[str]) -> str:
+    def mask_api_key(key: str | None) -> str:
         if not key or key == "no-key-required":
             return "[dim]未设置或无需设置[/dim]"
-        if len(key) > 12:
-            return f"[white]{key[:6]}...{key[-4:]}[/white]"
-        return "[white]已设置[/white]"
+        return "[dim]已设置（值已隐藏）[/dim]"
 
     table = Table(
         box=box.ROUNDED,

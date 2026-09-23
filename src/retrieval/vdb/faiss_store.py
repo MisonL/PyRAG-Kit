@@ -4,14 +4,17 @@
 
 import json
 import os
-import pickle
-import time
-from pathlib import Path
-from typing import Any, Dict, List, Optional
 
-import jieba
+# Pickle is retained only for trusted local legacy snapshots.
+import pickle  # nosec B403
+import time
+from copy import deepcopy
+from pathlib import Path
+from typing import Any
+
+import jieba  # type: ignore[import-untyped]
 import numpy as np
-from rank_bm25 import BM25Okapi
+from rank_bm25 import BM25Okapi  # type: ignore[import-untyped]
 
 try:
     import faiss
@@ -20,31 +23,31 @@ except ImportError as exc:
         "FAISS is not installed. Please install it with `pip install faiss-cpu`."
     ) from exc
 
-from .base import VectorStoreBase
 from ...utils.log_manager import get_module_logger
+from .base import VectorStoreBase
 
 logger = get_module_logger(__name__)
 jieba.setLogLevel(jieba.logging.ERROR)
 
 
 class FaissStore(VectorStoreBase):
-    def __init__(self, file_path: Optional[str] = None):
+    def __init__(self, file_path: str | None = None):
         import asyncio
 
         self.file_path = file_path
-        self.documents: List[Dict[str, Any]] = []
-        self.embeddings: Optional[np.ndarray] = None
-        self.parent_documents: Dict[str, Dict[str, Any]] = {}
-        self._tokenized_docs_cache: List[List[str]] = []
-        self.bm25_index: Optional[BM25Okapi] = None
-        self.faiss_index: Optional[faiss.IndexFlatL2] = None
+        self.documents: list[dict[str, Any]] = []
+        self.embeddings: np.ndarray | None = None
+        self.parent_documents: dict[str, dict[str, Any]] = {}
+        self._tokenized_docs_cache: list[list[str]] = []
+        self.bm25_index: BM25Okapi | None = None
+        self.faiss_index: faiss.Index | None = None
         self.lock = asyncio.Lock()
 
         if self.file_path and os.path.exists(self.file_path):
             self.load(self.file_path)
 
     @staticmethod
-    def _normalize_parent_document(parent_document: Any) -> Dict[str, Any]:
+    def _normalize_parent_document(parent_document: Any) -> dict[str, Any]:
         if isinstance(parent_document, dict):
             return {
                 "content": parent_document.get("content", ""),
@@ -55,7 +58,7 @@ class FaissStore(VectorStoreBase):
         return {"content": "", "metadata": {}}
 
     @staticmethod
-    def _build_index_text(document: Dict[str, Any]) -> str:
+    def _build_index_text(document: dict[str, Any]) -> str:
         metadata = document.get("metadata") or {}
         source = metadata.get("source", "")
         source_hint = ""
@@ -100,7 +103,7 @@ class FaissStore(VectorStoreBase):
             document["metadata"] = metadata
         self.parent_documents = normalized_parent_documents
 
-    def register_parent_documents(self, parent_documents: Dict[str, Dict[str, Any]]):
+    def register_parent_documents(self, parent_documents: dict[str, dict[str, Any]]):
         for parent_id, parent_document in parent_documents.items():
             normalized = self._normalize_parent_document(parent_document)
             if normalized["content"]:
@@ -115,7 +118,7 @@ class FaissStore(VectorStoreBase):
         content = parent_document.get("content")
         return content if isinstance(content, str) and content else None
 
-    def upsert_embeddings(self, documents: List[Dict[str, Any]], embeddings: Any):
+    def upsert_embeddings(self, documents: list[dict[str, Any]], embeddings: Any):
         if not documents:
             return
 
@@ -134,30 +137,39 @@ class FaissStore(VectorStoreBase):
             self.embeddings = np.vstack((self.embeddings, new_embeddings))
         self._rebuild_indices()
 
-    def add_documents(self, documents: List[Dict[str, Any]]):
+    def add_documents(self, documents: list[dict[str, Any]]):
         raise RuntimeError("FaissStore.add_documents 已废弃，请使用外部 EmbeddingService 后调用 upsert_embeddings。")
 
-    async def aadd_documents(self, documents: List[Dict[str, Any]]):
+    async def aadd_documents(self, documents: list[dict[str, Any]]):
         raise RuntimeError("FaissStore.aadd_documents 已废弃，请使用 KnowledgeBuildService。")
 
-    def semantic_search(self, query_embedding: Any, top_k: int = 5) -> List[Dict[str, Any]]:
+    def semantic_search(self, query_embedding: Any, top_k: int = 5) -> list[dict[str, Any]]:
         if self.faiss_index is None or self.embeddings is None:
             return []
 
-        query_vector = np.array(query_embedding, dtype=np.float32).reshape(1, -1)
+        query_vector = np.asarray(query_embedding, dtype=np.float32)
+        if query_vector.ndim != 1 or query_vector.size == 0:
+            raise ValueError("查询向量必须是一维且非空。")
+        expected_dimension = int(self.embeddings.shape[1])
+        if query_vector.shape[0] != expected_dimension:
+            raise ValueError(
+                f"查询向量维度 {query_vector.shape[0]} 与索引维度 {expected_dimension} 不一致；"
+                "请重建知识快照或切换回构建该快照的嵌入模型。"
+            )
+        query_vector = query_vector.reshape(1, expected_dimension)
         distances, indices = self.faiss_index.search(query_vector, top_k)
         similarities = 1.0 / (1.0 + distances[0])
 
-        results: List[Dict[str, Any]] = []
+        results: list[dict[str, Any]] = []
         for index, doc_index in enumerate(indices[0]):
             if doc_index == -1:
                 continue
-            document = pickle.loads(pickle.dumps(self.documents[doc_index]))
+            document = deepcopy(self.documents[doc_index])
             document["score"] = float(similarities[index])
             results.append(document)
         return results
 
-    def keyword_search(self, query_text: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    def keyword_search(self, query_text: str, top_k: int = 5) -> list[dict[str, Any]]:
         if self.bm25_index is None:
             return []
 
@@ -165,22 +177,22 @@ class FaissStore(VectorStoreBase):
         doc_scores = self.bm25_index.get_scores(tokenized_query)
         top_indices = np.argsort(doc_scores)[::-1]
 
-        results: List[Dict[str, Any]] = []
+        results: list[dict[str, Any]] = []
         for index in top_indices:
             score = float(doc_scores[index])
             if score <= 0:
                 break
-            document = pickle.loads(pickle.dumps(self.documents[index]))
+            document = deepcopy(self.documents[index])
             document["score"] = score
             results.append(document)
             if len(results) >= top_k:
                 break
         return results
 
-    def search(self, query: str, top_k: int = 5, search_type: str = "semantic") -> List[Dict[str, Any]]:
+    def search(self, query: str, top_k: int = 5, search_type: str = "semantic") -> list[dict[str, Any]]:
         raise RuntimeError("FaissStore.search 已废弃，请通过 RetrievalService 调用语义检索或关键词检索。")
 
-    async def asearch(self, query: str, top_k: int = 5, search_type: str = "semantic") -> List[Dict[str, Any]]:
+    async def asearch(self, query: str, top_k: int = 5, search_type: str = "semantic") -> list[dict[str, Any]]:
         raise RuntimeError("FaissStore.asearch 已废弃，请通过 RetrievalService 调用语义检索或关键词检索。")
 
     def save(self, path: str):
@@ -197,8 +209,10 @@ class FaissStore(VectorStoreBase):
     def load(self, path: str):
         if not os.path.exists(path):
             raise FileNotFoundError(f"向量存储文件未找到: {path}")
+        # Legacy compatibility: this path is only for local files generated by
+        # PyRAG-Kit. Never point it at an untrusted pickle file.
         with open(path, "rb") as file:
-            data = pickle.load(file)
+            data = pickle.load(file)  # nosec B301
         self.documents = data.get("documents", [])
         self.embeddings = data.get("embeddings")
         self.parent_documents = data.get("parent_documents", {})
@@ -206,6 +220,8 @@ class FaissStore(VectorStoreBase):
         self._rebuild_indices()
 
     def save_snapshot(self, snapshot_dir: str):
+        if self.faiss_index is None or self.embeddings is None:
+            raise RuntimeError("当前语义索引为空，无法保存快照。")
         snapshot_path = Path(snapshot_dir)
         snapshot_path.mkdir(parents=True, exist_ok=True)
         with (snapshot_path / "chunks.pkl").open("wb") as file:
@@ -215,8 +231,6 @@ class FaissStore(VectorStoreBase):
         with (snapshot_path / "lexical.index").open("wb") as file:
             pickle.dump(self._tokenized_docs_cache, file)
         np.save(snapshot_path / "embeddings.npy", self.embeddings)
-        if self.faiss_index is None:
-            raise RuntimeError("当前语义索引为空，无法保存快照。")
         faiss.write_index(self.faiss_index, str(snapshot_path / "semantic.index"))
         stats = {
             "document_count": len({doc.get("metadata", {}).get("source") for doc in self.documents}),
@@ -231,10 +245,13 @@ class FaissStore(VectorStoreBase):
 
     def load_snapshot(self, snapshot_dir: str):
         snapshot_path = Path(snapshot_dir)
+        # SnapshotRepository accepts only application-managed snapshot dirs;
+        # keep the pickle extension for backward compatibility with existing
+        # Dify-derived snapshots and do not load arbitrary external files.
         with (snapshot_path / "chunks.pkl").open("rb") as file:
-            self.documents = pickle.load(file)
+            self.documents = pickle.load(file)  # nosec B301
         with (snapshot_path / "parents.pkl").open("rb") as file:
-            self.parent_documents = pickle.load(file)
+            self.parent_documents = pickle.load(file)  # nosec B301
         embeddings_path = snapshot_path / "embeddings.npy"
         self.embeddings = np.load(embeddings_path) if embeddings_path.exists() else None
         faiss_index_path = snapshot_path / "semantic.index"
@@ -242,7 +259,7 @@ class FaissStore(VectorStoreBase):
         lexical_path = snapshot_path / "lexical.index"
         if lexical_path.exists():
             with lexical_path.open("rb") as file:
-                self._tokenized_docs_cache = pickle.load(file)
+                self._tokenized_docs_cache = pickle.load(file)  # nosec B301
             self.bm25_index = BM25Okapi(self._tokenized_docs_cache)
         else:
             self._rebuild_indices()

@@ -1,32 +1,66 @@
-# 仓库指南 (Repository Guidelines)
+# Repository Guidelines
 
-## 项目结构与模块组织 (Project Structure & Module Organization)
+本指南适用于仓库根目录的 PyRAG-Kit。项目要求 Python 3.11 或更高版本，使用 `uv` 管理依赖。
 
-本仓库是一个 Python 3.11+ 的 RAG 工具集。核心代码位于 `src/` 目录下，按职责拆分为以下主要模块：
-`src/chat/`、`src/providers/`、`src/retrieval/`、`src/etl/`、`src/ui/` 和 `src/utils/`。入口程序和脚本位于
-`main.py` 和 `scripts/`。测试代码位于 `tests/`，其目录结构与源码对应。运行产物（如 `data/` 目录和生成的日志）不应提交至版本控制。
+## Project Structure & Module Organization
 
-## 构建、测试与开发命令 (Build, Test, and Development Commands)
+- `main.py` 是交互式入口；`src/` 按职责划分为 `chat/`、`etl/`、`models/`、`providers/`、`retrieval/`、`retrieval_test/`、`runtime/`、`services/`、`ui/` 和 `utils/`。
+- `scripts/` 放置知识库快照构建、发布打包和发布说明提取脚本；`tests/` 按源码模块组织 pytest 测试。
+- `knowledge_base/` 保存本地 Markdown 原文；`data/kb/` 和 `data/logs/` 保存运行产物，均不应提交。仓库不再包含 Dify 上游子模块，Dify 相关逻辑以 `src/` 中的移植代码维护。
+- 核心流程为 ETL -> embedding -> FAISS 快照 -> 混合检索 -> provider-backed chat。
 
-- `uv sync`：根据 `pyproject.toml` 安装依赖并创建本地环境。
-- `uv run main.py`：启动应用程序。
-- `uv run python -m scripts.embed_knowledge_base`：重建知识库快照。
-- `uv run pytest`：运行完整测试套件。
-- `uv run pytest tests/test_config.py`：在迭代特定更改时运行单个测试文件。
+## Build, Test, and Development Commands
 
-## 编码风格与命名规范 (Coding Style & Naming Conventions)
+```bash
+uv sync
+uv sync --group dev
+uv run main.py --smoke-test
+uv run main.py
+uv run python -m scripts.embed_knowledge_base --mode standard
+uv run pytest
+uv run pytest tests/providers/test_factory.py
+uv run python scripts/build_binary_release.py --target macos-arm64 --validate
+```
 
-遵循现有的 Python 风格：使用 4 空格缩进，公开函数必须包含明确的类型标注，命名应具有描述性。
-函数、变量和模块使用 `snake_case`；类使用 `PascalCase`；常量使用 `UPPER_CASE`。保持文档字符串（docstrings）和注释简短且客观。修改代码时应贴合周围代码风格，避免引入新的格式化样式。
+`standard` 也可替换为 `hierarchical`。发布目标支持 `windows-x64`、`macos-x64`、`macos-arm64`、`linux-x64` 和 `linux-arm64`；标签 `v*` 会触发 GitHub Release 工作流。
+发布脚本不做跨平台交叉编译，`--target` 必须匹配当前主机或 CI runner 的系统与 CPU 架构；目标不匹配时会在清理构建产物前显式失败。
 
-## 测试指南 (Testing Guidelines)
+## Quality Checks
 
-所有自动化测试统一使用 `pytest`。测试文件命名为 `test_*.py`，测试函数命名为 `test_*`。建议将针对特定行为的测试放在该行为相关的代码附近，特别是对于配置解析、提供商工厂、ETL 和检索逻辑。项目没有强制的覆盖率阈值；针对每次行为变更都应补充测试，并优先运行最小相关测试集。
+开发依赖包含 Ruff、Bandit 和 MyPy。提交前可运行：
 
-## 提交与拉取请求指引 (Commit & Pull Request Guidelines)
+```bash
+uv run ruff check main.py src scripts tests
+uv run bandit -r main.py src scripts -ll
+uv run mypy --cache-dir /tmp/pyrag-kit-mypy main.py src
+uv run python -m compileall -q main.py src scripts tests
+uv lock --check
+git diff --check
+```
 
-Git 提交历史应使用约定式前缀，如 `feat:`、`refactor:`、`test:` 和 `chore:`，后接简短摘要。提交信息应具体且使用祈使句。拉取请求（PR）需说明改动内容，列出验证命令，并注明是否对配置或数据文件产生影响。仅在 UI 输出发生变化时附带截图。
+MyPy 使用任务专用缓存目录，避免多个进程共享 `.mypy_cache` 造成锁等待；优先修复本次改动引入的问题，并记录未覆盖的历史基线告警。
 
-## 安全与配置提示 (Security & Configuration Tips)
+## Coding Style & Naming Conventions
 
-严禁提交密钥或本地覆盖配置。请复制 `config.toml.example` 为本地 `config.toml`，并使用 `.env` 文件处理私密数值。`config.toml` 为本地文件，默认不纳入版本控制。将 `data/` 目录和生成的日志视为本地产物。若在 `dify/` 子目录下工作，请先阅读该目录下的 `AGENTS.md`，因为子目录指令优先于此根目录指南。
+使用 4 个空格缩进、明确的公开函数类型标注和简短客观的 docstring。函数、变量和模块使用 `snake_case`，类使用 `PascalCase`，常量使用 `UPPER_CASE`。项目使用 Ruff 做 lint 检查，未配置独立 formatter；修改时遵循相邻代码风格并运行 `git diff --check`。保持服务、provider、检索和快照边界，不用静默回退或占位结果掩盖失败。
+
+## Testing Guidelines
+
+测试框架为 pytest，配置见 `pytest.ini`；该配置禁用未使用的 `langsmith` 插件。测试文件命名为 `test_*.py`，测试函数命名为 `test_*`。新增行为应在对应 `tests/` 子目录补充回归测试；优先运行相关文件，再运行完整 `uv run pytest`。仓库未设置强制覆盖率阈值。
+
+## Commit & Pull Request Guidelines
+
+提交历史使用 `feat:`、`fix:`、`docs:`、`build:`、`ci:`、`chore:` 等约定式前缀，并以简短祈使句说明变更。PR 应说明目的、影响范围和验证命令，注明配置或生成数据影响；只有 UI 输出改变时才附截图。发布相关变更同步更新 `CHANGELOG.md`。
+
+## Security & Configuration Tips
+
+用 `cp config.toml.example config.toml` 和 `cp .env.example .env` 创建本地配置。密钥只放环境变量或本地 `.env`，不得写入源码、示例、日志或提交。根项目框架采用 MIT；`src/etl/`、`src/retrieval/` 等 Dify 衍生部分仍须遵守 `DIFY_LICENSE`，并保留上游版权声明。移除上游子模块不改变这些许可义务。
+知识快照保留 Dify 兼容的 pickle 文件格式；只从本项目生成的本地快照或明确受信的 legacy 文件加载，不导入不可信来源的 `.pkl` 文件。
+
+## API Channel Integration
+
+Provider 必须在 `src/providers/factory.py` 声明能力并通过对应抽象接口校验。OpenAI 兼容渠道复用 `openai` SDK；Google、Anthropic、Volcengine 使用各自 SDK；Jina 和 SiliconFlow Rerank 使用 HTTP JSON。新增或调整渠道时同步更新 `config.toml.example`、用户文档和 provider 契约测试。Google 的 Auth Token、Anthropic Beta 资源和 Ark Classification 资源都需通过显式 Facade/入口调用，不能把缺少资源挂载静默当成成功。
+
+`local-hash` 是无需远端凭证的离线 Embedding provider，默认配置使用它构建本地知识快照。
+
+LLM 配置可通过 `protocol = "responses"` 选择 OpenAI/Ark Responses；省略时保持 `chat_completions` 兼容行为。Responses 仅在目标 Base URL 确实提供 `/responses` 时可用，`protocol_status()` 的 `adapter_supported` 不等于真实服务端验收；兼容渠道和 Ark 都必须在 `options.server_verified_protocols` 中显式登记已验证协议。Ark Responses 可使用 SDK 支持的 `input_audio`、`input_video` 和 `image_pixel_limit`，OpenAI 兼容适配器不得把这些 Ark 专属块静默发送。Embedding 和 Rerank 配置不得填写 `protocol`。

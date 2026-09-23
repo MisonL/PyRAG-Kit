@@ -1,10 +1,10 @@
-# -*- coding: utf-8 -*-
-import os
-import glob
 import atexit
+import os
 import shutil
-from .config import get_settings # 导入 get_settings 函数
-from .log_manager import get_module_logger # 导入日志管理器
+
+from .config import get_settings  # 导入 get_settings 函数
+from .log_manager import get_module_logger  # 导入日志管理器
+from .security import redact_sensitive_text
 
 logger = get_module_logger(__name__) # 获取当前模块的日志器
 
@@ -23,7 +23,12 @@ def cleanup_temp_files():
             shutil.rmtree(cache_dir)
             logger.info(f"已成功删除缓存目录: {cache_dir}")
         except OSError as e:
-            logger.error(f"删除缓存目录 {cache_dir} 时出错: {e}", exc_info=True)
+            error_text = redact_sensitive_text(str(e))
+            logger.exception(
+                "删除缓存目录 %s 时出错: %s",
+                cache_dir,
+                error_text,
+            )
     else:
         logger.info("未找到 .cache 目录，无需清理。")
 

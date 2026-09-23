@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 import argparse
 import os
+import platform
 import shutil
-import subprocess
+
+# The release command is assembled from fixed local build arguments.
+import subprocess  # nosec B404
 import sys
 import tarfile
 import tomllib
 import zipfile
 from pathlib import Path
-
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BUILD_ROOT = PROJECT_ROOT / "build"
@@ -21,6 +22,9 @@ PACKAGE_FILES = [
     "README.md",
     "LICENSE",
     "DIFY_LICENSE",
+    # Dify 衍生代码遵循修改后的 Apache 2.0，该许可证第 4(a) 条要求随分发
+    # 提供许可证副本；DIFY_LICENSE 只是引用它的摘要，不能替代全文。
+    "licenses/APACHE-2.0.txt",
     "config.toml.example",
     ".env.example",
 ]
@@ -46,6 +50,54 @@ EXCLUDED_MODULES = [
     "pytest",
     "_pytest",
 ]
+
+_TARGET_ENVIRONMENTS = {
+    "windows-x64": ("windows", "x86_64"),
+    "macos-x64": ("darwin", "x86_64"),
+    "macos-arm64": ("darwin", "arm64"),
+    "linux-x64": ("linux", "x86_64"),
+    "linux-arm64": ("linux", "arm64"),
+}
+
+
+def _normalize_machine(machine: str) -> str:
+    aliases = {
+        "amd64": "x86_64",
+        "x64": "x86_64",
+        "x86-64": "x86_64",
+        "aarch64": "arm64",
+    }
+    normalized = machine.strip().lower().replace("-", "_")
+    return aliases.get(normalized, normalized)
+
+
+def validate_target_environment(
+    target: str,
+    *,
+    system: str | None = None,
+    machine: str | None = None,
+) -> None:
+    """Reject targets that the current PyInstaller host cannot produce.
+
+    PyInstaller builds for the interpreter's host platform and architecture;
+    the release script does not perform cross-compilation. Failing before the
+    output cleanup prevents an incorrectly named artifact from replacing a
+    previously valid one.
+    """
+    expected = _TARGET_ENVIRONMENTS.get(target)
+    if expected is None:
+        raise ValueError(f"不支持的发布目标: {target}")
+
+    actual_system = (system or platform.system()).strip().lower()
+    actual_machine = _normalize_machine(machine or platform.machine())
+    expected_system, expected_machine = expected
+    if actual_system != expected_system or actual_machine != expected_machine:
+        detected = f"{actual_system}-{actual_machine}"
+        required = f"{expected_system}-{expected_machine}"
+        raise RuntimeError(
+            f"发布目标 {target} 需要 {required} 构建环境，当前检测到 {detected}。"
+            " PyInstaller 不执行跨平台交叉编译，请在匹配的 runner 或主机上构建。"
+        )
 
 
 def load_version() -> str:
@@ -103,7 +155,8 @@ def run_pyinstaller() -> None:
     for excluded_module in EXCLUDED_MODULES:
         command.extend(["--exclude-module", excluded_module])
     command.append("main.py")
-    subprocess.run(command, cwd=PROJECT_ROOT, check=True)
+    # shell=False and fixed command arguments keep this invocation bounded.
+    subprocess.run(command, cwd=PROJECT_ROOT, check=True)  # nosec B603
 
 
 def stage_bundle(target: str, version: str) -> Path:
@@ -114,7 +167,11 @@ def stage_bundle(target: str, version: str) -> Path:
 
     shutil.copytree(app_source, app_target)
     for relative_file in PACKAGE_FILES:
-        shutil.copy2(PROJECT_ROOT / relative_file, bundle_root / relative_file)
+        target = bundle_root / relative_file
+        # PACKAGE_FILES 含子目录路径（如 licenses/APACHE-2.0.txt），
+        # copy2 不会自动创建父目录。
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(PROJECT_ROOT / relative_file, target)
     prepare_runtime_layout(bundle_root)
 
     return bundle_root
@@ -158,7 +215,8 @@ def executable_path(bundle_root: Path) -> Path:
 
 def validate_bundle(bundle_root: Path) -> None:
     executable = executable_path(bundle_root)
-    result = subprocess.run(
+    # The executable is the bundle produced immediately before validation.
+    result = subprocess.run(  # nosec B603
         [str(executable), "--smoke-test"],
         cwd=bundle_root,
         text=True,
@@ -174,6 +232,7 @@ def main() -> None:
     args = parse_args()
     version = load_version()
 
+    validate_target_environment(args.target)
     clean_output_dirs()
     run_pyinstaller()
     bundle_root = stage_bundle(args.target, version)

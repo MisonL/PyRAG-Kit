@@ -3,8 +3,9 @@
 # 遵循修改后的 Apache License 2.0 许可证。详情请参阅项目根目录下的 DIFY_LICENSE 文件。
 
 from abc import ABC, abstractmethod
-from typing import List
+
 from src.models.document import Document
+
 
 class BaseSplitter(ABC):
     """
@@ -13,7 +14,7 @@ class BaseSplitter(ABC):
     """
 
     @abstractmethod
-    def split(self, documents: List[Document], **kwargs) -> List[Document]:
+    def split(self, documents: list[Document], **kwargs) -> list[Document]:
         """
         将文档列表中的文本内容分割成更小的块。
 
@@ -24,4 +25,3 @@ class BaseSplitter(ABC):
         Returns:
             List[Document]: 分割后的文档块列表。
         """
-        pass

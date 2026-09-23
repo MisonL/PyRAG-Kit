@@ -49,17 +49,23 @@ PyRAG-Kit 采用了清晰、模块化的项目结构，旨在实现高内聚、�
 
 这是扩展新模型的关键目录。
 
-*   **`__base__/model_provider.py`**: 定义了所有模型提供商必须遵循的抽象基类 `LargeLanguageModel` 和 `RerankModel`。它们规定了 `invoke` 和 `rerank` 等核心接口。
+*   **`__base__/model_provider.py`**: 定义 `CompletionRequest`、`CompletionResult`、`LargeLanguageModel`、`TextEmbeddingModel` 和 `RerankModel`。`invoke`/`ainvoke` 保留文本流兼容接口；需要多轮、多模态、工具调用、结构化输出和 usage 时使用 `complete`/`acomplete`。
 *   **`factory.py`**: 实现了一个工厂模式，用于根据配置动态创建和获取指定的模型提供商实例。
 *   **`google.py`, `openai.py`, etc.**: 每个文件都是一个具体模型提供商的实现，负责处理与该平台 API 的所有交互（如认证、请求构建、响应解析）。
 
 **如何添加一个新的模型提供商？**
 
 1.  在 `src/providers/` 目录下创建一个新的 `my_new_provider.py` 文件。
-2.  在该文件中创建一个类，继承自 `LargeLanguageModel`。
-3.  实现基类中定义的抽象方法，主要是 `invoke()`。
-4.  在 `src/providers/factory.py` 中导入您的新类，并在 `ModelProviderFactory` 的 `get_llm_provider` 方法中添加一个 `elif` 分支来注册您的新提供商。
-5.  在 `config.toml` 的 `llm_configurations`、`embedding_configurations` 或 `rerank_configurations` 中添加使用您的新提供商的配置。
+2.  在该文件中实现所需能力接口：`LargeLanguageModel`、`TextEmbeddingModel` 或 `RerankModel`。
+3.  实现对应抽象方法，并在 `src/providers/factory.py` 的 `_provider_map` 中注册模块和类；不要在 `get_*_provider` 方法中添加分支。
+4.  确保配置角色与实现能力匹配。工厂会在实例化时校验接口，并对需要不同协议实现的渠道使用角色别名。
+5.  在 `config.toml` 的 `llm_configurations`、`embedding_configurations` 或 `rerank_configurations` 中添加配置，并为工厂和渠道请求补充测试。
+
+Provider 的协议边界保持清晰：OpenAI、Qwen、SiliconFlow、DeepSeek、Grok、Ollama 和 LM Studio 复用 `openai` SDK 的 Chat/Responses 兼容接口；这些渠道的 LLM 配置默认使用 Chat Completions，也可显式选择 `responses`，但兼容服务端是否实现该路径必须单独验证。官方 OpenAI Base URL 可按 SDK 契约使用 Responses；代理、中转或自建 Base URL 必须在完成实际验证后通过 `options.server_verified_protocols = ["responses"]` 登记，否则 Provider 会在请求前显式拒绝。只有官方 OpenAI Provider 声明 Files、Batches、Vector Stores、Skills、Realtime、Webhooks、Admin 和 Content Provenance Checks 等 OpenAI 专属资源，并通过 `.native` 保留当前 SDK 的完整资源树。Google、Anthropic 和 Volcengine 使用各自 SDK，Volcengine 同时支持 Ark Chat、Responses 和 Classification；Ark Classification 通过 SDK 官方资源类显式挂载，SDK 不提供该资源时直接报错。Jina 与 SiliconFlow Rerank 使用 HTTP JSON 接口。新增渠道时先确认协议、服务端证据和能力，再选择复用适配器或实现独立 provider。
+
+`ModelDetail.options` 是非敏感 SDK 扩展参数的唯一配置入口。工厂会将其传入 Provider，并拒绝凭证、请求头和 Base URL 字段；Provider 还会把客户端构造参数与请求参数分流，不支持的能力应在 Provider 边界显式报错。SDK 专属文件、批处理、缓存、token 计数等资源通过 Provider 的显式方法调用，不得塞进普通 `invoke()`。同步和异步 Facade 应保持 SDK 的真实调用约定：例如 Google `aio.models.generate_content_stream()` 需要等待一次后再异步迭代，而 `aio.chats.create()` 本身同步返回 `AsyncChat`。
+
+Responses 适配位于 `src/providers/openai_compatible.py`，共享消息归一化位于 `src/providers/__base__/model_provider.py`。请求构造、Chat Completions 工具转换、`assistant.tool_calls`/`role=tool` 历史转换、`text`/`image_url`/`file` 多模态块转换、同步/异步文本提取和 SSE 事件解析集中在这些适配器中；Ark Responses 还要按目标 SDK 变体转换 `input_audio`、`input_video` 和 `image_pixel_limit`，当前 OpenAI SDK 不支持的音视频输入块必须在请求前显式拒绝。`response.failed`、`response.incomplete`、取消状态和错误事件必须显式转换为异常，不能静默结束流。扩展事件类型时应先补契约测试，再修改统一文本流接口。
 
 **当前默认嵌入提供商**
 

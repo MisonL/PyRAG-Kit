@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Dict, List
+from copy import deepcopy
 
 from rich.console import Console
 
@@ -19,6 +19,14 @@ from ..services.retrieval_service import (
     _merge_hybrid_results,
 )
 from ..utils.config import RetrievalMethod, get_settings
+
+__all__ = [
+    "HybridReranker",
+    "ModelProviderFactory",
+    "_merge_hybrid_results",
+    "aretrieve_documents",
+    "retrieve_documents",
+]
 
 
 def _build_session_config(
@@ -44,8 +52,8 @@ def _build_session_config(
         score_threshold=score_threshold,
         active_llm_configuration=settings.default_llm_provider,
         active_rerank_configuration=active_rerank_configuration,
-        llm_configurations=settings.llm_configurations,
-        rerank_configurations=settings.rerank_configurations,
+        llm_configurations=deepcopy(settings.llm_configurations),
+        rerank_configurations=deepcopy(settings.rerank_configurations),
         chat_temperature=settings.chat_temperature,
     )
     return session_config
@@ -64,7 +72,7 @@ def retrieve_documents(
     score_threshold: float,
     fusion_strategy: str = "rrf",
     candidate_multiplier: int = 3,
-) -> List[Dict]:
+) -> list[dict]:
     return asyncio.run(
         aretrieve_documents(
             query=query,
@@ -96,7 +104,7 @@ async def aretrieve_documents(
     score_threshold: float,
     fusion_strategy: str = "rrf",
     candidate_multiplier: int = 3,
-) -> List[Dict]:
+) -> list[dict]:
     run_config = build_run_config(get_settings())
     session_config = _build_session_config(
         retrieval_method=retrieval_method,
@@ -113,4 +121,7 @@ async def aretrieve_documents(
         vector_store=vector_store,
         embedding_service=EmbeddingService(run_config),
     )
-    return await retrieval_service.retrieve(query=query, session_config=session_config, console=console)
+    try:
+        return await retrieval_service.retrieve(query=query, session_config=session_config, console=console)
+    finally:
+        await retrieval_service.aclose()

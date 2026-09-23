@@ -3,16 +3,15 @@
 # 遵循修改后的 Apache License 2.0 许可证。详情请参阅项目根目录下的 DIFY_LICENSE 文件。
 
 import time
-from typing import List, Type
 from pathlib import Path
-from src.etl.extractors.base import BaseExtractor
+
 from src.etl.cleaners.base import BaseCleaner
-from src.etl.splitters.base import BaseSplitter
-from src.etl.extractors.markdown_extractor import MarkdownExtractor
 from src.etl.cleaners.basic_cleaner import BasicCleaner
+from src.etl.extractors.base import BaseExtractor
+from src.etl.extractors.markdown_extractor import MarkdownExtractor
+from src.etl.splitters.base import BaseSplitter
 from src.etl.splitters.recursive_text_splitter import RecursiveTextSplitter
 from src.models.document import Document
-from src.utils.config import get_settings
 from src.utils.log_manager import get_module_logger
 
 logger = get_module_logger(__name__)
@@ -56,7 +55,7 @@ class Pipeline:
             splitter=splitter_instance
         )
 
-    def process(self, document: Document) -> List[Document]:
+    def process(self, document: Document) -> list[Document]:
         """
         处理单个文档，并监控每一步的耗时 (CSE Sensor)。
         """
