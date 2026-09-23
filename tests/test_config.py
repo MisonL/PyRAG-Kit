@@ -77,6 +77,59 @@ def test_settings_model_validation():
         Settings(chat_score_threshold=1.1)
 
 
+@pytest.mark.parametrize(
+    ("field_name", "bad_value"),
+    [
+        ("log_retention_days", -5),
+        ("log_retention_days", 0),
+        ("kb_chunk_size", 0),
+        ("kb_chunk_size", -100),
+        ("kb_chunk_overlap", -1),
+        ("kb_child_chunk_size", 0),
+        ("kb_child_chunk_overlap", -1),
+        ("kb_embedding_batch_size", 0),
+        ("kb_embedding_batch_size", -1),
+        ("chat_vector_weight", -1.0),
+        ("chat_vector_weight", 5.0),
+        ("chat_keyword_weight", 2.0),
+    ],
+)
+def test_numeric_settings_reject_illegal_values(field_name, bad_value):
+    """数值字段的非法值必须在加载期报错，而不是拖到分片/检索期。
+
+    ``kb_chunk_size=0`` 此前会一路通过配置校验，直到 langchain 在分片阶段
+    才抛 ``chunk_size must be > 0``；负权重会反向加成分数。UI 层
+    （``src/ui/config_menu.py``）已有 0..1 校验，TOML/env 路径此前没有。
+    """
+    with pytest.raises(ValidationError, match=field_name):
+        Settings(**{field_name: bad_value})
+
+
+def test_chunk_overlap_must_be_strictly_smaller_than_chunk_size():
+    """overlap 必须严格小于 size，否则分片无法推进（会得到空分片或死循环）。"""
+    with pytest.raises(ValidationError, match="kb_chunk_overlap"):
+        Settings(kb_chunk_size=100, kb_chunk_overlap=100)
+    with pytest.raises(ValidationError, match="kb_child_chunk_overlap"):
+        Settings(kb_child_chunk_size=50, kb_child_chunk_overlap=50)
+
+
+def test_numeric_settings_accept_legal_boundary_values():
+    """合法边界值必须仍然可用，避免校验过紧。"""
+    settings = Settings(
+        log_retention_days=1,
+        kb_chunk_size=1,
+        kb_chunk_overlap=0,
+        kb_child_chunk_size=1,
+        kb_child_chunk_overlap=0,
+        kb_embedding_batch_size=1,
+        chat_vector_weight=0.0,
+        chat_keyword_weight=1.0,
+    )
+    assert settings.kb_chunk_overlap == 0
+    assert settings.chat_vector_weight == 0.0
+    assert settings.chat_keyword_weight == 1.0
+
+
 def test_settings_splitter_separators_empty_string_falls_back_to_default():
     settings = Settings(kb_splitter_separators="")
     assert settings.kb_splitter_separators == ["###"]

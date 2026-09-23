@@ -1452,6 +1452,12 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
                 calls.append(
                     {
                         "id": field(call, "id"),
+                        # 与 openai_compatible.py 的 _extract_tool_calls 及本函数
+                        # 的 Responses 分支（下方 function_call/custom_tool_call）
+                        # 对齐：CompletionResult.tool_calls 的契约是扁平的
+                        # {"id", "type", "name", "arguments"}。缺 type 会让调用方
+                        # 回填的 assistant 历史不符合 OpenAI Chat Completions 形状。
+                        "type": field(call, "type", "function"),
                         "name": field(fn, "name"),
                         "arguments": normalize_tool_arguments(field(fn, "arguments", "")),
                     }

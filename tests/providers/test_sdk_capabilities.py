@@ -2455,6 +2455,75 @@ def test_ark_non_stream_result_preserves_chat_reasoning_content():
     assert result.reasoning == "思考过程"
 
 
+def test_ark_chat_completions_tool_calls_carry_type_key():
+    """Ark 的 Chat Completions 分支必须产出契约形状的 tool_calls。
+
+    ``CompletionResult.tool_calls`` 的契约（``model_provider.py:343`` 与
+    ``docs/user_guide/llm-providers.md:108``）是扁平的
+    ``{"id", "type", "name", "arguments"}``。此前 Ark 的 CC 分支漏掉
+    ``type``，而 Responses 分支（同一函数内）却有——两条分支形状不一致。
+    本测试直接钉住该键，并断言它与 OpenAI 兼容侧产出完全一致。
+    """
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None,
+                    tool_calls=[
+                        SimpleNamespace(
+                            id="call-1",
+                            type="function",
+                            function=SimpleNamespace(name="lookup", arguments='{"id": 1}'),
+                        )
+                    ],
+                ),
+                finish_reason="tool_calls",
+            )
+        ],
+        usage=None,
+        output=None,
+        output_text=None,
+    )
+
+    result = VolcengineProvider._extract_result(response)
+
+    assert len(result.tool_calls) == 1
+    call = result.tool_calls[0]
+    assert call["type"] == "function"
+    assert set(call) == {"id", "type", "name", "arguments"}
+
+    # 与 OpenAI 兼容侧逐键对齐，防止两条路径再次分叉。
+    oai_calls = OpenAICompatibleProvider._extract_tool_calls(response)
+    assert call == oai_calls[0]
+
+
+def test_ark_chat_completions_tool_calls_default_type_to_function():
+    """Ark 未回传 ``type`` 时也要补 ``function``，与 openai_compatible 一致。"""
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None,
+                    tool_calls=[
+                        SimpleNamespace(
+                            id="call-2",
+                            function=SimpleNamespace(name="lookup", arguments="{}"),
+                        )
+                    ],
+                ),
+                finish_reason="tool_calls",
+            )
+        ],
+        usage=None,
+        output=None,
+        output_text=None,
+    )
+
+    result = VolcengineProvider._extract_result(response)
+
+    assert result.tool_calls[0]["type"] == "function"
+
+
 def test_ark_responses_result_does_not_replace_answer_with_reasoning_text():
     """正文与 reasoning 必须分开取。
 

@@ -315,6 +315,53 @@ class Settings(BaseSettings):
             raise ValueError("chat_score_threshold 必须在 0 到 1 之间。")
         return value
 
+    @field_validator("log_retention_days")
+    @classmethod
+    def validate_log_retention_days(cls, value: int) -> int:
+        if isinstance(value, bool) or value < 1:
+            raise ValueError("log_retention_days 必须是大于等于 1 的整数。")
+        return value
+
+    @field_validator(
+        "kb_chunk_size",
+        "kb_child_chunk_size",
+        "kb_embedding_batch_size",
+    )
+    @classmethod
+    def validate_positive_sizes(cls, value: int) -> int:
+        if isinstance(value, bool) or value < 1:
+            raise ValueError(
+                "kb_chunk_size/kb_child_chunk_size/kb_embedding_batch_size 必须是大于等于 1 的整数。"
+            )
+        return value
+
+    @field_validator("kb_chunk_overlap", "kb_child_chunk_overlap")
+    @classmethod
+    def validate_non_negative_overlap(cls, value: int) -> int:
+        if isinstance(value, bool) or value < 0:
+            raise ValueError("kb_chunk_overlap/kb_child_chunk_overlap 必须是非负整数。")
+        return value
+
+    @field_validator("chat_vector_weight", "chat_keyword_weight")
+    @classmethod
+    def validate_hybrid_weights(cls, value: float) -> float:
+        if isinstance(value, bool) or not 0 <= value <= 1:
+            raise ValueError("chat_vector_weight/chat_keyword_weight 必须在 0 到 1 之间。")
+        return value
+
+    @model_validator(mode="after")
+    def validate_overlap_smaller_than_size(self) -> "Settings":
+        """overlap 必须严格小于 size，否则分片无法推进。
+
+        ``chunk_size == chunk_overlap`` 会让切分器无法前进（得到空分片或
+        死循环），且这一约束无法用单字段 validator 表达。
+        """
+        if self.kb_chunk_overlap >= self.kb_chunk_size:
+            raise ValueError("kb_chunk_overlap 必须小于 kb_chunk_size。")
+        if self.kb_child_chunk_overlap >= self.kb_child_chunk_size:
+            raise ValueError("kb_child_chunk_overlap 必须小于 kb_child_chunk_size。")
+        return self
+
     @field_validator("log_level", mode="before")
     @classmethod
     def validate_log_level(cls, v: str) -> str:

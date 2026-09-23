@@ -81,6 +81,8 @@
 - Google `tool_choice` 不再静默接受未知模式：`FunctionCallingConfigMode` 是大小写不敏感枚举，未命中时会合成一个同名成员、只发 `UserWarning`，随后被静默发往服务端；OpenAI 风格的 `{"type": "tool"}` 正会落到这里。现按已知模式显式映射，未知值报 `ValueError`，并给出可选值。`ToolConfig` 的未知键也从裸 pydantic `ValidationError` 归一为本项目的 `ValueError`。
 - Responses `json_schema` 缺 `schema` 时显式报错：此前会回退成 `schema` 本身，伪造出 `{"type": "json_schema"}` 的 schema 发给服务端，调用方以为拿到了结构化输出约束而实际没有；同时 `strict` 不再被硬编码的 `True` 覆盖调用方取值。
 - 补充流式重试助手的回归测试：`retry_sync_stream`/`retry_async_stream` 的建立阶段重试此前零覆盖，现覆盖「建立失败重试」「首事件后不再重试（避免重复输出）」「空流不算失败」「校验器只作用于首事件」「消费方提前退出时关闭迭代器」以及异步等价场景。
+- 修复 Ark Chat Completions 工具调用缺 `type` 键：`VolcengineProvider._extract_result` 的 Chat Completions 分支只产出 `{"id", "name", "arguments"}`，而同一函数的 Responses 分支与 `openai_compatible.py` 的 `_extract_tool_calls` 都产出契约声明的扁平 `{"id", "type", "name", "arguments"}`（`model_provider.py:343` 与 `docs/user_guide/llm-providers.md:108` 双重写明）。调用方按契约回填 `role=tool` 历史时会配不上；现补 `type`（缺省 `function`）并新增两条钉住该键与逐键对齐 OpenAI 兼容侧的回归测试。
+- 数值配置补齐加载期校验：`log_retention_days`、`kb_chunk_size`、`kb_chunk_overlap`、`kb_child_chunk_size`、`kb_child_chunk_overlap`、`kb_embedding_batch_size`、`chat_vector_weight`、`chat_keyword_weight` 此前接受任意数值，`kb_chunk_size=0` 会一路通过配置校验、直到 langchain 在分片阶段才抛 `chunk_size must be > 0`，负权重会反向加成分数；而 UI 层（`src/ui/config_menu.py`）对权重已有 `0..1` 校验，TOML/env 路径没有，形成不对称。现按字段加 validator，并用 `model_validator` 补上「overlap 必须严格小于 size」这条无法用单字段表达、但会让切分器无法推进的跨字段约束。
 
 ## [1.3.0] - 2026-03-20
 
