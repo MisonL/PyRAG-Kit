@@ -7,7 +7,8 @@ import tomllib
 import uuid
 from pathlib import Path
 
-from src.runtime.contracts import KnowledgeSnapshotManifest, RunConfig
+from src.runtime.contracts import SCHEMA_VERSION, KnowledgeSnapshotManifest, RunConfig
+from src.utils.security import resolve_within
 
 
 class SnapshotRepository:
@@ -65,9 +66,24 @@ class SnapshotRepository:
         (snapshot_dir / "manifest.toml").write_text(manifest.to_toml(), encoding="utf-8")
 
     def load_manifest(self, snapshot_dir: Path) -> KnowledgeSnapshotManifest:
+        """读取 manifest，并校验 ``schema_version`` 与当前实现一致。
+
+        版本放在这里判而不是 ``from_mapping`` 里：``from_mapping`` 是纯解析，
+        塞进版本策略会让「解析」和「准入」两件事在同一处各判一次。未知版本必须
+        拒绝——旧/新 schema 的字段语义可能已经变了（本项目 v1 到 v2 就调整过
+        分块与 embedding 的落盘结构），照着当前代码去解释未知版本会得到错误结果
+        而不是报错。
+        """
         with (snapshot_dir / "manifest.toml").open("rb") as file:
             data = tomllib.load(file)
-        return KnowledgeSnapshotManifest.from_mapping(data)
+        manifest = KnowledgeSnapshotManifest.from_mapping(data)
+        if manifest.schema_version != SCHEMA_VERSION:
+            raise ValueError(
+                "知识快照的 schema 版本与当前程序不兼容。"
+                f" 快照={manifest.schema_version}，当前程序={SCHEMA_VERSION}。"
+                " 请重建知识快照；如需保留旧快照，请先用生成它的版本导出数据。"
+            )
+        return manifest
 
     def validate_snapshot_dir(self, snapshot_dir: Path) -> None:
         """校验快照文件齐全**且三个数据源的行数自洽**。
@@ -79,6 +95,19 @@ class SnapshotRepository:
         ``self.documents`` 会越界，而报错现场离真正的原因（写入时就不一致）
         很远。这里在加载/切换快照的入口就把三者对齐。
         """
+        # 先确认目录归属，再谈内容：快照目录里的 chunks.pkl/parents.pkl/
+        # lexical.index 都是 pickle，反序列化即执行代码，而「路径长在 root 附近」
+        # 不构成来源证明。resolve_within 会把符号链接逃逸（root/link -> /etc）
+        # 一并拦下。
+        resolved = resolve_within(snapshot_dir, self.root, label="知识快照目录")
+        if snapshot_dir.is_symlink():
+            raise ValueError(f"知识快照目录不能是符号链接: {snapshot_dir}")
+        if resolved.parent != Path(self.root).resolve():
+            raise ValueError(
+                f"知识快照目录必须直接位于快照根目录之下: {resolved}（根={self.root}）。"
+            )
+        snapshot_dir = resolved
+
         required_files = [
             snapshot_dir / "manifest.toml",
             snapshot_dir / "chunks.pkl",

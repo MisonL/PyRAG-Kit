@@ -40,11 +40,14 @@ class MockFaissStore(VectorStoreBase):
     def save(self, path: str):
         """模拟保存操作"""
 
-    def load(self, path: str):
-        """模拟加载操作"""
+    def load(self, path: str, *, trusted_paths=None):
+        """模拟加载操作（签名与 FaissStore 一致，含来源校验参数）。"""
+        self.file_path = path
 
-    def load_snapshot(self, snapshot_dir: str):
+    def load_snapshot(self, snapshot_dir: str, *, snapshot_root=None):
         """模拟从快照目录加载，记录路径供断言。"""
+        if not snapshot_root:
+            raise ValueError("缺少 snapshot_root，已拒绝加载快照。")
         self.file_path = snapshot_dir
 
     def get_embedding_model(self) -> Any:
@@ -98,7 +101,9 @@ def patch_settings(monkeypatch, tmp_path):
         )
 
         # 直接模拟 VectorStoreFactory.get_vector_store 方法
-        def mock_get_vector_store(store_type: str, file_path: str | None = None) -> VectorStoreBase:
+        def mock_get_vector_store(
+            store_type: str, file_path: str | None = None, *, trusted_paths=None
+        ) -> VectorStoreBase:
             if store_type.lower() == "faiss":
                 return MockFaissStore(file_path=file_path)
             else:
@@ -213,3 +218,73 @@ def test_default_vector_store_accepts_matching_embedding(tmp_path):
 
     store = VectorStoreFactory.get_default_vector_store()
     assert isinstance(store, MockFaissStore)
+
+
+# ── 回归：legacy 导入失败必须清理 .tmp-*，且不污染已有快照 ──
+
+
+class _PartialWriterStore:
+    """``save_snapshot`` 只落一个残缺文件，模拟构建中途失败。"""
+
+    def __init__(self):
+        self.documents = [{"page_content": "旧数据", "metadata": {"source": "old.md"}}]
+
+    def load(self, path: str, *, trusted_paths=None):
+        return
+
+    def save_snapshot(self, snapshot_dir: str) -> None:
+        from pathlib import Path
+
+        (Path(snapshot_dir) / "chunks.pkl").write_bytes(b"partial")
+
+
+def test_legacy_import_cleans_temp_dir_on_failure(tmp_path):
+    """legacy 导入在 ``create_temp_snapshot_dir`` 之后失败时必须清掉 ``.tmp-*``。
+
+    ``factory.py`` 的 legacy 分支原先没有 ``knowledge_build_service`` 那样的
+    ``finalized``/``finally`` 结构，任何中途失败都会在快照根目录留下
+    ``.tmp-legacy-*``，并随时间累积。
+    """
+    import pickle
+    from pathlib import Path
+
+    from src.retrieval.snapshot_repository import SnapshotRepository
+    from src.retrieval.vdb.factory import VectorStoreFactory
+    from src.runtime.contracts import build_run_config
+    from src.utils.config import get_settings
+
+    settings = get_settings()
+    snapshot_root = Path(settings.snapshot_root)
+    snapshot_root.mkdir(parents=True, exist_ok=True)
+
+    # 已有正式快照 + 活动标记，断言它们不被 legacy 导入的失败牵连
+    previous = snapshot_root / "previous"
+    previous.mkdir(exist_ok=True)
+    (previous / "keep.txt").write_text("保留", encoding="utf-8")
+    (snapshot_root / "ACTIVE_SNAPSHOT").write_text("previous", encoding="utf-8")
+
+    legacy_path = Path(settings.pkl_path)
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    with legacy_path.open("wb") as file:
+        pickle.dump({"documents": [], "embeddings": None}, file)
+
+    run_config = build_run_config(settings)
+    repository = SnapshotRepository(run_config)
+    monkeypatch_generated = "legacy-fixed-id"
+
+    with (
+        patch.object(repository, "generate_snapshot_id", return_value=monkeypatch_generated),
+        patch("src.retrieval.vdb.factory.SnapshotRepository", return_value=repository),
+        patch(
+            "src.retrieval.vdb.factory.VectorStoreFactory.get_vector_store",
+            return_value=_PartialWriterStore(),
+        ),
+        pytest.raises(FileNotFoundError, match="知识快照不完整"),
+    ):
+        VectorStoreFactory._load_existing_state(object(), run_config)
+
+    assert not (snapshot_root / f".tmp-{monkeypatch_generated}").exists(), (
+        "失败的 legacy 导入留下了临时快照目录"
+    )
+    assert (snapshot_root / "ACTIVE_SNAPSHOT").read_text(encoding="utf-8") == "previous"
+    assert (previous / "keep.txt").read_text(encoding="utf-8") == "保留"

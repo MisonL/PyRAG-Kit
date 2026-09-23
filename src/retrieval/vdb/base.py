@@ -37,8 +37,8 @@ class VectorStoreBase(ABC):
         """保存向量存储。"""
 
     @abstractmethod
-    def load(self, path: str):
-        """加载向量存储。"""
+    def load(self, path: str, *, trusted_paths: Any = None):
+        """加载向量存储。``trusted_paths`` 声明可信来源根（实现可据此拒绝任意路径）。"""
 
     @abstractmethod
     def get_embedding_model(self) -> Any:
@@ -60,8 +60,12 @@ class VectorStoreBase(ABC):
         """将当前状态保存为快照。默认未实现。"""
         raise NotImplementedError("当前向量存储未实现 save_snapshot。")
 
-    def load_snapshot(self, snapshot_dir: str):
-        """从快照目录加载状态。默认未实现。"""
+    def load_snapshot(self, snapshot_dir: str, *, snapshot_root: Any = None):
+        """从快照目录加载状态。默认未实现。
+
+        ``snapshot_root`` 是调用方声明的信任根：快照目录内的文件可能参与反序列化，
+        路径本身不足以证明来源，实现应据此校验归属。
+        """
         raise NotImplementedError("当前向量存储未实现 load_snapshot。")
 
     def register_parent_documents(self, parent_documents: dict[str, dict[str, Any]]):

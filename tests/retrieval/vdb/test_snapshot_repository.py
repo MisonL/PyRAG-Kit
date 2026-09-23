@@ -177,3 +177,135 @@ def test_validate_snapshot_dir_reports_unparseable_chunks_as_value_error(tmp_pat
 
     with pytest.raises(ValueError, match="无法解析"):
         repository.validate_snapshot_dir(snapshot_dir)
+
+
+# ── 回归：manifest 的 schema 版本准入 ──
+
+
+def test_load_manifest_rejects_unknown_schema_version(tmp_path, monkeypatch):
+    """未知 schema 版本必须拒绝，而不是照着当前代码去解释。
+
+    ``from_mapping`` 是纯解析（``str(data["schema_version"])``），不做版本判断；
+    版本准入放在 ``load_manifest``。旧/新 schema 的字段语义可能已经变了
+    （本项目 v1→v2 调整过分块与 embedding 的落盘结构），静默接受未知版本会得到
+    错误结果而不是报错。
+    """
+    from src.retrieval.snapshot_repository import SnapshotRepository
+
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_root.mkdir()
+    monkeypatch.setattr("src.utils.config.ROOT_DIR", tmp_path)
+    (tmp_path / "config.toml").write_text('snapshot_root = "snapshots"\n', encoding="utf-8")
+    get_settings.cache_clear()
+    repository = SnapshotRepository(build_run_config(get_settings()))
+
+    snapshot_dir = snapshot_root / "kb-old-schema"
+    snapshot_dir.mkdir()
+    # 故意写一个当前程序不认识的 schema 版本
+    (snapshot_dir / "manifest.toml").write_text(
+        'schema_version = "999"\n'
+        'snapshot_id = "kb-old-schema"\n'
+        'created_at = "2020-01-01T00:00:00+00:00"\n'
+        'store_type = "faiss"\n'
+        'embedding_provider = "local-hash"\n'
+        'embedding_model = "local-hash-256"\n'
+        'chunk_mode = "standard"\n'
+        'source_digest = "d"\n'
+        "document_count = 1\n"
+        "chunk_count = 1\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="schema") as excinfo:
+        repository.load_manifest(snapshot_dir)
+
+    message = str(excinfo.value)
+    assert "999" in message
+    assert "2" in message
+
+
+def test_load_manifest_accepts_current_schema_version(tmp_path, monkeypatch):
+    """收紧不能误伤：当前版本的 manifest 必须能读回。"""
+    from src.retrieval.snapshot_repository import SnapshotRepository
+
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_root.mkdir()
+    monkeypatch.setattr("src.utils.config.ROOT_DIR", tmp_path)
+    (tmp_path / "config.toml").write_text('snapshot_root = "snapshots"\n', encoding="utf-8")
+    get_settings.cache_clear()
+    repository = SnapshotRepository(build_run_config(get_settings()))
+
+    snapshot_dir = snapshot_root / "kb-current"
+    snapshot_dir.mkdir()
+    manifest = KnowledgeSnapshotManifest.create(
+        snapshot_id="kb-current",
+        store_type="faiss",
+        embedding_provider="local-hash",
+        embedding_model="local-hash-256",
+        chunk_mode="standard",
+        source_digest="d",
+        document_count=1,
+        chunk_count=1,
+    )
+    repository.write_manifest(snapshot_dir, manifest)
+
+    loaded = repository.load_manifest(snapshot_dir)
+
+    assert loaded.schema_version == manifest.schema_version
+    assert loaded.snapshot_id == "kb-current"
+
+
+def test_validate_snapshot_dir_rejects_directory_outside_root(tmp_path, monkeypatch):
+    """快照目录必须在受信根内：快照内的 pickle 反序列化即执行代码。"""
+    from src.retrieval.snapshot_repository import SnapshotRepository
+
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_root.mkdir()
+    monkeypatch.setattr("src.utils.config.ROOT_DIR", tmp_path)
+    (tmp_path / "config.toml").write_text('snapshot_root = "snapshots"\n', encoding="utf-8")
+    get_settings.cache_clear()
+    repository = SnapshotRepository(build_run_config(get_settings()))
+
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+
+    with pytest.raises(ValueError, match="受信根"):
+        repository.validate_snapshot_dir(outside)
+
+
+def test_validate_snapshot_dir_rejects_symlinked_snapshot_dir(tmp_path, monkeypatch):
+    """快照目录本身是符号链接时必须拒绝，即使目标在根内。"""
+    from src.retrieval.snapshot_repository import SnapshotRepository
+
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_root.mkdir()
+    monkeypatch.setattr("src.utils.config.ROOT_DIR", tmp_path)
+    (tmp_path / "config.toml").write_text('snapshot_root = "snapshots"\n', encoding="utf-8")
+    get_settings.cache_clear()
+    repository = SnapshotRepository(build_run_config(get_settings()))
+
+    real = repository.root / "kb-real"
+    real.mkdir()
+    link = repository.root / "kb-link"
+    link.symlink_to(real)
+
+    with pytest.raises(ValueError, match="符号链接"):
+        repository.validate_snapshot_dir(link)
+
+
+def test_validate_snapshot_dir_rejects_nested_snapshot_dir(tmp_path, monkeypatch):
+    """快照目录必须是根的直接子目录，不能嵌在更深层级。"""
+    from src.retrieval.snapshot_repository import SnapshotRepository
+
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_root.mkdir()
+    monkeypatch.setattr("src.utils.config.ROOT_DIR", tmp_path)
+    (tmp_path / "config.toml").write_text('snapshot_root = "snapshots"\n', encoding="utf-8")
+    get_settings.cache_clear()
+    repository = SnapshotRepository(build_run_config(get_settings()))
+
+    nested = repository.root / "outer" / "kb-inner"
+    nested.mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="直接位于快照根目录之下"):
+        repository.validate_snapshot_dir(nested)

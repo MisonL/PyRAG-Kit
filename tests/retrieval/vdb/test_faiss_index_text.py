@@ -98,13 +98,17 @@ def test_load_snapshot_tolerates_empty_lexical_index(tmp_path):
 
     import numpy as np
 
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_dir = snapshot_root / "kb-empty"
+    snapshot_dir.mkdir(parents=True)
     for name, payload in (("chunks.pkl", []), ("parents.pkl", {}), ("lexical.index", [])):
-        with (tmp_path / name).open("wb") as file:
+        with (snapshot_dir / name).open("wb") as file:
             pickle.dump(payload, file)
-    np.save(tmp_path / "embeddings.npy", np.zeros((0, 4), dtype=np.float32))
+    np.save(snapshot_dir / "embeddings.npy", np.zeros((0, 4), dtype=np.float32))
+    (snapshot_root / "ACTIVE_SNAPSHOT").write_text("kb-empty", encoding="utf-8")
 
     store = FaissStore(file_path=None)
-    store.load_snapshot(str(tmp_path))
+    store.load_snapshot(str(snapshot_dir), snapshot_root=snapshot_root)
 
     assert store.bm25_index is None
     assert store.keyword_search("任意查询") == []

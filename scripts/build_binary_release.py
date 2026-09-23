@@ -195,8 +195,31 @@ def prepare_runtime_layout(bundle_root: Path) -> None:
     )
 
 
+def find_dangling_symlinks(bundle_root: Path) -> list[Path]:
+    """列出 bundle 内目标不存在的符号链接。
+
+    ``ZipFile.write`` 会解引用符号链接去取元数据，目标缺失时抛的是裸
+    ``FileNotFoundError``（不带任何「这是发布包符号链接」的线索），而
+    ``tarfile.add`` 会把链接本身写进归档、不报错。两个分支行为不一致，
+    且在 Windows 这个唯一的 zip 目标上表现为一个难以归因的构建失败。
+    归档前先显式找出它们，让失败信息说清是什么、有几条。
+    """
+    return sorted(
+        entry for entry in bundle_root.rglob("*") if entry.is_symlink() and not entry.exists()
+    )
+
+
 def archive_bundle(bundle_root: Path, target: str) -> Path:
     if target == "windows-x64":
+        dangling = find_dangling_symlinks(bundle_root)
+        if dangling:
+            listed = "\n  ".join(str(path.relative_to(bundle_root)) for path in dangling)
+            raise RuntimeError(
+                f"发布包内含 {len(dangling)} 个目标不存在的符号链接，无法打包为 ZIP："
+                f"\n  {listed}\n"
+                " ZIP 格式无法保留符号链接，``ZipFile.write`` 又会解引用它们，"
+                "请检查构建产物；若这些链接是有意为之，请改用 tar.gz 目标。"
+            )
         archive_path = bundle_root.parent / f"{bundle_root.name}.zip"
         with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for file_path in sorted(bundle_root.rglob("*")):

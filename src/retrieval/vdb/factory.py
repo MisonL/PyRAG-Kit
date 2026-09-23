@@ -2,20 +2,29 @@
 # 原始来源: https://github.com/langgenius/dify
 # 遵循修改后的 Apache License 2.0 许可证。详情请参阅项目根目录下的 DIFY_LICENSE 文件。
 
+from collections.abc import Iterable
 from pathlib import Path
 
 from ...runtime.contracts import KnowledgeSnapshotManifest, build_run_config
 from ...utils.config import get_settings
+from ...utils.log_manager import get_module_logger
 from ..snapshot_repository import SnapshotRepository
 from .base import VectorStoreBase
 from .faiss_store import FaissStore
 
+logger = get_module_logger(__name__)
+
 
 class VectorStoreFactory:
     @staticmethod
-    def get_vector_store(store_type: str, file_path: str | None = None) -> VectorStoreBase:
+    def get_vector_store(
+        store_type: str,
+        file_path: str | None = None,
+        *,
+        trusted_paths: Iterable[str | Path] | None = None,
+    ) -> VectorStoreBase:
         if store_type.lower() == "faiss":
-            return FaissStore(file_path=file_path)
+            return FaissStore(file_path=file_path, trusted_paths=trusted_paths)
         raise ValueError(f"不支持的向量存储类型: {store_type}")
 
     @staticmethod
@@ -51,31 +60,50 @@ class VectorStoreFactory:
                     f"当前={run_config.default_embedding_provider}/{embedding_detail.model_name}。"
                     "请重建知识快照或切换回原 embedding 配置。"
                 )
-            store.load_snapshot(str(active_snapshot_dir))
+            store.load_snapshot(str(active_snapshot_dir), snapshot_root=run_config.snapshot_root)
             return
 
         legacy_path = Path(run_config.legacy_pkl_path)
         if not legacy_path.exists():
             return
 
-        store.load(str(legacy_path))
+        # 只信任配置里声明的 legacy 文件所在目录：这条路径要 pickle.load，
+        # 而路径本身不能证明来源。
+        store.load(str(legacy_path), trusted_paths=[legacy_path.parent])
         snapshot_id = snapshot_repository.generate_snapshot_id(prefix="legacy")
         temp_dir = snapshot_repository.create_temp_snapshot_dir(snapshot_id)
-        store.save_snapshot(str(temp_dir))
-        manifest = KnowledgeSnapshotManifest.create(
-            snapshot_id=snapshot_id,
-            store_type=run_config.default_vector_store,
-            embedding_provider=run_config.default_embedding_provider,
-            embedding_model=run_config.embedding_configurations[
-                run_config.default_embedding_provider
-            ].model_name,
-            chunk_mode="legacy-import",
-            source_digest="legacy-import",
-            document_count=len(
-                {doc.get("metadata", {}).get("source") for doc in getattr(store, "documents", [])}
-            ),
-            chunk_count=len(getattr(store, "documents", [])),
-        )
-        snapshot_repository.write_manifest(temp_dir, manifest)
-        final_dir = snapshot_repository.finalize_snapshot(temp_dir, snapshot_id)
-        snapshot_repository.validate_snapshot_dir(final_dir)
+        finalized = False
+        try:
+            store.save_snapshot(str(temp_dir))
+            manifest = KnowledgeSnapshotManifest.create(
+                snapshot_id=snapshot_id,
+                store_type=run_config.default_vector_store,
+                embedding_provider=run_config.default_embedding_provider,
+                embedding_model=run_config.embedding_configurations[
+                    run_config.default_embedding_provider
+                ].model_name,
+                chunk_mode="legacy-import",
+                source_digest="legacy-import",
+                document_count=len(
+                    {
+                        doc.get("metadata", {}).get("source")
+                        for doc in getattr(store, "documents", [])
+                    }
+                ),
+                chunk_count=len(getattr(store, "documents", [])),
+            )
+            snapshot_repository.write_manifest(temp_dir, manifest)
+            # 先在临时目录里校验再 finalize：finalize 会更新 ACTIVE_SNAPSHOT，
+            # 校验放到它后面就只剩「坏快照已经被激活」这一种收场方式。
+            snapshot_repository.validate_snapshot_dir(temp_dir)
+            final_dir = snapshot_repository.finalize_snapshot(temp_dir, snapshot_id)
+            snapshot_repository.validate_snapshot_dir(final_dir)
+            finalized = True
+        finally:
+            if not finalized:
+                # 与 KnowledgeBuildService.build 一致：清理失败只记日志，
+                # 不能掩盖真正的失败原因。
+                try:
+                    snapshot_repository.cleanup_temp_snapshot_dir(snapshot_id)
+                except Exception:
+                    logger.exception("清理临时知识快照失败: %s", temp_dir)

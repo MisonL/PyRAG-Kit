@@ -682,3 +682,37 @@ def test_get_settings_wraps_settings_error_from_unparseable_env_list(monkeypatch
 
     get_settings.cache_clear()
     assert "kb_splitter_separators" in str(excinfo.value)
+
+
+# ── 回归：仓库自身代码路径不得产生被吞掉的警告 ──
+
+
+def test_repository_code_paths_emit_no_swallowed_warnings():
+    """走一遍本仓库的配置加载路径，断言不产生 UserWarning/DeprecationWarning。
+
+    ``pytest.ini`` 原先用全局 ``ignore::UserWarning`` / ``ignore::DeprecationWarning``
+    把它们静音了：实测同一个探针用例在全局忽略下静默通过、在
+    ``-W error::UserWarning`` 下失败，说明警告确实发生却被吞掉。现在过滤只按
+    第三方 module 前缀限定，所以本仓库代码产生的警告必须在这里被显式盯住——
+    否则「收窄过滤」本身也会在未来某次改动里悄悄失效。
+    """
+    import warnings
+
+    get_settings.cache_clear()
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            settings = get_settings()
+            # 触发几条常见的配置读写路径
+            settings.model_dump()
+            build_runtime_paths = resolve_app_root()
+            assert build_runtime_paths is not None
+    finally:
+        get_settings.cache_clear()
+
+    offenders = [
+        f"{warning.category.__name__}: {warning.message}"
+        for warning in caught
+        if issubclass(warning.category, (UserWarning, DeprecationWarning))
+    ]
+    assert not offenders, f"本仓库代码产生了警告，请修复而不是加过滤: {offenders}"

@@ -1,9 +1,11 @@
 """配置、请求和日志边界的安全校验工具。"""
 
 import copy
+import os
 import re
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from itertools import pairwise
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
@@ -715,3 +717,60 @@ def validate_secret_free_resource_args(
             + ", ".join(sorted(set(found)))
         )
     return sanitized
+
+
+def resolve_within(
+    candidate: str | os.PathLike[str],
+    root: str | os.PathLike[str],
+    *,
+    label: str,
+) -> Path:
+    """把一个路径解析到 ``root`` 之内，越界即拒绝。
+
+    用于 pickle 一类「解析即执行」的加载入口：``AGENTS.md`` 要求知识快照只从
+    本项目生成的本地快照或明确受信的 legacy 文件加载，但路径本身并不能证明
+    来源，所以调用方必须给出信任根，由这里判断归属。
+
+    两个路径都先 ``resolve()`` 再比较，因此符号链接指向根外时会被拦下
+    （``root/link -> /etc`` 这类逃逸）。``resolve()`` 用默认的
+    ``strict=False``：目标可以尚不存在，此处只判断归属，存在性由调用方另行校验。
+    """
+    resolved_root = Path(root).resolve()
+    resolved_candidate = Path(candidate).resolve()
+    if resolved_candidate != resolved_root and not resolved_candidate.is_relative_to(resolved_root):
+        raise ValueError(
+            f"{label} 必须位于受信根目录内。"
+            f" 路径={resolved_candidate}，受信根={resolved_root}。"
+            " 请只加载本项目生成的快照；如需导入外部文件，请显式把它放入受信目录。"
+        )
+    return resolved_candidate
+
+
+def ensure_trusted_source(
+    candidate: str | os.PathLike[str],
+    trusted_roots: Iterable[str | os.PathLike[str]] | None,
+    *,
+    label: str,
+) -> Path:
+    """要求 ``candidate`` 命中给定的受信根之一，否则拒绝加载。
+
+    ``trusted_roots`` 为 ``None`` 或空集合时一律拒绝——调用方没有声明任何
+    信任来源时，不能退化成「任意路径都可加载」，否则这个边界等于不存在。
+    """
+    roots = [Path(root) for root in trusted_roots] if trusted_roots else []
+    if not roots:
+        raise ValueError(
+            f"缺少 {label} 的受信来源声明，已拒绝加载。"
+            " 请在调用处显式传入 trusted_paths/trusted_roots（通常来自 RunConfig 的"
+            " snapshot_root 或 legacy_pkl_path）。"
+        )
+    errors: list[str] = []
+    for root in roots:
+        try:
+            return resolve_within(candidate, root, label=label)
+        except ValueError as exc:
+            errors.append(str(exc))
+    raise ValueError(
+        f"{label} 不在任何受信路径内。路径={Path(candidate)}。"
+        f" 受信路径={[str(root) for root in roots]}。"
+    )
