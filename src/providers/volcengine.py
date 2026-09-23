@@ -56,6 +56,39 @@ def _load_ark_clients() -> tuple[type[Any], type[Any]]:
     return Ark, AsyncArk
 
 
+# Responses 的 output 里，除 message 与 function_call 外还有内置工具的调用项。
+# 这些项既无正文也不是 function_call，但都是 SDK ``ResponseOutputItem`` 联合的
+# 正式成员，且都是「需要后续轮次」的中间态——调用方要读 output 里的工具调用
+# 才能继续，因此返回空正文是正确的。
+#
+# 不含 ``reasoning``：它不是工具调用，本轮有摘要时 ``reasoning`` 字段非空，
+# 前面 ``and not reasoning`` 已经放行；只有空摘要且无正文、无工具调用时才走到
+# 失败分支，那确实是什么都没有，报错才对。把 reasoning 列入豁免会让这种响应
+# 静默返回空成功，掩盖失败（项目规则禁止）。
+#
+# 白名单需与 SDK 联合成员保持同步，`test_ark_builtin_item_whitelist_covers_sdk_union`
+# 会对差集断言。
+_ARK_BUILTIN_TOOL_ITEM_TYPES = frozenset(
+    {
+        "web_search_call",
+        "mcp_call",
+        "mcp_list_tools",
+        "mcp_approval_request",
+        "knowledge_search_call",
+        "doubao_app_call",
+        "image_process",
+        "agent_tool_call",
+    }
+)
+
+
+def _ark_responses_has_builtin_tool_items(response: Any) -> bool:
+    """判断响应里是否含 Ark 内置工具的调用项。"""
+    for item in field(response, "output", []) or []:
+        if field(item, "type") in _ARK_BUILTIN_TOOL_ITEM_TYPES:
+            return True
+    return False
+
 
 def _ark_responses_output_text(response: Any) -> str:
     """从 Responses 的 ``output[].content[]`` 提取助手正文。
@@ -81,33 +114,89 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
 
     _ARK_CHAT_MODEL_OPTION_KEYS = frozenset(
         {
-            "frequency_penalty", "function_call", "logit_bias", "logprobs",
-            "max_completion_tokens", "max_tokens", "n", "parallel_tool_calls",
-            "presence_penalty", "reasoning_effort", "repetition_penalty",
-            "response_format", "service_tier", "stop", "stream_options",
-            "temperature", "thinking", "tool_choice", "top_logprobs", "top_p",
-            "user", "extra_body", "top_k", "seed",
+            "frequency_penalty",
+            "function_call",
+            "logit_bias",
+            "logprobs",
+            "max_completion_tokens",
+            "max_tokens",
+            "n",
+            "parallel_tool_calls",
+            "presence_penalty",
+            "reasoning_effort",
+            "repetition_penalty",
+            "response_format",
+            "service_tier",
+            "stop",
+            "stream_options",
+            "temperature",
+            "thinking",
+            "tool_choice",
+            "top_logprobs",
+            "top_p",
+            "user",
+            "extra_body",
+            "top_k",
+            "seed",
         }
     )
     _ARK_RESPONSES_MODEL_OPTION_KEYS = frozenset(
         {
-            "caching", "context_management", "conversation", "expire_at",
-            "extra_body", "frequency_penalty", "max_completion_tokens",
-            "max_output_tokens", "max_tokens", "max_tool_calls",
-            "parallel_tool_calls", "previous_response_id", "presence_penalty",
-            "reasoning", "reasoning_effort", "response_format", "service_tier",
-            "session", "store", "temperature", "text", "thinking", "tool_choice",
-            "top_k", "top_p", "seed",
+            "caching",
+            "context_management",
+            "conversation",
+            "expire_at",
+            "extra_body",
+            "frequency_penalty",
+            "max_completion_tokens",
+            "max_output_tokens",
+            "max_tokens",
+            "max_tool_calls",
+            "parallel_tool_calls",
+            "previous_response_id",
+            "presence_penalty",
+            "reasoning",
+            "reasoning_effort",
+            "response_format",
+            "service_tier",
+            "session",
+            "store",
+            "temperature",
+            "text",
+            "thinking",
+            "tool_choice",
+            "top_k",
+            "top_p",
+            "seed",
         }
     )
     _ARK_RESPONSES_CREATE_KEYS = frozenset(
         {
-            "input", "model", "instructions", "max_output_tokens",
-            "parallel_tool_calls", "previous_response_id", "thinking", "store",
-            "caching", "stream", "temperature", "text", "tool_choice", "tools",
-            "top_p", "max_tool_calls", "context_management", "expire_at",
-            "extra_headers", "extra_query", "extra_body", "timeout", "reasoning",
-            "session", "service_tier",
+            "input",
+            "model",
+            "instructions",
+            "max_output_tokens",
+            "parallel_tool_calls",
+            "previous_response_id",
+            "thinking",
+            "store",
+            "caching",
+            "stream",
+            "temperature",
+            "text",
+            "tool_choice",
+            "tools",
+            "top_p",
+            "max_tool_calls",
+            "context_management",
+            "expire_at",
+            "extra_headers",
+            "extra_query",
+            "extra_body",
+            "timeout",
+            "reasoning",
+            "session",
+            "service_tier",
         }
     )
     _ARK_RESPONSES_RETRIEVE_KEYS = frozenset(
@@ -115,120 +204,292 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
     )
     _ARK_RESPONSES_INPUT_ITEMS_KEYS = frozenset(
         {
-            "after", "before", "include", "limit", "order",
-            "extra_headers", "extra_query", "extra_body", "timeout",
+            "after",
+            "before",
+            "include",
+            "limit",
+            "order",
+            "extra_headers",
+            "extra_query",
+            "extra_body",
+            "timeout",
         }
     )
     _ARK_BATCH_MULTIMODAL_EMBEDDING_KEYS = frozenset(
         {
-            "input", "model", "encoding_format", "dimensions", "instructions",
-            "extra_headers", "extra_query", "extra_body", "timeout",
+            "input",
+            "model",
+            "encoding_format",
+            "dimensions",
+            "instructions",
+            "extra_headers",
+            "extra_query",
+            "extra_body",
+            "timeout",
         }
     )
     _ARK_BATCH_CHAT_KEYS = frozenset(
         {
-            "messages", "model", "frequency_penalty", "function_call",
-            "logit_bias", "logprobs", "max_tokens", "presence_penalty",
-            "stop", "temperature", "tools", "top_logprobs", "top_p",
-            "repetition_penalty", "n", "parallel_tool_calls", "service_tier",
-            "tool_choice", "response_format", "thinking", "max_completion_tokens",
-            "user", "extra_headers", "extra_query", "extra_body", "timeout",
+            "messages",
+            "model",
+            "frequency_penalty",
+            "function_call",
+            "logit_bias",
+            "logprobs",
+            "max_tokens",
+            "presence_penalty",
+            "stop",
+            "temperature",
+            "tools",
+            "top_logprobs",
+            "top_p",
+            "repetition_penalty",
+            "n",
+            "parallel_tool_calls",
+            "service_tier",
+            "tool_choice",
+            "response_format",
+            "thinking",
+            "max_completion_tokens",
+            "user",
+            "extra_headers",
+            "extra_query",
+            "extra_body",
+            "timeout",
         }
     )
     _ARK_BATCH_EMBEDDING_KEYS = frozenset(
         {
-            "input", "model", "encoding_format", "user", "extra_headers",
-            "extra_query", "extra_body", "timeout",
+            "input",
+            "model",
+            "encoding_format",
+            "user",
+            "extra_headers",
+            "extra_query",
+            "extra_body",
+            "timeout",
         }
     )
     _ARK_BATCH_CHAT_ASYNC_KEYS = _ARK_BATCH_CHAT_KEYS
     _ARK_CONTEXT_CREATE_KEYS = frozenset(
         {
-            "model", "messages", "ttl", "mode", "truncation_strategy",
-            "extra_headers", "extra_query", "extra_body", "timeout",
+            "model",
+            "messages",
+            "ttl",
+            "mode",
+            "truncation_strategy",
+            "extra_headers",
+            "extra_query",
+            "extra_body",
+            "timeout",
         }
     )
     _ARK_CONTEXT_COMPLETION_KEYS = frozenset(
         {
-            "context_id", "messages", "model", "frequency_penalty",
-            "function_call", "logit_bias", "logprobs", "max_tokens",
-            "presence_penalty", "stop", "stream", "stream_options",
-            "temperature", "tools", "top_logprobs", "top_p",
-            "repetition_penalty", "n", "tool_choice", "response_format",
-            "user", "extra_headers", "extra_query", "extra_body", "timeout",
+            "context_id",
+            "messages",
+            "model",
+            "frequency_penalty",
+            "function_call",
+            "logit_bias",
+            "logprobs",
+            "max_tokens",
+            "presence_penalty",
+            "stop",
+            "stream",
+            "stream_options",
+            "temperature",
+            "tools",
+            "top_logprobs",
+            "top_p",
+            "repetition_penalty",
+            "n",
+            "tool_choice",
+            "response_format",
+            "user",
+            "extra_headers",
+            "extra_query",
+            "extra_body",
+            "timeout",
         }
-    )
-    _ARK_CLASSIFICATION_KEYS = frozenset(
-        {"query", "model", "labels", "user", "extra_headers", "extra_query", "extra_body", "timeout"}
     )
     _ARK_CONTENT_GENERATION_CREATE_KEYS = frozenset(
         {
-            "model", "content", "safety_identifier", "callback_url",
-            "return_last_frame", "service_tier", "execution_expires_after",
-            "priority", "generate_audio", "draft", "camera_fixed", "watermark",
-            "seed", "resolution", "ratio", "duration", "frames", "tools",
-            "output_format", "omni_reference_task_type", "extra_headers",
-            "extra_query", "extra_body", "timeout",
+            "model",
+            "content",
+            "safety_identifier",
+            "callback_url",
+            "return_last_frame",
+            "service_tier",
+            "execution_expires_after",
+            "priority",
+            "generate_audio",
+            "draft",
+            "camera_fixed",
+            "watermark",
+            "seed",
+            "resolution",
+            "ratio",
+            "duration",
+            "frames",
+            "tools",
+            "output_format",
+            "omni_reference_task_type",
+            "extra_headers",
+            "extra_query",
+            "extra_body",
+            "timeout",
         }
     )
     _ARK_CONTENT_GENERATION_LIST_KEYS = frozenset(
         {
-            "page_num", "page_size", "status", "task_ids", "model", "service_tier",
-            "extra_headers", "extra_query", "extra_body", "timeout",
+            "page_num",
+            "page_size",
+            "status",
+            "task_ids",
+            "model",
+            "service_tier",
+            "extra_headers",
+            "extra_query",
+            "extra_body",
+            "timeout",
         }
     )
     _ARK_FILE_CREATE_KEYS = frozenset(
         {
-            "expire_at", "preprocess_configs", "url", "tos", "extra_headers",
-            "extra_query", "extra_body", "timeout",
+            "expire_at",
+            "preprocess_configs",
+            "url",
+            "tos",
+            "extra_headers",
+            "extra_query",
+            "extra_body",
+            "timeout",
         }
     )
     _ARK_FILE_LIST_KEYS = frozenset(
         {
-            "after", "limit", "order", "purpose", "extra_headers", "extra_query",
-            "extra_body", "timeout",
+            "after",
+            "limit",
+            "order",
+            "purpose",
+            "extra_headers",
+            "extra_query",
+            "extra_body",
+            "timeout",
         }
     )
     _ARK_IMAGE_GENERATE_KEYS = frozenset(
         {
-            "model", "prompt", "image", "response_format", "size", "seed",
-            "guidance_scale", "watermark", "optimize_prompt",
-            "optimize_prompt_options", "extra_headers", "extra_query", "extra_body",
-            "timeout", "sequential_image_generation",
-            "sequential_image_generation_options", "tools", "output_format",
-            "layer_decomposition", "stream",
+            "model",
+            "prompt",
+            "image",
+            "response_format",
+            "size",
+            "seed",
+            "guidance_scale",
+            "watermark",
+            "optimize_prompt",
+            "optimize_prompt_options",
+            "extra_headers",
+            "extra_query",
+            "extra_body",
+            "timeout",
+            "sequential_image_generation",
+            "sequential_image_generation_options",
+            "tools",
+            "output_format",
+            "layer_decomposition",
+            "stream",
         }
     )
     _ARK_BETA_CHAT_KEYS = frozenset(
         {
-            "messages", "model", "response_format", "frequency_penalty", "logit_bias",
-            "logprobs", "max_tokens", "n", "parallel_tool_calls", "presence_penalty",
-            "service_tier", "stop", "stream_options", "temperature", "tool_choice",
-            "tools", "top_logprobs", "top_p", "user", "reasoning_effort",
-            "extra_headers", "extra_query", "extra_body", "timeout",
+            "messages",
+            "model",
+            "response_format",
+            "frequency_penalty",
+            "logit_bias",
+            "logprobs",
+            "max_tokens",
+            "n",
+            "parallel_tool_calls",
+            "presence_penalty",
+            "service_tier",
+            "stop",
+            "stream_options",
+            "temperature",
+            "tool_choice",
+            "tools",
+            "top_logprobs",
+            "top_p",
+            "user",
+            "reasoning_effort",
+            "extra_headers",
+            "extra_query",
+            "extra_body",
+            "timeout",
         }
     )
     _ARK_BOT_CHAT_KEYS = frozenset(
         {
-            "messages", "model", "frequency_penalty", "function_call", "logit_bias",
-            "logprobs", "max_tokens", "presence_penalty", "stop", "stream",
-            "stream_options", "temperature", "tools", "top_logprobs", "top_p",
-            "repetition_penalty", "n", "parallel_tool_calls", "service_tier",
-            "tool_choice", "response_format", "user", "metadata", "extra_headers",
-            "extra_query", "extra_body", "timeout",
+            "messages",
+            "model",
+            "frequency_penalty",
+            "function_call",
+            "logit_bias",
+            "logprobs",
+            "max_tokens",
+            "presence_penalty",
+            "stop",
+            "stream",
+            "stream_options",
+            "temperature",
+            "tools",
+            "top_logprobs",
+            "top_p",
+            "repetition_penalty",
+            "n",
+            "parallel_tool_calls",
+            "service_tier",
+            "tool_choice",
+            "response_format",
+            "user",
+            "metadata",
+            "extra_headers",
+            "extra_query",
+            "extra_body",
+            "timeout",
         }
     )
 
     capabilities = frozenset(
         {
-            "chat", "stream", "messages", "multimodal", "tools", "structured_output",
-            "usage", "embedding", "responses", "files", "batches", "token_count",
-            "images", "multimodal_embedding", "context", "content_generation",
-            "beta_chat", "bot_chat", "classification",
+            "chat",
+            "stream",
+            "messages",
+            "multimodal",
+            "tools",
+            "structured_output",
+            "usage",
+            "embedding",
+            "responses",
+            "files",
+            "batches",
+            "token_count",
+            "images",
+            "multimodal_embedding",
+            "context",
+            "content_generation",
+            "beta_chat",
+            "bot_chat",
+            "classification",
         }
     )
 
-    def __init__(self, model_name: str, protocol: str = "ark", options: dict[str, Any] | None = None):
+    def __init__(
+        self, model_name: str, protocol: str = "ark", options: dict[str, Any] | None = None
+    ):
         normalized = str(protocol).strip().lower().replace("-", "_")
         if normalized in {"ark", "chat", "chat_completion", "chat_completions"}:
             self._protocol = "chat_completions"
@@ -271,9 +532,7 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         return AsyncArkResources(self)
 
     def _client_options(self) -> dict[str, Any]:
-        options = self._normalize_client_options(
-            getattr(self, "_options", {}) or {}
-        )
+        options = self._normalize_client_options(getattr(self, "_options", {}) or {})
         result: dict[str, Any] = {"base_url": self._base_url} if self._base_url else {}
         if self._api_key and self._secret_key:
             result.update({"ak": self._api_key, "sk": self._secret_key})
@@ -325,9 +584,7 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
                         "Volcengine options.max_retries 必须是大于等于 0 的整数。"
                     ) from exc
                 if text not in {str(parsed), f"+{parsed}"}:
-                    raise ValueError(
-                        "Volcengine options.max_retries 必须是大于等于 0 的整数。"
-                    )
+                    raise ValueError("Volcengine options.max_retries 必须是大于等于 0 的整数。")
                 value = parsed
             elif isinstance(value, float) and math.isfinite(value) and value.is_integer():
                 value = int(value)
@@ -361,9 +618,7 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         normalized: set[str] = set()
         for value in configured:
             if not isinstance(value, str) or not value.strip():
-                raise ValueError(
-                    "server_verified_protocols 中的协议必须是非空字符串。"
-                )
+                raise ValueError("server_verified_protocols 中的协议必须是非空字符串。")
             protocol = value.strip().lower().replace("-", "_")
             protocol = aliases.get(protocol, protocol)
             if protocol not in supported:
@@ -374,16 +629,60 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             normalized.add(protocol)
         return frozenset(normalized)
 
-    def _require_provider_resource(self, method_name: str) -> None:
-        """在原生资源方法触达 SDK 前校验 Ark 渠道能力。
+    # Responses 资源树下的子资源。它们的路径不含 ``responses`` 分段
+    # （``volcengine.input_items.list`` 打的是 ``/responses/{id}/input_items``），
+    # 只看分段会把它们漏掉；但 ``files.create`` 这类同名无关调用必须放行，
+    # 因此用精确集合而不是子串匹配。
+    # 这些字段出现即说明调用意图是「创建/发起 Responses 请求」，无论方法名
+    # 是什么。用字段而非动词判断，避免 SDK 新增入口时漏检。
+    # 触发参数校验的字段。``extra_body`` 不在此列：它是 retrieve/delete/list
+    # 等非创建调用的**合法**参数（见 ``_ARK_RESPONSES_RETRIEVE_KEYS``），
+    # 出现在这些调用里不代表要执行创建校验。放进触发集会让
+    # ``resources.responses.retrieve("r1", extra_body={...})`` 被要求提供
+    # ``model`` 与 ``input``，而同样的调用走 Facade 是通过的——动态路径与
+    # Facade 的新不对称（方向相反：动态路径过严）。
+    #
+    # ``input``/``model`` 作为触发器是安全的：``create`` 二者皆必填，任何
+    # 带它们的调用本就该走创建校验，无法被规避。
+    _ARK_RESPONSES_VALIDATED_KWARGS = frozenset(
+        {"input", "instructions", "caching", "model", "tools"}
+    )
+
+    _ARK_RESPONSES_SUBRESOURCES = frozenset(
+        {
+            "input_items",
+            "input_tokens",
+            "output_items",
+        }
+    )
+
+    def _require_provider_resource(
+        self, method_name: str, kwargs: Mapping[str, Any] | None = None
+    ) -> None:
+        """在原生资源方法触达 SDK 前校验 Ark 渠道能力与参数约束。
 
         ``method_name`` 可能是显式方法名（``create_response``），也可能是动态
         资源树路径（``volcengine.responses.create``）。按路径分段判断，避免把
         ``files.create`` 这类同名但无关的调用一并拦下。
+
+        动态路径不经过 Facade，因此 Facade 上的参数校验必须在这里对同一组
+        ``kwargs`` 再执行一次，否则 ``resources.responses.create(...)`` 可以
+        带着 ``instructions`` 与 ``caching={"type": "enabled"}`` 直接发出。
         """
         segments = method_name.split(".")
-        if "responses" in segments or method_name.endswith("_response") or "response" in segments:
+        if (
+            "responses" in segments
+            or method_name.endswith("_response")
+            or "response" in segments
+            or any(segment in self._ARK_RESPONSES_SUBRESOURCES for segment in segments)
+        ):
             self._require_responses_resource(method_name)
+            # 不按动词白名单判断（``{"create", "generate"}`` 会漏掉
+            # ``async_create`` 这类 SDK 演进后新增的写法）。凡是参数里出现
+            # 受校验字段就执行同一套校验——这正是「动态路径与 Facade 受同一
+            # 约束」的判据。
+            if kwargs and self._ARK_RESPONSES_VALIDATED_KWARGS.intersection(kwargs):
+                self._validate_native_response_kwargs(kwargs)
 
     def _require_responses_resource(self, operation: str) -> None:
         """阻止未验证的 Ark Responses 请求到达远端。"""
@@ -421,23 +720,10 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             return await result
         return result
 
-    @staticmethod
-    def _merge_options(request: dict[str, Any], options: dict[str, Any]) -> None:
-        reserved = {"model", "messages", "input", "stream", "instructions", "tools"}
-        overlap = sorted(reserved.intersection(options))
-        if overlap:
-            raise ValueError(f"Provider options 不允许覆盖请求字段: {', '.join(overlap)}")
-        for key, value in options.items():
-            request.setdefault(key, value)
-
-    @staticmethod
-    def _validate_model_options(
-        options: Mapping[str, Any],
-        allowed: frozenset[str],
-        endpoint: str,
-    ) -> None:
-        unknown = {key: value for key, value in options.items() if key not in allowed}
-        reject_unsupported_kwargs(endpoint, unknown)
+    # 以下 4 个 helper 是 OpenAICompatibleProvider 的逐字节副本，改为委托。
+    # 保留本类方法名是因为调用点很多；实现只留一份，避免两边漂移。
+    _merge_options = staticmethod(OpenAICompatibleProvider._merge_options)
+    _validate_model_options = staticmethod(OpenAICompatibleProvider._validate_model_options)
 
     def _request_options(self) -> dict[str, Any]:
         """返回不会误传给 Ark 请求的模型级选项。"""
@@ -445,45 +731,17 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         return {
             key: value
             for key, value in self._options.items()
-            if key not in {
-                "timeout", "max_retries", "region",
+            if key
+            not in {
+                "timeout",
+                "max_retries",
+                "region",
                 "server_verified_protocols",
             }
         }
 
-    @staticmethod
-    def _validated_extra_body(
-        value: Any,
-        endpoint: str,
-        reserved: set[str],
-    ) -> dict[str, Any]:
-        if value is None:
-            return {}
-        if not isinstance(value, Mapping):
-            raise ValueError(f"{endpoint} extra_body 必须是对象。")
-        value = validate_secret_free_payload(value, endpoint, "extra_body")
-        overlap = sorted(set(value).intersection(reserved))
-        if overlap:
-            raise ValueError(
-                f"{endpoint} extra_body 不允许覆盖请求字段: {', '.join(overlap)}"
-            )
-        return dict(value)
-
-    @staticmethod
-    def _merge_extra_body(
-        configured: Mapping[str, Any] | None,
-        extensions: Mapping[str, Any] | None,
-        endpoint: str,
-    ) -> dict[str, Any]:
-        """合并模型级扩展，拒绝同一字段的静默覆盖。"""
-        configured_values = dict(configured or {})
-        extension_values = dict(extensions or {})
-        overlap = sorted(set(configured_values).intersection(extension_values))
-        if overlap:
-            raise ValueError(
-                f"{endpoint} 模型 options 的扩展字段重复: {', '.join(overlap)}"
-            )
-        return {**configured_values, **extension_values}
+    _validated_extra_body = staticmethod(OpenAICompatibleProvider._validated_extra_body)
+    _merge_extra_body = staticmethod(OpenAICompatibleProvider._merge_extra_body)
 
     @staticmethod
     def _convert_responses_format(response_format: dict[str, Any]) -> dict[str, Any]:
@@ -520,36 +778,24 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
                 native_tool = dict(tool)
                 tool_type = native_tool.get("type")
                 if not isinstance(tool_type, str) or not tool_type.strip():
-                    raise ValueError(
-                        f"Ark Responses 工具定义[{index}] 缺少有效 type。"
-                    )
+                    raise ValueError(f"Ark Responses 工具定义[{index}] 缺少有效 type。")
                 if tool_type == "function":
                     name = native_tool.get("name")
                     if not isinstance(name, str) or not name.strip():
-                        raise ValueError(
-                            f"Ark Responses 工具定义[{index}] 缺少 name。"
-                        )
-                    parameters = native_tool.get(
-                        "parameters", {"type": "object", "properties": {}}
-                    )
+                        raise ValueError(f"Ark Responses 工具定义[{index}] 缺少 name。")
+                    parameters = native_tool.get("parameters", {"type": "object", "properties": {}})
                     if not isinstance(parameters, Mapping):
-                        raise ValueError(
-                            f"Ark Responses 工具定义[{index}].parameters 必须是对象。"
-                        )
+                        raise ValueError(f"Ark Responses 工具定义[{index}].parameters 必须是对象。")
                     native_tool["parameters"] = dict(parameters)
                 converted.append(native_tool)
                 continue
             function = tool["function"]
             if not isinstance(function, Mapping):
-                raise ValueError(
-                    f"Ark Responses 工具定义[{index}].function 必须是对象。"
-                )
+                raise ValueError(f"Ark Responses 工具定义[{index}].function 必须是对象。")
             name = function.get("name")
             if not isinstance(name, str) or not name.strip():
                 raise ValueError("Ark Responses 工具定义缺少 function.name。")
-            parameters = function.get(
-                "parameters", {"type": "object", "properties": {}}
-            )
+            parameters = function.get("parameters", {"type": "object", "properties": {}})
             if not isinstance(parameters, Mapping):
                 raise ValueError(
                     f"Ark Responses 工具定义[{index}].function.parameters 必须是对象。"
@@ -586,27 +832,45 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
                 if not name:
                     raise ValueError("Ark Responses 的 function tool_choice 缺少 name。")
                 return {"type": "function", "name": name}
-            if tool_choice.get("type") in {
-                "mcp", "web_search", "knowledge_search"
-            }:
+            if tool_choice.get("type") in {"mcp", "web_search", "knowledge_search"}:
                 return dict(tool_choice)
         raise ValueError("Ark Responses 的 tool_choice 必须是 auto、none、required 或工具对象。")
 
-    def _build_chat_request(self, prompt: str | None = None, system_prompt: str | None = None,
-                            tools: list[dict[str, Any]] | None = None, temperature: float | None = None,
-                            stream: bool = True, *, messages: Any = None, max_tokens: int | None = None,
-                            top_p: float | None = None, top_k: int | None = None, seed: int | None = None,
-                            stop: str | list[str] | None = None,
-                            response_format: dict[str, Any] | None = None, tool_choice: Any = None,
-                            extra_body: dict[str, Any] | None = None, user: str | None = None,
-                            extra_headers: dict[str, str] | None = None, extra_query: dict[str, Any] | None = None,
-                            frequency_penalty: float | None = None, presence_penalty: float | None = None,
-                            repetition_penalty: float | None = None, n: int | None = None,
-                            logit_bias: dict[str, int] | None = None, logprobs: bool | None = None,
-                            top_logprobs: int | None = None, parallel_tool_calls: bool | None = None,
-                            service_tier: str | None = None, thinking: dict[str, Any] | None = None,
-                            reasoning: dict[str, Any] | None = None, stream_options: dict[str, Any] | None = None,
-                            timeout: float | None = None, **ignored: Any) -> dict[str, Any]:
+    def _build_chat_request(
+        self,
+        prompt: str | None = None,
+        system_prompt: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        temperature: float | None = None,
+        stream: bool = True,
+        *,
+        messages: Any = None,
+        max_tokens: int | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        seed: int | None = None,
+        stop: str | list[str] | None = None,
+        response_format: dict[str, Any] | None = None,
+        tool_choice: Any = None,
+        extra_body: dict[str, Any] | None = None,
+        user: str | None = None,
+        extra_headers: dict[str, str] | None = None,
+        extra_query: dict[str, Any] | None = None,
+        frequency_penalty: float | None = None,
+        presence_penalty: float | None = None,
+        repetition_penalty: float | None = None,
+        n: int | None = None,
+        logit_bias: dict[str, int] | None = None,
+        logprobs: bool | None = None,
+        top_logprobs: int | None = None,
+        parallel_tool_calls: bool | None = None,
+        service_tier: str | None = None,
+        thinking: dict[str, Any] | None = None,
+        reasoning: dict[str, Any] | None = None,
+        stream_options: dict[str, Any] | None = None,
+        timeout: float | None = None,
+        **ignored: Any,
+    ) -> dict[str, Any]:
         reject_unsupported_kwargs("Ark Chat Completions", ignored)
         extra_headers, extra_query = validate_secret_free_request_overrides(
             extra_headers,
@@ -639,24 +903,19 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         configured_max_completion_tokens = configured_options.pop("max_completion_tokens", None)
         if configured_max_tokens is not None and configured_max_completion_tokens is not None:
             raise ValueError(
-                "Ark Chat Completions options 不能同时设置 max_tokens 和 "
-                "max_completion_tokens。"
+                "Ark Chat Completions options 不能同时设置 max_tokens 和 max_completion_tokens。"
             )
         configured_top_k = configured_options.pop("top_k", None)
         configured_seed = configured_options.pop("seed", None)
         configured_scalar_extra_keys: set[str] = set()
         if configured_top_k is not None:
             if "top_k" in configured_extra_body:
-                raise ValueError(
-                    "Ark Chat Completions 模型 options 的 top_k 与 extra_body 重复。"
-                )
+                raise ValueError("Ark Chat Completions 模型 options 的 top_k 与 extra_body 重复。")
             configured_extra_body["top_k"] = configured_top_k
             configured_scalar_extra_keys.add("top_k")
         if configured_seed is not None:
             if "seed" in configured_extra_body:
-                raise ValueError(
-                    "Ark Chat Completions 模型 options 的 seed 与 extra_body 重复。"
-                )
+                raise ValueError("Ark Chat Completions 模型 options 的 seed 与 extra_body 重复。")
             configured_extra_body["seed"] = configured_seed
             configured_scalar_extra_keys.add("seed")
         self._merge_options(request, configured_options)
@@ -688,7 +947,9 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             "parallel_tool_calls": parallel_tool_calls,
             "service_tier": service_tier,
             "thinking": thinking,
-            "reasoning_effort": (reasoning or {}).get("effort") if isinstance(reasoning, dict) else None,
+            "reasoning_effort": (reasoning or {}).get("effort")
+            if isinstance(reasoning, dict)
+            else None,
             "stream_options": stream_options,
             "timeout": timeout,
             "extra_headers": extra_headers,
@@ -698,15 +959,11 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
                 request[key] = value
         if top_k is not None:
             if "top_k" in configured_extra_body and "top_k" not in configured_scalar_extra_keys:
-                raise ValueError(
-                    "Ark Chat Completions top_k 与模型 options.extra_body 重复。"
-                )
+                raise ValueError("Ark Chat Completions top_k 与模型 options.extra_body 重复。")
             request.setdefault("extra_body", {})["top_k"] = top_k
         if seed is not None:
             if "seed" in configured_extra_body and "seed" not in configured_scalar_extra_keys:
-                raise ValueError(
-                    "Ark Chat Completions seed 与模型 options.extra_body 重复。"
-                )
+                raise ValueError("Ark Chat Completions seed 与模型 options.extra_body 重复。")
             request.setdefault("extra_body", {})["seed"] = seed
         if stop is not None:
             request["stop"] = stop
@@ -746,13 +1003,38 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             "Ark Responses",
         )
         unsupported_fields = (
-            "repetition_penalty", "n", "logit_bias", "logprobs", "modalities", "audio",
-            "prediction", "web_search_options", "stop", "include", "background",
-            "metadata", "user", "moderation", "prompt_cache_options", "top_logprobs",
-            "safety_identifier", "prompt_cache_key", "prompt_cache_retention",
-            "truncation", "stream_options", "cache_control", "container",
-            "inference_geo", "mcp_servers", "output_config", "output_format",
-            "speed", "betas", "diagnostics", "fallback_credit_token", "fallbacks",
+            "repetition_penalty",
+            "n",
+            "logit_bias",
+            "logprobs",
+            "modalities",
+            "audio",
+            "prediction",
+            "web_search_options",
+            "stop",
+            "include",
+            "background",
+            "metadata",
+            "user",
+            "moderation",
+            "prompt_cache_options",
+            "top_logprobs",
+            "safety_identifier",
+            "prompt_cache_key",
+            "prompt_cache_retention",
+            "truncation",
+            "stream_options",
+            "cache_control",
+            "container",
+            "inference_geo",
+            "mcp_servers",
+            "output_config",
+            "output_format",
+            "speed",
+            "betas",
+            "diagnostics",
+            "fallback_credit_token",
+            "fallbacks",
         )
         reject_unsupported_kwargs(
             "Ark Responses",
@@ -811,22 +1093,16 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         configured_conversation = configured_options.pop("conversation", None)
         configured_session = configured_options.pop("session", None)
         if configured_conversation is not None and configured_session is not None:
-            raise ValueError(
-                "Ark Responses 模型 options 不能同时设置 conversation 和 session。"
-            )
+            raise ValueError("Ark Responses 模型 options 不能同时设置 conversation 和 session。")
         configured_scalar_extra_keys: set[str] = set()
         if configured_top_k is not None:
             if "top_k" in configured_extra_body:
-                raise ValueError(
-                    "Ark Responses 模型 options 的 top_k 与 extra_body 重复。"
-                )
+                raise ValueError("Ark Responses 模型 options 的 top_k 与 extra_body 重复。")
             configured_extra_body["top_k"] = configured_top_k
             configured_scalar_extra_keys.add("top_k")
         if configured_seed is not None:
             if "seed" in configured_extra_body:
-                raise ValueError(
-                    "Ark Responses 模型 options 的 seed 与 extra_body 重复。"
-                )
+                raise ValueError("Ark Responses 模型 options 的 seed 与 extra_body 重复。")
             configured_extra_body["seed"] = configured_seed
             configured_scalar_extra_keys.add("seed")
         if request.system_prompt and request.messages is None:
@@ -860,15 +1136,11 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         reject_unsupported_kwargs("Ark Responses", {"top_logprobs": request.top_logprobs})
         if request.top_k is not None:
             if "top_k" in configured_extra_body and "top_k" not in configured_scalar_extra_keys:
-                raise ValueError(
-                    "Ark Responses top_k 与模型 options.extra_body 重复。"
-                )
+                raise ValueError("Ark Responses top_k 与模型 options.extra_body 重复。")
             configured_extra_body["top_k"] = request.top_k
         if request.seed is not None:
             if "seed" in configured_extra_body and "seed" not in configured_scalar_extra_keys:
-                raise ValueError(
-                    "Ark Responses seed 与模型 options.extra_body 重复。"
-                )
+                raise ValueError("Ark Responses seed 与模型 options.extra_body 重复。")
             configured_extra_body["seed"] = request.seed
         converted_tools = self._convert_responses_tools(request.tools)
         if converted_tools:
@@ -879,19 +1151,26 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         if request.tool_choice is not None:
             params["tool_choice"] = self._convert_responses_tool_choice(request.tool_choice)
         elif configured_tool_choice is not None:
-            params["tool_choice"] = self._convert_responses_tool_choice(
-                configured_tool_choice
-            )
-        for key in ("previous_response_id", "reasoning", "thinking", "store", "caching", "parallel_tool_calls", "max_tool_calls", "context_management", "expire_at", "service_tier"):
+            params["tool_choice"] = self._convert_responses_tool_choice(configured_tool_choice)
+        for key in (
+            "previous_response_id",
+            "reasoning",
+            "thinking",
+            "store",
+            "caching",
+            "parallel_tool_calls",
+            "max_tool_calls",
+            "context_management",
+            "expire_at",
+            "service_tier",
+        ):
             value = getattr(request, key, None)
             if value is not None:
                 params[key] = value
         if request.reasoning is None and configured_reasoning_effort is not None:
             params["reasoning"] = {"effort": configured_reasoning_effort}
         if request.conversation is not None and request.session is not None:
-            raise ValueError(
-                "Ark Responses 不能同时传 conversation 和 session。"
-            )
+            raise ValueError("Ark Responses 不能同时传 conversation 和 session。")
         # Ark calls the response conversation state a session. Keep
         # `conversation` as the portable request field for OpenAI-compatible
         # channels while mapping it to the SDK's actual parameter here.
@@ -933,8 +1212,7 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             )
             if configured_overlap:
                 raise ValueError(
-                    "Ark Responses extra_body 与模型 options 重复: "
-                    + ", ".join(configured_overlap)
+                    "Ark Responses extra_body 与模型 options 重复: " + ", ".join(configured_overlap)
                 )
             params.setdefault("extra_body", {}).update(request_extra_body)
         if params.get("extra_body"):
@@ -954,24 +1232,34 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         缓存，``caching`` 为 ``enabled`` 时服务端直接报错。SDK 不做本地校验，
         会原样发到服务端，因此在构造阶段显式拒绝，避免用户从远端 400 反推。
 
-        ``caching`` 有两条来源：顶层参数，以及 ``extra_body``（Ark SDK 在
-        ``_base_client`` 里把 ``extra_body`` 合并进请求体，服务端看到的仍是
-        ``caching=enabled``）。两条都要检查，否则该守卫可被绕过。
+        ``instructions`` 与 ``caching`` 各有两条来源：顶层参数，以及
+        ``extra_body``（Ark SDK 在 ``_base_client`` 里把 ``extra_body`` 合并
+        进请求体，服务端看到的仍是同名参数）。只查顶层会漏掉
+        ``extra_body={"instructions": ...}`` 配顶层 ``caching`` 这种组合。
         """
-        if params.get("instructions") is None:
+        extra_body = params.get("extra_body")
+        instructions = params.get("instructions")
+        if instructions is None and isinstance(extra_body, Mapping):
+            instructions = extra_body.get("instructions")
+        if instructions is None:
             return
         candidates = [params.get("caching")]
-        extra_body = params.get("extra_body")
         if isinstance(extra_body, Mapping):
             candidates.append(extra_body.get("caching"))
         for candidate in candidates:
-            if isinstance(candidate, Mapping) and candidate.get("type") == "enabled":
+            if not isinstance(candidate, Mapping):
+                continue
+            # SDK 的 ``ResponseCaching.type`` 是 ``Literal["disabled","enabled"]``，
+            # 但那是类型注解、不做运行时校验：``"ENABLED"`` / ``" enabled"`` 会
+            # 原样发到服务端。归一化后再比较，否则大小写与空白变体可绕过互斥检查。
+            candidate_type = candidate.get("type")
+            if isinstance(candidate_type, str) and candidate_type.strip().lower() == "enabled":
                 raise ValueError(
-                    "Ark Responses 的 instructions 与 caching={\"type\": \"enabled\"} 互斥："
+                    'Ark Responses 的 instructions 与 caching={"type": "enabled"} 互斥：'
                     "官方规定配置 instructions 后本轮请求无法写入或使用缓存，caching 为 "
                     "enabled 时请求会直接报错。instructions 来自 system_prompt，"
                     "注意 CompletionRequest.system_prompt 有兼容默认值"
-                    "（未显式传入时为 \"You are a helpful assistant.\"）；"
+                    '（未显式传入时为 "You are a helpful assistant."）；'
                     "请显式传入 system_prompt=None 并改用 messages 携带系统提示，"
                     "或移除 caching。"
                 )
@@ -981,12 +1269,14 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         """校验 Ark SDK 原生 Responses 参数，不改变其必填字段语义。"""
         params = dict(kwargs)
         unsupported = {
-            key: value
-            for key, value in params.items()
-            if key not in cls._ARK_RESPONSES_CREATE_KEYS
+            key: value for key, value in params.items() if key not in cls._ARK_RESPONSES_CREATE_KEYS
         }
         reject_unsupported_kwargs("Ark Responses", unsupported)
-        if "model" not in params or not isinstance(params.get("model"), str) or not params["model"].strip():
+        if (
+            "model" not in params
+            or not isinstance(params.get("model"), str)
+            or not params["model"].strip()
+        ):
             raise ValueError("Ark Responses 原生调用必须显式提供 model。")
         if "input" not in params or params.get("input") is None:
             raise ValueError("Ark Responses 创建需要 input。")
@@ -1088,15 +1378,9 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         params = dict(kwargs)
         if params.get("model") is None:
             params["model"] = model_name
-        missing = [
-            name
-            for name in required
-            if name not in params or params[name] is None
-        ]
+        missing = [name for name in required if name not in params or params[name] is None]
         if missing:
-            raise ValueError(
-                f"Ark {resource} 缺少必填参数: {', '.join(missing)}"
-            )
+            raise ValueError(f"Ark {resource} 缺少必填参数: {', '.join(missing)}")
         model = params.get("model")
         if not isinstance(model, str) or not model.strip():
             raise ValueError(f"Ark {resource} 的 model 必须是非空字符串。")
@@ -1113,11 +1397,19 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             text = content_to_text(field(message, "content", ""))
             for call in field(message, "tool_calls", []) or []:
                 fn = field(call, "function")
-                calls.append({
-                    "id": field(call, "id"),
-                    "name": field(fn, "name"),
-                    "arguments": normalize_tool_arguments(field(fn, "arguments", "")),
-                })
+                calls.append(
+                    {
+                        "id": field(call, "id"),
+                        # 与 openai_compatible.py 的 _extract_tool_calls 及本函数
+                        # 的 Responses 分支（下方 function_call/custom_tool_call）
+                        # 对齐：CompletionResult.tool_calls 的契约是扁平的
+                        # {"id", "type", "name", "arguments"}。缺 type 会让调用方
+                        # 回填的 assistant 历史不符合 OpenAI Chat Completions 形状。
+                        "type": field(call, "type", "function"),
+                        "name": field(fn, "name"),
+                        "arguments": normalize_tool_arguments(field(fn, "arguments", "")),
+                    }
+                )
         output_text = field(response, "output_text")
         if isinstance(output_text, str):
             text = output_text
@@ -1186,26 +1478,44 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             and not refusal
             and not reasoning
             and field(response, "status") == "completed"
+            and not _ark_responses_has_builtin_tool_items(response)
         ):
             # 项目规则禁止用占位结果掩盖失败。Responses 响应标记为 completed
             # 却既无正文、无工具调用、也无拒答与推理，说明响应结构与预期不符
             # （例如 SDK 改了字段形状）。此时静默返回空文本会让上层拿到空串后
             # 继续，最终表现为难以定位的「空结果」错误，因此在边界显式失败。
+            #
+            # 但内置工具（web_search_call、mcp_call、mcp_list_tools 等）的
+            # 调用项既不是 function_call 也没有正文，而它们是 Ark 内置工具
+            # 的正常中间态——没有工具调用就不可能有后续轮次，调用方需要读
+            # output 才能继续。把它们判为「结构不符」会让这类响应无法处理。
             raise RuntimeError(
                 "Ark Responses 响应已完成但未包含任何正文、工具调用或拒答内容；"
                 "请检查响应结构与 SDK 版本是否匹配。"
             )
-        return CompletionResult(text=text, tool_calls=calls, usage=usage_dict,
-                                finish_reason=field(choices[0], "finish_reason") if choices else field(response, "status"),
-                                response_id=field(response, "id"), refusal=refusal,
-                                reasoning=reasoning, raw=response)
+        return CompletionResult(
+            text=text,
+            tool_calls=calls,
+            usage=usage_dict,
+            finish_reason=field(choices[0], "finish_reason")
+            if choices
+            else field(response, "status"),
+            response_id=field(response, "id"),
+            refusal=refusal,
+            reasoning=reasoning,
+            raw=response,
+        )
 
     @staticmethod
     def _raise_for_response_error(response: Any) -> None:
         status = field(response, "status")
         if status == "failed":
             error = field(response, "error")
-            message = error if isinstance(error, str) else field(error, "message", "Ark Responses 请求失败")
+            message = (
+                error
+                if isinstance(error, str)
+                else field(error, "message", "Ark Responses 请求失败")
+            )
             raise RuntimeError(str(message))
         if status == "incomplete":
             details = field(response, "incomplete_details")
@@ -1243,7 +1553,9 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             )
         if isinstance(reasoning, str) and reasoning:
             events.append(
-                StreamEvent(type="reasoning_delta", reasoning=reasoning, response_id=response_id, raw=chunk)
+                StreamEvent(
+                    type="reasoning_delta", reasoning=reasoning, response_id=response_id, raw=chunk
+                )
             )
         if calls:
             for position, call in enumerate(calls):
@@ -1336,7 +1648,9 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             response_error_handler=self._raise_for_response_error,
         )
 
-    def stream_events(self, request: CompletionRequest | None = None, **kwargs: Any) -> Generator[StreamEvent, None, None]:
+    def stream_events(
+        self, request: CompletionRequest | None = None, **kwargs: Any
+    ) -> Generator[StreamEvent, None, None]:
         request = coerce_completion_request(request, kwargs, "Ark stream_events").copy_with(
             stream=True,
         )
@@ -1424,12 +1738,19 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
                         if key not in completed_chat_tool_calls:
                             validate_complete_tool_call(tool_call, "Ark Chat Completions")
                             completed_chat_tool_calls.add(key)
-                            yield StreamEvent(type="tool_call_completed", tool_call=dict(tool_call), response_id=converted.response_id, raw=converted.raw)
+                            yield StreamEvent(
+                                type="tool_call_completed",
+                                tool_call=dict(tool_call),
+                                response_id=converted.response_id,
+                                raw=converted.raw,
+                            )
                 yield converted
         if not terminal_seen:
             raise RuntimeError("Ark Chat Completions 流在 finish 事件之前结束。")
 
-    async def astream_events(self, request: CompletionRequest | None = None, **kwargs: Any) -> AsyncGenerator[StreamEvent, None]:
+    async def astream_events(
+        self, request: CompletionRequest | None = None, **kwargs: Any
+    ) -> AsyncGenerator[StreamEvent, None]:
         request = coerce_completion_request(request, kwargs, "Ark astream_events").copy_with(
             stream=True,
         )
@@ -1516,7 +1837,12 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
                         if key not in completed_chat_tool_calls:
                             validate_complete_tool_call(tool_call, "Ark Chat Completions")
                             completed_chat_tool_calls.add(key)
-                            yield StreamEvent(type="tool_call_completed", tool_call=dict(tool_call), response_id=converted.response_id, raw=converted.raw)
+                            yield StreamEvent(
+                                type="tool_call_completed",
+                                tool_call=dict(tool_call),
+                                response_id=converted.response_id,
+                                raw=converted.raw,
+                            )
                 yield converted
         if not terminal_seen:
             raise RuntimeError("Ark Chat Completions 异步流在 finish 事件之前结束。")
@@ -1532,9 +1858,7 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         request = request.copy_with(stream=False)
         if self._protocol == "responses":
             self._require_responses_resource("complete")
-            response = self._get_client().responses.create(
-                **self._build_responses_request(request)
-            )
+            response = self._get_client().responses.create(**self._build_responses_request(request))
             self._raise_for_response_error(response)
         else:
             response = self._get_client().chat.completions.create(
@@ -1546,7 +1870,9 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             )
         return self._extract_result(response)
 
-    async def acomplete(self, request: CompletionRequest | None = None, **kwargs: Any) -> CompletionResult:
+    async def acomplete(
+        self, request: CompletionRequest | None = None, **kwargs: Any
+    ) -> CompletionResult:
         """使用 AsyncArk 聚合完整结果，保留 Responses/Chat 元数据。"""
         request = coerce_completion_request(request, kwargs, "Ark acomplete")
         request = request.copy_with(stream=False)
@@ -1570,13 +1896,37 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             )
         return self._extract_result(response)
 
-    def invoke(self, prompt: str | None = None, system_prompt: str | None = "You are a helpful assistant.",
-               tools: list[dict[str, Any]] | None = None, stream: bool = True,
-               temperature: float | None = _UNSET_TEMPERATURE,  # type: ignore[assignment]
-               messages: Any = None, max_tokens: int | None = None, top_p: float | None = None,
-               stop: str | list[str] | None = None, response_format: dict[str, Any] | None = None,
-               tool_choice: Any = None, extra_body: dict[str, Any] | None = None, **kwargs: Any) -> Generator[str, None, None]:
-        request = CompletionRequest(prompt=prompt, system_prompt=system_prompt, messages=messages, tools=tools, stream=stream, temperature=temperature, max_tokens=max_tokens, top_p=top_p, stop=stop, response_format=response_format, tool_choice=tool_choice, extra_body=extra_body, **kwargs)
+    def invoke(
+        self,
+        prompt: str | None = None,
+        system_prompt: str | None = "You are a helpful assistant.",
+        tools: list[dict[str, Any]] | None = None,
+        stream: bool = True,
+        temperature: float | None = _UNSET_TEMPERATURE,  # type: ignore[assignment]
+        messages: Any = None,
+        max_tokens: int | None = None,
+        top_p: float | None = None,
+        stop: str | list[str] | None = None,
+        response_format: dict[str, Any] | None = None,
+        tool_choice: Any = None,
+        extra_body: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> Generator[str, None, None]:
+        request = CompletionRequest(
+            prompt=prompt,
+            system_prompt=system_prompt,
+            messages=messages,
+            tools=tools,
+            stream=stream,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            stop=stop,
+            response_format=response_format,
+            tool_choice=tool_choice,
+            extra_body=extra_body,
+            **kwargs,
+        )
         if self._protocol == "responses":
             self._require_responses_resource("invoke")
             if tools:
@@ -1649,10 +1999,15 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             if result.text:
                 yield result.text
 
-    async def ainvoke(self, prompt: str | None = None, system_prompt: str | None = "You are a helpful assistant.",
-                      tools: list[dict[str, Any]] | None = None, stream: bool = True,
-                      temperature: float | None = _UNSET_TEMPERATURE,  # type: ignore[assignment]
-                      **kwargs: Any) -> AsyncGenerator[str, None]:
+    async def ainvoke(
+        self,
+        prompt: str | None = None,
+        system_prompt: str | None = "You are a helpful assistant.",
+        tools: list[dict[str, Any]] | None = None,
+        stream: bool = True,
+        temperature: float | None = _UNSET_TEMPERATURE,  # type: ignore[assignment]
+        **kwargs: Any,
+    ) -> AsyncGenerator[str, None]:
         if prompt is not None:
             kwargs["prompt"] = prompt
         kwargs["system_prompt"] = system_prompt
@@ -1754,7 +2109,15 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         self._validate_resource_kwargs(
             "Embedding",
             request_options,
-            {"encoding_format", "dimensions", "user", "extra_body", "extra_headers", "extra_query", "timeout"},
+            {
+                "encoding_format",
+                "dimensions",
+                "user",
+                "extra_body",
+                "extra_headers",
+                "extra_query",
+                "timeout",
+            },
         )
         request_extra_body = self._validated_extra_body(
             request_options.pop("extra_body", None),
@@ -1792,7 +2155,15 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         self._validate_resource_kwargs(
             "Embedding",
             request_options,
-            {"encoding_format", "dimensions", "user", "extra_body", "extra_headers", "extra_query", "timeout"},
+            {
+                "encoding_format",
+                "dimensions",
+                "user",
+                "extra_body",
+                "extra_headers",
+                "extra_query",
+                "timeout",
+            },
         )
         request_extra_body = self._validated_extra_body(
             request_options.pop("extra_body", None),
@@ -1806,7 +2177,9 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         )
         if merged_extra_body:
             request["extra_body"] = merged_extra_body
-        response = await self._resolve_async_result(self._get_aclient().embeddings.create(**request))
+        response = await self._resolve_async_result(
+            self._get_aclient().embeddings.create(**request)
+        )
         return [normalize_embedding_vector(item.embedding) for item in response.data]
 
     def upload_file(self, file: Any, purpose: str, **kwargs: Any) -> Any:
@@ -1820,12 +2193,16 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
 
     def retrieve_file(self, file_id: str, **kwargs: Any) -> Any:
         file_id = self._require_non_empty_string(file_id, "Ark 文件 file_id")
-        self._validate_resource_kwargs("文件获取", kwargs, {"extra_headers", "extra_query", "extra_body", "timeout"})
+        self._validate_resource_kwargs(
+            "文件获取", kwargs, {"extra_headers", "extra_query", "extra_body", "timeout"}
+        )
         return self._get_client().files.retrieve(file_id, **kwargs)
 
     def delete_file(self, file_id: str, **kwargs: Any) -> Any:
         file_id = self._require_non_empty_string(file_id, "Ark 文件 file_id")
-        self._validate_resource_kwargs("文件删除", kwargs, {"extra_headers", "extra_query", "extra_body", "timeout"})
+        self._validate_resource_kwargs(
+            "文件删除", kwargs, {"extra_headers", "extra_query", "extra_body", "timeout"}
+        )
         return self._get_client().files.delete(file_id, **kwargs)
 
     def wait_for_file(
@@ -1978,8 +2355,14 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         return self._get_client().content_generation.tasks.delete(task_id=task_id, **kwargs)
 
     def count_tokens(self, text: str | list[str], **kwargs: Any) -> int:
-        self._validate_resource_kwargs("Tokenization", kwargs, {"user", "extra_headers", "extra_query", "extra_body", "timeout"})
-        response = self._get_client().tokenization.create(text=text, model=self._model_name, **kwargs)
+        self._validate_resource_kwargs(
+            "Tokenization",
+            kwargs,
+            {"user", "extra_headers", "extra_query", "extra_body", "timeout"},
+        )
+        response = self._get_client().tokenization.create(
+            text=text, model=self._model_name, **kwargs
+        )
         values = field(response, "data", []) or []
         if not values:
             raise RuntimeError("Ark tokenization 响应缺少 data。")
@@ -1989,9 +2372,20 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         self._validate_resource_kwargs(
             "Multimodal Embedding",
             kwargs,
-            {"encoding_format", "dimensions", "instructions", "sparse_embedding", "extra_headers", "extra_query", "extra_body", "timeout"},
+            {
+                "encoding_format",
+                "dimensions",
+                "instructions",
+                "sparse_embedding",
+                "extra_headers",
+                "extra_query",
+                "extra_body",
+                "timeout",
+            },
         )
-        return self._get_client().multimodal_embeddings.create(input=inputs, model=self._model_name, **kwargs)
+        return self._get_client().multimodal_embeddings.create(
+            input=inputs, model=self._model_name, **kwargs
+        )
 
     def list_input_items(self, response_id: str, **kwargs: Any) -> Any:
         self._require_responses_resource("list_input_items")
@@ -2062,8 +2456,10 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
     ) -> Any:
         """调用 Ark Classification 接口。"""
         query = self._require_non_empty_string(query, "Ark Classification 的 query")
-        if not isinstance(labels, list) or not labels or any(
-            not isinstance(label, str) or not label.strip() for label in labels
+        if (
+            not isinstance(labels, list)
+            or not labels
+            or any(not isinstance(label, str) or not label.strip() for label in labels)
         ):
             raise ValueError("Ark Classification 的 labels 必须是非空字符串列表。")
         labels = [label.strip() for label in labels]
@@ -2087,7 +2483,9 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
     async def async_upload_file(self, file: Any, purpose: str, **kwargs: Any) -> Any:
         purpose = self._require_non_empty_string(purpose, "Ark 文件 purpose")
         self._validate_resource_kwargs("文件创建", kwargs, self._ARK_FILE_CREATE_KEYS)
-        return await self._resolve_async_result(self._get_aclient().files.create(file=file, purpose=purpose, **kwargs))
+        return await self._resolve_async_result(
+            self._get_aclient().files.create(file=file, purpose=purpose, **kwargs)
+        )
 
     async def async_list_files(self, **kwargs: Any) -> Any:
         self._validate_resource_kwargs("文件列表", kwargs, self._ARK_FILE_LIST_KEYS)
@@ -2095,12 +2493,18 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
 
     async def async_retrieve_file(self, file_id: str, **kwargs: Any) -> Any:
         file_id = self._require_non_empty_string(file_id, "Ark 文件 file_id")
-        self._validate_resource_kwargs("文件获取", kwargs, {"extra_headers", "extra_query", "extra_body", "timeout"})
-        return await self._resolve_async_result(self._get_aclient().files.retrieve(file_id, **kwargs))
+        self._validate_resource_kwargs(
+            "文件获取", kwargs, {"extra_headers", "extra_query", "extra_body", "timeout"}
+        )
+        return await self._resolve_async_result(
+            self._get_aclient().files.retrieve(file_id, **kwargs)
+        )
 
     async def async_delete_file(self, file_id: str, **kwargs: Any) -> Any:
         file_id = self._require_non_empty_string(file_id, "Ark 文件 file_id")
-        self._validate_resource_kwargs("文件删除", kwargs, {"extra_headers", "extra_query", "extra_body", "timeout"})
+        self._validate_resource_kwargs(
+            "文件删除", kwargs, {"extra_headers", "extra_query", "extra_body", "timeout"}
+        )
         return await self._resolve_async_result(self._get_aclient().files.delete(file_id, **kwargs))
 
     async def async_wait_for_file(
@@ -2135,9 +2539,13 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         self._validate_resource_kwargs(
             "Responses retrieve_response", kwargs, self._ARK_RESPONSES_RETRIEVE_KEYS
         )
-        return await self._resolve_async_result(self._get_aclient().responses.retrieve(response_id, **kwargs))
+        return await self._resolve_async_result(
+            self._get_aclient().responses.retrieve(response_id, **kwargs)
+        )
 
-    async def async_create_response(self, request: CompletionRequest | None = None, **kwargs: Any) -> Any:
+    async def async_create_response(
+        self, request: CompletionRequest | None = None, **kwargs: Any
+    ) -> Any:
         """异步创建 Ark Responses；可传统一请求或原生 SDK 参数。"""
         self._require_responses_resource("create_response")
         if request is not None:
@@ -2153,7 +2561,9 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         self._validate_resource_kwargs(
             "Responses delete_response", kwargs, self._ARK_RESPONSES_RETRIEVE_KEYS
         )
-        return await self._resolve_async_result(self._get_aclient().responses.delete(response_id, **kwargs))
+        return await self._resolve_async_result(
+            self._get_aclient().responses.delete(response_id, **kwargs)
+        )
 
     async def async_list_response_input_items(self, response_id: str, **kwargs: Any) -> Any:
         self._require_responses_resource("list_response_input_items")
@@ -2287,10 +2697,14 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         )
 
     async def async_count_tokens(self, text: str | list[str], **kwargs: Any) -> int:
-        self._validate_resource_kwargs("Tokenization", kwargs, {"user", "extra_headers", "extra_query", "extra_body", "timeout"})
-        response = await self._resolve_async_result(self._get_aclient().tokenization.create(
-            text=text, model=self._model_name, **kwargs
-        ))
+        self._validate_resource_kwargs(
+            "Tokenization",
+            kwargs,
+            {"user", "extra_headers", "extra_query", "extra_body", "timeout"},
+        )
+        response = await self._resolve_async_result(
+            self._get_aclient().tokenization.create(text=text, model=self._model_name, **kwargs)
+        )
         values = field(response, "data", []) or []
         if not values:
             raise RuntimeError("Ark tokenization 响应缺少 data。")
@@ -2300,11 +2714,22 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         self._validate_resource_kwargs(
             "Multimodal Embedding",
             kwargs,
-            {"encoding_format", "dimensions", "instructions", "sparse_embedding", "extra_headers", "extra_query", "extra_body", "timeout"},
+            {
+                "encoding_format",
+                "dimensions",
+                "instructions",
+                "sparse_embedding",
+                "extra_headers",
+                "extra_query",
+                "extra_body",
+                "timeout",
+            },
         )
-        return await self._resolve_async_result(self._get_aclient().multimodal_embeddings.create(
-            input=inputs, model=self._model_name, **kwargs
-        ))
+        return await self._resolve_async_result(
+            self._get_aclient().multimodal_embeddings.create(
+                input=inputs, model=self._model_name, **kwargs
+            )
+        )
 
     async def async_generate_image(self, **kwargs: Any) -> Any:
         self._validate_resource_kwargs("Images", kwargs, self._ARK_IMAGE_GENERATE_KEYS)
@@ -2314,7 +2739,9 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
     async def async_beta_chat_parse(self, **kwargs: Any) -> Any:
         self._validate_resource_kwargs("Beta Chat Parse", kwargs, self._ARK_BETA_CHAT_KEYS)
         kwargs.setdefault("model", self._model_name)
-        return await self._resolve_async_result(self._get_aclient().beta.chat.completions.parse(**kwargs))
+        return await self._resolve_async_result(
+            self._get_aclient().beta.chat.completions.parse(**kwargs)
+        )
 
     def async_beta_chat_stream(self, **kwargs: Any) -> Any:
         """返回 Ark 异步 Beta Chat 的原生流式上下文管理器。
@@ -2330,7 +2757,9 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
     async def async_bot_chat(self, **kwargs: Any) -> Any:
         self._validate_resource_kwargs("Bot Chat", kwargs, self._ARK_BOT_CHAT_KEYS)
         kwargs.setdefault("model", self._model_name)
-        return await self._resolve_async_result(self._get_aclient().bot_chat.completions.create(**kwargs))
+        return await self._resolve_async_result(
+            self._get_aclient().bot_chat.completions.create(**kwargs)
+        )
 
     async def _get_async_classification_resource(self) -> Any:
         """返回 Ark Async Classification 资源，保持与同步入口相同的显式边界。"""
@@ -2362,8 +2791,10 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
     ) -> Any:
         """异步调用 Ark Classification 接口。"""
         query = self._require_non_empty_string(query, "Ark Classification 的 query")
-        if not isinstance(labels, list) or not labels or any(
-            not isinstance(label, str) or not label.strip() for label in labels
+        if (
+            not isinstance(labels, list)
+            or not labels
+            or any(not isinstance(label, str) or not label.strip() for label in labels)
         ):
             raise ValueError("Ark Classification 的 labels 必须是非空字符串列表。")
         labels = [label.strip() for label in labels]
@@ -2378,12 +2809,14 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             {"user", "extra_headers", "extra_query", "extra_body", "timeout"},
         )
         resource = await self._get_async_classification_resource()
-        return await self._resolve_async_result(resource.create(
-            query=query,
-            model=effective_model,
-            labels=labels,
-            **kwargs,
-        ))
+        return await self._resolve_async_result(
+            resource.create(
+                query=query,
+                model=effective_model,
+                labels=labels,
+                **kwargs,
+            )
+        )
 
     def close(self) -> None:
         """释放同步和异步 Ark SDK 客户端及分类资源。"""

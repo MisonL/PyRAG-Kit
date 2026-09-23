@@ -36,12 +36,32 @@ def _allow_resource_business_parameters(*names: str) -> Callable[[_FacadeMethod]
 class _NativeResourceProxy:
     """为 SDK 原生资源树增加请求扩展校验，同时保持结果对象原样返回。
 
-    `.native` 仍然返回官方客户端本身；只有通过 Facade 动态访问的资源节点
-    使用此代理。这样既能兼容 SDK 新增资源，又不会让 `extra_headers`、
-    `extra_query` 或 `extra_body` 绕过统一凭证边界。
+    只有通过 Facade 动态访问的资源节点使用此代理，这样既能兼容 SDK 新增
+    资源，又不会让 `extra_headers`、`extra_query` 或 `extra_body` 绕过统一
+    凭证边界。
+
+    绕过说明：``provider.resources.native`` 是文档化的出口，按设计返回完整
+    原生客户端，不经过凭证扫描与能力门禁。注意它挂在 **Facade 层**，代理
+    节点本身没有 ``native`` 属性。本代理内部的 ``_value`` 指向同一个对象，
+    因此它不是独立的绕过路径——想绕过门禁的用户用 ``resources.native``
+    即可，无需依赖实现细节。``_value`` 只是内部持有者，不属于公共 API。
     """
 
     __slots__ = ("_children", "_path", "_provider", "_value")
+
+    def __dir__(self) -> list[str]:
+        """从自动补全中隐藏实现细节，避免被当成公共 API 使用。
+
+        两处来源都要过滤：``__slots__`` 里的自有槽位，以及 ``__getattr__``
+        转发来的底层 SDK 节点属性（其中含 ``_client`` 这类可直达原始客户端的
+        通路）。出口是 Facade 层的 ``provider.resources.native``。
+        """
+        # ``super().__dir__()`` 对 ``__slots__`` 类只给出 dunder 与槽位名，
+        # 真实资源名要经 ``__getattr__`` 从底层节点取（并缓存进 ``_children``）。
+        names = {name for name in super().__dir__() if not name.startswith("_")}
+        names.update(name for name in self._children if not name.startswith("_"))
+        names.update(name for name in dir(self._value) if not name.startswith("_"))
+        return sorted(names)
 
     def __init__(self, value: Any, provider: Any, path: str):
         self._value = value
@@ -49,7 +69,16 @@ class _NativeResourceProxy:
         self._path = path
         self._children: dict[str, Any] = {}
 
+    # 底层 SDK 节点的私有名不能经代理转发。``_NativeResourceProxy`` 没有
+    # 自己的 ``__dict__``（``__slots__`` 已封闭），因此 ``__getattr__`` 会把
+    # 这些名字转发给 SDK 节点——``proxy.__dict__["_client"]`` 能拿到未包装的
+    # 原始客户端，绕开全部凭证扫描与能力门禁。``.native`` 是文档化的出口，
+    # 这里要堵的是「实现细节意外成为第二条出口」。
+    _BLOCKED_ATTRIBUTES = frozenset({"__dict__", "__class__", "__weakref__"})
+
     def __getattr__(self, name: str) -> Any:
+        if name in self._BLOCKED_ATTRIBUTES or name.startswith("_"):
+            raise AttributeError(f"{type(self).__name__} 不暴露 {name!r}。")
         if name in self._children:
             return self._children[name]
         value = getattr(self._value, name)
@@ -80,8 +109,10 @@ class _NativeResourceProxy:
         if callable(resource_guard):
             # 传完整路径（``volcengine.responses.create``）而不是末段方法名：
             # ``files.create`` 与 ``responses.create`` 末段相同，只看方法名无法
-            # 区分该走哪条能力门禁。
-            resource_guard(self._path)
+            # 区分该走哪条能力门禁。同时把调用参数一并传入：动态路径不经过
+            # Facade，Provider 在 Facade 上做的参数校验（例如 Ark 的
+            # instructions × caching 互斥）必须在这里得到同等执行。
+            resource_guard(self._path, safe_kwargs)
         # Call results are deliberately not wrapped.  They are response models,
         # pagers, streams, or context managers rather than mutable resource
         # trees; preserving their SDK identity keeps normal client code intact.
@@ -111,18 +142,13 @@ def _wrap_native_resource_value(value: Any, provider: Any, path: str) -> Any:
 
 
 def _resource_provider_label(provider: Any) -> str:
-    return str(
-        getattr(provider, "_provider", None)
-        or provider.__class__.__name__
-    )
+    return str(getattr(provider, "_provider", None) or provider.__class__.__name__)
 
 
 def _guard_resource_method(method: _FacadeMethod) -> _FacadeMethod:
     """在所有显式 Facade 方法前统一校验 SDK 扩展参数。"""
 
-    allowed_business_parameters = frozenset(
-        getattr(method, "_resource_business_parameters", ())
-    )
+    allowed_business_parameters = frozenset(getattr(method, "_resource_business_parameters", ()))
 
     def sanitize_call(
         self: Any,
@@ -147,9 +173,9 @@ def _guard_resource_method(method: _FacadeMethod) -> _FacadeMethod:
             elif parameter.kind is inspect.Parameter.VAR_KEYWORD:
                 bound.arguments[name] = validate_secret_free_resource_kwargs(value, label)
             else:
-                bound.arguments[name] = validate_secret_free_resource_kwargs(
-                    {name: value}, label
-                )[name]
+                bound.arguments[name] = validate_secret_free_resource_kwargs({name: value}, label)[
+                    name
+                ]
         return bound.args[1:], dict(bound.kwargs)
 
     if inspect.iscoroutinefunction(method):
@@ -381,13 +407,17 @@ class OpenAIResources(OpenAICompatibleResources):
     def create_vector_store_file(self, vector_store_id: str, file_id: str, **kwargs: Any) -> Any:
         return self.provider.create_vector_store_file(vector_store_id, file_id, **kwargs)
 
-    def create_vector_store_file_and_poll(self, vector_store_id: str, file_id: str, **kwargs: Any) -> Any:
+    def create_vector_store_file_and_poll(
+        self, vector_store_id: str, file_id: str, **kwargs: Any
+    ) -> Any:
         return self.provider.create_vector_store_file_and_poll(vector_store_id, file_id, **kwargs)
 
     def upload_vector_store_file(self, vector_store_id: str, file: Any, **kwargs: Any) -> Any:
         return self.provider.upload_vector_store_file(vector_store_id, file, **kwargs)
 
-    def upload_vector_store_file_and_poll(self, vector_store_id: str, file: Any, **kwargs: Any) -> Any:
+    def upload_vector_store_file_and_poll(
+        self, vector_store_id: str, file: Any, **kwargs: Any
+    ) -> Any:
         return self.provider.upload_vector_store_file_and_poll(vector_store_id, file, **kwargs)
 
     def retrieve_vector_store_file(self, vector_store_id: str, file_id: str, **kwargs: Any) -> Any:
@@ -414,20 +444,32 @@ class OpenAIResources(OpenAICompatibleResources):
     def create_vector_store_file_batch_and_poll(self, vector_store_id: str, **kwargs: Any) -> Any:
         return self.provider.create_vector_store_file_batch_and_poll(vector_store_id, **kwargs)
 
-    def retrieve_vector_store_file_batch(self, vector_store_id: str, batch_id: str, **kwargs: Any) -> Any:
+    def retrieve_vector_store_file_batch(
+        self, vector_store_id: str, batch_id: str, **kwargs: Any
+    ) -> Any:
         return self.provider.retrieve_vector_store_file_batch(vector_store_id, batch_id, **kwargs)
 
-    def cancel_vector_store_file_batch(self, vector_store_id: str, batch_id: str, **kwargs: Any) -> Any:
+    def cancel_vector_store_file_batch(
+        self, vector_store_id: str, batch_id: str, **kwargs: Any
+    ) -> Any:
         return self.provider.cancel_vector_store_file_batch(vector_store_id, batch_id, **kwargs)
 
-    def poll_vector_store_file_batch(self, vector_store_id: str, batch_id: str, **kwargs: Any) -> Any:
+    def poll_vector_store_file_batch(
+        self, vector_store_id: str, batch_id: str, **kwargs: Any
+    ) -> Any:
         return self.provider.poll_vector_store_file_batch(vector_store_id, batch_id, **kwargs)
 
-    def list_vector_store_file_batch_files(self, vector_store_id: str, batch_id: str, **kwargs: Any) -> Any:
+    def list_vector_store_file_batch_files(
+        self, vector_store_id: str, batch_id: str, **kwargs: Any
+    ) -> Any:
         return self.provider.list_vector_store_file_batch_files(vector_store_id, batch_id, **kwargs)
 
-    def upload_vector_store_file_batch_and_poll(self, vector_store_id: str, files: Any, **kwargs: Any) -> Any:
-        return self.provider.upload_vector_store_file_batch_and_poll(vector_store_id, files, **kwargs)
+    def upload_vector_store_file_batch_and_poll(
+        self, vector_store_id: str, files: Any, **kwargs: Any
+    ) -> Any:
+        return self.provider.upload_vector_store_file_batch_and_poll(
+            vector_store_id, files, **kwargs
+        )
 
     def list_models(self, **kwargs: Any) -> Any:
         return self.provider.list_models(**kwargs)
@@ -552,8 +594,12 @@ class OpenAIResources(OpenAICompatibleResources):
     def delete_container(self, container_id: str, **kwargs: Any) -> Any:
         return self.provider.delete_container(container_id, **kwargs)
 
-    def create_container_file(self, container_id: str, file: Any = None, file_id: str | None = None, **kwargs: Any) -> Any:
-        return self.provider.create_container_file(container_id, file=file, file_id=file_id, **kwargs)
+    def create_container_file(
+        self, container_id: str, file: Any = None, file_id: str | None = None, **kwargs: Any
+    ) -> Any:
+        return self.provider.create_container_file(
+            container_id, file=file, file_id=file_id, **kwargs
+        )
 
     def list_container_files(self, container_id: str, **kwargs: Any) -> Any:
         return self.provider.list_container_files(container_id, **kwargs)
@@ -681,7 +727,9 @@ class AsyncOpenAIResources(AsyncOpenAICompatibleResources):
     async def wait_for_file(self, file_id: str, **kwargs: Any) -> Any:
         return await self.provider.async_wait_for_file(file_id, **kwargs)
 
-    async def create_batch(self, input_file_id: str, endpoint: str | None = None, **kwargs: Any) -> Any:
+    async def create_batch(
+        self, input_file_id: str, endpoint: str | None = None, **kwargs: Any
+    ) -> Any:
         return await self.provider.async_create_batch(input_file_id, endpoint=endpoint, **kwargs)
 
     async def retrieve_batch(self, batch_id: str, **kwargs: Any) -> Any:
@@ -732,56 +780,110 @@ class AsyncOpenAIResources(AsyncOpenAICompatibleResources):
     async def update_vector_store(self, vector_store_id: str, **kwargs: Any) -> Any:
         return await self.provider.async_update_vector_store(vector_store_id, **kwargs)
 
-    async def create_vector_store_file(self, vector_store_id: str, file_id: str, **kwargs: Any) -> Any:
-        return await self.provider.async_create_vector_store_file(vector_store_id, file_id, **kwargs)
+    async def create_vector_store_file(
+        self, vector_store_id: str, file_id: str, **kwargs: Any
+    ) -> Any:
+        return await self.provider.async_create_vector_store_file(
+            vector_store_id, file_id, **kwargs
+        )
 
-    async def create_vector_store_file_and_poll(self, vector_store_id: str, file_id: str, **kwargs: Any) -> Any:
-        return await self.provider.async_create_vector_store_file_and_poll(vector_store_id, file_id, **kwargs)
+    async def create_vector_store_file_and_poll(
+        self, vector_store_id: str, file_id: str, **kwargs: Any
+    ) -> Any:
+        return await self.provider.async_create_vector_store_file_and_poll(
+            vector_store_id, file_id, **kwargs
+        )
 
     async def upload_vector_store_file(self, vector_store_id: str, file: Any, **kwargs: Any) -> Any:
         return await self.provider.async_upload_vector_store_file(vector_store_id, file, **kwargs)
 
-    async def upload_vector_store_file_and_poll(self, vector_store_id: str, file: Any, **kwargs: Any) -> Any:
-        return await self.provider.async_upload_vector_store_file_and_poll(vector_store_id, file, **kwargs)
+    async def upload_vector_store_file_and_poll(
+        self, vector_store_id: str, file: Any, **kwargs: Any
+    ) -> Any:
+        return await self.provider.async_upload_vector_store_file_and_poll(
+            vector_store_id, file, **kwargs
+        )
 
     async def create_vector_store_file_batch(self, vector_store_id: str, **kwargs: Any) -> Any:
         return await self.provider.async_create_vector_store_file_batch(vector_store_id, **kwargs)
 
-    async def create_vector_store_file_batch_and_poll(self, vector_store_id: str, **kwargs: Any) -> Any:
-        return await self.provider.async_create_vector_store_file_batch_and_poll(vector_store_id, **kwargs)
+    async def create_vector_store_file_batch_and_poll(
+        self, vector_store_id: str, **kwargs: Any
+    ) -> Any:
+        return await self.provider.async_create_vector_store_file_batch_and_poll(
+            vector_store_id, **kwargs
+        )
 
-    async def retrieve_vector_store_file(self, vector_store_id: str, file_id: str, **kwargs: Any) -> Any:
-        return await self.provider.async_retrieve_vector_store_file(vector_store_id, file_id, **kwargs)
+    async def retrieve_vector_store_file(
+        self, vector_store_id: str, file_id: str, **kwargs: Any
+    ) -> Any:
+        return await self.provider.async_retrieve_vector_store_file(
+            vector_store_id, file_id, **kwargs
+        )
 
     async def list_vector_store_files(self, vector_store_id: str, **kwargs: Any) -> Any:
         return await self.provider.async_list_vector_store_files(vector_store_id, **kwargs)
 
-    async def update_vector_store_file(self, vector_store_id: str, file_id: str, **kwargs: Any) -> Any:
-        return await self.provider.async_update_vector_store_file(vector_store_id, file_id, **kwargs)
+    async def update_vector_store_file(
+        self, vector_store_id: str, file_id: str, **kwargs: Any
+    ) -> Any:
+        return await self.provider.async_update_vector_store_file(
+            vector_store_id, file_id, **kwargs
+        )
 
-    async def delete_vector_store_file(self, vector_store_id: str, file_id: str, **kwargs: Any) -> Any:
-        return await self.provider.async_delete_vector_store_file(vector_store_id, file_id, **kwargs)
+    async def delete_vector_store_file(
+        self, vector_store_id: str, file_id: str, **kwargs: Any
+    ) -> Any:
+        return await self.provider.async_delete_vector_store_file(
+            vector_store_id, file_id, **kwargs
+        )
 
-    async def vector_store_file_content(self, vector_store_id: str, file_id: str, **kwargs: Any) -> Any:
-        return await self.provider.async_vector_store_file_content(vector_store_id, file_id, **kwargs)
+    async def vector_store_file_content(
+        self, vector_store_id: str, file_id: str, **kwargs: Any
+    ) -> Any:
+        return await self.provider.async_vector_store_file_content(
+            vector_store_id, file_id, **kwargs
+        )
 
-    async def poll_vector_store_file(self, vector_store_id: str, file_id: str, **kwargs: Any) -> Any:
+    async def poll_vector_store_file(
+        self, vector_store_id: str, file_id: str, **kwargs: Any
+    ) -> Any:
         return await self.provider.async_poll_vector_store_file(vector_store_id, file_id, **kwargs)
 
-    async def retrieve_vector_store_file_batch(self, vector_store_id: str, batch_id: str, **kwargs: Any) -> Any:
-        return await self.provider.async_retrieve_vector_store_file_batch(vector_store_id, batch_id, **kwargs)
+    async def retrieve_vector_store_file_batch(
+        self, vector_store_id: str, batch_id: str, **kwargs: Any
+    ) -> Any:
+        return await self.provider.async_retrieve_vector_store_file_batch(
+            vector_store_id, batch_id, **kwargs
+        )
 
-    async def cancel_vector_store_file_batch(self, vector_store_id: str, batch_id: str, **kwargs: Any) -> Any:
-        return await self.provider.async_cancel_vector_store_file_batch(vector_store_id, batch_id, **kwargs)
+    async def cancel_vector_store_file_batch(
+        self, vector_store_id: str, batch_id: str, **kwargs: Any
+    ) -> Any:
+        return await self.provider.async_cancel_vector_store_file_batch(
+            vector_store_id, batch_id, **kwargs
+        )
 
-    async def poll_vector_store_file_batch(self, vector_store_id: str, batch_id: str, **kwargs: Any) -> Any:
-        return await self.provider.async_poll_vector_store_file_batch(vector_store_id, batch_id, **kwargs)
+    async def poll_vector_store_file_batch(
+        self, vector_store_id: str, batch_id: str, **kwargs: Any
+    ) -> Any:
+        return await self.provider.async_poll_vector_store_file_batch(
+            vector_store_id, batch_id, **kwargs
+        )
 
-    async def list_vector_store_file_batch_files(self, vector_store_id: str, batch_id: str, **kwargs: Any) -> Any:
-        return await self.provider.async_list_vector_store_file_batch_files(vector_store_id, batch_id, **kwargs)
+    async def list_vector_store_file_batch_files(
+        self, vector_store_id: str, batch_id: str, **kwargs: Any
+    ) -> Any:
+        return await self.provider.async_list_vector_store_file_batch_files(
+            vector_store_id, batch_id, **kwargs
+        )
 
-    async def upload_vector_store_file_batch_and_poll(self, vector_store_id: str, files: Any, **kwargs: Any) -> Any:
-        return await self.provider.async_upload_vector_store_file_batch_and_poll(vector_store_id, files, **kwargs)
+    async def upload_vector_store_file_batch_and_poll(
+        self, vector_store_id: str, files: Any, **kwargs: Any
+    ) -> Any:
+        return await self.provider.async_upload_vector_store_file_batch_and_poll(
+            vector_store_id, files, **kwargs
+        )
 
     async def list_models(self, **kwargs: Any) -> Any:
         return await self.provider.async_list_models(**kwargs)
@@ -885,14 +987,24 @@ class AsyncOpenAIResources(AsyncOpenAICompatibleResources):
     async def list_conversation_items(self, conversation_id: str, **kwargs: Any) -> Any:
         return await self.provider.async_list_conversation_items(conversation_id, **kwargs)
 
-    async def create_conversation_items(self, conversation_id: str, items: Any, **kwargs: Any) -> Any:
+    async def create_conversation_items(
+        self, conversation_id: str, items: Any, **kwargs: Any
+    ) -> Any:
         return await self.provider.async_create_conversation_items(conversation_id, items, **kwargs)
 
-    async def retrieve_conversation_item(self, conversation_id: str, item_id: str, **kwargs: Any) -> Any:
-        return await self.provider.async_retrieve_conversation_item(conversation_id, item_id, **kwargs)
+    async def retrieve_conversation_item(
+        self, conversation_id: str, item_id: str, **kwargs: Any
+    ) -> Any:
+        return await self.provider.async_retrieve_conversation_item(
+            conversation_id, item_id, **kwargs
+        )
 
-    async def delete_conversation_item(self, conversation_id: str, item_id: str, **kwargs: Any) -> Any:
-        return await self.provider.async_delete_conversation_item(conversation_id, item_id, **kwargs)
+    async def delete_conversation_item(
+        self, conversation_id: str, item_id: str, **kwargs: Any
+    ) -> Any:
+        return await self.provider.async_delete_conversation_item(
+            conversation_id, item_id, **kwargs
+        )
 
     async def create_container(self, **kwargs: Any) -> Any:
         return await self.provider.async_create_container(**kwargs)
@@ -906,8 +1018,12 @@ class AsyncOpenAIResources(AsyncOpenAICompatibleResources):
     async def delete_container(self, container_id: str, **kwargs: Any) -> Any:
         return await self.provider.async_delete_container(container_id, **kwargs)
 
-    async def create_container_file(self, container_id: str, file: Any = None, file_id: str | None = None, **kwargs: Any) -> Any:
-        return await self.provider.async_create_container_file(container_id, file=file, file_id=file_id, **kwargs)
+    async def create_container_file(
+        self, container_id: str, file: Any = None, file_id: str | None = None, **kwargs: Any
+    ) -> Any:
+        return await self.provider.async_create_container_file(
+            container_id, file=file, file_id=file_id, **kwargs
+        )
 
     async def list_container_files(self, container_id: str, **kwargs: Any) -> Any:
         return await self.provider.async_list_container_files(container_id, **kwargs)
@@ -984,7 +1100,6 @@ class AsyncOpenAIResources(AsyncOpenAICompatibleResources):
 
 
 class GoogleResources(_NativeFacade):
-
     _delegate_native = True
 
     @property
@@ -1068,9 +1183,7 @@ class GoogleResources(_NativeFacade):
     def tune(
         self, base_model: str, training_dataset: Any, config: Any = None, **kwargs: Any
     ) -> Any:
-        return self.provider.tune(
-            base_model, training_dataset, config=config, **kwargs
-        )
+        return self.provider.tune(base_model, training_dataset, config=config, **kwargs)
 
     def get_tuning(self, name: str, **kwargs: Any) -> Any:
         return self.provider.get_tuning(name, **kwargs)
@@ -1230,10 +1343,16 @@ class GoogleResources(_NativeFacade):
     def delete_file_search_store(self, name: str, **kwargs: Any) -> Any:
         return self.provider.delete_file_search_store(name, **kwargs)
 
-    def import_file_to_file_search_store(self, file_search_store_name: str, file_name: str, **kwargs: Any) -> Any:
-        return self.provider.import_file_to_file_search_store(file_search_store_name, file_name, **kwargs)
+    def import_file_to_file_search_store(
+        self, file_search_store_name: str, file_name: str, **kwargs: Any
+    ) -> Any:
+        return self.provider.import_file_to_file_search_store(
+            file_search_store_name, file_name, **kwargs
+        )
 
-    def upload_to_file_search_store(self, file_search_store_name: str, file: Any, **kwargs: Any) -> Any:
+    def upload_to_file_search_store(
+        self, file_search_store_name: str, file: Any, **kwargs: Any
+    ) -> Any:
         return self.provider.upload_to_file_search_store(file_search_store_name, file, **kwargs)
 
     def download_file_search_media(self, media_id: str, **kwargs: Any) -> bytes:
@@ -1408,9 +1527,7 @@ class AsyncGoogleResources(_NativeFacade):
     async def tune(
         self, base_model: str, training_dataset: Any, config: Any = None, **kwargs: Any
     ) -> Any:
-        return await self.provider.async_tune(
-            base_model, training_dataset, config=config, **kwargs
-        )
+        return await self.provider.async_tune(base_model, training_dataset, config=config, **kwargs)
 
     async def get_tuning(self, name: str, **kwargs: Any) -> Any:
         return await self.provider.async_get_tuning(name, **kwargs)
@@ -1490,12 +1607,16 @@ class AsyncGoogleResources(_NativeFacade):
     async def delete_file_search_store(self, name: str, **kwargs: Any) -> Any:
         return await self.provider.async_delete_file_search_store(name, **kwargs)
 
-    async def import_file_to_file_search_store(self, file_search_store_name: str, file_name: str, **kwargs: Any) -> Any:
+    async def import_file_to_file_search_store(
+        self, file_search_store_name: str, file_name: str, **kwargs: Any
+    ) -> Any:
         return await self.provider.async_import_file_to_file_search_store(
             file_search_store_name, file_name, **kwargs
         )
 
-    async def upload_to_file_search_store(self, file_search_store_name: str, file: Any, **kwargs: Any) -> Any:
+    async def upload_to_file_search_store(
+        self, file_search_store_name: str, file: Any, **kwargs: Any
+    ) -> Any:
         return await self.provider.async_upload_to_file_search_store(
             file_search_store_name, file, **kwargs
         )
@@ -1505,7 +1626,6 @@ class AsyncGoogleResources(_NativeFacade):
 
 
 class AnthropicResources(_NativeFacade):
-
     _delegate_native = True
 
     def _beta_resource(self, name: str) -> Any:
@@ -1757,7 +1877,6 @@ class AsyncAnthropicResources(_NativeFacade):
 
 
 class ArkResources(_NativeFacade):
-
     _delegate_native = True
 
     def upload_file(self, file: Any, purpose: str, **kwargs: Any) -> Any:

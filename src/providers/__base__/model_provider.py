@@ -325,6 +325,10 @@ def merge_tool_call_fragment(
 
 
 _CHAT_TOOL_CALL_TYPES = frozenset({"function"})
+# 归一化过程中挂在消息/工具调用上的内部标记。它们只服务于本模块的分支判断，
+# 必须在交给 SDK 之前剥离：Responses 的兜底分支会原样复制消息，标记会随请求
+# 体发给服务端。
+_INTERNAL_MESSAGE_KEYS = frozenset({"_responses_tool_call_type"})
 
 
 def _chat_tool_call_item(
@@ -378,7 +382,15 @@ def _chat_tool_call_item(
     # Chat Completions 的 ``tool_calls[].type`` 只接受 ``function``；Responses 的
     # ``function_call``/``custom_tool_call`` 与流式片段都要映射回该取值。
     source_type = normalized.get("type")
-    tool_type = source_type if source_type in _CHAT_TOOL_CALL_TYPES else "function"
+    # 非字符串的 ``type``（例如 ``["function"]``）直接做集合查找会抛
+    # ``TypeError: unhashable type``，把「类型不合法」变成崩溃。此处与
+    # ``_normalize_responses_native_item`` 的守卫保持同一口径：先做
+    # isinstance 短路，再按取值映射。
+    tool_type = (
+        source_type
+        if isinstance(source_type, str) and source_type in _CHAT_TOOL_CALL_TYPES
+        else "function"
+    )
 
     item: dict[str, Any] = {
         "type": tool_type,
@@ -511,35 +523,87 @@ def _responses_provider_variant(provider: str) -> str:
 
 
 # Ark 专属的 Responses 内容块类型；OpenAI 兼容端点不接受这些块。
-_ARK_ONLY_RESPONSES_ITEM_TYPES = frozenset(
-    {"input_audio", "audio_url", "input_video", "video_url"}
+_ARK_ONLY_RESPONSES_ITEM_TYPES = frozenset({"input_audio", "audio_url", "input_video", "video_url"})
+
+# 顶层 item 形态能书写的全部内容块类型。这些类型在 ``_responses_content_part``
+# 里已有完整校验（provider 变体、必填字段、取值范围），顶层路径必须复用同一套
+# 实现，否则会出现「写成 content 被拒、写成顶层 item 却放行」的不一致。
+_RESPONSES_CONTENT_BLOCK_TYPES = frozenset(
+    {
+        "text",
+        "input_text",
+        "output_text",
+        "audio_url",
+        "input_audio",
+        "video_url",
+        "input_video",
+        "image_url",
+        "input_image",
+        "file",
+        "input_file",
+    }
 )
 
 
-def _reject_unsupported_responses_item(
+def _reject_unsupported_responses_top_level_fields(
     item: Mapping[str, Any],
     location: str,
     provider: str,
 ) -> None:
-    """拒绝经顶层 item 形态绕过 variant 守卫的供应商专属内容块。
+    """拒绝 OpenAI 兼容渠道发出 Ark 专属的顶层字段。
 
-    ``normalize_responses_input`` 对带 ``content`` 的消息走
-    ``_responses_message_content``，那里会按 provider 变体拒绝 Ark 专属块。
-    但原生 Responses item（``{"type": "input_audio", ...}``）没有 ``content``，
-    会直通到请求体，因此需要在这里做等价检查，避免同一种块因书写位置不同
-    而一个被拒、一个静默发给不支持它的端点。
+    这类字段与 item 类型无关：无论写成内容块、原生 item 还是普通消息的顶层
+    字段，OpenAI Responses 都不接受。只检查内容块路径会留下旁路——
+    ``{"role": "user", "content": "hi", "input_audio": {...}}`` 带一个无关的
+    ``content`` 键就绕开了 ``_normalize_responses_native_item`` 的类型分流，
+    请求体里原样带上 Ark 专属块发给不支持它的端点。
     """
     if _responses_provider_variant(provider) == "ark":
         return
-    item_type = item.get("type")
-    if item_type in _ARK_ONLY_RESPONSES_ITEM_TYPES:
-        raise ValueError(
-            f"{location} 的 {item_type} 内容块当前不受 Responses SDK 支持。"
-        )
+    unsupported = sorted(_ARK_ONLY_RESPONSES_ITEM_TYPES.intersection(item))
+    if unsupported:
+        raise ValueError(f"{location}.{unsupported[0]} 不受 OpenAI Responses SDK 支持。")
     if "image_pixel_limit" in item:
-        raise ValueError(
-            f"{location}.image_pixel_limit 不受 OpenAI Responses SDK 支持。"
-        )
+        raise ValueError(f"{location}.image_pixel_limit 不受 OpenAI Responses SDK 支持。")
+
+
+def _normalize_responses_native_item(
+    item: Mapping[str, Any],
+    location: str,
+    provider: str,
+) -> dict[str, Any]:
+    """归一化原生 Responses item，并复用内容块的完整校验。
+
+    原生 item（``{"type": "input_audio", ...}``）不带 ``content``，会直通到
+    请求体。若只在这里做少量检查，同一种块会因书写位置不同而一个被拒、一个
+    静默发给不支持它的端点——加一个无关的 ``content`` 键就能改走另一条路径，
+    从而绕过全部变体校验。
+
+    因此类型属于内容块时，整项交给 ``_responses_content_part``：它同时完成
+    校验与形状归一化（例如把嵌套的 ``image_url`` 对象展平成 SDK 期望的扁平
+    形式）。其余键按原样保留。
+    """
+    # ``image_pixel_limit`` 是 Ark 专属字段，与 item 类型无关：无论写成内容块
+    # 还是顶层字段，OpenAI 兼容渠道都不能发出。这个检查必须在类型门禁之前，
+    # 否则 ``{"type": "reasoning", "image_pixel_limit": ...}`` 这类非内容块
+    # item 会整体跳过校验——只是把绕过点从 ``content`` 键换成了 ``type`` 键。
+    _reject_unsupported_responses_top_level_fields(item, location, provider)
+
+    item_type = item.get("type")
+    # ``type`` 可能是任意 JSON 值。直接做集合查找对不可哈希的值（``list``/
+    # ``dict``）会抛 ``TypeError: unhashable type``，把可诊断的类型错误变成
+    # 崩溃；非字符串的 ``type`` 一律交给 ``_responses_content_part`` 报错。
+    if not isinstance(item_type, str) or item_type not in _RESPONSES_CONTENT_BLOCK_TYPES:
+        if isinstance(item_type, str) or item_type is None:
+            return dict(item)
+        return _responses_content_part(item, location, provider=provider)
+    converted = _responses_content_part(item, location, provider=provider)
+    # 内容块转换只产出 SDK 输入联合里的字段；``id``/``status`` 等 item 级
+    # 元数据不在其中，需要保留。
+    for key in ("id", "status"):
+        if key in item and key not in converted:
+            converted[key] = item[key]
+    return converted
 
 
 def _responses_content_part(
@@ -564,6 +628,11 @@ def _responses_content_part(
 
     source = dict(part)
     part_type = source.get("type")
+    # ``type`` 是任意 JSON 值。下面所有分支都用集合成员判断，对不可哈希的值
+    # （``list``/``dict``）会抛 ``TypeError: unhashable type``，把可诊断的
+    # 类型错误变成崩溃。非字符串统一在此显式失败。
+    if not isinstance(part_type, str) or not part_type.strip():
+        raise ValueError(f"{location}.type 必须是非空字符串。")
     variant = _responses_provider_variant(provider)
     if part_type in {"text", "input_text", "output_text"}:
         text = source.get("text")
@@ -578,9 +647,7 @@ def _responses_content_part(
 
     if part_type in {"audio_url", "input_audio"}:
         if variant != "ark":
-            raise ValueError(
-                f"{location} 的 {part_type} 内容块当前不受 Responses SDK 支持。"
-            )
+            raise ValueError(f"{location} 的 {part_type} 内容块当前不受 Responses SDK 支持。")
         audio_value = source.get("audio_url")
         if isinstance(audio_value, Mapping):
             audio_url = audio_value.get("url") or audio_value.get("audio_url")
@@ -607,9 +674,7 @@ def _responses_content_part(
 
     if part_type in {"video_url", "input_video"}:
         if variant != "ark":
-            raise ValueError(
-                f"{location} 的 {part_type} 内容块当前不受 Responses SDK 支持。"
-            )
+            raise ValueError(f"{location} 的 {part_type} 内容块当前不受 Responses SDK 支持。")
         video_value = source.get("video_url")
         if isinstance(video_value, Mapping):
             video_url = video_value.get("url") or video_value.get("video_url")
@@ -756,9 +821,7 @@ def _responses_content_part(
         if "file_url" not in source and isinstance(source.get("url"), str):
             source["file_url"] = source["url"]
         if not any(source.get(key) for key in ("file_id", "file_data", "file_url")):
-            raise ValueError(
-                f"{location} 缺少 file_id、file_data 或 file_url。"
-            )
+            raise ValueError(f"{location} 缺少 file_id、file_data 或 file_url。")
         for key in ("file_id", "file_data", "file_url", "filename"):
             if source.get(key) is not None and not isinstance(source[key], str):
                 raise ValueError(f"{location}.{key} 必须是字符串。")
@@ -781,9 +844,7 @@ def _responses_content_part(
             if source.get(key) is not None and not isinstance(source[key], str):
                 raise ValueError(f"{location}.{key} 必须是字符串。")
         if not any(source.get(key) for key in ("file_id", "file_data", "file_url")):
-            raise ValueError(
-                f"{location} 缺少 file_id、file_data 或 file_url。"
-            )
+            raise ValueError(f"{location} 缺少 file_id、file_data 或 file_url。")
         converted = {"type": "input_file"}
         if source.get("detail") is not None:
             if variant != "openai" or source["detail"] not in {"auto", "low", "high"}:
@@ -798,11 +859,7 @@ def _responses_content_part(
             raise ValueError(f"{location}.prompt_cache_breakpoint 不受 Ark Responses SDK 支持。")
         return converted
 
-    if not isinstance(part_type, str) or not part_type.strip():
-        raise ValueError(f"{location}.type 必须是非空字符串。")
-    raise ValueError(
-        f"{location} 的内容类型 {part_type} 不受 Responses SDK 支持。"
-    )
+    raise ValueError(f"{location} 的内容类型 {part_type} 不受 Responses SDK 支持。")
 
 
 def _responses_message_content(
@@ -861,7 +918,11 @@ def _responses_function_call_item(
     # Completions 唯一允许的 ``function``，直接读它会丢掉 custom 语义。
     source_type = tool_call.get("_responses_tool_call_type") or tool_call.get("type")
     if source_type == "custom_tool_call":
-        custom_input = "" if raw_arguments is None else str(raw_arguments)
+        # SDK 契约里 ``input`` 是任意文本。结构化值（dict/list）必须走 JSON
+        # 编码而不是 ``str()``：后者产出 Python repr（单引号、``None``/``True``
+        # 字面量），同一份数据经 ``assistant.tool_calls`` 路径会被 JSON 编码，
+        # 两条路径对同一输入给出不同文本。
+        custom_input = "" if raw_arguments is None else normalize_tool_arguments(raw_arguments)
         item: dict[str, Any] = {
             "type": "custom_tool_call",
             "call_id": call_id,
@@ -876,10 +937,14 @@ def _responses_function_call_item(
             "arguments": _responses_json_text(raw_arguments, f"{location}.arguments"),
         }
     # A Chat Completions ``id`` is the call identifier, not the Responses
-    # output-item identifier. Do not duplicate it as ``id`` unless the caller
-    # supplied a distinct Responses-style ``call_id`` explicitly.
-    if explicit_call_id is not None and tool_call.get("id") is not None:
-        item["id"] = tool_call["id"]
+    # output-item identifier. Only emit ``id`` when it is a genuinely distinct
+    # output-item identifier: the caller must have supplied an explicit
+    # ``call_id``, and ``id`` must differ from it. Providers normalize streamed
+    # tool calls so that ``id == call_id``, and duplicating it here would send
+    # the call identifier where the SDK expects the output-item identifier.
+    explicit_id = tool_call.get("id")
+    if explicit_call_id is not None and explicit_id is not None and explicit_id != explicit_call_id:
+        item["id"] = explicit_id
     if tool_call.get("status") is not None:
         item["status"] = tool_call["status"]
     return item
@@ -988,9 +1053,8 @@ def normalize_responses_input(
         role = message.get("role")
         tool_calls = message.get("tool_calls")
         if role == "assistant" and tool_calls is not None:
-            if (
-                isinstance(tool_calls, (str, bytes, bytearray))
-                or not isinstance(tool_calls, Sequence)
+            if isinstance(tool_calls, (str, bytes, bytearray)) or not isinstance(
+                tool_calls, Sequence
             ):
                 raise ValueError(f"{location}.tool_calls 必须是工具调用序列。")
             content = message.get("content")
@@ -1009,9 +1073,7 @@ def normalize_responses_input(
                 converted.append(assistant_message)
             for call_index, tool_call in enumerate(tool_calls):
                 if not isinstance(tool_call, Mapping):
-                    raise ValueError(
-                        f"{location}.tool_calls[{call_index}] 必须是对象。"
-                    )
+                    raise ValueError(f"{location}.tool_calls[{call_index}] 必须是对象。")
                 converted.append(
                     _responses_function_call_item(
                         tool_call,
@@ -1032,27 +1094,56 @@ def normalize_responses_input(
             raise ValueError(f"{location} 的 function 消息缺少 tool_call_id。")
 
         normalized_message = dict(message)
+        # 归一化时会在工具调用项上挂仅用于内部判定的标记
+        # （``_responses_tool_call_type``）。走 assistant.tool_calls 分支时它们
+        # 被消费掉，但本兜底分支原样复制消息，标记会随请求体发给服务端。
+        # 消息级与工具调用项级都要剥离。
+        for internal_key in _INTERNAL_MESSAGE_KEYS:
+            normalized_message.pop(internal_key, None)
+        fallback_tool_calls = normalized_message.get("tool_calls")
+        if isinstance(fallback_tool_calls, Sequence) and not isinstance(
+            fallback_tool_calls, (str, bytes, bytearray)
+        ):
+            normalized_message["tool_calls"] = [
+                {
+                    key: value
+                    for key, value in tool_call.items()
+                    if key not in _INTERNAL_MESSAGE_KEYS
+                }
+                if isinstance(tool_call, Mapping)
+                else tool_call
+                for tool_call in fallback_tool_calls
+            ]
         if "content" in normalized_message:
             normalized_message["content"] = _responses_message_content(
                 normalized_message["content"],
                 location,
                 provider=provider,
             )
-        else:
-            # 原生 Responses item 形态（例如 ``{"type": "input_audio", ...}``）
-            # 不带 role/content，因此不会经过 _responses_message_content 的
-            # 内容块转换。同一个 Ark 专属块写成 content 会被拒、写成顶层 item
-            # 却静默发出，等于绕过了 variant 守卫，因此这里补一次等价检查。
-            _reject_unsupported_responses_item(normalized_message, location, provider)
+        # 顶层字段也要查：``image_pixel_limit`` 与 ``type``/``content`` 都无关，
+        # 写在消息顶层时不会经过内容块转换，OpenAI 兼容渠道不能发出。
+        _reject_unsupported_responses_top_level_fields(normalized_message, location, provider)
+        # 顶层 item 形态（例如 ``{"type": "input_audio", ...}``）不带 role，
+        # 会直通到请求体。这里统一做一次归一化与校验——注意不能以「有没有
+        # ``content`` 键」来分流：加一个无关的 ``content`` 键就能改走上面的
+        # 分支，从而绕过顶层路径的全部变体校验。
+        # 归一化并校验顶层 item 形态。这里不能只判「``type`` 是否在内容块
+        # 集合里」：集合查找对不可哈希的值会抛 ``TypeError``；也不能只在没有
+        # ``role`` 时调用——``{"role": "user", "type": "input_audio", ...}``
+        # 会跳过类型校验直通请求体。
+        if "role" not in normalized_message or "type" in normalized_message:
+            normalized_message = _normalize_responses_native_item(
+                normalized_message, location, provider
+            )
         converted.append(normalized_message)
     return converted
-
 
 
 def normalize_usage(usage: Any) -> dict[str, Any]:
     """将常见供应商 usage 结构规范为统一 token 字段。"""
     if usage is None:
         return {}
+
     def usage_key(prefix: str) -> str:
         return f"{prefix}_tokens"
 
@@ -1072,10 +1163,16 @@ def normalize_usage(usage: Any) -> dict[str, Any]:
         if value is not None:
             result[target] = value
     for key in (
-        "prompt_tokens", "completion_tokens", "total_tokens", "input_tokens",
-        "output_tokens", "cached_tokens", "reasoning_tokens",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+        "cached_tokens",
+        "reasoning_tokens",
         "tool_use_prompt_tokens",
-        "cache_creation_input_tokens", "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
     ):
         value = field(usage, key)
         if value is not None:
@@ -1093,7 +1190,11 @@ def extract_system_prompt(messages: Sequence[Mapping[str, Any]] | None) -> str |
     """提取消息列表中的 system 内容，供无 system role 的 SDK 使用。"""
     if not messages:
         return None
-    values = [content_to_text(message.get("content", "")) for message in messages if message.get("role") == "system"]
+    values = [
+        content_to_text(message.get("content", ""))
+        for message in messages
+        if message.get("role") == "system"
+    ]
     value = "\n\n".join(item for item in values if item)
     return value or None
 
@@ -1137,9 +1238,7 @@ def validate_complete_tool_call(tool_call: Mapping[str, Any], provider: str) -> 
         try:
             json.loads(arguments)
         except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                f"{provider} 工具调用 {name} 的 arguments 不是完整 JSON。"
-            ) from exc
+            raise RuntimeError(f"{provider} 工具调用 {name} 的 arguments 不是完整 JSON。") from exc
     return dict(tool_call)
 
 
@@ -1190,7 +1289,10 @@ def is_retryable_error(error: BaseException) -> bool:
             numeric_status = int(status)
             return numeric_status == 429 or numeric_status >= 500
     name = error.__class__.__name__.lower()
-    return any(token in name for token in ("timeout", "connection", "ratelimit", "internalserver", "serviceunavailable"))
+    return any(
+        token in name
+        for token in ("timeout", "connection", "ratelimit", "internalserver", "serviceunavailable")
+    )
 
 
 def reject_unsupported_kwargs(provider: str, values: Mapping[str, Any]) -> None:
@@ -1302,7 +1404,9 @@ def raise_for_stream_error_event(event: Any, provider: str) -> None:
         if isinstance(current, Mapping):
             values = [current.get(key) for key in ("message", "detail", "reason", "error", "body")]
         else:
-            values = [field(current, key) for key in ("message", "detail", "reason", "error", "body")]
+            values = [
+                field(current, key) for key in ("message", "detail", "reason", "error", "body")
+            ]
         for value in values:
             if isinstance(value, str) and value.strip():
                 message = value.strip()
@@ -1361,6 +1465,7 @@ def retry_sync_stream(
     first_event_validator: Callable[[Any], None] | None = None,
 ) -> Generator[Any, None, None]:
     """只重试同步流在首个事件前的建立阶段，避免重复已输出内容。"""
+
     def open_and_peek() -> tuple[Any, Any]:
         iterator = iter(factory())
         try:
@@ -1392,6 +1497,7 @@ async def retry_async_stream(
     first_event_validator: Callable[[Any], None] | None = None,
 ) -> AsyncGenerator[Any, None]:
     """只重试异步流在首个事件前的建立阶段，避免重复已输出内容。"""
+
     async def open_and_peek() -> tuple[Any, Any]:
         response = factory()
         response = await response if inspect.isawaitable(response) else response
@@ -1428,6 +1534,7 @@ async def retry_async_stream(
 @contextmanager
 def retry_sync_stream_context(factory: Callable[[], Any]) -> Any:
     """重试同步流上下文的进入阶段，不重试已经开始的事件消费。"""
+
     def enter() -> tuple[Any, Any]:
         manager = factory()
         try:
@@ -1451,6 +1558,7 @@ def retry_sync_stream_context(factory: Callable[[], Any]) -> Any:
 @asynccontextmanager
 async def retry_async_stream_context(factory: Callable[[], Any]) -> Any:
     """重试异步流上下文的进入阶段，不重试已经开始的事件消费。"""
+
     async def enter() -> tuple[Any, Any]:
         manager = factory()
         try:
@@ -1520,9 +1628,7 @@ def _is_duplicate_argument_error(error: TypeError) -> bool:
     """识别 SDK 调用中由显式参数与 ``**kwargs`` 重复造成的 TypeError。"""
 
     message = str(error).lower()
-    return "multiple values for" in message and (
-        "argument" in message or "keyword" in message
-    )
+    return "multiple values for" in message and ("argument" in message or "keyword" in message)
 
 
 def _sanitize_resource_call(
@@ -1546,15 +1652,9 @@ def _sanitize_resource_call(
         return copied_args, _validate_secret_free_resource_kwargs(copied_kwargs, label)
 
     extension_names = {"extra_headers", "extra_query", "extra_body"}
-    explicit = {
-        name: bound.arguments[name]
-        for name in extension_names
-        if name in bound.arguments
-    }
+    explicit = {name: bound.arguments[name] for name in extension_names if name in bound.arguments}
     if explicit:
-        bound.arguments.update(
-            _validate_secret_free_resource_kwargs(explicit, label)
-        )
+        bound.arguments.update(_validate_secret_free_resource_kwargs(explicit, label))
     for name, parameter in signature.parameters.items():
         if parameter.kind is inspect.Parameter.VAR_KEYWORD and name in bound.arguments:
             bound.arguments[name] = _validate_secret_free_resource_kwargs(
@@ -1577,9 +1677,7 @@ def _guard_provider_resource_method(method: Callable[..., Any]) -> Callable[...,
         async def async_wrapper(provider: Any, *args: Any, **kwargs: Any) -> Any:
             # 凭证校验先行：它约束参数本身，与渠道是否具备该能力无关。
             # 顺序反了会让携带凭证的调用报出能力错误，把安全问题掩盖成配置问题。
-            safe_args, safe_kwargs = _sanitize_resource_call(
-                method, provider, args, kwargs
-            )
+            safe_args, safe_kwargs = _sanitize_resource_call(method, provider, args, kwargs)
             resource_guard = getattr(provider, "_require_provider_resource", None)
             if callable(resource_guard):
                 resource_guard(method.__name__)
@@ -1609,9 +1707,7 @@ def _guard_provider_resource_method(method: Callable[..., Any]) -> Callable[...,
     @wraps(method)
     def wrapper(provider: Any, *args: Any, **kwargs: Any) -> Any:
         # 与 async_wrapper 保持同一顺序：先凭证，后能力。
-        safe_args, safe_kwargs = _sanitize_resource_call(
-            method, provider, args, kwargs
-        )
+        safe_args, safe_kwargs = _sanitize_resource_call(method, provider, args, kwargs)
         resource_guard = getattr(provider, "_require_provider_resource", None)
         if callable(resource_guard):
             resource_guard(method.__name__)
@@ -1622,26 +1718,18 @@ def _guard_provider_resource_method(method: Callable[..., Any]) -> Callable[...,
             return method(provider, *safe_args, **safe_kwargs)
         except TypeError as exc:
             if "unexpected keyword argument" in str(exc):
-                raise ValueError(
-                    f"{_provider_label(provider)} 资源 SDK 参数不匹配: {exc}"
-                ) from exc
+                raise ValueError(f"{_provider_label(provider)} 资源 SDK 参数不匹配: {exc}") from exc
             if _is_duplicate_argument_error(exc):
-                raise ValueError(
-                    f"{_provider_label(provider)} 资源 SDK 参数重复: {exc}"
-                ) from exc
+                raise ValueError(f"{_provider_label(provider)} 资源 SDK 参数重复: {exc}") from exc
             if provider_call_is_valid and _is_missing_required_argument_error(exc):
-                raise ValueError(
-                    f"{_provider_label(provider)} 资源 SDK 参数不匹配: {exc}"
-                ) from exc
+                raise ValueError(f"{_provider_label(provider)} 资源 SDK 参数不匹配: {exc}") from exc
             raise
 
     setattr(wrapper, "_resource_guarded", True)  # noqa: B010
     return wrapper
 
 
-def _is_provider_resource_method(
-    name: str, method: Any
-) -> bool:
+def _is_provider_resource_method(name: str, method: Any) -> bool:
     if name.startswith("_") or name in _RESOURCE_GUARD_EXCLUDED:
         return False
     if not callable(method):
@@ -1685,6 +1773,7 @@ async def _await_resource_close(result: Awaitable[Any]) -> None:
     """将任意可等待关闭结果包装为 asyncio.run 可接受的协程。"""
     await result
 
+
 class LargeLanguageModel(ABC):
     """语言模型抽象基类"""
 
@@ -1698,12 +1787,24 @@ class LargeLanguageModel(ABC):
             if _is_provider_resource_method(name, method):
                 setattr(cls, name, _guard_provider_resource_method(method))
 
-    @classmethod
-    def supports(cls, capability: str) -> bool:
-        return capability in cls.capabilities
+    def _require_provider_resource(
+        self, method_name: str, kwargs: Mapping[str, Any] | None = None
+    ) -> None:
+        """为 Provider 原生资源入口提供可选的能力门禁。
 
-    def _require_provider_resource(self, method_name: str) -> None:
-        """为 Provider 原生资源入口提供可选的能力门禁。"""
+        ``kwargs`` 是即将交给原生方法的调用参数。动态资源路径不经过 Facade，
+        因此 Provider 若在 Facade 上做了参数校验，需要在这里对同一组参数
+        再校验一次，否则动态路径成为绕过参数约束的旁路。
+
+        目前只有 ``VolcengineProvider`` 需要这么做（``_validate_native_response_kwargs``
+        校验 ``instructions`` 与 ``caching`` 的互斥）。其余 Provider 不在 Facade
+        上做参数校验，因此忽略 ``kwargs`` 与契约一致，不是遗漏——新增 Facade
+        参数校验时必须同步到这里，否则动态路径会成为旁路。
+
+        凭证边界不依赖本钩子：``_NativeResourceProxy.__call__`` 在调用门禁
+        之前已对同一组参数执行 ``validate_secret_free_resource_*``，两条路径
+        的凭证约束一致。
+        """
         return
 
     @property
@@ -1762,7 +1863,9 @@ class LargeLanguageModel(ABC):
         request = request.copy_with(stream=False)
         invoke_kwargs = request.to_invoke_kwargs()
         accepted = inspect.signature(self.invoke).parameters
-        if not any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in accepted.values()):
+        if not any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in accepted.values()
+        ):
             invoke_kwargs = {key: value for key, value in invoke_kwargs.items() if key in accepted}
         text = "".join(self.invoke(**invoke_kwargs))
         return CompletionResult(text=text)
@@ -1776,30 +1879,40 @@ class LargeLanguageModel(ABC):
         chunks: list[str] = []
         invoke_kwargs = request.to_invoke_kwargs()
         accepted = inspect.signature(self.ainvoke).parameters
-        if not any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in accepted.values()):
+        if not any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in accepted.values()
+        ):
             invoke_kwargs = {key: value for key, value in invoke_kwargs.items() if key in accepted}
         async for chunk in self.ainvoke(**invoke_kwargs):
             chunks.append(chunk)
         return CompletionResult(text="".join(chunks))
 
-    def stream_events(self, request: CompletionRequest | None = None, **kwargs: Any) -> Generator[StreamEvent, None, None]:
+    def stream_events(
+        self, request: CompletionRequest | None = None, **kwargs: Any
+    ) -> Generator[StreamEvent, None, None]:
         """以统一事件形式读取流；旧 Provider 默认包装文本流。"""
         request = coerce_completion_request(request, kwargs, "stream_events")
         request = request.copy_with(stream=True)
         invoke_kwargs = request.to_invoke_kwargs()
         accepted = inspect.signature(self.invoke).parameters
-        if not any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in accepted.values()):
+        if not any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in accepted.values()
+        ):
             invoke_kwargs = {key: value for key, value in invoke_kwargs.items() if key in accepted}
         for chunk in self.invoke(**invoke_kwargs):
             yield StreamEvent(type="text_delta", text=chunk)
 
-    async def astream_events(self, request: CompletionRequest | None = None, **kwargs: Any) -> AsyncGenerator[StreamEvent, None]:
+    async def astream_events(
+        self, request: CompletionRequest | None = None, **kwargs: Any
+    ) -> AsyncGenerator[StreamEvent, None]:
         """异步统一事件流；旧 Provider 默认包装文本流。"""
         request = coerce_completion_request(request, kwargs, "astream_events")
         request = request.copy_with(stream=True)
         invoke_kwargs = request.to_invoke_kwargs()
         accepted = inspect.signature(self.ainvoke).parameters
-        if not any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in accepted.values()):
+        if not any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in accepted.values()
+        ):
             invoke_kwargs = {key: value for key, value in invoke_kwargs.items() if key in accepted}
         async for chunk in self.ainvoke(**invoke_kwargs):
             yield StreamEvent(type="text_delta", text=chunk)
@@ -1811,6 +1924,7 @@ class LargeLanguageModel(ABC):
     async def aclose(self) -> None:
         """释放 Provider 持有的异步 SDK 客户端。"""
         return
+
 
 class TextEmbeddingModel(ABC):
     """文本向量化模型抽象基类"""
@@ -1844,6 +1958,7 @@ class TextEmbeddingModel(ABC):
         """释放向量模型持有的异步资源；默认实现为空操作。"""
         return
 
+
 class RerankModel(ABC):
     """Rerank模型抽象基类"""
 
@@ -1852,7 +1967,9 @@ class RerankModel(ABC):
         """同步对文档列表进行重排序。"""
 
     @abstractmethod
-    async def arerank(self, query: str, documents: list[str], top_n: int) -> tuple[list[int], list[float]]:
+    async def arerank(
+        self, query: str, documents: list[str], top_n: int
+    ) -> tuple[list[int], list[float]]:
         """异步对文档列表进行重排序。"""
 
     def close(self) -> None:

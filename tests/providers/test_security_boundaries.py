@@ -3,6 +3,7 @@
 import pytest
 
 from src.utils.security import (
+    find_sensitive_option_paths,
     is_sensitive_option_key,
     redact_sensitive_text,
     validate_secret_free_options,
@@ -100,9 +101,16 @@ def test_security_redacts_every_sensitive_key_name_in_text(key):
 
 @pytest.mark.parametrize("key", _TEXT_REDACTION_KEYS)
 def test_security_redacts_sensitive_key_names_in_url_query(key):
-    """URL query 形态同样要覆盖，不能只处理 key=value。"""
-    secret = "SUPERSECRETVALUE12345"
-    assert secret not in redact_sensitive_text(f"https://example.invalid/x?{key}={secret}")
+    """URL query 形态同样要覆盖，不能只处理 key=value。
+
+    值必须**短到只有 ``_URL_QUERY_SECRET_RE`` 能覆盖**：``_KEY_VALUE_TEXT_RE``
+    的空白/标点形态要求值至少 12 字符且含数字或符号，用一个长值会让这条断言
+    由另一条规则满足——删掉 URL query 规则测试照样通过，即测错了对象。
+    """
+    for secret in ("x", "0", "none"):
+        redacted = redact_sensitive_text(f"https://example.invalid/x?{key}={secret}")
+        # 断言精确形式：值必须被替换掉，且替换位置就在 ``?key=`` 之后。
+        assert redacted == f"https://example.invalid/x?{key}=[REDACTED]", (key, secret, redacted)
 
 
 @pytest.mark.parametrize(
@@ -141,14 +149,14 @@ def test_security_redacts_masked_credentials_after_bearer_prefix(value):
 def test_security_rejects_credential_hidden_behind_unparseable_url():
     """``urlsplit`` 对畸形 URL 抛 ValueError。若该分支直接 return，任何凭证
     都能随一个畸形前缀整体绕过边界校验（这是叶子值的唯一检查入口）。"""
-    unparseable = "https://[::1 token sk-abcdefghijklmnopqrstuvwxyz0123456789"
+    unparseable = "https://[::1 token sk-FAKE0000FAKE0000FAKE0000FAKE0000"
     with pytest.raises(ValueError, match="凭证"):
         validate_secret_free_options({"note": unparseable}, "Provider")
 
 
 def test_security_parseable_and_unparseable_urls_are_equally_strict():
     """同样藏凭证的两个值，只因 URL 可解析与否而一个被拒一个放行，即为漏洞。"""
-    secret = "token sk-abcdefghijklmnopqrstuvwxyz0123456789"
+    secret = "token sk-FAKE0000FAKE0000FAKE0000FAKE0000"
     with pytest.raises(ValueError, match="凭证"):
         validate_secret_free_options({"note": f"https://h/x {secret}"}, "Provider")
     with pytest.raises(ValueError, match="凭证"):
@@ -162,7 +170,7 @@ def test_safe_exception_text_redacts_credentials():
     """SDK 异常常回显请求头或 URL，终端与日志是凭证最容易泄漏的出口。"""
     from src.utils.security import safe_exception_text
 
-    secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789"
+    secret = "sk-FAKE0000FAKE0000FAKE0000FAKE0000"
     rendered = safe_exception_text(RuntimeError(f"auth failed for {secret}"))
 
     assert secret not in rendered
@@ -177,13 +185,447 @@ def test_safe_exception_text_handles_empty_and_long_messages():
 
 
 def test_user_facing_error_paths_do_not_print_raw_exceptions():
-    """``retrieval_test`` 与顶层入口曾把裸异常交给 console/logger，凭证会
-    原样落到终端与日志；``chat`` 路径已做脱敏，三者必须一致。"""
+    """面向用户的错误出口必须经 ``safe_exception_text``。
+
+    这里只做「是否引用」的存在性检查，作为粗筛；真正的行为断言在
+    ``tests/retrieval_test/test_retrieval_cli.py``——读源码做子串匹配拦不住
+    回归（``str(exc)``、f-string 拼接等写法都能绕过），也覆盖不到新出口。
+    """
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parents[2]
     for relative in ("src/retrieval_test/core.py", "main.py", "src/chat/core.py"):
         source = (root / relative).read_text(encoding="utf-8")
         assert "safe_exception_text" in source, relative
-        assert 'console.print(f"[red]召回测试出错: {exc}' not in source, relative
-        assert '{e}")' not in source, relative
+
+
+# ── 回归：文本键名口径必须与 is_sensitive_option_key 一致 ──
+
+
+# 键名识别按 camelCase 边界切词，因此这些驼峰键在配置边界判为敏感。
+# 文本正则若要求键名前是非字母数字字符，它们会在日志里明文输出——即
+# 「配置边界拦住、文本边界放过」的不一致，正是本文件要消灭的形态。
+_CAMEL_CASE_REDACTION_KEYS = [
+    "dbPassword",
+    "myApiKey",
+    "userToken",
+    "myAccessKey",
+    "clientSecret",
+]
+
+
+@pytest.mark.parametrize("key", _CAMEL_CASE_REDACTION_KEYS)
+def test_security_redacts_camel_case_sensitive_key_names(key):
+    """驼峰键名在文本与配置两个边界上必须同口径。"""
+    secret = "SUPERSECRETVALUE12345"
+    assert is_sensitive_option_key(key) is True
+    assert secret not in redact_sensitive_text(f"{key}={secret}")
+
+
+def test_security_rejects_camel_case_credential_hidden_in_ordinary_option():
+    """驼峰键藏进普通选项值时也必须被拦下，不能因前缀是字母而漏检。"""
+    with pytest.raises(ValueError, match="凭证"):
+        validate_secret_free_options({"note": "myApiKey=SUPERSECRETVALUE12345"}, "Provider")
+
+
+# ── 回归：裸关键词加标点不能把普通文本判成凭证 ──
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Set auth: none to disable",
+        "cookie: enabled",
+        "secret: false",
+        "token: 0",
+        "The bearer: standard",
+    ],
+)
+def test_security_keeps_benign_keyword_assignments_intact(text):
+    """``auth``/``cookie``/``secret`` 等裸关键词后接普通词，是文档与提示词里的
+    常见写法。判为凭证会让合法配置在边界被误拒。"""
+    assert redact_sensitive_text(text) == text
+
+
+def test_security_accepts_benign_keyword_text_in_options():
+    """误判不止影响日志：``find_sensitive_option_paths`` 用值是否被改写来判断
+    值里有没有凭证，误脱敏会让合法 options 直接被拒。"""
+    assert validate_secret_free_options(
+        {"instructions": "Set auth: none to disable"}, "Provider"
+    ) == {"instructions": "Set auth: none to disable"}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Authorization: Bearer sk-FAKE0000SHORT0000FAKE0000",
+        '{"api_key": "secret-value-xyz"}',
+        "token: sk-FAKE0000FAKE0000FAKE0000FAKE0000",
+    ],
+)
+def test_security_still_redacts_real_credentials_after_value_shape_check(value):
+    """加了值的形态约束后，真凭证不能跟着一起放过。"""
+    assert "[REDACTED]" in redact_sensitive_text(value)
+
+
+# ── 回归：掩码尾部不能吞掉紧邻的键名 ──
+
+
+def test_security_masked_credential_does_not_swallow_adjacent_key_name():
+    """``sk-abc***token=<secret>`` 里的 ``token`` 若被掩码规则吞进匹配，
+    后面的键值对就失去锚点，值会从脱敏变成明文——净漏检。"""
+    secret = "SECRETVALUE1234567890"
+    redacted = redact_sensitive_text(f"sk-abc***token={secret}")
+    assert secret not in redacted
+    # 键名保留是预期行为（脱敏的是值），关键是掩码规则没有把 ``token`` 吞掉
+    # 而让后续的 ``=<secret>`` 失去锚点。
+    assert redacted.count("[REDACTED]") == 2
+
+
+# ── 回归：urlsplit 回退分支也要检查 query 键名 ──
+
+
+def test_security_unparseable_url_still_checks_query_key_names():
+    """回退分支若只做值脱敏，``?myApiKey=`` 这类空值敏感键会在畸形 URL 下漏检，
+    而同样的值在可解析 URL 下会被拦下。"""
+    with pytest.raises(ValueError, match="凭证"):
+        validate_secret_free_options({"endpoint": "https://[::1?myApiKey="}, "Provider")
+
+
+def test_security_parseable_and_unparseable_urls_check_query_keys_equally():
+    with pytest.raises(ValueError, match="凭证"):
+        validate_secret_free_options({"endpoint": "https://host/v1?myApiKey="}, "Provider")
+
+
+def test_security_accepts_benign_unparseable_url():
+    """严格度提升不能把无害的畸形 URL 也一并拒掉。"""
+    assert validate_secret_free_options({"endpoint": "https://[::1/v1/models"}, "Provider") == {
+        "endpoint": "https://[::1/v1/models"
+    }
+
+
+# ── 回归：CJK 紧邻时词边界失效导致密钥整体漏检 ──
+
+
+# 项目主对接 SiliconFlow、Ark/火山、DashScope，这些网关的错误体是中文；
+# 而中文属 ``\w``，``\b`` 在 ``密钥sk-...`` 两侧都不成立。
+_CJK_ADJACENT_SECRETS = [
+    "sk-proj-FAKE0000FAKE0000FAKE0000FAKE0000",
+    "AIzaFAKE0000FAKE0000FAKE0000FAKE0000",
+]
+
+
+@pytest.mark.parametrize("secret", _CJK_ADJACENT_SECRETS)
+@pytest.mark.parametrize(
+    "template",
+    ["请求失败，密钥{secret}无效", "鉴权失败，请检查{secret}是否正确", "无效的令牌{secret}"],
+)
+def test_security_redacts_secrets_adjacent_to_cjk(template, secret):
+    """中文错误消息紧贴密钥时必须照常脱敏。"""
+    redacted = redact_sensitive_text(template.format(secret=secret))
+    assert secret not in redacted
+    assert "[REDACTED]" in redacted
+
+
+@pytest.mark.parametrize("secret", _CJK_ADJACENT_SECRETS)
+def test_safe_exception_text_redacts_secrets_adjacent_to_cjk(secret):
+    """面向用户的异常出口同样要覆盖中文消息。"""
+    from src.utils.security import safe_exception_text
+
+    rendered = safe_exception_text(RuntimeError(f"服务端返回错误密钥为{secret}。"))
+    assert secret not in rendered
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["disk-abcdefghijklmnop", "risk-analysis-report", "task = value", "mask=none"],
+)
+def test_security_cjk_boundary_change_does_not_flag_ordinary_text(text):
+    """放宽词边界不能把普通连字符单词误判成凭证。"""
+    assert redact_sensitive_text(text) == text
+
+
+# ── 不变量：文本脱敏词表与配置边界词表的差异必须是有意为之 ──
+
+
+# 这些键在配置边界被禁止，是因为它们会覆盖请求边界（连接类），本身不是凭证。
+# 纳入文本识别会让普通配置值被误判为凭证，因此有意排除。
+_CONNECTION_ONLY_KEYS = frozenset(
+    {
+        "aiohttpclient",
+        "asyncclientargs",
+        "baseurl",
+        "clientargs",
+        "httpclient",
+        "httpxasyncclient",
+        "httpxclient",
+        "websocketbaseurl",
+    }
+)
+
+
+def test_text_redaction_covers_every_credential_key_except_connection_only():
+    """配置边界判为敏感的键名，在文本里也必须脱敏——除有意排除的连接类键名。
+
+    这条不变量此前无人看守：往 ``SENSITIVE_OPTION_KEYS`` 加真凭证键时，
+    文本词表不会自动跟上，日志就会明文输出该键的值。
+    """
+    from src.utils.security import SENSITIVE_OPTION_KEYS
+
+    secret = "SUPERSECRETVALUE12345"
+    missing = {
+        key
+        for key in SENSITIVE_OPTION_KEYS
+        if key not in _CONNECTION_ONLY_KEYS and secret in redact_sensitive_text(f"{key}={secret}")
+    }
+
+    assert missing == set()
+
+
+def test_connection_only_keys_are_deliberately_excluded_from_text_redaction():
+    """锁定有意排除的那一侧：这些键名出现时不能被误判为凭证。"""
+    from src.utils.security import SENSITIVE_OPTION_KEYS
+
+    for key in _CONNECTION_ONLY_KEYS:
+        assert key in SENSITIVE_OPTION_KEYS, key
+        text = f"{key}=https://example.invalid/v1"
+        assert redact_sensitive_text(text) == text, key
+
+
+# ── 回归：值的形态约束不能收窄真凭证的取值域 ──
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        # 值必须**真的短**（12 字符以下）且纯字母——那正是本用例要覆盖的属性。
+        # 取值 ≥12 字符时旧规则本就能命中，回退源码后测试仍绿，等于没测。
+        # 用明显合成的标记而非常见口令词：后者会触发仓库的密钥扫描告警，
+        # 把提交历史染上无法消除的误报。
+        "password: FakePwOnly",
+        "api_key: FakeKeyOnly",
+        "token: FakeTokOnly",
+        "secret: FakeSecOnly",
+        "client_secret: FakeSecOnly",
+        "passwd: FakePwOnly",
+        "credential: FakeCredOnly",
+    ],
+)
+def test_security_redacts_short_alphabetic_credential_values(value):
+    """短且纯字母的值也是凭证。
+
+    此前对全部键名统一加「≥12 字符或含数字/符号」的形态约束，使
+    ``password: FakePwOnly`` 这类键值对整条漏检——那是比误判更严重的净漏检。
+    形态约束只该用于排除误判源，不该收窄真凭证的取值域。
+
+    断言检查**值本身**被替换，而不是「文本被改写过」：后者会被键名之外的
+    任何一处改写满足，回退被测机制后仍能通过。
+    """
+    key, _, secret = value.partition(": ")
+    redacted = redact_sensitive_text(value)
+    assert secret not in redacted, value
+    # 只要求键名与值被正确处理，不钉死分隔符：实现保留原文的 ``:``/``=``，
+    # 不会把分隔符改写成 ``=``（那会篡改被脱敏文本的结构）。
+    assert redacted == f"{key}: [REDACTED]", value
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "passwordHash",
+        "passwordSalt",
+        "tokenCount",
+        "tokenExpiry",
+        "cookieJar",
+        "cookieName",
+        "apikeyValue",
+        "bearerFormat",
+        "accessTokenHash",
+        "authTokenCount",
+        "password_hash",
+        "token_count",
+        "cookie_jar",
+    ],
+)
+def test_security_text_and_boundary_agree_on_compound_credential_keys(key):
+    """文本脱敏与配置边界必须对同一个键给出相同判定。
+
+    ``is_sensitive_option_key`` 按 camelCase/分隔符切词，``passwordHash`` 切出
+    ``password``+``hash`` 判为敏感；文本侧此前只用正则的字符断言逼近这套切词，
+    这些「凭证词 + 另一个词」的键因此出现双向不一致：真凭证在日志里明文输出，
+    而键名相同的合法配置值又在边界被误拒。现在文本侧也调用同一个判定函数。
+    """
+    secret = "FakeSecretValue9876"
+    redacted = redact_sensitive_text(f"{key}: {secret}")
+
+    assert is_sensitive_option_key(key) is True, key
+    assert secret not in redacted, key
+    assert redacted == f"{key}: [REDACTED]", key
+
+
+@pytest.mark.parametrize(
+    "key", ["topsecret", "sessiontoken", "oauth", "passwordless", "secretive", "cookiecutter"]
+)
+def test_security_text_and_boundary_agree_on_non_credential_lookalikes(key):
+    """切词后只有一个普通词的键，两侧都要放行。
+
+    这些键含凭证词的子串，但按切词不是凭证——文本侧若从词中间切开，会让
+    ``find_sensitive_option_paths`` 据此拒绝合法配置。
+    """
+    value = "plainvalue"
+    redacted = redact_sensitive_text(f"{key}: {value}")
+
+    assert is_sensitive_option_key(key) is False, key
+    assert redacted == f"{key}: {value}", key
+
+
+@pytest.mark.parametrize("literal", ["none", "off", "enabled", "false", "0"])
+def test_security_short_credential_keys_exclude_state_literals(literal):
+    """``sk``/``ak`` 在配置里常作开关，状态字面量不该被当成凭证值。
+
+    这两个键与裸关键词（``auth``/``token``）是同一类误判源，此前只给裸关键词
+    加了值约束，短键没有，口径不一致。
+    """
+    text = f"sk: {literal}"
+
+    assert redact_sensitive_text(text) == text
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["oauth: 2.0", "topsecret: 42", "sessiontoken: x1", "mytoken: abc12345", "xxtoken: 99"],
+)
+def test_security_does_not_flag_ordinary_identifiers_ending_in_credential_words(value):
+    """以凭证词结尾的普通标识符不能被从词中间切开。
+
+    ``is_sensitive_option_key`` 按 camelCase 边界切词，``topsecret`` 切出的是
+    单个词 ``topsecret``，判为**非敏感**；文本侧若不加界断言就会命中里面的
+    ``secret``，而边界校验用「值是否被改写」判断，于是合法配置被误拒。
+    """
+    assert redact_sensitive_text(value) == value
+
+
+# ── 回归：掩码规则的性能与尾部裁剪 ──
+
+
+def _time_redaction(text: str) -> float:
+    """返回一次脱敏的墙钟耗时（秒）。"""
+    import time
+
+    start = time.perf_counter()
+    redact_sensitive_text(text)
+    return time.perf_counter() - start
+
+
+def test_security_masked_rule_stays_linear_on_long_trailing_runs():
+    """掩码尾部不能引入二次回溯。
+
+    ``redact_sensitive_text`` 挂在每条日志的 formatter 上，一个回显掩码密钥
+    前缀、后面跟长 token 的错误体就能拖住进程。逐字符前瞻的写法在尾部无冒号
+    时退化成 O(n²)。
+    """
+
+    # 尾随一个掩码占位符 ``.`` 是必需的：正则尾部字符类含 ``.``，游程因此
+    # 一直延伸到串尾；替换函数若用无锚点的 ``re.search(r"[A-Za-z0-9_-]+$")``
+    # 找后缀，引擎会在每个起点重试 ``+$``，退化成 O(n²)。少了这个尾随字符
+    # 时游程恰好在串尾结束，二次实现也能通过，测试形同虚设。
+    #
+    # 两个维度都要拿捏：
+    #
+    # 1) 规模要足够大，让线性与二次的差距是**数量级**而非倍数。32000 字符
+    #    时线性约 8ms、二次约 9.6 秒，相差三个数量级；阈值取 0.5 秒，向上
+    #    离线性 60 倍、向下离二次 19 倍，两侧都不会被抖动穿透。此前用 4000
+    #    字符配 20ms 阈值，实测二次实现 5 轮里有 1 轮跑进阈值而误判通过。
+    #
+    # 2) 取多轮最小值而不是单次采样：单次墙钟受 GC 与调度影响，实测本机
+    #    p99.9 就到 100ms，单样本会撞上尾部事件误报。
+    #
+    # 尾随的 ``.`` 是必需的一维：它不在正则尾部字符类里，游程因此够不到
+    # ``$``，二次实现必然退化；无尾随字符时游程恰好延伸到串尾，二次实现
+    # 也能通过，那一维只用来守住常见形态、不承担区分职责。
+    for suffix in ("", "."):
+        text = "sk-abc***" + "deadbeef" * 4000 + suffix
+
+        best = min(_time_redaction(text) for _ in range(3))
+
+        assert best < 0.5, f"最快一轮耗时 {best * 1000:.1f}ms，疑似二次回溯（suffix={suffix!r}）"
+
+
+def test_security_masked_rule_keeps_adjacent_key_name_for_key_value_rule():
+    """掩码尾部混进的敏感键名要留给键值规则处理，否则值变明文。"""
+    secret = "SECRETVALUE1234567890"
+    redacted = redact_sensitive_text(f"sk-abc***token={secret}")
+
+    assert secret not in redacted
+    assert redacted == "[REDACTED]token=[REDACTED]"
+
+
+def test_security_masked_rule_keeps_non_sensitive_key_name_before_equals():
+    """掩码尾部游程后紧跟 ``=`` 时，它就是键值对的键名，必须保留。
+
+    尾部字符类不含 ``=``，匹配正好停在分隔符前；若把游程整段吃掉，
+    ``=<值>`` 会失去锚点，后续键值规则再也匹配不到，值从脱敏变明文。
+    即使键名本身不是敏感键（``xxxtoken``），掩码前缀也说明它是凭证的
+    可见尾部，后面的值必须一并脱敏。
+    """
+    secret = "FakeSecretValue9876"
+    for key in ("xxxtoken", "oauth", "topsecret", "xyz"):
+        redacted = redact_sensitive_text(f"sk-abc***{key}={secret}")
+        assert secret not in redacted, key
+        assert redacted == f"[REDACTED]{key}=[REDACTED]", key
+
+
+@pytest.mark.parametrize("literal", ["None", "NONE", "Null", "False", "Enabled", "TRUE"])
+def test_security_non_credential_literals_are_case_insensitive(literal):
+    """非凭证字面量枚举要大小写不敏感，否则 ``auth: None`` 会被判成凭证。
+
+    ``find_sensitive_option_paths`` 用「值是否被改写」判断值里有没有凭证，
+    枚举漏掉大写变体就会让合法配置在边界被拒。
+    """
+    assert find_sensitive_option_paths({"prompt": f"auth: {literal}"}) == []
+
+
+@pytest.mark.parametrize("key", ["HTTPBearer", "HTTPSSecret", "HTTPToken"])
+def test_security_redacts_acronym_prefixed_camel_case_keys(key):
+    """``is_sensitive_option_key`` 的切词有「大写串接小写词」这条分支。
+
+    文本侧的界断言此前只实现了前两条（非字母数字、小写接大写），
+    ``HTTPBearer`` 在配置边界判敏感、在文本里却明文输出——正是本文件
+    要消灭的那类不一致。
+    """
+    secret = "FakeSecretValue9876"
+    redacted = redact_sensitive_text(f"{key}: {secret}")
+
+    assert secret not in redacted
+    assert is_sensitive_option_key(key) is True
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("sk-abc***defghijkl: boom", "[REDACTED]: boom"),
+        ("sess-abc***tail: unauthorized", "[REDACTED]: unauthorized"),
+        ("sk-abc***xyz: boom", "[REDACTED]: boom"),
+    ],
+)
+def test_security_masked_rule_consumes_visible_trailing_fragment(text, expected):
+    """尾部可见片段不是键名时，应随掩码一起吃掉，不能留在 ``[REDACTED]`` 之后。
+
+    断言用全文相等而不是 ``startswith("[REDACTED]")``：掩码前缀总会被替换成
+    ``[REDACTED]``，前缀断言在任何实现下都成立——包括尾部片段原样泄漏的实现，
+    等于没测。
+    """
+    assert redact_sensitive_text(text) == expected
+
+
+def test_security_bearer_rule_redacts_alphabetic_token_adjacent_to_cjk():
+    """``Bearer`` 分支的界断言此前是 ``\\b``，在中文两侧不成立。
+
+    这条断言此前无测试锚定：CJK 用例都由 ``_OPENAI_KEY_RE`` 等兜底满足，
+    回退 bearer 那一行测试仍全绿。
+    """
+    token = "abcdefghijklmnopqrst"
+    rendered = redact_sensitive_text(f"鉴权失败Bearer {token}")
+
+    assert token not in rendered
+    assert "[REDACTED]" in rendered

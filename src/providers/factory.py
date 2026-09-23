@@ -19,7 +19,8 @@ from src.utils.config import (  # 导入 get_settings 函数
 from src.utils.log_manager import get_module_logger  # 导入日志管理器
 from src.utils.security import redact_sensitive_text, validate_secret_free_options
 
-logger = get_module_logger(__name__) # 获取当前模块的日志器
+logger = get_module_logger(__name__)  # 获取当前模块的日志器
+
 
 class ModelProviderFactory:
     """模型提供商工厂"""
@@ -156,7 +157,6 @@ class ModelProviderFactory:
             "integration": "local",
             "capabilities": {"embedding"},
         },
-        
         # Rerank Providers
         "jina": {
             "module": "src.providers.jina",
@@ -186,7 +186,9 @@ class ModelProviderFactory:
         try:
             module = importlib.import_module(provider_info["module"])
             ProviderClass = getattr(module, provider_info["class"])
-            logger.debug(f"成功加载提供商类: {provider_info['class']} from {provider_info['module']}")
+            logger.debug(
+                f"成功加载提供商类: {provider_info['class']} from {provider_info['module']}"
+            )
             return ProviderClass
         except ImportError as e:
             logger.error(
@@ -255,8 +257,7 @@ class ModelProviderFactory:
         provider_class = ModelProviderFactory._get_provider_class(resolved_provider_name)
         if not issubclass(provider_class, expected_type):
             raise TypeError(
-                f"提供商 {provider_name} 不支持 {role} 能力，"
-                f"需要实现 {expected_type.__name__}。"
+                f"提供商 {provider_name} 不支持 {role} 能力，需要实现 {expected_type.__name__}。"
             )
         provider_options = dict(options or {})
         parameters = inspect.signature(provider_class).parameters
@@ -279,8 +280,7 @@ class ModelProviderFactory:
         # protocol 构造参数；OpenAI 兼容 provider 才需要显式选择协议。
         parameters = inspect.signature(provider_class).parameters
         if "protocol" not in parameters and not any(
-            parameter.kind is inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters.values()
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
         ):
             if (
                 protocol_value is not None
@@ -316,9 +316,7 @@ class ModelProviderFactory:
             # ``http_options`` is a supported google-genai SDK container. Keep
             # the general options boundary strict while allowing only this
             # explicitly supported container and its safe trace headers.
-            remaining = {
-                key: value for key, value in options.items() if key != "http_options"
-            }
+            remaining = {key: value for key, value in options.items() if key != "http_options"}
             validated = validate_secret_free_options(remaining, "Provider")
             validated["http_options"] = validate_secret_free_options(
                 {"http_options": options["http_options"]},
@@ -400,11 +398,15 @@ class ModelProviderFactory:
         # `protocols` describes LLM wire protocols. Embedding and Rerank use
         # their own endpoint contracts and must not inherit chat protocol names.
         protocols = sorted(info.get("protocols", set())) if normalized_role == "llm" else []
-        verified = set(info.get("server_verified_protocols", set()))
+        # 与 protocol_status 对齐：非 llm 角色的协议不适用，其 server_verified
+        # 登记既不能被报告，也不能被 _runtime_verified_protocols 接纳。
+        verified = (
+            set(info.get("server_verified_protocols", set())) if normalized_role == "llm" else set()
+        )
         verified.update(
             cls._runtime_verified_protocols(
                 options,
-                set(info.get("protocols", set())),
+                set(info.get("protocols", set())) if normalized_role == "llm" else set(),
                 resolved,
             )
         )
@@ -450,7 +452,8 @@ class ModelProviderFactory:
                 (
                     candidate
                     for candidate in candidates
-                    if candidate in cls._provider_map.get(
+                    if candidate
+                    in cls._provider_map.get(
                         cls._resolve_provider_name(provider_name, candidate), {}
                     ).get("capabilities", set())
                 ),
@@ -516,7 +519,12 @@ class ModelProviderFactory:
 
         try:
             instance = ModelProviderFactory._create_provider(
-                provider_name, model_name, "llm", LargeLanguageModel, config.protocol, config.options
+                provider_name,
+                model_name,
+                "llm",
+                LargeLanguageModel,
+                config.protocol,
+                config.options,
             )
             logger.info(f"成功获取LLM提供商实例: {provider_name} ({model_name})")
             return instance
@@ -544,7 +552,9 @@ class ModelProviderFactory:
 
         try:
             if config.protocol is not None:
-                raise ValueError("Embedding 配置不支持 protocol；协议只能配置在 llm_configurations 中。")
+                raise ValueError(
+                    "Embedding 配置不支持 protocol；协议只能配置在 llm_configurations 中。"
+                )
             instance = ModelProviderFactory._create_provider(
                 provider_name, model_name, "embedding", TextEmbeddingModel, options=config.options
             )
@@ -574,7 +584,9 @@ class ModelProviderFactory:
 
         try:
             if config.protocol is not None:
-                raise ValueError("Rerank 配置不支持 protocol；协议只能配置在 llm_configurations 中。")
+                raise ValueError(
+                    "Rerank 配置不支持 protocol；协议只能配置在 llm_configurations 中。"
+                )
             instance = ModelProviderFactory._create_provider(
                 provider_name, model_name, "rerank", RerankModel, options=config.options
             )

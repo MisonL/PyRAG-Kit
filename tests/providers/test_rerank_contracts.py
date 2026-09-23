@@ -32,9 +32,20 @@ def test_siliconflow_duplicate_documents_keep_distinct_indices():
 
 @pytest.mark.parametrize("provider_type", [JinaProvider, SiliconflowRerankProvider])
 def test_rerank_accepts_top_n_larger_than_document_count(provider_type):
+    """上游 rerank API 自行截断，top_n 超过文档数属合法输入。"""
     provider = object.__new__(provider_type)
 
-    provider._validate_inputs("query", ["document"], 2)
+    assert provider._validate_inputs("query", ["document"], 2) is None
+
+
+@pytest.mark.parametrize("provider_type", [JinaProvider, SiliconflowRerankProvider])
+@pytest.mark.parametrize("top_n", [0, -1, True, 1.5, "1", None])
+def test_rerank_rejects_invalid_top_n(provider_type, top_n):
+    """top_n 必须是 >= 1 的整数；bool 是 int 的子类，须显式排除。"""
+    provider = object.__new__(provider_type)
+
+    with pytest.raises(ValueError, match="top_n"):
+        provider._validate_inputs("query", ["document"], top_n)
 
 
 @pytest.mark.parametrize("provider_type", [JinaProvider, SiliconflowRerankProvider])

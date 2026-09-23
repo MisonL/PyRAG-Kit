@@ -4,23 +4,30 @@ import questionary
 from rich.console import Console
 from rich.panel import Panel
 
-from ..utils.config import RetrievalMethod
+from ..utils.config import (
+    _MAX_RETRIEVAL_MULTIPLIER,
+    _MAX_RETRIEVAL_TOP_K,
+    RetrievalMethod,
+)
 from ..utils.log_manager import get_module_logger  # 导入日志管理器
 from .display_utils import display_chat_config
 
-logger = get_module_logger(__name__) # 获取当前模块的日志器
+logger = get_module_logger(__name__)  # 获取当前模块的日志器
 console = Console()
+
 
 def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
     """编辑检索相关参数。"""
     logger.info("进入检索参数编辑菜单。")
     while True:
-        current_method = chat_config['retrieval_method'].value
-        current_top_k = chat_config['top_k']
-        current_rerank = "启用" if chat_config['rerank_enabled'] else "禁用"
-        current_weights = f"向量: {chat_config['vector_weight']} / 关键词: {chat_config['keyword_weight']}"
-        current_fusion_strategy = chat_config['hybrid_fusion_strategy'].upper()
-        current_candidate_multiplier = chat_config['retrieval_candidate_multiplier']
+        current_method = chat_config["retrieval_method"].value
+        current_top_k = chat_config["top_k"]
+        current_rerank = "启用" if chat_config["rerank_enabled"] else "禁用"
+        current_weights = (
+            f"向量: {chat_config['vector_weight']} / 关键词: {chat_config['keyword_weight']}"
+        )
+        current_fusion_strategy = chat_config["hybrid_fusion_strategy"].upper()
+        current_candidate_multiplier = chat_config["retrieval_candidate_multiplier"]
 
         choice = questionary.select(
             "选择要调整的检索参数:",
@@ -29,12 +36,17 @@ def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
                 questionary.Choice(f"2. 检索数量 Top K (当前: {current_top_k})", value="top_k"),
                 questionary.Choice(f"3. Rerank重排 (当前: {current_rerank})", value="rerank"),
                 questionary.Choice(f"4. 混合搜索权重 (当前: {current_weights})", value="weights"),
-                questionary.Choice(f"5. 混合融合策略 (当前: {current_fusion_strategy})", value="fusion"),
-                questionary.Choice(f"6. 候选过量招募倍率 (当前: {current_candidate_multiplier})", value="candidate_multiplier"),
+                questionary.Choice(
+                    f"5. 混合融合策略 (当前: {current_fusion_strategy})", value="fusion"
+                ),
+                questionary.Choice(
+                    f"6. 候选过量招募倍率 (当前: {current_candidate_multiplier})",
+                    value="candidate_multiplier",
+                ),
                 questionary.Separator(),
-                questionary.Choice("返回主菜单", value="back")
+                questionary.Choice("返回主菜单", value="back"),
             ],
-            style=questionary.Style([('pointer', 'bold fg:yellow')]),
+            style=questionary.Style([("pointer", "bold fg:yellow")]),
         ).ask()
 
         if choice == "back" or choice is None:
@@ -47,41 +59,44 @@ def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
                 choices=[
                     questionary.Choice("全文检索", value=RetrievalMethod.FULL_TEXT_SEARCH.value),
                     questionary.Choice("向量检索", value=RetrievalMethod.SEMANTIC_SEARCH.value),
-                    questionary.Choice("混合检索 (全文+向量)", value=RetrievalMethod.HYBRID_SEARCH.value)
+                    questionary.Choice(
+                        "混合检索 (全文+向量)", value=RetrievalMethod.HYBRID_SEARCH.value
+                    ),
                 ],
-                default=current_method
+                default=current_method,
             ).ask()
             if new_method:
-                chat_config['retrieval_method'] = RetrievalMethod(new_method)
+                chat_config["retrieval_method"] = RetrievalMethod(new_method)
                 console.print(f"[green]检索模式已更新为: {new_method}[/green]")
                 logger.info(f"检索模式已更新为: {new_method}")
 
         elif choice == "top_k":
+            # 上界与 SessionConfig/Settings 的守卫一致：此处不挡，非法值会一路
+            # 走到 faiss_index.search()，FAISS 既不报错也不截断。
             new_top_k = questionary.text(
-                f"输入新的Top K值 (当前: {current_top_k}):",
-                validate=lambda text: text.isdigit() and int(text) > 0,
-                default=str(current_top_k)
+                f"输入新的Top K值 (1-{_MAX_RETRIEVAL_TOP_K}, 当前: {current_top_k}):",
+                validate=lambda text: text.isdigit() and 1 <= int(text) <= _MAX_RETRIEVAL_TOP_K,
+                default=str(current_top_k),
             ).ask()
             if new_top_k:
-                chat_config['top_k'] = int(new_top_k)
+                chat_config["top_k"] = int(new_top_k)
                 console.print(f"[green]Top K 已更新为: {new_top_k}[/green]")
                 logger.info(f"Top K 已更新为: {new_top_k}")
 
         elif choice == "rerank":
             new_rerank = questionary.confirm(
-                "是否启用Rerank重排?",
-                default=chat_config['rerank_enabled']
+                "是否启用Rerank重排?", default=chat_config["rerank_enabled"]
             ).ask()
             if new_rerank is not None:
-                chat_config['rerank_enabled'] = new_rerank
+                chat_config["rerank_enabled"] = new_rerank
                 console.print(f"[green]Rerank已更新为: {'启用' if new_rerank else '禁用'}[/green]")
                 logger.info(f"Rerank已更新为: {'启用' if new_rerank else '禁用'}")
-        
+
         elif choice == "weights":
-            if chat_config['retrieval_method'] != RetrievalMethod.HYBRID_SEARCH:
+            if chat_config["retrieval_method"] != RetrievalMethod.HYBRID_SEARCH:
                 console.print("[yellow]警告: 权重调整仅在 '混合检索' 模式下生效。[/yellow]")
                 logger.warning("尝试调整权重，但当前检索模式不是混合检索。")
-            
+
             def is_float_between_0_and_1(text):
                 try:
                     val = float(text)
@@ -92,19 +107,23 @@ def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
             new_vector_weight_str = questionary.text(
                 f"输入新的向量权重 (0.0-1.0, 当前: {chat_config['vector_weight']}):",
                 validate=is_float_between_0_and_1,
-                default=str(chat_config['vector_weight'])
+                default=str(chat_config["vector_weight"]),
             ).ask()
 
             if new_vector_weight_str:
                 new_vector_weight = float(new_vector_weight_str)
                 new_keyword_weight = 1.0 - new_vector_weight
-                chat_config['vector_weight'] = new_vector_weight
-                chat_config['keyword_weight'] = round(new_keyword_weight, 2)
-                console.print(f"[green]混合搜索权重已更新为 -> 向量: {chat_config['vector_weight']}, 关键词: {chat_config['keyword_weight']}[/green]")
-                logger.info(f"混合搜索权重已更新为 -> 向量: {chat_config['vector_weight']}, 关键词: {chat_config['keyword_weight']}")
+                chat_config["vector_weight"] = new_vector_weight
+                chat_config["keyword_weight"] = round(new_keyword_weight, 2)
+                console.print(
+                    f"[green]混合搜索权重已更新为 -> 向量: {chat_config['vector_weight']}, 关键词: {chat_config['keyword_weight']}[/green]"
+                )
+                logger.info(
+                    f"混合搜索权重已更新为 -> 向量: {chat_config['vector_weight']}, 关键词: {chat_config['keyword_weight']}"
+                )
 
         elif choice == "fusion":
-            if chat_config['retrieval_method'] != RetrievalMethod.HYBRID_SEARCH:
+            if chat_config["retrieval_method"] != RetrievalMethod.HYBRID_SEARCH:
                 console.print("[yellow]警告: 融合策略仅在 '混合检索' 模式下生效。[/yellow]")
                 logger.warning("尝试调整融合策略，但当前检索模式不是混合检索。")
 
@@ -114,42 +133,47 @@ def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
                     questionary.Choice("RRF (倒数排名融合)", value="rrf"),
                     questionary.Choice("Weighted (分值加权)", value="weighted"),
                 ],
-                default=chat_config['hybrid_fusion_strategy'],
+                default=chat_config["hybrid_fusion_strategy"],
             ).ask()
             if new_strategy:
-                chat_config['hybrid_fusion_strategy'] = new_strategy
+                chat_config["hybrid_fusion_strategy"] = new_strategy
                 console.print(f"[green]混合融合策略已更新为: {new_strategy.upper()}[/green]")
                 logger.info(f"混合融合策略已更新为: {new_strategy.upper()}")
 
         elif choice == "candidate_multiplier":
             new_multiplier = questionary.text(
-                f"输入候选过量招募倍率 (当前: {current_candidate_multiplier}):",
-                validate=lambda text: text.isdigit() and int(text) >= 1,
+                f"输入候选过量招募倍率 (1-{_MAX_RETRIEVAL_MULTIPLIER}, 当前: {current_candidate_multiplier}):",
+                validate=lambda text: (
+                    text.isdigit() and 1 <= int(text) <= _MAX_RETRIEVAL_MULTIPLIER
+                ),
                 default=str(current_candidate_multiplier),
             ).ask()
             if new_multiplier:
-                chat_config['retrieval_candidate_multiplier'] = int(new_multiplier)
+                chat_config["retrieval_candidate_multiplier"] = int(new_multiplier)
                 console.print(f"[green]候选过量招募倍率已更新为: {new_multiplier}[/green]")
                 logger.info(f"候选过量招募倍率已更新为: {new_multiplier}")
     # 检索参数的更改不需要重载任何模型
+
 
 def edit_model_params(chat_config: dict[str, Any]) -> bool:
     """编辑模型相关参数。"""
     logger.info("进入模型参数编辑菜单。")
     llm_changed = False
     while True:
-        current_llm = chat_config['active_llm_configuration']
-        current_rerank = chat_config['active_rerank_configuration']
+        current_llm = chat_config["active_llm_configuration"]
+        current_rerank = chat_config["active_rerank_configuration"]
 
         choice = questionary.select(
             "选择要切换的模型:",
             choices=[
                 questionary.Choice(f"1. 语言模型 (LLM) (当前: {current_llm})", value="llm"),
-                questionary.Choice(f"2. 重排模型 (Rerank) (当前: {current_rerank})", value="rerank"),
+                questionary.Choice(
+                    f"2. 重排模型 (Rerank) (当前: {current_rerank})", value="rerank"
+                ),
                 questionary.Separator(),
-                questionary.Choice("返回主菜单", value="back")
+                questionary.Choice("返回主菜单", value="back"),
             ],
-            style=questionary.Style([('pointer', 'bold fg:yellow')]),
+            style=questionary.Style([("pointer", "bold fg:yellow")]),
         ).ask()
 
         if choice == "back" or choice is None:
@@ -157,32 +181,29 @@ def edit_model_params(chat_config: dict[str, Any]) -> bool:
             break
 
         if choice == "llm":
-            llm_options = list(chat_config['llm_configurations'].keys())
+            llm_options = list(chat_config["llm_configurations"].keys())
             new_llm = questionary.select(
-                "选择新的LLM配置:",
-                choices=llm_options,
-                default=current_llm
+                "选择新的LLM配置:", choices=llm_options, default=current_llm
             ).ask()
             if new_llm and new_llm != current_llm:
-                chat_config['active_llm_configuration'] = new_llm
+                chat_config["active_llm_configuration"] = new_llm
                 console.print(f"[green]LLM配置已切换为: {new_llm}[/green]")
                 logger.info(f"LLM配置已切换为: {new_llm}")
                 llm_changed = True
 
         elif choice == "rerank":
-            rerank_options = list(chat_config['rerank_configurations'].keys())
+            rerank_options = list(chat_config["rerank_configurations"].keys())
             new_rerank = questionary.select(
-                "选择新的Rerank配置:",
-                choices=rerank_options,
-                default=current_rerank
+                "选择新的Rerank配置:", choices=rerank_options, default=current_rerank
             ).ask()
             if new_rerank:
-                chat_config['active_rerank_configuration'] = new_rerank
+                chat_config["active_rerank_configuration"] = new_rerank
                 console.print(f"[green]Rerank已切换为: {new_rerank}[/green]")
                 logger.info(f"Rerank已切换为: {new_rerank}")
                 # Rerank模型是按需加载的，所以不需要标记状态
 
     return llm_changed
+
 
 def launch_config_editor(chat_config: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
     """
@@ -190,8 +211,10 @@ def launch_config_editor(chat_config: dict[str, Any]) -> tuple[bool, dict[str, A
     返回一个元组 (llm_needs_reload, updated_config)
     """
     logger.info("启动配置编辑器。")
-    console.print(Panel("进入配置模式...", title="[yellow]配置编辑器[/yellow]", border_style="yellow"))
-    
+    console.print(
+        Panel("进入配置模式...", title="[yellow]配置编辑器[/yellow]", border_style="yellow")
+    )
+
     llm_needs_reload = False
 
     while True:
@@ -202,16 +225,22 @@ def launch_config_editor(chat_config: dict[str, Any]) -> tuple[bool, dict[str, A
                 "2. 切换模型",
                 "3. 查看当前完整配置",
                 questionary.Separator(),
-                questionary.Choice("4. 保存并返回聊天", value="exit")
+                questionary.Choice("4. 保存并返回聊天", value="exit"),
             ],
-            style=questionary.Style([('pointer', 'bold fg:cyan')]),
+            style=questionary.Style([("pointer", "bold fg:cyan")]),
         ).ask()
 
         if choice == "exit" or choice is None:
-            console.print(Panel("配置完成，返回聊天。", title="[yellow]配置编辑器[/yellow]", border_style="yellow"))
+            console.print(
+                Panel(
+                    "配置完成，返回聊天。",
+                    title="[yellow]配置编辑器[/yellow]",
+                    border_style="yellow",
+                )
+            )
             logger.info("配置编辑器退出，保存并返回聊天。")
             break
-        
+
         if "1." in choice:
             logger.debug("用户选择调整检索参数。")
             # 检索参数的更改不会触发重载

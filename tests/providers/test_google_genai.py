@@ -17,6 +17,7 @@ def mock_settings(monkeypatch):
     monkeypatch.setenv("GOOGLE_API_KEY", "fake_key")
     return mock_settings_instance
 
+
 @pytest.fixture
 def mock_genai_client():
     with patch.object(google_module.genai, "Client") as mock_client_class:
@@ -24,10 +25,12 @@ def mock_genai_client():
         mock_client_class.return_value = mock_client
         yield mock_client
 
+
 def test_google_provider_init(mock_settings):
     provider = GoogleProvider(model_name="gemini-1.5-flash")
     assert provider._model_name == "gemini-1.5-flash"
     assert provider._client is None
+
 
 def test_google_provider_get_client(mock_settings, mock_genai_client):
     provider = GoogleProvider(model_name="gemini-1.5-flash")
@@ -35,6 +38,7 @@ def test_google_provider_get_client(mock_settings, mock_genai_client):
     assert client == mock_genai_client
     # Verify Client initialization
     from src.providers.google import genai
+
     genai.Client.assert_called_once_with(api_key="fake_key")
 
 
@@ -67,9 +71,7 @@ def test_google_provider_accepts_gemini_api_key_alias(monkeypatch):
 
 
 def test_google_api_key_takes_precedence_over_gemini_alias(monkeypatch):
-    settings = SimpleNamespace(
-        google_api_key="google-key", gemini_api_key="gemini-key"
-    )
+    settings = SimpleNamespace(google_api_key="google-key", gemini_api_key="gemini-key")
     monkeypatch.setattr(google_module, "get_settings", lambda: settings)
     with patch.object(google_module.genai, "Client") as client_class:
         client_class.return_value = MagicMock()
@@ -104,8 +106,9 @@ def test_google_credentials_reject_explicit_developer_api_mode(monkeypatch):
         model_name="gemini-1.5-flash",
         options={"credentials": credentials, "vertexai": False},
     )
-    with patch.object(google_module.genai, "Client"), pytest.raises(
-        ValueError, match="Vertex/Enterprise"
+    with (
+        patch.object(google_module.genai, "Client"),
+        pytest.raises(ValueError, match="Vertex/Enterprise"),
     ):
         provider._get_client()
 
@@ -118,9 +121,7 @@ def test_google_vertex_uses_adc_without_api_key(monkeypatch):
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     with patch.object(google_module.genai, "Client") as client_class:
         client_class.return_value = MagicMock()
-        provider = GoogleProvider(
-            model_name="gemini-1.5-flash", options={"vertexai": True}
-        )
+        provider = GoogleProvider(model_name="gemini-1.5-flash", options={"vertexai": True})
 
         provider._get_client()
 
@@ -165,8 +166,9 @@ def test_google_get_client_requires_explicit_auth_without_key_or_vertex_mode(mon
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     provider = GoogleProvider(model_name="gemini-1.5-flash", options={})
 
-    with patch.object(google_module.genai, "Client") as client_class, pytest.raises(
-        ValueError, match="GOOGLE_API_KEY|Vertex/Enterprise"
+    with (
+        patch.object(google_module.genai, "Client") as client_class,
+        pytest.raises(ValueError, match="GOOGLE_API_KEY|Vertex/Enterprise"),
     ):
         provider._get_client()
 
@@ -253,8 +255,9 @@ def test_google_invoke_non_stream_refusal_is_explicit_error():
     client = MagicMock()
     client.models.generate_content.return_value = response
 
-    with patch.object(provider, "_get_client", return_value=client), pytest.raises(
-        RuntimeError, match="安全策略|拒答"
+    with (
+        patch.object(provider, "_get_client", return_value=client),
+        pytest.raises(RuntimeError, match="安全策略|拒答"),
     ):
         list(provider.invoke("hello", stream=False))
 
@@ -272,8 +275,9 @@ def test_google_invoke_stream_refusal_is_explicit_error():
     client = MagicMock()
     client.models.generate_content_stream.return_value = iter([chunk])
 
-    with patch.object(provider, "_get_client", return_value=client), pytest.raises(
-        RuntimeError, match="安全策略|拒答"
+    with (
+        patch.object(provider, "_get_client", return_value=client),
+        pytest.raises(RuntimeError, match="安全策略|拒答"),
     ):
         list(provider.invoke("hello", stream=True))
 
@@ -430,37 +434,39 @@ def test_google_get_client_reuses_falsey_client(monkeypatch):
         assert provider._get_client() is client
         client_class.assert_not_called()
 
+
 def test_google_provider_invoke_non_stream(mock_settings, mock_genai_client):
     provider = GoogleProvider(model_name="gemini-1.5-flash")
-    
+
     # 直接模拟 _get_client 以规避 tenacity 装饰器可能带来的环境隔离问题
-    with patch.object(GoogleProvider, '_get_client', return_value=mock_genai_client):
+    with patch.object(GoogleProvider, "_get_client", return_value=mock_genai_client):
         mock_response = MagicMock()
         mock_response.text = "Hello world"
         mock_genai_client.models.generate_content.return_value = mock_response
-        
+
         result = list(provider.invoke("test prompt", stream=False))
-        
+
         assert result == ["Hello world"]
         mock_genai_client.models.generate_content.assert_called_once()
 
+
 def test_google_provider_embed_documents(mock_settings, mock_genai_client):
     provider = GoogleProvider(model_name="embedding-001")
-    
+
     # 直接模拟 _get_client
-    with patch.object(GoogleProvider, '_get_client', return_value=mock_genai_client):
+    with patch.object(GoogleProvider, "_get_client", return_value=mock_genai_client):
         mock_emb_1 = MagicMock()
         mock_emb_1.values = [0.1, 0.2]
         mock_emb_2 = MagicMock()
         mock_emb_2.values = [0.3, 0.4]
-        
+
         mock_response = MagicMock()
         mock_response.embeddings = [mock_emb_1, mock_emb_2]
         mock_genai_client.models.embed_content.return_value = mock_response
-        
+
         texts = ["text1", "text2"]
         result = provider.embed_documents(texts)
-        
+
         assert result == [[0.1, 0.2], [0.3, 0.4]]
         mock_genai_client.models.embed_content.assert_called_once()
 
@@ -469,7 +475,9 @@ def test_google_embedding_rejects_request_credentials_before_client_init(mock_se
     provider = GoogleProvider(model_name="embedding-001")
 
     with (
-        patch.object(provider, "_get_client", side_effect=AssertionError("client must not initialize")),
+        patch.object(
+            provider, "_get_client", side_effect=AssertionError("client must not initialize")
+        ),
         pytest.raises(ValueError, match="凭证"),
     ):
         provider.embed_documents(
@@ -479,7 +487,9 @@ def test_google_embedding_rejects_request_credentials_before_client_init(mock_se
 
     async def consume() -> None:
         with (
-            patch.object(provider, "_get_client", side_effect=AssertionError("client must not initialize")),
+            patch.object(
+                provider, "_get_client", side_effect=AssertionError("client must not initialize")
+            ),
             pytest.raises(ValueError, match="凭证"),
         ):
             await provider.aembed_documents(

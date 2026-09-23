@@ -1,4 +1,6 @@
 import functools
+import math
+import re
 import sys
 import tomllib
 import warnings
@@ -7,19 +9,28 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, ClassVar, cast
 
-from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 from pydantic.fields import FieldInfo
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
     SettingsConfigDict,
 )
+from pydantic_settings.exceptions import SettingsError
 
-from src.utils.security import validate_secret_free_options
+from src.utils.security import redact_sensitive_text, validate_secret_free_options
 
 # =================================================================
 # 1. 基础定义 (DEFINITIONS)
 # =================================================================
+
 
 # 项目根目录
 def resolve_app_root() -> Path:
@@ -36,10 +47,12 @@ def resolve_app_root() -> Path:
 
 ROOT_DIR = resolve_app_root()
 # 配置文件路径
-CONFIG_TOML_PATH = ROOT_DIR / 'config.toml'
+CONFIG_TOML_PATH = ROOT_DIR / "config.toml"
+
 
 class RetrievalMethod(str, Enum):
     """定义知识库检索的策略枚举。"""
+
     SEMANTIC_SEARCH = "向量检索"
     FULL_TEXT_SEARCH = "全文检索"
     HYBRID_SEARCH = "混合检索"
@@ -57,6 +70,7 @@ class ModelProtocol(str, Enum):
 
 class ModelDetail(BaseModel):
     """定义单个模型配置的结构。"""
+
     provider: str
     model_name: str
     protocol: ModelProtocol | None = None
@@ -78,11 +92,7 @@ class ModelDetail(BaseModel):
         try:
             if provider == "google" and "http_options" in value:
                 http_options = value["http_options"]
-                remaining = {
-                    key: nested
-                    for key, nested in value.items()
-                    if key != "http_options"
-                }
+                remaining = {key: nested for key, nested in value.items() if key != "http_options"}
                 validated = validate_secret_free_options(remaining, "模型")
                 validated["http_options"] = validate_secret_free_options(
                     {"http_options": http_options},
@@ -92,7 +102,12 @@ class ModelDetail(BaseModel):
                 return validated
             return validate_secret_free_options(value, "模型")
         except ValueError as exc:
-            raise ValueError(str(exc).replace("模型 options 不允许包含凭证或请求头/query 配置", "模型 options 不允许包含凭证或连接字段")) from exc
+            raise ValueError(
+                str(exc).replace(
+                    "模型 options 不允许包含凭证或请求头/query 配置",
+                    "模型 options 不允许包含凭证或连接字段",
+                )
+            ) from exc
 
     @field_validator("protocol", mode="before")
     @classmethod
@@ -123,15 +138,85 @@ class ModelDetail(BaseModel):
             supported = ", ".join(protocol.value for protocol in ModelProtocol)
             raise ValueError(f"不支持的模型协议: {value}。可选值: {supported}") from exc
 
+
 # =================================================================
 # 2. 主配置模型 (MAIN SETTINGS MODEL)
 # =================================================================
+
+
+# 检索规模的上界。不是洁癖：``effective_top_k = chat_top_k *
+# retrieval_candidate_multiplier`` 直通 ``faiss_index.search()``，FAISS 既不报错
+# 也不截断。实测 ``chat_top_k=10**9`` 单次查询分配约 3.6 GB 数组、RSS 涨
+# 10.3 GB、耗时 8.4 秒。10_000 远超任何真实场景（默认 top_k=5 × multiplier=3）。
+_MAX_RETRIEVAL_TOP_K = 10_000
+# 日志保留天数与分片/批处理规模的上界。两者原来都无上界，实测
+# ``log_retention_days=10**400``、``kb_chunk_size=10**400`` 均被接受，
+# 直到真正参与运算（日期减法、内存申请）才炸。
+_MAX_LOG_RETENTION_DAYS = 3650
+_MAX_KB_CHUNK_TOKENS = 1_000_000
+_MAX_RETRIEVAL_MULTIPLIER = 100
+
+
+# 十进制数值字面量：可选负号、可选小数点、可选指数。不含下划线分组（``1_0``）、
+# 不含正号（``+7``）、不含十六进制（``0x10``）。Python 的 ``int()``/``float()``
+# 都会接受它们（``int("1_0") == 10``、``float("1_0") == 10.0``、
+# ``float("+7") == 7.0``），静默读出一个「看起来成功」的错值，因此这里先做形状
+# 校验再交给 ``float()`` 解析。
+_DECIMAL_LITERAL_PATTERN = re.compile(r"-?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
+
+
+def _parse_int_literal(text: str) -> int | None:
+    """严格解析十进制整数字面量，不做科学计数法/下划线/正号的宽松放行。
+
+    只接受 ``[0-9]+``（可带前导负号）。``"1_0"`` 被静默读成 10 这类安静的
+    成功正是本项目反复踩到的模式，所以宁愿在这里明确拒绝。
+    """
+    digits = text.removeprefix("-")
+    if digits and all(char in "0123456789" for char in digits):
+        return int(text)
+    return None
+
+
+def _coerce_number(value: Any, field_label: str) -> int | float:
+    """把 ``mode="before"`` 收到的原始输入转成数值。
+
+    ``mode="before"`` 的 validator 拿到的是**未经 pydantic 强转**的原始值：
+    ``.env``/TOML 来源是字符串（``"5"``），Python 调用方可能是 ``int``/``float``，
+    而 ``bool`` 是 ``int`` 的子类（``int(True) == 1``）必须显式拒绝，否则
+    ``Settings(chat_top_k=True)`` 会静默变成 ``1``。
+
+    字符串只接受十进制数值字面量：``"1500"``、``"0.4"``、``"1e3"``。不接受
+    ``"0x10"``（十六进制）与 ``"inf"``/``"nan"``（非有限值由各 validator 的
+    ``math.isfinite`` 或上下界负责，但让 ``float()`` 接住它们会得到
+    ``inf`` 这类「成功解析出的非法值」，不如直接在这里当解析失败处理）。
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{field_label} 不能是布尔值 {value!r}。")
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        parsed_int = _parse_int_literal(text)
+        if parsed_int is not None:
+            return parsed_int
+        if not _DECIMAL_LITERAL_PATTERN.fullmatch(text):
+            raise ValueError(f"无法把 {field_label} 的 {value!r} 转换为数值。")
+        try:
+            number = float(text)
+        except ValueError as exc:
+            raise ValueError(f"无法把 {field_label} 的 {value!r} 转换为数值。") from exc
+        if not math.isfinite(number):
+            raise ValueError(f"{field_label} 必须是有限数值，但得到 {value!r}。")
+        return number
+    raise ValueError(f"{field_label} 必须是数值，但得到 {type(value).__name__}。")
+
 
 class Settings(BaseSettings):
     """
     定义整个应用的配置，使用Pydantic进行类型校验和分层加载。
     加载顺序: 环境变量 > .env 文件 > config.toml 文件 > 模型中定义的默认值。
     """
+
     # --- [API_KEYS] ---
     anthropic_api_key: str | None = Field(default=None, repr=False)
     google_api_key: str | None = Field(default=None, repr=False)
@@ -154,11 +239,19 @@ class Settings(BaseSettings):
 
     _secret_fields: ClassVar[frozenset[str]] = frozenset(
         {
-            "anthropic_api_key", "google_api_key", "siliconflow_api_key",
+            "anthropic_api_key",
+            "google_api_key",
+            "siliconflow_api_key",
             "gemini_api_key",
             "google_application_credentials",
-            "openai_api_key", "qwen_api_key", "ark_api_key", "volc_access_key",
-            "volc_secret_key", "jina_api_key", "deepseek_api_key", "grok_api_key",
+            "openai_api_key",
+            "qwen_api_key",
+            "ark_api_key",
+            "volc_access_key",
+            "volc_secret_key",
+            "jina_api_key",
+            "deepseek_api_key",
+            "grok_api_key",
             "lm_studio_api_key",
         }
     )
@@ -198,8 +291,8 @@ class Settings(BaseSettings):
     grok_base_url: str = "https://api.x.ai/v1"
 
     # --- [GENERAL] ---
-    log_level: str = "WARNING" # 新增 log_level 字段，默认级别调整为 WARNING
-    cache_path: str = ".cache" # 新增 cache_path 字段
+    log_level: str = "WARNING"  # 新增 log_level 字段，默认级别调整为 WARNING
+    cache_path: str = ".cache"  # 新增 cache_path 字段
     log_path: str = "data/logs"
     log_retention_days: int = 15
 
@@ -224,7 +317,7 @@ class Settings(BaseSettings):
     default_llm_provider: str = "google"
     default_embedding_provider: str = "local-hash"
     default_rerank_provider: str = "siliconflow"
-    default_vector_store: str = "faiss" # 新增向量存储默认提供商
+    default_vector_store: str = "faiss"  # 新增向量存储默认提供商
 
     # --- [CHAT] ---
     chat_retrieval_method: RetrievalMethod = RetrievalMethod.HYBRID_SEARCH
@@ -235,50 +328,188 @@ class Settings(BaseSettings):
     chat_rerank_enabled: bool = False
     chat_top_k: int = 5
     chat_score_threshold: float = 0.4
-    chat_temperature: float = 0.7 # 将 chat_temperature 移到这里
+    chat_temperature: float = 0.7  # 将 chat_temperature 移到这里
 
     # --- [MODEL_CONFIGURATIONS] ---
-    embedding_configurations: dict[str, ModelDetail] = Field(default_factory=lambda: {
-        # 与 llm_configurations 同理：兜底值必须写成当前有效的官方 ID。
-        "local-hash": ModelDetail(provider="local-hash", model_name="local-hash-256"),
-        "google": ModelDetail(provider="google", model_name="gemini-embedding-2"),
-        "siliconflow": ModelDetail(provider="siliconflow", model_name="BAAI/bge-large-zh-v1.5"),
-        "openai": ModelDetail(provider="openai", model_name="text-embedding-3-small"),
-    })
-    rerank_configurations: dict[str, ModelDetail] = Field(default_factory=lambda: {
-        "siliconflow": ModelDetail(provider="siliconflow", model_name="BAAI/bge-reranker-v2-m3"),
-    })
-    llm_configurations: dict[str, ModelDetail] = Field(default_factory=lambda: {
-        # 默认条目只作为缺失配置时的兜底；模型名保持在写就时仍可用的现行 ID，
-        # 避免新用户照抄到已退役模型。
-        "google": ModelDetail(provider="google", model_name="gemini-2.5-flash"),
-        "anthropic": ModelDetail(provider="anthropic", model_name="claude-sonnet-4-6"),
-        "qwen": ModelDetail(provider="qwen", model_name="qwen3.8-max"),
-        "deepseek": ModelDetail(provider="deepseek", model_name="deepseek-v4-pro"),
-        "grok": ModelDetail(provider="grok", model_name="grok-4.6"),
-        "volcengine": ModelDetail(provider="volcengine", model_name="doubao-seed-2-0-lite-260428"),
-        "siliconflow": ModelDetail(provider="siliconflow", model_name="deepseek-ai/DeepSeek-V3.2"),
-        "openai": ModelDetail(provider="openai", model_name="gpt-5.6-sol"),
-        "ollama": ModelDetail(provider="ollama", model_name="llama3.1"),
-        "lm-studio": ModelDetail(provider="lm-studio", model_name="LM-Studio-Community/Meta-Llama-3-8B-Instruct-GGUF"),
-    })
+    embedding_configurations: dict[str, ModelDetail] = Field(
+        default_factory=lambda: {
+            # 与 llm_configurations 同理：兜底值必须写成当前有效的官方 ID。
+            "local-hash": ModelDetail(provider="local-hash", model_name="local-hash-256"),
+            "google": ModelDetail(provider="google", model_name="gemini-embedding-2"),
+            "siliconflow": ModelDetail(provider="siliconflow", model_name="BAAI/bge-large-zh-v1.5"),
+            "openai": ModelDetail(provider="openai", model_name="text-embedding-3-small"),
+        }
+    )
+    rerank_configurations: dict[str, ModelDetail] = Field(
+        default_factory=lambda: {
+            "siliconflow": ModelDetail(
+                provider="siliconflow", model_name="BAAI/bge-reranker-v2-m3"
+            ),
+        }
+    )
+    llm_configurations: dict[str, ModelDetail] = Field(
+        default_factory=lambda: {
+            # 默认条目只作为缺失配置时的兜底；模型名保持在写就时仍可用的现行 ID，
+            # 避免新用户照抄到已退役模型。
+            "google": ModelDetail(provider="google", model_name="gemini-2.5-flash"),
+            "anthropic": ModelDetail(provider="anthropic", model_name="claude-sonnet-4-6"),
+            "qwen": ModelDetail(provider="qwen", model_name="qwen3.8-max"),
+            "deepseek": ModelDetail(provider="deepseek", model_name="deepseek-v4-pro"),
+            "grok": ModelDetail(provider="grok", model_name="grok-4.6"),
+            "volcengine": ModelDetail(
+                provider="volcengine", model_name="doubao-seed-2-0-lite-260428"
+            ),
+            "siliconflow": ModelDetail(
+                provider="siliconflow", model_name="deepseek-ai/DeepSeek-V3.2"
+            ),
+            "openai": ModelDetail(provider="openai", model_name="gpt-5.6-sol"),
+            "ollama": ModelDetail(provider="ollama", model_name="llama3.1"),
+            "lm-studio": ModelDetail(
+                provider="lm-studio", model_name="LM-Studio-Community/Meta-Llama-3-8B-Instruct-GGUF"
+            ),
+        }
+    )
 
     # --- [VALIDATORS] ---
-    @field_validator("chat_top_k")
+    @field_validator("chat_top_k", mode="before")
     @classmethod
-    def validate_chat_top_k(cls, value: int) -> int:
-        if isinstance(value, bool) or value < 1:
-            raise ValueError("chat_top_k 必须是大于等于 1 的整数。")
-        return value
+    def validate_chat_top_k(cls, value: Any) -> int:
+        # 上界不是洁癖：effective_top_k = chat_top_k * retrieval_candidate_multiplier
+        # 会直通 faiss_index.search()，FAISS 不报错也不截断。实测 chat_top_k=10**9
+        # 时单次查询真实分配约 3.6 GB 数组、RSS 涨 10.3 GB 并挂起 8.4 秒。
+        number = _coerce_number(value, "chat_top_k")
+        if isinstance(number, float) and not number.is_integer():
+            raise ValueError(f"chat_top_k 必须是整数，但得到 {number}。")
+        number = int(number)
+        if not 1 <= number <= _MAX_RETRIEVAL_TOP_K:
+            raise ValueError(f"chat_top_k 必须是 1 到 {_MAX_RETRIEVAL_TOP_K} 之间的整数。")
+        return number
 
-    @field_validator("chat_score_threshold")
+    @field_validator("chat_score_threshold", mode="before")
     @classmethod
-    def validate_chat_score_threshold(cls, value: float) -> float:
-        if isinstance(value, bool) or not 0 <= value <= 1:
-            raise ValueError("chat_score_threshold 必须在 0 到 1 之间。")
-        return value
+    def validate_chat_score_threshold(cls, value: Any) -> float:
+        number = _coerce_number(value, "chat_score_threshold")
+        # 先做范围判断再转 float：``float(10**400)`` 抛的是裸 ``OverflowError``，
+        # 它不是 ``ValidationError``，会穿透 ``get_settings`` 的 ``except`` 变成
+        # 未脱敏的 traceback。范围判断对任意大的 int 都能给出正常结论。
+        if not isinstance(number, (int, float)) or isinstance(number, bool):
+            raise ValueError(f"chat_score_threshold 必须是数值，但得到 {value!r}。")
+        if not 0 <= number <= 1:
+            raise ValueError(f"chat_score_threshold 必须在 0 到 1 之间，但得到 {value!r}。")
+        return float(number)
 
-    @field_validator('log_level', mode='before')
+    @field_validator("log_retention_days", mode="before")
+    @classmethod
+    def validate_log_retention_days(cls, value: Any) -> int:
+        number = _coerce_number(value, "log_retention_days")
+        if isinstance(number, float) and not number.is_integer():
+            raise ValueError(f"log_retention_days 必须是整数，但得到 {number}。")
+        number = int(number)
+        # 上界不是洁癖：无上界时 10**400 会被接受（实测），而它接下来会被交给
+        # 日期运算做 ``today - timedelta(days=N)``，直接 OverflowError。
+        if not 1 <= number <= _MAX_LOG_RETENTION_DAYS:
+            raise ValueError(
+                f"log_retention_days 必须是 1 到 {_MAX_LOG_RETENTION_DAYS} 之间的整数。"
+            )
+        return number
+
+    @field_validator(
+        "kb_chunk_size",
+        "kb_child_chunk_size",
+        "kb_embedding_batch_size",
+        mode="before",
+    )
+    @classmethod
+    def validate_positive_sizes(cls, value: Any) -> int:
+        number = _coerce_number(value, "kb_chunk_size/kb_child_chunk_size/kb_embedding_batch_size")
+        if isinstance(number, float) and not number.is_integer():
+            raise ValueError(
+                "kb_chunk_size/kb_child_chunk_size/kb_embedding_batch_size 必须是整数。"
+            )
+        number = int(number)
+        # 上界不是洁癖：无上界时 10**400 会被接受（实测），随后分片/批处理会把它
+        # 当成真实规模去申请内存。tiktoken 编码前的分片上限取 100 万 token，比任何
+        # 现实文档都宽，但仍挡住溢出量级。
+        if not 1 <= number <= _MAX_KB_CHUNK_TOKENS:
+            raise ValueError(
+                "kb_chunk_size/kb_child_chunk_size/kb_embedding_batch_size"
+                f" 必须是 1 到 {_MAX_KB_CHUNK_TOKENS} 之间的整数。"
+            )
+        return number
+
+    @field_validator("kb_chunk_overlap", "kb_child_chunk_overlap", mode="before")
+    @classmethod
+    def validate_non_negative_overlap(cls, value: Any) -> int:
+        number = _coerce_number(value, "kb_chunk_overlap/kb_child_chunk_overlap")
+        if isinstance(number, float) and not number.is_integer():
+            raise ValueError("kb_chunk_overlap/kb_child_chunk_overlap 必须是整数。")
+        number = int(number)
+        if number < 0:
+            raise ValueError("kb_chunk_overlap/kb_child_chunk_overlap 必须是非负整数。")
+        return number
+
+    @field_validator("chat_vector_weight", "chat_keyword_weight", mode="before")
+    @classmethod
+    def validate_hybrid_weights(cls, value: Any) -> float:
+        number = float(_coerce_number(value, "chat_vector_weight/chat_keyword_weight"))
+        if not 0 <= number <= 1:
+            raise ValueError("chat_vector_weight/chat_keyword_weight 必须在 0 到 1 之间。")
+        return number
+
+    @model_validator(mode="after")
+    def validate_retrieval_size_bounds(self) -> "Settings":
+        """检索规模必须有上界，否则单次查询就能耗尽内存。"""
+        if self.retrieval_candidate_multiplier > _MAX_RETRIEVAL_MULTIPLIER:
+            raise ValueError(
+                f"retrieval_candidate_multiplier 必须不超过 {_MAX_RETRIEVAL_MULTIPLIER}。"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_overlap_smaller_than_size(self) -> "Settings":
+        """overlap 必须严格小于 size，否则分片无法推进。
+
+        ``chunk_size == chunk_overlap`` 会让切分器无法前进（得到空分片或
+        死循环），且这一约束无法用单字段 validator 表达。
+        """
+        if self.kb_chunk_overlap >= self.kb_chunk_size:
+            raise ValueError("kb_chunk_overlap 必须小于 kb_chunk_size。")
+        if self.kb_child_chunk_overlap >= self.kb_child_chunk_size:
+            raise ValueError("kb_child_chunk_overlap 必须小于 kb_child_chunk_size。")
+        return self
+
+    @model_validator(mode="after")
+    def validate_child_chunk_size_not_larger_than_parent(self) -> "Settings":
+        """子分片不得大于父分片，否则层级结构静默退化为一层。
+
+        实测 ``kb_chunk_size=300, kb_child_chunk_size=1500`` 被接受后，父块数
+        从 2 涨到 10（每个父块只产出 1 个子块），「先粗后细」的父子检索意图
+        失效，且没有任何报错。同属无法用单字段 validator 表达的约束。
+        """
+        # 相等同样要拒：实测 parent=child=300 时不同父块数 == 分块数（15/15），
+        # 即每个父块只产出一个子块，层级与 child>parent 一样退化为一层。
+        if self.kb_child_chunk_size >= self.kb_chunk_size:
+            raise ValueError(
+                "kb_child_chunk_size 必须小于 kb_chunk_size（子分片不得大于或等于父分片）。"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_hybrid_weights_not_both_zero(self) -> "Settings":
+        """两个融合权重不得同时为 0，否则检索结果被静默全部丢弃。
+
+        ``retrieval_service._weight_tuple()`` 在 ``total <= 0`` 时返回
+        ``(0.0, 0.0)``，所有候选得分为 0；再叠加 ``weighted`` 策略会启用阈值
+        过滤（默认 ``chat_score_threshold=0.4``），结果是空列表且无任何报错。
+        单个为 0 是合法的（纯向量 / 纯关键词检索）。
+        """
+        if self.chat_vector_weight == 0 and self.chat_keyword_weight == 0:
+            raise ValueError(
+                "chat_vector_weight 与 chat_keyword_weight 不能同时为 0，否则检索结果会被全部丢弃。"
+            )
+        return self
+
+    @field_validator("log_level", mode="before")
     @classmethod
     def validate_log_level(cls, v: str) -> str:
         """验证日志级别是否有效。"""
@@ -295,9 +526,7 @@ class Settings(BaseSettings):
         info: ValidationInfo,
     ) -> dict[str, ModelDetail]:
         """Embedding/Rerank 配置不允许携带 LLM 线协议。"""
-        invalid = sorted(
-            key for key, detail in value.items() if detail.protocol is not None
-        )
+        invalid = sorted(key for key, detail in value.items() if detail.protocol is not None)
         if invalid:
             role = "Embedding" if info.field_name == "embedding_configurations" else "Rerank"
             raise ValueError(
@@ -306,10 +535,13 @@ class Settings(BaseSettings):
             )
         return value
 
-    @field_validator('chat_temperature', mode='before')
+    @field_validator("chat_temperature", mode="before")
     @classmethod
     def validate_chat_temperature(cls, v: Any) -> float:
         """验证聊天温度在 0.0 到 1.0 之间。"""
+        # ``bool`` 是 ``int`` 的子类，``float(True) == 1.0`` 会被静默接受。
+        if isinstance(v, bool):
+            raise ValueError(f"聊天温度必须是数字，不能是布尔值 {v!r}。")
         try:
             value = float(v)
         except (ValueError, TypeError) as exc:
@@ -319,7 +551,7 @@ class Settings(BaseSettings):
             raise ValueError(f"聊天温度必须在 0.0 到 1.0 之间，但得到 {value}。")
         return value
 
-    @field_validator('hybrid_fusion_strategy', mode='before')
+    @field_validator("hybrid_fusion_strategy", mode="before")
     @classmethod
     def validate_hybrid_fusion_strategy(cls, v: Any) -> str:
         """验证混合检索融合策略。"""
@@ -329,7 +561,9 @@ class Settings(BaseSettings):
         normalized = v.strip().lower()
         valid_strategies = {"rrf", "weighted"}
         if normalized not in valid_strategies:
-            raise ValueError(f"无效的混合检索融合策略: {v}. 必须是 {', '.join(sorted(valid_strategies))}。")
+            raise ValueError(
+                f"无效的混合检索融合策略: {v}. 必须是 {', '.join(sorted(valid_strategies))}。"
+            )
         return normalized
 
     @model_validator(mode="after")
@@ -367,17 +601,19 @@ class Settings(BaseSettings):
             current = getattr(self, field_name, None)
             if isinstance(current, str) and current.rstrip("/") == old_url:
                 warnings.warn(
-                    f"{field_name} 指向旧端点 {old_url}（{reason}），"
-                    f"请改为 {new_url}。",
+                    f"{field_name} 指向旧端点 {old_url}（{reason}），请改为 {new_url}。",
                     UserWarning,
                     stacklevel=2,
                 )
         return self
 
-    @field_validator('retrieval_candidate_multiplier', mode='before')
+    @field_validator("retrieval_candidate_multiplier", mode="before")
     @classmethod
     def validate_retrieval_candidate_multiplier(cls, v: Any) -> int:
         """验证检索候选过量招募倍率。"""
+        # ``bool`` 是 ``int`` 的子类，``int(True) == 1`` 会被静默接受。
+        if isinstance(v, bool):
+            raise ValueError(f"检索候选倍率必须是整数，不能是布尔值 {v!r}。")
         try:
             value = int(v)
         except (ValueError, TypeError) as exc:
@@ -387,7 +623,7 @@ class Settings(BaseSettings):
             raise ValueError(f"检索候选倍率必须大于等于 1，但得到 {value}。")
         return value
 
-    @field_validator('kb_splitter_separators', mode='before')
+    @field_validator("kb_splitter_separators", mode="before")
     @classmethod
     def split_separators(cls, v: Any) -> list[str]:
         """
@@ -404,19 +640,19 @@ class Settings(BaseSettings):
                 default_value = []
 
         # 如果输入为空（来自 .env 或环境变量的空字符串），则回退到默认值
-        if v is None or v == '':
+        if v is None or v == "":
             return default_value
 
         if isinstance(v, str):
             # 按逗号分割，并过滤掉空的元素
-            separators = [s.strip() for s in v.split(',') if s.strip()]
+            separators = [s.strip() for s in v.split(",") if s.strip()]
             # 如果分割后列表为空（例如，输入是" , "），也使用默认值
             return separators if separators else default_value
-        
+
         # 如果输入已经是列表或其他类型，直接返回
         return v
 
-    @field_validator('chat_retrieval_method', mode='before')
+    @field_validator("chat_retrieval_method", mode="before")
     @classmethod
     def validate_retrieval_method(cls, v: Any) -> Any:
         """允许使用枚举的键名（如HYBRID_SEARCH）或值（如'混合检索'）进行配置。"""
@@ -431,7 +667,9 @@ class Settings(BaseSettings):
         # 如果已经是枚举成员或无法转换，则让默认验证器处理
         return v
 
-    @field_validator('knowledge_base_path', 'pkl_path', 'snapshot_root', 'log_path', 'cache_path', mode='before')
+    @field_validator(
+        "knowledge_base_path", "pkl_path", "snapshot_root", "log_path", "cache_path", mode="before"
+    )
     @classmethod
     def resolve_path(cls, v: str) -> str:
         """将相对路径解析为绝对路径。"""
@@ -461,12 +699,13 @@ class Settings(BaseSettings):
         )
 
     model_config = SettingsConfigDict(
-        env_file='.env',
-        env_file_encoding='utf-8',
+        env_file=".env",
+        env_file_encoding="utf-8",
         case_sensitive=False,
-        extra='ignore',
+        extra="ignore",
         protected_namespaces=(),
     )
+
 
 def load_toml_config() -> dict[str, Any]:
     """
@@ -583,13 +822,13 @@ def load_toml_config() -> dict[str, Any]:
 
     return flat_config
 
+
 class TomlConfigSettingsSource(PydanticBaseSettingsSource):
     """
     一个 pydantic-settings 的自定义源，用于从 config.toml 文件加载配置。
     """
-    def get_field_value(
-        self, field: FieldInfo, field_name: str
-    ) -> tuple[Any, str, bool]:
+
+    def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
         # 在 __call__ 中处理所有逻辑，这里可以什么都不做
         return None, field_name, False
 
@@ -601,117 +840,51 @@ class TomlConfigSettingsSource(PydanticBaseSettingsSource):
         """
         return load_toml_config()
 
+
 # =================================================================
 # 3. 实例化并导出 (INSTANTIATE & EXPORT)
 # =================================================================
+
 
 @functools.lru_cache
 def get_settings() -> Settings:
     """
     获取 Settings 实例的单例。
     加载顺序由 settings_customise_sources 定义。
+
+    配置校验失败时重抛一个已脱敏的异常。``Settings()`` 在 import 期就会被调用
+    （``log_manager.get_module_logger``），早于任何入口的 ``try``，pydantic 的
+    默认渲染会把 ``input_value`` 明文交给解释器默认 handler——而 ``options`` 是
+    文档指定的扩展入口，把 ``api_key`` 放进去恰好就是被校验拒绝的那类错误。
     """
-    return Settings()
+    try:
+        return Settings()
+    except ValidationError as exc:
+        raise ValueError(_redacted_settings_error(exc)) from None
+    except SettingsError as exc:
+        # pydantic-settings 在解析复杂字段（list/dict）时抛的是 SettingsError，
+        # 它继承 ValueError 但**不是** ValidationError，因此上面那个分支接不住。
+        # 实测 ``KB_SPLITTER_SEPARATORS='###'``（非 JSON 形态）走的正是这条路，
+        # 用户看到的是解释器默认 handler 打出的多屏 traceback，而不是脱敏消息。
+        raise ValueError(f"配置解析失败 - {redact_sensitive_text(str(exc))}") from None
+
+
+def _redacted_settings_error(exc: ValidationError) -> str:
+    """把配置校验失败整理成一行脱敏消息。
+
+    直接重抛 ``ValidationError`` 会让 pydantic 再包一层，原始报告的
+    ``input_value`` 会以嵌套形式重复出现；这里逐条取 ``loc`` 与 ``msg``
+    重建，只保留定位信息和校验原因，并把值整体交给 ``redact_sensitive_text``。
+    """
+    lines = []
+    for error in exc.errors():
+        location = ".".join(str(part) for part in error.get("loc", ()))
+        message = str(error.get("msg", "校验失败"))
+        value = redact_sensitive_text(str(error.get("input")))
+        lines.append(f"{location}: {message} (input={value})" if location else f"{message}")
+    return "配置校验失败 - " + "; ".join(lines) if lines else "配置校验失败"
+
 
 # 导出 get_settings 函数，供其他模块在需要时调用
 # 这样可以确保在测试中能够灵活地替换或模拟配置
 # settings = get_settings() # 移除直接导出 settings 实例
-
-# =================================================================
-# 4. 向后兼容层 (BACKWARD COMPATIBILITY LAYER)
-# =================================================================
-# 目标: 最小化对现有代码的侵入性。
-# 策略: 保持旧的配置变量，但使其从新的settings实例派生。
-# 后续重构中，应逐步淘汰这些变量，直接使用 `get_settings()` 对象。
-
-def get_backward_compatible_configs() -> dict[str, Any]:
-    """
-    获取向后兼容的配置字典。
-    """
-    current_settings = get_settings()
-
-    # --- 路径与环境配置 ---
-    KB_PATH = Path(current_settings.knowledge_base_path)
-    PKL_PATH = Path(current_settings.pkl_path)
-    LOG_PATH = Path(current_settings.log_path)
-    LOG_RETENTION_DAYS = current_settings.log_retention_days
-    CACHE_PATH = Path(current_settings.cache_path)
-
-    # --- 知识库构建配置 ---
-    KB_CONFIG = {
-        "replace_consecutive_whitespace": current_settings.kb_replace_whitespace,
-        "remove_extra_spaces": current_settings.kb_remove_spaces,
-        "remove_urls_and_emails": current_settings.kb_remove_urls,
-        "text_splitter_separators": current_settings.kb_splitter_separators,
-        "chunk_size": current_settings.kb_chunk_size,
-        "chunk_overlap": current_settings.kb_chunk_overlap,
-        "child_chunk_size": current_settings.kb_child_chunk_size,
-        "child_chunk_overlap": current_settings.kb_child_chunk_overlap,
-        "use_qa_segmentation": current_settings.kb_use_qa_segmentation,
-        "embedding_configurations": current_settings.embedding_configurations,
-        "active_embedding_configuration": current_settings.default_embedding_provider,
-        "embedding_batch_size": current_settings.kb_embedding_batch_size,
-        "kb_dir": str(KB_PATH),
-        "output_file": str(PKL_PATH),
-    }
-
-    # --- 聊天机器人配置 (可动态修改) ---
-    CHAT_CONFIG = {
-        "active_llm_configuration": current_settings.default_llm_provider,
-        "retrieval_method": current_settings.chat_retrieval_method,
-        "vector_weight": current_settings.chat_vector_weight,
-        "keyword_weight": current_settings.chat_keyword_weight,
-        "hybrid_fusion_strategy": current_settings.hybrid_fusion_strategy,
-        "retrieval_candidate_multiplier": current_settings.retrieval_candidate_multiplier,
-        "rerank_enabled": current_settings.chat_rerank_enabled,
-        "top_k": current_settings.chat_top_k,
-        "score_threshold": current_settings.chat_score_threshold,
-        "active_rerank_configuration": current_settings.default_rerank_provider,
-        "rerank_configurations": current_settings.rerank_configurations,
-        "llm_configurations": current_settings.llm_configurations,
-    }
-
-    # --- API密钥与URL配置 ---
-    API_CONFIG = {
-        "ANTHROPIC_API_KEY": current_settings.anthropic_api_key,
-        "GOOGLE_API_KEY": current_settings.google_api_key,
-        "GEMINI_API_KEY": current_settings.gemini_api_key,
-        "SILICONFLOW_API_KEY": current_settings.siliconflow_api_key,
-        "OPENAI_API_KEY": current_settings.openai_api_key,
-        "QWEN_API_KEY": current_settings.qwen_api_key,
-        "ARK_API_KEY": current_settings.ark_api_key,
-        "VOLC_ACCESS_KEY": current_settings.volc_access_key,
-        "VOLC_SECRET_KEY": current_settings.volc_secret_key,
-        "JINA_API_KEY": current_settings.jina_api_key,
-        "DEEPSEEK_API_KEY": current_settings.deepseek_api_key,
-        "GROK_API_KEY": current_settings.grok_api_key,
-        "LM_STUDIO_API_KEY": current_settings.lm_studio_api_key,
-        "OPENAI_API_BASE": str(current_settings.openai_api_base),
-        "SILICONFLOW_BASE_URL": str(current_settings.siliconflow_base_url),
-        "QWEN_BASE_URL": str(current_settings.qwen_base_url),
-        "DEEPSEEK_BASE_URL": str(current_settings.deepseek_base_url),
-        "OLLAMA_BASE_URL": str(current_settings.ollama_base_url),
-        "LM_STUDIO_BASE_URL": str(current_settings.lm_studio_base_url),
-        "VOLC_BASE_URL": str(current_settings.volc_base_url),
-        "GROK_BASE_URL": str(current_settings.grok_base_url),
-    }
-    
-    return {
-        "KB_PATH": KB_PATH,
-        "PKL_PATH": PKL_PATH,
-        "LOG_PATH": LOG_PATH,
-        "LOG_RETENTION_DAYS": LOG_RETENTION_DAYS,
-        "CACHE_PATH": CACHE_PATH,
-        "KB_CONFIG": KB_CONFIG,
-        "CHAT_CONFIG": CHAT_CONFIG,
-        "API_CONFIG": API_CONFIG,
-        "EMBEDDING_CONFIGS": current_settings.embedding_configurations,
-        "RERANK_CONFIGS": current_settings.rerank_configurations,
-        "LLM_CONFIGS": current_settings.llm_configurations,
-    }
-
-# --- 为了解决循环导入问题，将模型配置的导出移到最后 ---
-# 这些变量现在通过 get_backward_compatible_configs() 函数提供
-# EMBEDDING_CONFIGS = settings.embedding_configurations
-# RERANK_CONFIGS = settings.rerank_configurations
-# LLM_CONFIGS = settings.llm_configurations

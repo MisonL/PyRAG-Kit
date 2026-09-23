@@ -3,7 +3,7 @@ import inspect
 import math
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Generator, Iterator, Mapping
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 from urllib.parse import urlsplit
 
 import openai
@@ -19,6 +19,7 @@ from src.providers.__base__.model_provider import (
     close_resource_sync,
     coerce_completion_request,
     content_to_text,
+    field,
     is_retryable_error,
     merge_tool_call_fragment,
     normalize_embedding_vector,
@@ -51,6 +52,7 @@ from src.utils.security import (
 
 logger = get_module_logger(__name__)
 
+
 class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     """
     处理所有与OpenAI API格式兼容的提供商的通用逻辑。
@@ -59,8 +61,15 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
 
     capabilities = frozenset(
         {
-            "chat", "stream", "messages", "multimodal", "tools",
-            "structured_output", "usage", "embedding", "responses",
+            "chat",
+            "stream",
+            "messages",
+            "multimodal",
+            "tools",
+            "structured_output",
+            "usage",
+            "embedding",
+            "responses",
         }
     )
     # OpenAI's resource methods live on this shared adapter for code reuse, but
@@ -76,9 +85,19 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     # all other compatible providers fail-closed.
     _OFFICIAL_OPENAI_RESOURCE_CAPABILITIES = frozenset(
         {
-            "files", "batches", "vector_stores", "models", "moderation",
-            "images", "audio", "videos", "uploads", "conversations",
-            "containers", "fine_tuning", "evals",
+            "files",
+            "batches",
+            "vector_stores",
+            "models",
+            "moderation",
+            "images",
+            "audio",
+            "videos",
+            "uploads",
+            "conversations",
+            "containers",
+            "fine_tuning",
+            "evals",
         }
     )
     # These fields are accepted by OpenAI Chat Completions but are not part of
@@ -119,29 +138,81 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     # reach the OpenAI SDK as an unknown keyword argument.
     _CHAT_MODEL_OPTION_KEYS = frozenset(
         {
-            "temperature", "max_tokens", "max_completion_tokens", "top_p",
-            "frequency_penalty", "presence_penalty", "n", "logit_bias",
-            "logprobs", "top_logprobs", "modalities", "audio", "prediction",
-            "web_search_options", "seed", "stop", "response_format",
-            "tool_choice", "metadata", "user", "reasoning_effort",
-            "stream_options", "parallel_tool_calls", "store", "service_tier",
-            "prompt_cache_key", "prompt_cache_options", "prompt_cache_retention",
-            "safety_identifier", "moderation", "verbosity", "extra_body",
+            "temperature",
+            "max_tokens",
+            "max_completion_tokens",
+            "top_p",
+            "frequency_penalty",
+            "presence_penalty",
+            "n",
+            "logit_bias",
+            "logprobs",
+            "top_logprobs",
+            "modalities",
+            "audio",
+            "prediction",
+            "web_search_options",
+            "seed",
+            "stop",
+            "response_format",
+            "tool_choice",
+            "metadata",
+            "user",
+            "reasoning_effort",
+            "stream_options",
+            "parallel_tool_calls",
+            "store",
+            "service_tier",
+            "prompt_cache_key",
+            "prompt_cache_options",
+            "prompt_cache_retention",
+            "safety_identifier",
+            "moderation",
+            "verbosity",
+            "extra_body",
         }
     )
     _RESPONSES_MODEL_OPTION_KEYS = frozenset(
         {
-            "background", "context_management", "conversation", "include",
-            "max_output_tokens", "max_tool_calls", "metadata", "moderation",
-            "parallel_tool_calls", "previous_response_id", "prompt",
-            "prompt_cache_key", "prompt_cache_options", "prompt_cache_retention",
-            "reasoning", "reasoning_effort", "safety_identifier", "service_tier",
-            "store", "stream_options", "temperature", "text", "tool_choice",
-            "tools", "top_logprobs", "top_p", "truncation", "user",
+            "background",
+            "context_management",
+            "conversation",
+            "include",
+            "max_output_tokens",
+            "max_tool_calls",
+            "metadata",
+            "moderation",
+            "parallel_tool_calls",
+            "previous_response_id",
+            "prompt",
+            "prompt_cache_key",
+            "prompt_cache_options",
+            "prompt_cache_retention",
+            "reasoning",
+            "reasoning_effort",
+            "safety_identifier",
+            "service_tier",
+            "store",
+            "stream_options",
+            "temperature",
+            "text",
+            "tool_choice",
+            "tools",
+            "top_logprobs",
+            "top_p",
+            "truncation",
+            "user",
             # Portable/common names normalized by this adapter.
-            "max_tokens", "max_completion_tokens", "response_format", "stop", "seed",
+            "max_tokens",
+            "max_completion_tokens",
+            "response_format",
+            "stop",
+            "seed",
             "verbosity",
-            "top_k", "frequency_penalty", "presence_penalty", "extra_body",
+            "top_k",
+            "frequency_penalty",
+            "presence_penalty",
+            "extra_body",
         }
     )
     _EMBEDDING_MODEL_OPTION_KEYS = frozenset(
@@ -167,27 +238,27 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             self._options.get("server_verified_protocols", ())
         )
         settings = settings if settings is not None else get_settings()
-        
+
         settings_prefix = provider.lower().replace("-", "_")
         api_key_name = f"{settings_prefix}_api_key"
         base_url_name = f"{settings_prefix}_base_url"
-        
+
         self._api_key = getattr(settings, api_key_name, None)
         self._base_url = getattr(settings, base_url_name, None)
         if self._base_url is None:
             # OpenAI 旧配置字段使用 `openai_api_base`，继续兼容现有配置文件。
             self._base_url = getattr(settings, f"{settings_prefix}_api_base", None)
-        
+
         if provider in ["ollama", "lm-studio"] and not self._api_key:
             self._api_key = "no-key-required"
-            
+
         if not self._api_key:
             logger.error(f"{provider} API Key 未设置。")
             raise ValueError(f"{api_key_name} is required for {provider}")
         if provider != "openai" and not self._base_url:
             logger.error(f"{provider} Base URL 未设置。")
             raise ValueError(f"{base_url_name} is required for {provider}")
-        
+
         self._client: openai.OpenAI | None = None
         self._aclient: openai.AsyncOpenAI | None = None
         logger.info(f"初始化 OpenAICompatibleProvider ({provider})，模型: {model_name}")
@@ -219,15 +290,11 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         if isinstance(configured, str):
             configured = (configured,)
         elif not isinstance(configured, (list, tuple, set, frozenset)):
-            raise ValueError(
-                "server_verified_protocols 必须是字符串或协议序列。"
-            )
+            raise ValueError("server_verified_protocols 必须是字符串或协议序列。")
         normalized: set[str] = set()
         for value in configured:
             if not isinstance(value, str) or not value.strip():
-                raise ValueError(
-                    "server_verified_protocols 中的协议必须是非空字符串。"
-                )
+                raise ValueError("server_verified_protocols 中的协议必须是非空字符串。")
             normalized.add(cls._normalize_protocol(value))
         return frozenset(normalized)
 
@@ -238,7 +305,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 for key, value in self._options.items()
                 if key in {"timeout", "max_retries"}
             }
-            self._client = openai.OpenAI(api_key=self._api_key, base_url=self._base_url, **client_options)
+            self._client = openai.OpenAI(
+                api_key=self._api_key, base_url=self._base_url, **client_options
+            )
         return self._client
 
     def _get_aclient(self) -> openai.AsyncOpenAI:
@@ -248,7 +317,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 for key, value in self._options.items()
                 if key in {"timeout", "max_retries"}
             }
-            self._aclient = openai.AsyncOpenAI(api_key=self._api_key, base_url=self._base_url, **client_options)
+            self._aclient = openai.AsyncOpenAI(
+                api_key=self._api_key, base_url=self._base_url, **client_options
+            )
         return self._aclient
 
     @staticmethod
@@ -349,11 +420,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         allowed: frozenset[str],
         endpoint: str,
     ) -> None:
-        unknown = {
-            key: value
-            for key, value in options.items()
-            if key not in allowed
-        }
+        unknown = {key: value for key, value in options.items() if key not in allowed}
         reject_unsupported_kwargs(endpoint, unknown)
 
     def _background_poll_config(self) -> tuple[float, float]:
@@ -391,10 +458,10 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         }
 
     def _poll_background_response(self, response: Any, params: Mapping[str, Any]) -> Any:
-        status = self._field(response, "status")
+        status = field(response, "status")
         if status not in {"queued", "in_progress", "pending"}:
             return response
-        response_id = self._field(response, "id")
+        response_id = field(response, "id")
         if not response_id:
             raise RuntimeError("Responses background 响应缺少 id，无法轮询。")
         interval, timeout = self._background_poll_config()
@@ -411,14 +478,16 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             response = retry_sync_call(
                 lambda: self._get_client().responses.retrieve(response_id, **retrieve_kwargs)
             )
-            status = self._field(response, "status")
+            status = field(response, "status")
         return response
 
-    async def _poll_background_response_async(self, response: Any, params: Mapping[str, Any]) -> Any:
-        status = self._field(response, "status")
+    async def _poll_background_response_async(
+        self, response: Any, params: Mapping[str, Any]
+    ) -> Any:
+        status = field(response, "status")
         if status not in {"queued", "in_progress", "pending"}:
             return response
-        response_id = self._field(response, "id")
+        response_id = field(response, "id")
         if not response_id:
             raise RuntimeError("Responses background 响应缺少 id，无法轮询。")
         interval, timeout = self._background_poll_config()
@@ -435,7 +504,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             response = await retry_async_call(
                 lambda: self._get_aclient().responses.retrieve(response_id, **retrieve_kwargs)
             )
-            status = self._field(response, "status")
+            status = field(response, "status")
         return response
 
     def _compat_extra_options(self) -> dict[str, Any]:
@@ -525,9 +594,69 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 return capability
         return None
 
-    def _require_provider_resource(self, method_name: str) -> None:
-        """在原生资源方法真正触达 SDK 前校验渠道能力。"""
+    # 动态资源树路径（``OpenAIProvider.responses.create``）的末段是方法名，
+    # 与显式 Facade 名（``create_response``）不同形。只看显式名会让动态路径
+    # 拿到 capability=None 直接放行，正是 server_verified_protocols 门禁要堵的
+    # 旁路。这里按路径分段识别资源树。
+    # 资源树分段 → 能力名。必须与 ``_resource_capability_for_method`` 的显式
+    # 映射覆盖同一批能力：只覆盖 responses/files 会让
+    # ``resources.batches.create`` 这类写法拿到 capability=None 直接放行，
+    # 而显式名 ``create_batch`` 会被拦——同一能力因书写形式不同而区别对待，
+    # 正是本门禁要消灭的旁路。
+    #
+    # ``uploads`` 与 ``files`` 是两项独立能力（SDK 里也分属不同资源），
+    # 不能坍缩成同一个名字。
+    #
+    # 这里的键必须落在官方声明集 ``_OFFICIAL_OPENAI_RESOURCE_CAPABILITIES``
+    # 内：段映射一旦给出声明集之外的能力名，官方端点会从「放行」变成
+    # ``NotImplementedError``——而 ``OpenAIProvider.capabilities`` 里那些
+    # 资源（skills/realtime/webhooks/admin/content_provenance_checks）是
+    # 声明为可用的，用户看到可用、调用却被拦。
+    _RESOURCE_SEGMENTS_TO_CAPABILITY: ClassVar[Mapping[str, str]] = {
+        "responses": "responses",
+        "input_items": "responses",
+        "input_tokens": "responses",
+        "files": "files",
+        "uploads": "uploads",
+        "batches": "batches",
+        "vector_stores": "vector_stores",
+        "models": "models",
+        # SDK 客户端的属性是复数 ``moderations``（``client.moderations``），
+        # 而显式 Facade 名 ``create_moderation`` 解析出的能力名是单数。两个
+        # 拼写都要映射到同一能力，否则 ``resources.moderations.create`` 拿到
+        # capability=None 直接放行，而 ``create_moderation`` 会被拦。
+        "moderations": "moderation",
+        "images": "images",
+        "audio": "audio",
+        "videos": "videos",
+        "conversations": "conversations",
+        "containers": "containers",
+        "fine_tuning": "fine_tuning",
+        "evals": "evals",
+    }
+
+    @classmethod
+    def _resource_capability_for_path(cls, method_name: str) -> str | None:
+        """从动态资源树路径推断能力名称。"""
+        for segment in method_name.split("."):
+            capability = cls._RESOURCE_SEGMENTS_TO_CAPABILITY.get(segment)
+            if capability is not None:
+                return capability
+        return None
+
+    def _require_provider_resource(
+        self, method_name: str, kwargs: Mapping[str, Any] | None = None
+    ) -> None:
+        """在原生资源方法真正触达 SDK 前校验渠道能力。
+
+        ``kwargs`` 未使用：本 Provider 不在 Facade 上做参数校验，动态路径
+        因此没有可绕过的参数约束（兼容渠道的动态路径也不可达——
+        ``OpenAICompatibleResources._delegate_native`` 为 ``False``）。
+        """
         capability = self._resource_capability_for_method(method_name)
+        if capability is None:
+            # 显式 Facade 名匹配不上时，再按动态资源树路径判断。
+            capability = self._resource_capability_for_path(method_name)
         if capability is None:
             return
         if capability == "responses":
@@ -545,9 +674,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         if provider_name == "openai" and not declared:
             declared = self._OFFICIAL_OPENAI_RESOURCE_CAPABILITIES
         if capability not in declared:
-            raise NotImplementedError(
-                f"{provider_name} 未声明 {capability} 资源能力。"
-            )
+            raise NotImplementedError(f"{provider_name} 未声明 {capability} 资源能力。")
 
     def _chat_max_tokens_key(self) -> str:
         """返回当前 Chat Completions 端点的输出长度字段名。"""
@@ -575,11 +702,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             f"{getattr(self, '_provider', 'OpenAI-compatible')} Embedding 模型 options",
             {key: value for key, value in options.items() if key not in allowed},
         )
-        return {
-            key: value
-            for key, value in options.items()
-            if key in supported
-        }
+        return {key: value for key, value in options.items() if key in supported}
 
     @staticmethod
     def _validate_embedding_kwargs(kwargs: Mapping[str, Any]) -> None:
@@ -601,9 +724,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             "server_verified_protocols",
         }
         unsupported = {
-            key: value
-            for key, value in kwargs.items()
-            if key not in allowed or key in client_only
+            key: value for key, value in kwargs.items() if key not in allowed or key in client_only
         }
         reject_unsupported_kwargs("OpenAI Embedding", unsupported)
         validate_secret_free_request_overrides(
@@ -640,7 +761,10 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
 
     def _require_responses_resource(self, operation: str) -> None:
         """阻止兼容渠道把本地 SDK 资源误当成远端 Responses 能力。"""
-        if self._protocol != "responses":
+        # ``object.__new__`` 构造的实例没有 ``_protocol``；此时没有协议可校验，
+        # 交给下面的服务端验证门禁判断（与 ``_provider`` 缺失时的处理一致）。
+        protocol = getattr(self, "_protocol", None)
+        if protocol is not None and protocol != "responses":
             raise ValueError(f"{operation} 仅适用于 responses 协议。")
         # 官方端点由其 SDK 契约覆盖；代理、自建网关和其它兼容渠道必须
         # 显式声明已验证的服务端协议，避免本地 SDK 资源导致远端 404/405。
@@ -676,9 +800,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         value = validate_secret_free_payload(value, endpoint, "extra_body")
         overlap = sorted(set(value).intersection(reserved))
         if overlap:
-            raise ValueError(
-                f"{endpoint} extra_body 不允许覆盖请求字段: {', '.join(overlap)}"
-            )
+            raise ValueError(f"{endpoint} extra_body 不允许覆盖请求字段: {', '.join(overlap)}")
         return dict(value)
 
     @staticmethod
@@ -692,9 +814,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         extension_values = dict(extensions or {})
         overlap = sorted(set(configured_values).intersection(extension_values))
         if overlap:
-            raise ValueError(
-                f"{endpoint} 模型 options 的扩展字段重复: {', '.join(overlap)}"
-            )
+            raise ValueError(f"{endpoint} 模型 options 的扩展字段重复: {', '.join(overlap)}")
         return {**configured_values, **extension_values}
 
     @staticmethod
@@ -707,16 +827,12 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     ) -> dict[str, Any]:
         """合并资源入口参数，拒绝调用方覆盖 Facade 已绑定的字段。"""
         fixed_values = {
-            key: value
-            for key, value in fixed.items()
-            if not omit_none or value is not None
+            key: value for key, value in fixed.items() if not omit_none or value is not None
         }
         override_values = dict(overrides or {})
         overlap = sorted(set(fixed_values).intersection(override_values))
         if overlap:
-            raise ValueError(
-                f"{operation} 资源 SDK 参数重复: {', '.join(overlap)}"
-            )
+            raise ValueError(f"{operation} 资源 SDK 参数重复: {', '.join(overlap)}")
         return {**fixed_values, **override_values}
 
     def _build_chat_request(
@@ -795,8 +911,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         configured_max_completion_tokens = configured_options.pop("max_completion_tokens", None)
         if configured_max_tokens is not None and configured_max_completion_tokens is not None:
             raise ValueError(
-                "Chat Completions options 不能同时设置 max_tokens 和 "
-                "max_completion_tokens。"
+                "Chat Completions options 不能同时设置 max_tokens 和 max_completion_tokens。"
             )
         configured_extra_body = self._validated_extra_body(
             configured_options.pop("extra_body", None),
@@ -821,13 +936,19 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         max_tokens_key = self._chat_max_tokens_key()
         if max_tokens is not None:
             request[max_tokens_key] = max_tokens
-            request.pop("max_tokens" if max_tokens_key != "max_tokens" else "max_completion_tokens", None)
+            request.pop(
+                "max_tokens" if max_tokens_key != "max_tokens" else "max_completion_tokens", None
+            )
         elif configured_max_tokens is not None and max_tokens_key not in request:
             request[max_tokens_key] = configured_max_tokens
-            request.pop("max_tokens" if max_tokens_key != "max_tokens" else "max_completion_tokens", None)
+            request.pop(
+                "max_tokens" if max_tokens_key != "max_tokens" else "max_completion_tokens", None
+            )
         elif configured_max_completion_tokens is not None and max_tokens_key not in request:
             request[max_tokens_key] = configured_max_completion_tokens
-            request.pop("max_tokens" if max_tokens_key != "max_tokens" else "max_completion_tokens", None)
+            request.pop(
+                "max_tokens" if max_tokens_key != "max_tokens" else "max_completion_tokens", None
+            )
         if top_p is not None:
             request["top_p"] = top_p
         request_extensions = {
@@ -865,9 +986,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             request.setdefault("extra_body", {})["repetition_penalty"] = repetition_penalty
         if top_k is not None and self._protocol == "chat_completions":
             if "top_k" in configured_explicit_extra_keys:
-                raise ValueError(
-                    "Chat Completions top_k 与模型 options.extra_body 重复。"
-                )
+                raise ValueError("Chat Completions top_k 与模型 options.extra_body 重复。")
             request.setdefault("extra_body", {})["top_k"] = top_k
         if seed is not None:
             if "seed" in configured_explicit_extra_keys:
@@ -893,15 +1012,11 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             effort = reasoning.get("effort") if isinstance(reasoning, Mapping) else None
             if effort is not None:
                 if "reasoning" in configured_explicit_extra_keys:
-                    raise ValueError(
-                        "Chat Completions reasoning 与模型 options.extra_body 重复。"
-                    )
+                    raise ValueError("Chat Completions reasoning 与模型 options.extra_body 重复。")
                 request["reasoning_effort"] = effort
             else:
                 if "reasoning" in configured_explicit_extra_keys:
-                    raise ValueError(
-                        "Chat Completions reasoning 与模型 options.extra_body 重复。"
-                    )
+                    raise ValueError("Chat Completions reasoning 与模型 options.extra_body 重复。")
                 request.setdefault("extra_body", {})["reasoning"] = reasoning
         if stream_options is not None:
             request["stream_options"] = stream_options
@@ -941,22 +1056,14 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 native_tool = dict(tool)
                 tool_type = native_tool.get("type")
                 if not isinstance(tool_type, str) or not tool_type.strip():
-                    raise ValueError(
-                        f"Responses 工具定义[{index}] 缺少有效 type。"
-                    )
+                    raise ValueError(f"Responses 工具定义[{index}] 缺少有效 type。")
                 if tool_type == "function":
                     name = native_tool.get("name")
                     if not isinstance(name, str) or not name.strip():
-                        raise ValueError(
-                            f"Responses 工具定义[{index}] 缺少 name。"
-                        )
-                    parameters = native_tool.get(
-                        "parameters", {"type": "object", "properties": {}}
-                    )
+                        raise ValueError(f"Responses 工具定义[{index}] 缺少 name。")
+                    parameters = native_tool.get("parameters", {"type": "object", "properties": {}})
                     if not isinstance(parameters, Mapping):
-                        raise ValueError(
-                            f"Responses 工具定义[{index}].parameters 必须是对象。"
-                        )
+                        raise ValueError(f"Responses 工具定义[{index}].parameters 必须是对象。")
                     native_tool["parameters"] = dict(parameters)
                     native_tool.setdefault("strict", False)
                 converted.append(native_tool)
@@ -964,19 +1071,13 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
 
             function = tool["function"]
             if not isinstance(function, Mapping):
-                raise ValueError(
-                    f"Responses 工具定义[{index}].function 必须是对象。"
-                )
+                raise ValueError(f"Responses 工具定义[{index}].function 必须是对象。")
             name = function.get("name")
             if not isinstance(name, str) or not name.strip():
                 raise ValueError(f"Responses 工具定义[{index}] 缺少 function.name。")
-            parameters = function.get(
-                "parameters", {"type": "object", "properties": {}}
-            )
+            parameters = function.get("parameters", {"type": "object", "properties": {}})
             if not isinstance(parameters, Mapping):
-                raise ValueError(
-                    f"Responses 工具定义[{index}].function.parameters 必须是对象。"
-                )
+                raise ValueError(f"Responses 工具定义[{index}].function.parameters 必须是对象。")
             response_tool: dict[str, Any] = {
                 "type": "function",
                 "name": name,
@@ -1119,8 +1220,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         }
         if len(configured_limits) > 1:
             raise ValueError(
-                "Responses options 不能同时设置多个输出长度字段: "
-                + ", ".join(configured_limits)
+                "Responses options 不能同时设置多个输出长度字段: " + ", ".join(configured_limits)
             )
         if configured_max_output_tokens is not None:
             configured_options.pop("max_output_tokens", None)
@@ -1292,9 +1392,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             request["reasoning"] = reasoning
         elif configured_reasoning_effort is not None:
             if "reasoning" in configured_explicit_extra_keys:
-                raise ValueError(
-                    "Responses reasoning_effort 与模型 options.extra_body 重复。"
-                )
+                raise ValueError("Responses reasoning_effort 与模型 options.extra_body 重复。")
             request["reasoning"] = {"effort": configured_reasoning_effort}
         if store is not None:
             request["store"] = store
@@ -1352,8 +1450,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             )
             if configured_overlap:
                 raise ValueError(
-                    "Responses extra_body 与模型 options 重复: "
-                    + ", ".join(configured_overlap)
+                    "Responses extra_body 与模型 options 重复: " + ", ".join(configured_overlap)
                 )
             request.setdefault("extra_body", {}).update(request_extra_body)
         if request.get("extra_body"):
@@ -1368,13 +1465,23 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     def _convert_responses_format(response_format: dict[str, Any]) -> dict[str, Any]:
         if response_format.get("type") == "json_schema":
             schema = response_format.get("json_schema", response_format)
-            json_schema = schema.get("schema", {}) if isinstance(schema, Mapping) else {}
+            if not isinstance(schema, Mapping):
+                raise ValueError("Responses json_schema 必须是对象。")
+            # 无 schema 时不能回退成 ``schema`` 本身：那会伪造出一个
+            # ``{"type": "json_schema"}`` 的 schema 发给服务端，客户端以为
+            # 拿到了结构化输出约束，实际没有。缺 schema 属调用方错误。
+            json_schema = schema.get("schema")
+            if not isinstance(json_schema, Mapping) or not json_schema:
+                raise ValueError(
+                    "Responses json_schema 缺少 schema 字段；"
+                    "请提供 {'type': 'json_schema', 'json_schema': {'name': ..., 'schema': {...}}}。"
+                )
             return {
                 "format": {
                     "type": "json_schema",
-                    "name": schema.get("name", "response") if isinstance(schema, Mapping) else "response",
-                    "schema": json_schema or response_format.get("schema", schema),
-                    "strict": schema.get("strict", True) if isinstance(schema, Mapping) else True,
+                    "name": schema.get("name", "response"),
+                    "schema": json_schema,
+                    "strict": schema.get("strict", True),
                 }
             }
         if response_format.get("type") == "json_object":
@@ -1383,30 +1490,24 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             return response_format
         raise ValueError("Responses response_format 仅支持 json_schema 或 json_object。")
 
-    @staticmethod
-    def _field(value: Any, name: str, default: Any = None) -> Any:
-        if isinstance(value, Mapping):
-            return value.get(name, default)
-        return getattr(value, name, default)
-
     @classmethod
     def _extract_response_text(cls, response: Any) -> str:
-        output_text = cls._field(response, "output_text")
+        output_text = field(response, "output_text")
         if isinstance(output_text, str):
             return output_text
 
         chunks: list[str] = []
-        choices = cls._field(response, "choices", []) or []
+        choices = field(response, "choices", []) or []
         for choice in choices:
-            message = cls._field(choice, "message") or cls._field(choice, "delta")
-            text = cls._field(message, "content")
+            message = field(choice, "message") or field(choice, "delta")
+            text = field(message, "content")
             if text:
                 chunks.append(content_to_text(text))
         if chunks:
             return "".join(chunks)
-        for item in cls._field(response, "output", []) or []:
-            for content in cls._field(item, "content", []) or []:
-                text = cls._field(content, "text")
+        for item in field(response, "output", []) or []:
+            for content in field(item, "content", []) or []:
+                text = field(content, "text")
                 if isinstance(text, str):
                     chunks.append(text)
         return "".join(chunks)
@@ -1414,28 +1515,28 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     @classmethod
     def _extract_tool_calls(cls, response: Any) -> list[dict[str, Any]]:
         calls: list[dict[str, Any]] = []
-        choices = cls._field(response, "choices", []) or []
+        choices = field(response, "choices", []) or []
         for choice in choices:
-            message = cls._field(choice, "message") or cls._field(choice, "delta")
-            for call in cls._field(message, "tool_calls", []) or []:
-                function = cls._field(call, "function")
+            message = field(choice, "message") or field(choice, "delta")
+            for call in field(message, "tool_calls", []) or []:
+                function = field(call, "function")
                 calls.append(
                     {
-                        "id": cls._field(call, "id"),
-                        "type": cls._field(call, "type", "function"),
-                        "name": cls._field(function, "name"),
-                        "arguments": normalize_tool_arguments(cls._field(function, "arguments", "")),
+                        "id": field(call, "id"),
+                        "type": field(call, "type", "function"),
+                        "name": field(function, "name"),
+                        "arguments": normalize_tool_arguments(field(function, "arguments", "")),
                     }
                 )
-        for item in cls._field(response, "output", []) or []:
-            if cls._field(item, "type") in {"function_call", "custom_tool_call"}:
+        for item in field(response, "output", []) or []:
+            if field(item, "type") in {"function_call", "custom_tool_call"}:
                 calls.append(
                     {
-                        "id": cls._field(item, "call_id") or cls._field(item, "id"),
-                        "type": cls._field(item, "type"),
-                        "name": cls._field(item, "name"),
+                        "id": field(item, "call_id") or field(item, "id"),
+                        "type": field(item, "type"),
+                        "name": field(item, "name"),
                         "arguments": normalize_tool_arguments(
-                            cls._field(item, "arguments", cls._field(item, "input", ""))
+                            field(item, "arguments", field(item, "input", ""))
                         ),
                     }
                 )
@@ -1443,33 +1544,33 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
 
     @classmethod
     def _extract_usage(cls, response: Any) -> dict[str, Any]:
-        return normalize_usage(cls._field(response, "usage"))
+        return normalize_usage(field(response, "usage"))
 
     @classmethod
     def _extract_reasoning(cls, response: Any) -> str:
         values: list[str] = []
-        choices = cls._field(response, "choices", []) or []
+        choices = field(response, "choices", []) or []
         for choice in choices:
-            message = cls._field(choice, "message") or cls._field(choice, "delta")
+            message = field(choice, "message") or field(choice, "delta")
             for name in ("reasoning_content", "reasoning"):
-                value = cls._field(message, name)
+                value = field(message, name)
                 if isinstance(value, str):
                     values.append(value)
-        for item in cls._field(response, "output", []) or []:
-            if cls._field(item, "type") in {"reasoning", "reasoning_item"}:
-                summary = cls._field(item, "summary")
+        for item in field(response, "output", []) or []:
+            if field(item, "type") in {"reasoning", "reasoning_item"}:
+                summary = field(item, "summary")
                 if isinstance(summary, str):
                     values.append(summary)
                 elif isinstance(summary, (list, tuple)):
                     for entry in summary:
-                        text = cls._field(entry, "text")
+                        text = field(entry, "text")
                         if isinstance(text, str):
                             values.append(text)
-                for content in cls._field(item, "content", []) or []:
-                    text = cls._field(content, "text")
+                for content in field(item, "content", []) or []:
+                    text = field(content, "text")
                     if isinstance(text, str):
                         values.append(text)
-                fallback = cls._field(item, "text")
+                fallback = field(item, "text")
                 if isinstance(fallback, str):
                     values.append(fallback)
         return "".join(values)
@@ -1477,20 +1578,20 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     @classmethod
     def _extract_refusal(cls, response: Any) -> str | None:
         """提取 Chat Completions 与 Responses 的统一拒答文本。"""
-        choices = cls._field(response, "choices", []) or []
+        choices = field(response, "choices", []) or []
         for choice in choices:
-            message = cls._field(choice, "message") or cls._field(choice, "delta")
-            refusal = cls._field(message, "refusal")
+            message = field(choice, "message") or field(choice, "delta")
+            refusal = field(message, "refusal")
             if isinstance(refusal, str) and refusal:
                 return refusal
-        for item in cls._field(response, "output", []) or []:
-            refusal = cls._field(item, "refusal")
+        for item in field(response, "output", []) or []:
+            refusal = field(item, "refusal")
             if isinstance(refusal, str) and refusal:
                 return refusal
-            for content in cls._field(item, "content", []) or []:
-                if cls._field(content, "type") != "refusal":
+            for content in field(item, "content", []) or []:
+                if field(content, "type") != "refusal":
                     continue
-                refusal = cls._field(content, "refusal") or cls._field(content, "text")
+                refusal = field(content, "refusal") or field(content, "text")
                 if isinstance(refusal, str) and refusal:
                     return refusal
         return None
@@ -1522,7 +1623,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     def _chat_response_error_detail(cls, response: Any) -> str | None:
         """提取兼容网关常见的顶层业务错误字段。"""
         for name in ("error", "msg", "message", "detail", "reason", "code", "error_code"):
-            value = cls._field(response, name)
+            value = field(response, name)
             if value is None or value == "":
                 continue
             if name == "error":
@@ -1546,14 +1647,14 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         字段仍必须显式失败。
         """
         detail = cls._chat_response_error_detail(response)
-        status = cls._field(response, "status")
-        if detail is not None and cls._field(response, "error") is not None:
+        status = field(response, "status")
+        if detail is not None and field(response, "error") is not None:
             raise RuntimeError(f"{provider} 返回错误: {detail}")
         if cls._chat_status_is_error(status):
             suffix = f": {detail}" if detail else "。"
             raise RuntimeError(f"{provider} 返回业务错误 (status={status}){suffix}")
 
-        choices = cls._field(response, "choices")
+        choices = field(response, "choices")
         if allow_empty_choices:
             if choices is None and detail is not None:
                 raise RuntimeError(f"{provider} 返回错误: {detail}")
@@ -1568,39 +1669,39 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         if self._protocol == "responses":
             self._require_responses_resource("complete")
             params = self._build_responses_request(**request.to_invoke_kwargs())
-            response = retry_sync_call(
-                lambda: self._get_client().responses.create(**params)
-            )
+            response = retry_sync_call(lambda: self._get_client().responses.create(**params))
             if params.get("background"):
                 response = self._poll_background_response(response, params)
             self._raise_for_response_error(response)
         else:
             params = self._build_chat_request(**request.to_invoke_kwargs())
-            response = retry_sync_call(
-                lambda: self._get_client().chat.completions.create(**params)
-            )
+            response = retry_sync_call(lambda: self._get_client().chat.completions.create(**params))
             self._raise_for_chat_response_error(
                 response,
                 provider=f"{getattr(self, '_provider', 'OpenAI-compatible')} Chat Completions",
             )
-        choices = self._field(response, "choices", []) or []
+        choices = field(response, "choices", []) or []
         finish_reason = (
-            self._field(response, "status")
+            field(response, "status")
             if self._protocol == "responses"
-            else self._field(choices[0], "finish_reason") if choices else None
+            else field(choices[0], "finish_reason")
+            if choices
+            else None
         )
         return CompletionResult(
             text=self._extract_response_text(response),
             tool_calls=self._extract_tool_calls(response),
             usage=self._extract_usage(response),
             finish_reason=finish_reason,
-            response_id=self._field(response, "id"),
+            response_id=field(response, "id"),
             refusal=self._extract_refusal(response),
             reasoning=self._extract_reasoning(response),
             raw=response,
         )
 
-    async def acomplete(self, request: CompletionRequest | None = None, **kwargs: Any) -> CompletionResult:
+    async def acomplete(
+        self, request: CompletionRequest | None = None, **kwargs: Any
+    ) -> CompletionResult:
         """使用 AsyncOpenAI 聚合完整结果，保留 SDK 元数据。"""
         request = coerce_completion_request(request, kwargs, "OpenAI-compatible acomplete")
         request = request.copy_with(stream=False)
@@ -1622,18 +1723,20 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 response,
                 provider=f"{getattr(self, '_provider', 'OpenAI-compatible')} Chat Completions",
             )
-        choices = self._field(response, "choices", []) or []
+        choices = field(response, "choices", []) or []
         finish_reason = (
-            self._field(response, "status")
+            field(response, "status")
             if self._protocol == "responses"
-            else self._field(choices[0], "finish_reason") if choices else None
+            else field(choices[0], "finish_reason")
+            if choices
+            else None
         )
         return CompletionResult(
             text=self._extract_response_text(response),
             tool_calls=self._extract_tool_calls(response),
             usage=self._extract_usage(response),
             finish_reason=finish_reason,
-            response_id=self._field(response, "id"),
+            response_id=field(response, "id"),
             refusal=self._extract_refusal(response),
             reasoning=self._extract_reasoning(response),
             raw=response,
@@ -1643,23 +1746,23 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     def _chat_stream_events(cls, chunk: Any) -> list[StreamEvent]:
         raise_for_stream_error_event(chunk, "Chat Completions")
         cls._raise_for_chat_response_error(chunk, allow_empty_choices=True)
-        choices = cls._field(chunk, "choices", []) or []
+        choices = field(chunk, "choices", []) or []
         usage = cls._extract_usage(chunk)
         if not choices:
             return [StreamEvent(type="usage", usage=usage, raw=chunk)] if usage else []
         choice = choices[0]
-        delta = cls._field(choice, "delta")
-        text = content_to_text(cls._field(delta, "content", ""))
-        reasoning = cls._field(delta, "reasoning_content") or cls._field(delta, "reasoning") or ""
-        refusal = cls._field(delta, "refusal")
-        tool_calls = cls._field(delta, "tool_calls", []) or []
-        finish_reason = cls._field(choice, "finish_reason")
+        delta = field(choice, "delta")
+        text = content_to_text(field(delta, "content", ""))
+        reasoning = field(delta, "reasoning_content") or field(delta, "reasoning") or ""
+        refusal = field(delta, "refusal")
+        tool_calls = field(delta, "tool_calls", []) or []
+        finish_reason = field(choice, "finish_reason")
         events: list[StreamEvent] = []
 
         if isinstance(refusal, str) and refusal:
             events.append(StreamEvent(type="refusal_delta", refusal=refusal, raw=chunk))
 
-        response_id = cls._field(chunk, "id")
+        response_id = field(chunk, "id")
         if text:
             events.append(
                 StreamEvent(
@@ -1680,16 +1783,16 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             )
         if tool_calls:
             for position, call in enumerate(tool_calls):
-                function = cls._field(call, "function")
+                function = field(call, "function")
                 events.append(
                     StreamEvent(
                         type="tool_call_delta",
                         tool_call={
-                            "id": cls._field(call, "id"),
-                            "index": cls._field(call, "index", position),
-                            "type": cls._field(call, "type", "function"),
-                            "name": cls._field(function, "name"),
-                            "arguments": cls._field(function, "arguments", ""),
+                            "id": field(call, "id"),
+                            "index": field(call, "index", position),
+                            "type": field(call, "type", "function"),
+                            "name": field(function, "name"),
+                            "arguments": field(function, "arguments", ""),
                         },
                         response_id=response_id,
                         raw=chunk,
@@ -1702,7 +1805,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                     type="finish",
                     usage=usage,
                     finish_reason=finish_reason,
-                    response_id=cls._field(chunk, "id"),
+                    response_id=field(chunk, "id"),
                     raw=chunk,
                 )
             )
@@ -1723,15 +1826,15 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     def _response_tool_keys(cls, event: Any, item: Any = None) -> list[Any]:
         """返回 Responses 工具事件可用的稳定关联键。"""
         item = item if item is not None else event
-        item_id = cls._field(event, "item_id")
+        item_id = field(event, "item_id")
         if item_id is None:
-            item_id = cls._field(item, "id")
-        output_index = cls._field(event, "output_index")
+            item_id = field(item, "id")
+        output_index = field(event, "output_index")
         if output_index is None:
-            output_index = cls._field(item, "output_index")
-        call_id = cls._field(event, "call_id")
+            output_index = field(item, "output_index")
+        call_id = field(event, "call_id")
         if call_id is None:
-            call_id = cls._field(item, "call_id")
+            call_id = field(item, "call_id")
         keys: list[Any] = []
         for prefix, value in (
             ("item_id", item_id),
@@ -1754,24 +1857,24 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         metadata: dict[Any, dict[str, Any]],
     ) -> None:
         """记录 output_item.added 中后续 delta/done 事件需要的工具元数据。"""
-        item = cls._field(event, "item") or event
-        item_type = cls._field(item, "type")
+        item = field(event, "item") or event
+        item_type = field(item, "type")
         if item_type not in {"function_call", "custom_tool_call"}:
             return
-        item_id = cls._field(item, "id") or cls._field(event, "item_id")
-        call_id = cls._field(item, "call_id") or cls._field(event, "call_id")
-        output_index = cls._field(event, "output_index")
+        item_id = field(item, "id") or field(event, "item_id")
+        call_id = field(item, "call_id") or field(event, "call_id")
+        output_index = field(event, "output_index")
         if output_index is None:
-            output_index = cls._field(item, "output_index")
+            output_index = field(item, "output_index")
         values: dict[str, Any] = {
             "id": call_id or item_id,
             "call_id": call_id,
             "index": output_index,
             "type": item_type,
-            "name": cls._field(item, "name"),
+            "name": field(item, "name"),
         }
         for field_name in ("arguments", "input"):
-            value = cls._field(item, field_name)
+            value = field(item, field_name)
             if value is not None:
                 values["arguments"] = normalize_tool_arguments(value)
                 break
@@ -1809,13 +1912,13 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         error_provider: str = "Responses API",
         response_error_handler: Any | None = None,
     ) -> StreamEvent | None:
-        event_type = cls._field(event, "type", "")
+        event_type = field(event, "type", "")
         if event_type == "response.output_item.added":
             if tool_metadata is not None:
                 cls._remember_response_tool_metadata(event, tool_metadata)
             return None
         if event_type in {"response.output_text.delta", "response.refusal.delta"}:
-            delta = cls._field(event, "delta")
+            delta = field(event, "delta")
             is_refusal = event_type.endswith("refusal.delta")
             return StreamEvent(
                 type="refusal_delta" if is_refusal else "text_delta",
@@ -1824,8 +1927,10 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 raw=event,
             )
         if event_type in {"response.reasoning_summary_text.delta", "response.reasoning_text.delta"}:
-            delta = cls._field(event, "delta")
-            return StreamEvent(type="reasoning_delta", reasoning=delta if isinstance(delta, str) else "", raw=event)
+            delta = field(event, "delta")
+            return StreamEvent(
+                type="reasoning_delta", reasoning=delta if isinstance(delta, str) else "", raw=event
+            )
         if event_type.endswith(".delta") and (
             "function_call_arguments" in event_type or "custom_tool_call_input" in event_type
         ):
@@ -1834,20 +1939,25 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 "type",
                 "custom_tool_call" if "custom_tool_call_input" in event_type else "function_call",
             )
-            item_id = cls._field(event, "item_id")
-            call_id = cls._field(event, "call_id") or metadata.get("call_id")
-            output_index = cls._field(event, "output_index")
+            item_id = field(event, "item_id")
+            call_id = field(event, "call_id") or metadata.get("call_id")
+            output_index = field(event, "output_index")
             if output_index is None:
                 output_index = metadata.get("index")
             return StreamEvent(
                 type="tool_call_delta",
                 tool_call={
-                    "id": item_id or cls._field(event, "call_id") or metadata.get("id"),
+                    # ``id`` 在流式路径上必须与 ``output_item.done`` 及非流式
+                    # 路径取同一语义（call_id）。取 ``item_id`` 会让同一轮工具
+                    # 调用在 delta 与 done 两个事件里得到不同的 id，且是否一致
+                    # 取决于事件到达顺序；调用方按 ``tool_call["id"]`` 回填
+                    # ``role=tool`` 时就会配不上。
+                    "id": call_id or item_id or metadata.get("id"),
                     "call_id": call_id,
-                    "index": output_index if output_index is not None else cls._field(event, "index"),
+                    "index": output_index if output_index is not None else field(event, "index"),
                     "type": item_type,
-                    "name": cls._field(event, "name") or metadata.get("name"),
-                    "arguments": normalize_tool_arguments(cls._field(event, "delta", "")),
+                    "name": field(event, "name") or metadata.get("name"),
+                    "arguments": normalize_tool_arguments(field(event, "delta", "")),
                 },
                 raw=event,
             )
@@ -1856,23 +1966,25 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             "response.function_call_arguments.done",
             "response.custom_tool_call_input.done",
         }:
-            item = cls._field(event, "item")
+            item = field(event, "item")
             metadata = cls._response_tool_metadata(event, tool_metadata, item)
-            item_type = cls._field(item, "type") if item is not None else None
+            item_type = field(item, "type") if item is not None else None
             item_type = item_type or metadata.get("type")
             if (
                 item_type in {"function_call", "custom_tool_call"}
                 or "function_call_arguments" in event_type
                 or "custom_tool_call_input" in event_type
             ):
-                call_id = cls._field(item, "call_id") or cls._field(event, "call_id") or metadata.get("call_id")
-                output_index = cls._field(event, "output_index")
+                call_id = (
+                    field(item, "call_id") or field(event, "call_id") or metadata.get("call_id")
+                )
+                output_index = field(event, "output_index")
                 if output_index is None:
                     output_index = metadata.get("index")
                 argument_value: Any = None
                 for source in (item, event):
                     for field_name in ("arguments", "input"):
-                        value = cls._field(source, field_name)
+                        value = field(source, field_name)
                         if value is not None:
                             argument_value = value
                             break
@@ -1881,13 +1993,21 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 if argument_value is None:
                     argument_value = metadata.get("arguments", "")
                 tool_call: dict[str, Any] = {
-                    "id": cls._field(item, "call_id")
-                    or cls._field(item, "id")
-                    or cls._field(event, "item_id")
+                    # 与非流式路径（``call_id or id``）和 delta 事件保持同一
+                    # 语义：``id`` 是调用标识符，不是 Responses 输出项标识符。
+                    # 取 ``item.id`` 或 ``item_id`` 会让同一轮工具调用在 delta
+                    # 与 done 事件里得到不同的 id，调用方按 ``tool_call["id"]``
+                    # 回填 ``role=tool`` 时就会配不上。上面解析出的 ``call_id``
+                    # 才是权威来源。
+                    "id": call_id
+                    or field(item, "id")
+                    or field(event, "item_id")
                     or metadata.get("id"),
-                    "index": output_index if output_index is not None else cls._field(event, "index"),
-                    "type": item_type if item_type in {"function_call", "custom_tool_call"} else "function_call",
-                    "name": cls._field(item, "name") or cls._field(event, "name") or metadata.get("name"),
+                    "index": output_index if output_index is not None else field(event, "index"),
+                    "type": item_type
+                    if item_type in {"function_call", "custom_tool_call"}
+                    else "function_call",
+                    "name": field(item, "name") or field(event, "name") or metadata.get("name"),
                     "arguments": normalize_tool_arguments(argument_value),
                 }
                 if call_id is not None:
@@ -1900,11 +2020,14 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         if event_type in {"error", "response.error"}:
             raise_for_stream_error_event(event, error_provider)
         if event_type in {
-            "response.completed", "response.incomplete", "response.failed", "response.cancelled"
+            "response.completed",
+            "response.incomplete",
+            "response.failed",
+            "response.cancelled",
         }:
-            response = cls._field(event, "response") or event
+            response = field(event, "response") or event
             usage = cls._extract_usage(response)
-            status = cls._field(response, "status")
+            status = field(response, "status")
             if status in {"failed", "incomplete", "cancelled"}:
                 handler = response_error_handler or cls._raise_for_response_error
                 handler(response)
@@ -1914,7 +2037,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 type="finish",
                 usage=usage,
                 finish_reason=status,
-                response_id=cls._field(response, "id"),
+                response_id=field(response, "id"),
                 raw=event,
             )
         return None
@@ -1940,6 +2063,12 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             value = tool_call.get(name)
             if value is not None and value != "":
                 merged[name] = value
+        # ``id`` 必须与调用标识符一致（非流式路径用 ``call_id or id``，delta
+        # 事件也用 call_id）。``output_item.done`` 带的 ``id`` 是输出项 ID，
+        # 按上面顺序会覆盖 delta 事件写入的 call_id，使同一轮工具调用在
+        # delta 与 completed 两个事件里得到不同的 id。这里统一回 call_id。
+        if merged.get("call_id"):
+            merged["id"] = merged["call_id"]
         arguments = tool_call.get("arguments")
         if arguments is not None and arguments != "":
             merged["arguments"] = normalize_tool_arguments(arguments)
@@ -1997,8 +2126,12 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             raw=converted.raw,
         )
 
-    def stream_events(self, request: CompletionRequest | None = None, **kwargs: Any) -> Generator[StreamEvent, None, None]:
-        request = coerce_completion_request(request, kwargs, "OpenAI-compatible stream_events").copy_with(
+    def stream_events(
+        self, request: CompletionRequest | None = None, **kwargs: Any
+    ) -> Generator[StreamEvent, None, None]:
+        request = coerce_completion_request(
+            request, kwargs, "OpenAI-compatible stream_events"
+        ).copy_with(
             stream=True,
         )
         if self._protocol == "responses":
@@ -2015,7 +2148,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             ):
                 if terminal_seen:
                     continue
-                event_type = self._field(event, "type", "")
+                event_type = field(event, "type", "")
                 converted = self._responses_stream_event(event, response_tool_metadata)
                 if converted:
                     if converted.type == "finish":
@@ -2074,18 +2207,22 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 chunk, getattr(self, "_provider", "OpenAI-compatible")
             ),
         ):
-            raise_for_stream_error_event(
-                chunk, getattr(self, "_provider", "OpenAI-compatible")
-            )
+            raise_for_stream_error_event(chunk, getattr(self, "_provider", "OpenAI-compatible"))
             for converted in self._chat_stream_events(chunk):
                 if converted.type == "finish":
                     terminal_seen = True
-                yield from self._chat_completion_events(converted, tool_calls, completed_chat_tool_calls)
+                yield from self._chat_completion_events(
+                    converted, tool_calls, completed_chat_tool_calls
+                )
         if not terminal_seen:
             raise RuntimeError("Chat Completions 流在 finish 事件之前结束。")
 
-    async def astream_events(self, request: CompletionRequest | None = None, **kwargs: Any) -> AsyncGenerator[StreamEvent, None]:
-        request = coerce_completion_request(request, kwargs, "OpenAI-compatible astream_events").copy_with(
+    async def astream_events(
+        self, request: CompletionRequest | None = None, **kwargs: Any
+    ) -> AsyncGenerator[StreamEvent, None]:
+        request = coerce_completion_request(
+            request, kwargs, "OpenAI-compatible astream_events"
+        ).copy_with(
             stream=True,
         )
         if self._protocol == "responses":
@@ -2102,7 +2239,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             ):
                 if terminal_seen:
                     continue
-                event_type = self._field(event, "type", "")
+                event_type = field(event, "type", "")
                 converted = self._responses_stream_event(event, response_tool_metadata)
                 if converted:
                     if converted.type == "finish":
@@ -2160,13 +2297,13 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 chunk, getattr(self, "_provider", "OpenAI-compatible")
             ),
         ):
-            raise_for_stream_error_event(
-                chunk, getattr(self, "_provider", "OpenAI-compatible")
-            )
+            raise_for_stream_error_event(chunk, getattr(self, "_provider", "OpenAI-compatible"))
             for converted in self._chat_stream_events(chunk):
                 if converted.type == "finish":
                     terminal_seen = True
-                for event in self._chat_completion_events(converted, tool_calls, completed_chat_tool_calls):
+                for event in self._chat_completion_events(
+                    converted, tool_calls, completed_chat_tool_calls
+                ):
                     yield event
         if not terminal_seen:
             raise RuntimeError("Chat Completions 异步流在 finish 事件之前结束。")
@@ -2250,46 +2387,50 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     def _error_message(cls, error: Any, default: str) -> str:
         if isinstance(error, str) and error:
             return error
-        message = cls._field(error, "message")
+        message = field(error, "message")
         if message:
             return str(message)
-        code = cls._field(error, "code")
+        code = field(error, "code")
         if code:
             return f"{code}"
         return default
 
     @classmethod
     def _raise_for_response_error(cls, response: Any) -> None:
-        error = cls._field(response, "error")
+        error = field(response, "error")
         if error:
-            raise RuntimeError(
-                f"Responses API 返回错误: {cls._error_message(error, '未知错误。')}"
-            )
+            # 与 _raise_for_chat_response_error 对齐：服务端消息常回显请求头或
+            # URL，异常文本会进日志与终端，是本项目凭证最容易泄漏的出口。
+            message = redact_sensitive_text(cls._error_message(error, "未知错误。"))
+            raise RuntimeError(f"Responses API 返回错误: {message}")
 
-        status = cls._field(response, "status")
+        status = field(response, "status")
         if status not in {"failed", "incomplete", "cancelled"}:
             return
 
         if status == "incomplete":
-            details = cls._field(response, "incomplete_details")
-            reason = cls._field(details, "reason")
+            details = field(response, "incomplete_details")
+            reason = field(details, "reason")
             detail = f"原因: {reason}" if reason else "未提供原因。"
         else:
             detail = "未提供原因。"
-        raise RuntimeError(f"Responses API 响应状态为 {status}: {detail}")
+        raise RuntimeError(f"Responses API 响应状态为 {status}: {redact_sensitive_text(detail)}")
 
     @classmethod
     def _stream_delta(cls, event: Any) -> str:
-        event_type = cls._field(event, "type", "")
+        event_type = field(event, "type", "")
         if event_type in {"response.output_text.delta", "response.refusal.delta"}:
-            delta = cls._field(event, "delta")
+            delta = field(event, "delta")
             return delta if isinstance(delta, str) else ""
         if event_type in {"error", "response.error"}:
             raise_for_stream_error_event(event, "Responses API")
         if event_type in {
-            "response.completed", "response.failed", "response.incomplete", "response.cancelled"
+            "response.completed",
+            "response.failed",
+            "response.incomplete",
+            "response.cancelled",
         }:
-            response = cls._field(event, "response") or event
+            response = field(event, "response") or event
             cls._raise_for_response_error(response)
             if event_type != "response.completed":
                 raise RuntimeError(f"Responses API 收到终止事件: {event_type}。")
@@ -2302,13 +2443,11 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 lambda: self._get_client().responses.create(**request),
                 lambda event: raise_for_stream_error_event(event, self._provider),
             ):
-                event_type = self._field(event, "type", "")
+                event_type = field(event, "type", "")
                 if event_type == "response.refusal.delta":
-                    refusal = self._field(event, "delta")
+                    refusal = field(event, "delta")
                     if refusal:
-                        raise RuntimeError(
-                            f"{self._provider} Responses 返回拒答: {refusal}"
-                        )
+                        raise RuntimeError(f"{self._provider} Responses 返回拒答: {refusal}")
                 delta = self._stream_delta(event)
                 if delta:
                     yield delta
@@ -2335,13 +2474,11 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 lambda: self._get_aclient().responses.create(**request),
                 lambda event: raise_for_stream_error_event(event, self._provider),
             ):
-                event_type = self._field(event, "type", "")
+                event_type = field(event, "type", "")
                 if event_type == "response.refusal.delta":
-                    refusal = self._field(event, "delta")
+                    refusal = field(event, "delta")
                     if refusal:
-                        raise RuntimeError(
-                            f"{self._provider} Responses 返回拒答: {refusal}"
-                        )
+                        raise RuntimeError(f"{self._provider} Responses 返回拒答: {refusal}")
                 delta = self._stream_delta(event)
                 if delta:
                     yield delta
@@ -2394,25 +2531,52 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 )
         client = self._get_client()
         start_time = time.perf_counter()
-        
+
         try:
             if self._protocol == "responses":
                 yield from self._invoke_responses(
-                    self._build_responses_request(prompt, system_prompt, tools, temperature, stream,
-                                                  messages=messages, max_tokens=max_tokens, top_p=top_p,
-                                                  top_k=top_k, seed=seed,
-                                                  stop=stop, response_format=response_format, tool_choice=tool_choice,
-                                                  extra_body=extra_body, metadata=metadata, user=user, timeout=timeout,
-                                                  **kwargs)
+                    self._build_responses_request(
+                        prompt,
+                        system_prompt,
+                        tools,
+                        temperature,
+                        stream,
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        top_p=top_p,
+                        top_k=top_k,
+                        seed=seed,
+                        stop=stop,
+                        response_format=response_format,
+                        tool_choice=tool_choice,
+                        extra_body=extra_body,
+                        metadata=metadata,
+                        user=user,
+                        timeout=timeout,
+                        **kwargs,
+                    )
                 )
                 return
 
             request = self._build_chat_request(
-                prompt, system_prompt, tools, temperature, stream,
-                messages=messages, max_tokens=max_tokens, top_p=top_p, stop=stop,
-                top_k=top_k, seed=seed, response_format=response_format,
-                tool_choice=tool_choice, extra_body=extra_body, metadata=metadata,
-                user=user, timeout=timeout, **kwargs,
+                prompt,
+                system_prompt,
+                tools,
+                temperature,
+                stream,
+                messages=messages,
+                max_tokens=max_tokens,
+                top_p=top_p,
+                stop=stop,
+                top_k=top_k,
+                seed=seed,
+                response_format=response_format,
+                tool_choice=tool_choice,
+                extra_body=extra_body,
+                metadata=metadata,
+                user=user,
+                timeout=timeout,
+                **kwargs,
             )
             if stream:
                 terminal_seen = False
@@ -2441,15 +2605,17 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 refusal = self._extract_refusal(response)
                 if refusal:
                     raise RuntimeError(f"{self._provider} Chat Completions 返回拒答: {refusal}")
-                choices = self._field(response, "choices", []) or []
+                choices = field(response, "choices", []) or []
                 if choices:
-                    message = self._field(choices[0], "message")
-                    content = self._field(message, "content")
+                    message = field(choices[0], "message")
+                    content = field(message, "content")
                     if content:
                         yield content_to_text(content)
-            
+
             duration = time.perf_counter() - start_time
-            logger.info(f"{self._provider} LLM ({self._model_name}) 调用完成，耗时: {duration:.2f}s")
+            logger.info(
+                f"{self._provider} LLM ({self._model_name}) 调用完成，耗时: {duration:.2f}s"
+            )
         except Exception as e:
             error_text = redact_sensitive_text(str(e))
             logger.exception(
@@ -2493,26 +2659,53 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 )
         aclient = self._get_aclient()
         start_time = time.perf_counter()
-        
+
         try:
             if self._protocol == "responses":
                 async for chunk in self._ainvoke_responses(
-                    self._build_responses_request(prompt, system_prompt, tools, temperature, stream,
-                                                  messages=messages, max_tokens=max_tokens, top_p=top_p,
-                                                  top_k=top_k, seed=seed,
-                                                  stop=stop, response_format=response_format, tool_choice=tool_choice,
-                                                  extra_body=extra_body, metadata=metadata, user=user, timeout=timeout,
-                                                  **kwargs)
+                    self._build_responses_request(
+                        prompt,
+                        system_prompt,
+                        tools,
+                        temperature,
+                        stream,
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        top_p=top_p,
+                        top_k=top_k,
+                        seed=seed,
+                        stop=stop,
+                        response_format=response_format,
+                        tool_choice=tool_choice,
+                        extra_body=extra_body,
+                        metadata=metadata,
+                        user=user,
+                        timeout=timeout,
+                        **kwargs,
+                    )
                 ):
                     yield chunk
                 return
 
             request = self._build_chat_request(
-                prompt, system_prompt, tools, temperature, stream,
-                messages=messages, max_tokens=max_tokens, top_p=top_p, stop=stop,
-                top_k=top_k, seed=seed, response_format=response_format,
-                tool_choice=tool_choice, extra_body=extra_body, metadata=metadata,
-                user=user, timeout=timeout, **kwargs,
+                prompt,
+                system_prompt,
+                tools,
+                temperature,
+                stream,
+                messages=messages,
+                max_tokens=max_tokens,
+                top_p=top_p,
+                stop=stop,
+                top_k=top_k,
+                seed=seed,
+                response_format=response_format,
+                tool_choice=tool_choice,
+                extra_body=extra_body,
+                metadata=metadata,
+                user=user,
+                timeout=timeout,
+                **kwargs,
             )
             if stream:
                 terminal_seen = False
@@ -2533,7 +2726,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 if not terminal_seen:
                     raise RuntimeError("Chat Completions 异步流在 finish 事件之前结束。")
             else:
-                response = await retry_async_call(lambda: aclient.chat.completions.create(**request))
+                response = await retry_async_call(
+                    lambda: aclient.chat.completions.create(**request)
+                )
                 self._raise_for_chat_response_error(
                     response,
                     provider=f"{getattr(self, '_provider', 'OpenAI-compatible')} Chat Completions",
@@ -2541,15 +2736,17 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 refusal = self._extract_refusal(response)
                 if refusal:
                     raise RuntimeError(f"{self._provider} Chat Completions 返回拒答: {refusal}")
-                choices = self._field(response, "choices", []) or []
+                choices = field(response, "choices", []) or []
                 if choices:
-                    message = self._field(choices[0], "message")
-                    content = self._field(message, "content")
+                    message = field(choices[0], "message")
+                    content = field(message, "content")
                     if content:
                         yield content_to_text(content)
-            
+
             duration = time.perf_counter() - start_time
-            logger.info(f"{self._provider} LLM ({self._model_name}) 异步调用完成，耗时: {duration:.2f}s")
+            logger.info(
+                f"{self._provider} LLM ({self._model_name}) 异步调用完成，耗时: {duration:.2f}s"
+            )
         except Exception as e:
             error_text = redact_sensitive_text(str(e))
             logger.exception(
@@ -2564,7 +2761,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
         retry=retry_if_exception(is_retryable_error),
-        reraise=True
+        reraise=True,
     )
     def embed_documents(self, texts: list[str], **kwargs: Any) -> list[list[float]]:
         """同步向量化文档。"""
@@ -2575,7 +2772,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             raise ValueError(f"{self._provider} Embedding 不允许覆盖请求字段: {', '.join(overlap)}")
         self._validate_embedding_kwargs(kwargs)
         client = self._get_client()
-        
+
         try:
             request: dict[str, Any] = {"input": texts, "model": self._model_name}
             configured_options = self._embedding_options()
@@ -2622,7 +2819,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
         retry=retry_if_exception(is_retryable_error),
-        reraise=True
+        reraise=True,
     )
     async def aembed_documents(self, texts: list[str], **kwargs: Any) -> list[list[float]]:
         """异步向量化文档。"""
@@ -2633,7 +2830,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             raise ValueError(f"{self._provider} Embedding 不允许覆盖请求字段: {', '.join(overlap)}")
         self._validate_embedding_kwargs(kwargs)
         aclient = self._get_aclient()
-        
+
         try:
             request: dict[str, Any] = {"input": texts, "model": self._model_name}
             configured_options = self._embedding_options()
@@ -2664,7 +2861,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             response = await self._resolve_async_result(aclient.embeddings.create(**request))
             embeddings = [normalize_embedding_vector(item.embedding) for item in response.data]
             duration = time.perf_counter() - start_time
-            logger.info(f"{self._provider} 嵌入 ({self._model_name}) 异步完成，耗时: {duration:.2f}s")
+            logger.info(
+                f"{self._provider} 嵌入 ({self._model_name}) 异步完成，耗时: {duration:.2f}s"
+            )
             return embeddings
         except Exception as e:
             error_text = redact_sensitive_text(str(e))
@@ -2706,9 +2905,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         files = getattr(self._get_client(), "files", None)
         method = getattr(files, "content", None)
         if not callable(method):
-            raise NotImplementedError(
-                "当前 OpenAI SDK 不提供文件内容读取资源（files.content）。"
-            )
+            raise NotImplementedError("当前 OpenAI SDK 不提供文件内容读取资源（files.content）。")
         return self._call_sdk_resource(
             method,
             args=(file_id,),
@@ -2756,9 +2953,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         }
         return self._call_sdk_resource(
             self._get_client().files.wait_for_processing,
-            kwargs=self._merge_resource_kwargs(
-                {"id": file_id}, poll_kwargs, "OpenAI 文件等待"
-            ),
+            kwargs=self._merge_resource_kwargs({"id": file_id}, poll_kwargs, "OpenAI 文件等待"),
             operation="OpenAI 文件等待",
         )
 
@@ -2872,7 +3067,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         if request is not None and kwargs:
             raise ValueError("stream_responses 不能同时传 request 和原生关键字参数。")
         if request is not None:
-            params = self._build_responses_request(**request.copy_with(stream=True).to_invoke_kwargs())
+            params = self._build_responses_request(
+                **request.copy_with(stream=True).to_invoke_kwargs()
+            )
             params.pop("stream", None)
         else:
             params = dict(kwargs)
@@ -2896,15 +3093,29 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         unsupported = {
             key: value
             for key, value in request.to_invoke_kwargs().items()
-            if key not in {
-                "prompt", "system_prompt", "messages", "tools", "tool_choice",
-                "parallel_tool_calls", "reasoning", "previous_response_id",
-                "personality", "response_format", "truncation", "conversation",
-                "extra_headers", "extra_query", "extra_body", "timeout",
+            if key
+            not in {
+                "prompt",
+                "system_prompt",
+                "messages",
+                "tools",
+                "tool_choice",
+                "parallel_tool_calls",
+                "reasoning",
+                "previous_response_id",
+                "personality",
+                "response_format",
+                "truncation",
+                "conversation",
+                "extra_headers",
+                "extra_query",
+                "extra_body",
+                "timeout",
                 # Shared generation defaults are not part of the token-count
                 # request, but accepting and dropping them is necessary for
                 # CompletionRequest compatibility. They are never forwarded.
-                "stream", "temperature",
+                "stream",
+                "temperature",
             }
         }
         reject_unsupported_kwargs("OpenAI Responses input token count", unsupported)
@@ -2956,7 +3167,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             kwargs=params,
             operation="OpenAI Responses 输入 token 统计",
         )
-        value = self._field(response, "input_tokens")
+        value = field(response, "input_tokens")
         if value is None:
             raise RuntimeError("OpenAI token count 响应缺少 input_tokens。")
         return int(value)
@@ -2983,7 +3194,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             operation="OpenAI Vector Store 列表",
         )
 
-    def search_vector_store(self, vector_store_id: str, query: str | list[str], **kwargs: Any) -> Any:
+    def search_vector_store(
+        self, vector_store_id: str, query: str | list[str], **kwargs: Any
+    ) -> Any:
         return self._call_sdk_resource(
             self._get_client().vector_stores.search,
             args=(vector_store_id,),
@@ -3019,7 +3232,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             operation="OpenAI Vector Store 文件创建",
         )
 
-    def create_vector_store_file_and_poll(self, vector_store_id: str, file_id: str, **kwargs: Any) -> Any:
+    def create_vector_store_file_and_poll(
+        self, vector_store_id: str, file_id: str, **kwargs: Any
+    ) -> Any:
         return self._call_sdk_resource(
             self._get_client().vector_stores.files.create_and_poll,
             args=(file_id,),
@@ -3042,9 +3257,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         """上传并挂载向量库文件，仅转发 SDK 支持的分块策略。"""
         reject_unsupported_kwargs("OpenAI 向量库文件上传", kwargs)
         upload_kwargs = (
-            {"chunking_strategy": chunking_strategy}
-            if chunking_strategy is not None
-            else {}
+            {"chunking_strategy": chunking_strategy} if chunking_strategy is not None else {}
         )
         return self._call_sdk_resource(
             self._get_client().vector_stores.files.upload,
@@ -3183,9 +3396,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             args=(file_id,),
             kwargs=self._merge_resource_kwargs(
                 {"vector_store_id": vector_store_id},
-                {"poll_interval_ms": poll_interval_ms}
-                if poll_interval_ms is not None
-                else {},
+                {"poll_interval_ms": poll_interval_ms} if poll_interval_ms is not None else {},
                 "OpenAI Vector Store 文件轮询",
             ),
             operation="OpenAI Vector Store 文件轮询",
@@ -3207,7 +3418,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             operation="OpenAI Vector Store 文件批次创建轮询",
         )
 
-    def retrieve_vector_store_file_batch(self, vector_store_id: str, batch_id: str, **kwargs: Any) -> Any:
+    def retrieve_vector_store_file_batch(
+        self, vector_store_id: str, batch_id: str, **kwargs: Any
+    ) -> Any:
         return self._call_sdk_resource(
             self._get_client().vector_stores.file_batches.retrieve,
             args=(batch_id,),
@@ -3219,7 +3432,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             operation="OpenAI Vector Store 文件批次读取",
         )
 
-    def cancel_vector_store_file_batch(self, vector_store_id: str, batch_id: str, **kwargs: Any) -> Any:
+    def cancel_vector_store_file_batch(
+        self, vector_store_id: str, batch_id: str, **kwargs: Any
+    ) -> Any:
         return self._call_sdk_resource(
             self._get_client().vector_stores.file_batches.cancel,
             args=(batch_id,),
@@ -3246,15 +3461,15 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             args=(batch_id,),
             kwargs=self._merge_resource_kwargs(
                 {"vector_store_id": vector_store_id},
-                {"poll_interval_ms": poll_interval_ms}
-                if poll_interval_ms is not None
-                else {},
+                {"poll_interval_ms": poll_interval_ms} if poll_interval_ms is not None else {},
                 "OpenAI Vector Store 文件批次轮询",
             ),
             operation="OpenAI Vector Store 文件批次轮询",
         )
 
-    def list_vector_store_file_batch_files(self, vector_store_id: str, batch_id: str, **kwargs: Any) -> Any:
+    def list_vector_store_file_batch_files(
+        self, vector_store_id: str, batch_id: str, **kwargs: Any
+    ) -> Any:
         return self._call_sdk_resource(
             self._get_client().vector_stores.file_batches.list_files,
             args=(batch_id,),
@@ -3324,18 +3539,14 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     def create_moderation(self, input: Any, **kwargs: Any) -> Any:
         return self._call_sdk_resource(
             self._get_client().moderations.create,
-            kwargs=self._merge_resource_kwargs(
-                {"input": input}, kwargs, "OpenAI Moderation 创建"
-            ),
+            kwargs=self._merge_resource_kwargs({"input": input}, kwargs, "OpenAI Moderation 创建"),
             operation="OpenAI Moderation 创建",
         )
 
     def generate_image(self, prompt: str, **kwargs: Any) -> Any:
         return self._call_sdk_resource(
             self._get_client().images.generate,
-            kwargs=self._merge_resource_kwargs(
-                {"prompt": prompt}, kwargs, "OpenAI 图片生成"
-            ),
+            kwargs=self._merge_resource_kwargs({"prompt": prompt}, kwargs, "OpenAI 图片生成"),
             operation="OpenAI 图片生成",
         )
 
@@ -3351,9 +3562,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     def create_image_variation(self, image: Any, **kwargs: Any) -> Any:
         return self._call_sdk_resource(
             self._get_client().images.create_variation,
-            kwargs=self._merge_resource_kwargs(
-                {"image": image}, kwargs, "OpenAI 图片变体"
-            ),
+            kwargs=self._merge_resource_kwargs({"image": image}, kwargs, "OpenAI 图片变体"),
             operation="OpenAI 图片变体",
         )
 
@@ -3468,9 +3677,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         return self._call_sdk_resource(
             self._get_client().videos.remix,
             args=(video_id,),
-            kwargs=self._merge_resource_kwargs(
-                {"prompt": prompt}, kwargs, "OpenAI 视频混剪"
-            ),
+            kwargs=self._merge_resource_kwargs({"prompt": prompt}, kwargs, "OpenAI 视频混剪"),
             operation="OpenAI 视频混剪",
         )
 
@@ -3488,7 +3695,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             args=(video_id,),
             kwargs={
                 "poll_interval_ms": poll_interval_ms,
-            } if poll_interval_ms is not None else {},
+            }
+            if poll_interval_ms is not None
+            else {},
             operation="OpenAI 视频轮询",
         )
 
@@ -3519,9 +3728,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         return self._call_sdk_resource(
             self._get_client().uploads.parts.create,
             args=(upload_id,),
-            kwargs=self._merge_resource_kwargs(
-                {"data": data}, kwargs, "OpenAI Upload 分片创建"
-            ),
+            kwargs=self._merge_resource_kwargs({"data": data}, kwargs, "OpenAI Upload 分片创建"),
             operation="OpenAI Upload 分片创建",
         )
 
@@ -3766,8 +3973,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         method = getattr(content, "retrieve", None)
         if not callable(method):
             raise NotImplementedError(
-                "当前 OpenAI SDK 不提供容器文件内容读取资源 "
-                "（containers.files.content.retrieve）。"
+                "当前 OpenAI SDK 不提供容器文件内容读取资源 （containers.files.content.retrieve）。"
             )
         return self._call_sdk_resource(
             method,
@@ -3972,9 +4178,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         files = getattr(self._get_aclient(), "files", None)
         method = getattr(files, "content", None)
         if not callable(method):
-            raise NotImplementedError(
-                "当前 OpenAI SDK 不提供文件内容读取资源（files.content）。"
-            )
+            raise NotImplementedError("当前 OpenAI SDK 不提供文件内容读取资源（files.content）。")
         return await self._call_async_sdk_resource(
             method,
             args=(file_id,),
@@ -4022,13 +4226,13 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         }
         return await self._call_async_sdk_resource(
             self._get_aclient().files.wait_for_processing,
-            kwargs=self._merge_resource_kwargs(
-                {"id": file_id}, poll_kwargs, "OpenAI 文件等待"
-            ),
+            kwargs=self._merge_resource_kwargs({"id": file_id}, poll_kwargs, "OpenAI 文件等待"),
             operation="OpenAI 文件等待",
         )
 
-    async def async_create_batch(self, input_file_id: str, endpoint: str | None = None, **kwargs: Any) -> Any:
+    async def async_create_batch(
+        self, input_file_id: str, endpoint: str | None = None, **kwargs: Any
+    ) -> Any:
         if self._protocol == "responses" and (
             endpoint is None or endpoint.rstrip("/") == "/v1/responses"
         ):
@@ -4115,13 +4319,17 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             operation="OpenAI Responses 连接",
         )
 
-    def async_stream_responses(self, request: CompletionRequest | None = None, **kwargs: Any) -> Any:
+    def async_stream_responses(
+        self, request: CompletionRequest | None = None, **kwargs: Any
+    ) -> Any:
         """返回 AsyncOpenAI Responses 流上下文管理器。"""
         self._require_responses_resource("stream_responses")
         if request is not None and kwargs:
             raise ValueError("async_stream_responses 不能同时传 request 和原生关键字参数。")
         if request is not None:
-            params = self._build_responses_request(**request.copy_with(stream=True).to_invoke_kwargs())
+            params = self._build_responses_request(
+                **request.copy_with(stream=True).to_invoke_kwargs()
+            )
             params.pop("stream", None)
         else:
             params = dict(kwargs)
@@ -4132,8 +4340,12 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             operation="OpenAI Responses 流",
         )
 
-    async def async_count_input_tokens(self, request: CompletionRequest | None = None, **kwargs: Any) -> int:
-        request = coerce_completion_request(request, kwargs, "OpenAI-compatible async_count_input_tokens")
+    async def async_count_input_tokens(
+        self, request: CompletionRequest | None = None, **kwargs: Any
+    ) -> int:
+        request = coerce_completion_request(
+            request, kwargs, "OpenAI-compatible async_count_input_tokens"
+        )
         self._require_responses_resource("count_input_tokens")
         params = self._build_token_count_request(request)
         response = await self._call_async_sdk_resource(
@@ -4141,7 +4353,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             kwargs=params,
             operation="OpenAI Responses 输入 token 统计",
         )
-        value = self._field(response, "input_tokens")
+        value = field(response, "input_tokens")
         if value is None:
             raise RuntimeError("OpenAI token count 响应缺少 input_tokens。")
         return int(value)
@@ -4168,7 +4380,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             operation="OpenAI Vector Store 列表",
         )
 
-    async def async_search_vector_store(self, vector_store_id: str, query: Any, **kwargs: Any) -> Any:
+    async def async_search_vector_store(
+        self, vector_store_id: str, query: Any, **kwargs: Any
+    ) -> Any:
         return await self._call_async_sdk_resource(
             self._get_aclient().vector_stores.search,
             args=(vector_store_id,),
@@ -4194,7 +4408,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             operation="OpenAI Vector Store 更新",
         )
 
-    async def async_create_vector_store_file(self, vector_store_id: str, file_id: str, **kwargs: Any) -> Any:
+    async def async_create_vector_store_file(
+        self, vector_store_id: str, file_id: str, **kwargs: Any
+    ) -> Any:
         return await self._call_async_sdk_resource(
             self._get_aclient().vector_stores.files.create,
             args=(vector_store_id,),
@@ -4204,7 +4420,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             operation="OpenAI Vector Store 文件创建",
         )
 
-    async def async_create_vector_store_file_and_poll(self, vector_store_id: str, file_id: str, **kwargs: Any) -> Any:
+    async def async_create_vector_store_file_and_poll(
+        self, vector_store_id: str, file_id: str, **kwargs: Any
+    ) -> Any:
         return await self._call_async_sdk_resource(
             self._get_aclient().vector_stores.files.create_and_poll,
             args=(file_id,),
@@ -4227,9 +4445,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         """异步上传并挂载向量库文件，仅转发 SDK 支持的分块策略。"""
         reject_unsupported_kwargs("OpenAI 向量库文件上传", kwargs)
         upload_kwargs = (
-            {"chunking_strategy": chunking_strategy}
-            if chunking_strategy is not None
-            else {}
+            {"chunking_strategy": chunking_strategy} if chunking_strategy is not None else {}
         )
         return await self._call_async_sdk_resource(
             self._get_aclient().vector_stores.files.upload,
@@ -4272,7 +4488,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             operation="OpenAI Vector Store 文件上传轮询",
         )
 
-    async def async_retrieve_vector_store_file(self, vector_store_id: str, file_id: str, **kwargs: Any) -> Any:
+    async def async_retrieve_vector_store_file(
+        self, vector_store_id: str, file_id: str, **kwargs: Any
+    ) -> Any:
         return await self._call_async_sdk_resource(
             self._get_aclient().vector_stores.files.retrieve,
             args=(file_id,),
@@ -4329,7 +4547,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             operation="OpenAI Vector Store 文件更新",
         )
 
-    async def async_delete_vector_store_file(self, vector_store_id: str, file_id: str, **kwargs: Any) -> Any:
+    async def async_delete_vector_store_file(
+        self, vector_store_id: str, file_id: str, **kwargs: Any
+    ) -> Any:
         return await self._call_async_sdk_resource(
             self._get_aclient().vector_stores.files.delete,
             args=(file_id,),
@@ -4341,7 +4561,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             operation="OpenAI Vector Store 文件删除",
         )
 
-    async def async_vector_store_file_content(self, vector_store_id: str, file_id: str, **kwargs: Any) -> Any:
+    async def async_vector_store_file_content(
+        self, vector_store_id: str, file_id: str, **kwargs: Any
+    ) -> Any:
         return await self._call_async_sdk_resource(
             self._get_aclient().vector_stores.files.content,
             args=(file_id,),
@@ -4368,15 +4590,15 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             args=(file_id,),
             kwargs=self._merge_resource_kwargs(
                 {"vector_store_id": vector_store_id},
-                {"poll_interval_ms": poll_interval_ms}
-                if poll_interval_ms is not None
-                else {},
+                {"poll_interval_ms": poll_interval_ms} if poll_interval_ms is not None else {},
                 "OpenAI Vector Store 文件轮询",
             ),
             operation="OpenAI Vector Store 文件轮询",
         )
 
-    async def async_create_vector_store_file_batch(self, vector_store_id: str, **kwargs: Any) -> Any:
+    async def async_create_vector_store_file_batch(
+        self, vector_store_id: str, **kwargs: Any
+    ) -> Any:
         return await self._call_async_sdk_resource(
             self._get_aclient().vector_stores.file_batches.create,
             args=(vector_store_id,),
@@ -4384,7 +4606,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             operation="OpenAI Vector Store 文件批次创建",
         )
 
-    async def async_create_vector_store_file_batch_and_poll(self, vector_store_id: str, **kwargs: Any) -> Any:
+    async def async_create_vector_store_file_batch_and_poll(
+        self, vector_store_id: str, **kwargs: Any
+    ) -> Any:
         return await self._call_async_sdk_resource(
             self._get_aclient().vector_stores.file_batches.create_and_poll,
             args=(vector_store_id,),
@@ -4392,7 +4616,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             operation="OpenAI Vector Store 文件批次创建轮询",
         )
 
-    async def async_retrieve_vector_store_file_batch(self, vector_store_id: str, batch_id: str, **kwargs: Any) -> Any:
+    async def async_retrieve_vector_store_file_batch(
+        self, vector_store_id: str, batch_id: str, **kwargs: Any
+    ) -> Any:
         return await self._call_async_sdk_resource(
             self._get_aclient().vector_stores.file_batches.retrieve,
             args=(batch_id,),
@@ -4404,7 +4630,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             operation="OpenAI Vector Store 文件批次读取",
         )
 
-    async def async_cancel_vector_store_file_batch(self, vector_store_id: str, batch_id: str, **kwargs: Any) -> Any:
+    async def async_cancel_vector_store_file_batch(
+        self, vector_store_id: str, batch_id: str, **kwargs: Any
+    ) -> Any:
         return await self._call_async_sdk_resource(
             self._get_aclient().vector_stores.file_batches.cancel,
             args=(batch_id,),
@@ -4431,15 +4659,15 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             args=(batch_id,),
             kwargs=self._merge_resource_kwargs(
                 {"vector_store_id": vector_store_id},
-                {"poll_interval_ms": poll_interval_ms}
-                if poll_interval_ms is not None
-                else {},
+                {"poll_interval_ms": poll_interval_ms} if poll_interval_ms is not None else {},
                 "OpenAI Vector Store 文件批次轮询",
             ),
             operation="OpenAI Vector Store 文件批次轮询",
         )
 
-    async def async_list_vector_store_file_batch_files(self, vector_store_id: str, batch_id: str, **kwargs: Any) -> Any:
+    async def async_list_vector_store_file_batch_files(
+        self, vector_store_id: str, batch_id: str, **kwargs: Any
+    ) -> Any:
         return await self._call_async_sdk_resource(
             self._get_aclient().vector_stores.file_batches.list_files,
             args=(batch_id,),
@@ -4474,9 +4702,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             }.items()
             if value is not None
         }
-        upload_and_poll = cast(
-            Any, self._get_aclient().vector_stores.file_batches.upload_and_poll
-        )
+        upload_and_poll = cast(Any, self._get_aclient().vector_stores.file_batches.upload_and_poll)
         return await self._call_async_sdk_resource(
             upload_and_poll,
             kwargs=self._merge_resource_kwargs(
@@ -4511,18 +4737,14 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     async def async_create_moderation(self, input: Any, **kwargs: Any) -> Any:
         return await self._call_async_sdk_resource(
             self._get_aclient().moderations.create,
-            kwargs=self._merge_resource_kwargs(
-                {"input": input}, kwargs, "OpenAI Moderation 创建"
-            ),
+            kwargs=self._merge_resource_kwargs({"input": input}, kwargs, "OpenAI Moderation 创建"),
             operation="OpenAI Moderation 创建",
         )
 
     async def async_generate_image(self, prompt: str, **kwargs: Any) -> Any:
         return await self._call_async_sdk_resource(
             self._get_aclient().images.generate,
-            kwargs=self._merge_resource_kwargs(
-                {"prompt": prompt}, kwargs, "OpenAI 图片生成"
-            ),
+            kwargs=self._merge_resource_kwargs({"prompt": prompt}, kwargs, "OpenAI 图片生成"),
             operation="OpenAI 图片生成",
         )
 
@@ -4538,9 +4760,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     async def async_create_image_variation(self, image: Any, **kwargs: Any) -> Any:
         return await self._call_async_sdk_resource(
             self._get_aclient().images.create_variation,
-            kwargs=self._merge_resource_kwargs(
-                {"image": image}, kwargs, "OpenAI 图片变体"
-            ),
+            kwargs=self._merge_resource_kwargs({"image": image}, kwargs, "OpenAI 图片变体"),
             operation="OpenAI 图片变体",
         )
 
@@ -4657,9 +4877,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         return await self._call_async_sdk_resource(
             self._get_aclient().videos.remix,
             args=(video_id,),
-            kwargs=self._merge_resource_kwargs(
-                {"prompt": prompt}, kwargs, "OpenAI 视频混剪"
-            ),
+            kwargs=self._merge_resource_kwargs({"prompt": prompt}, kwargs, "OpenAI 视频混剪"),
             operation="OpenAI 视频混剪",
         )
 
@@ -4677,7 +4895,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             args=(video_id,),
             kwargs={
                 "poll_interval_ms": poll_interval_ms,
-            } if poll_interval_ms is not None else {},
+            }
+            if poll_interval_ms is not None
+            else {},
             operation="OpenAI 视频轮询",
         )
 
@@ -4708,9 +4928,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         return await self._call_async_sdk_resource(
             self._get_aclient().uploads.parts.create,
             args=(upload_id,),
-            kwargs=self._merge_resource_kwargs(
-                {"data": data}, kwargs, "OpenAI Upload 分片创建"
-            ),
+            kwargs=self._merge_resource_kwargs({"data": data}, kwargs, "OpenAI Upload 分片创建"),
             operation="OpenAI Upload 分片创建",
         )
 
@@ -4830,7 +5048,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             operation="OpenAI Conversation 项目列表",
         )
 
-    async def async_create_conversation_items(self, conversation_id: str, items: Any, **kwargs: Any) -> Any:
+    async def async_create_conversation_items(
+        self, conversation_id: str, items: Any, **kwargs: Any
+    ) -> Any:
         return await self._call_async_sdk_resource(
             self._get_aclient().conversations.items.create,
             args=(conversation_id,),
@@ -4840,7 +5060,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             operation="OpenAI Conversation 项目创建",
         )
 
-    async def async_retrieve_conversation_item(self, conversation_id: str, item_id: str, **kwargs: Any) -> Any:
+    async def async_retrieve_conversation_item(
+        self, conversation_id: str, item_id: str, **kwargs: Any
+    ) -> Any:
         return await self._call_async_sdk_resource(
             self._get_aclient().conversations.items.retrieve,
             args=(item_id,),
@@ -4852,7 +5074,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             operation="OpenAI Conversation 项目读取",
         )
 
-    async def async_delete_conversation_item(self, conversation_id: str, item_id: str, **kwargs: Any) -> Any:
+    async def async_delete_conversation_item(
+        self, conversation_id: str, item_id: str, **kwargs: Any
+    ) -> Any:
         return await self._call_async_sdk_resource(
             self._get_aclient().conversations.items.delete,
             args=(item_id,),
@@ -4925,7 +5149,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             operation="OpenAI Container 文件列表",
         )
 
-    async def async_retrieve_container_file(self, container_id: str, file_id: str, **kwargs: Any) -> Any:
+    async def async_retrieve_container_file(
+        self, container_id: str, file_id: str, **kwargs: Any
+    ) -> Any:
         return await self._call_async_sdk_resource(
             self._get_aclient().containers.files.retrieve,
             args=(file_id,),
@@ -4937,7 +5163,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             operation="OpenAI Container 文件读取",
         )
 
-    async def async_delete_container_file(self, container_id: str, file_id: str, **kwargs: Any) -> Any:
+    async def async_delete_container_file(
+        self, container_id: str, file_id: str, **kwargs: Any
+    ) -> Any:
         return await self._call_async_sdk_resource(
             self._get_aclient().containers.files.delete,
             args=(file_id,),
@@ -4949,14 +5177,15 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             operation="OpenAI Container 文件删除",
         )
 
-    async def async_container_file_content(self, container_id: str, file_id: str, **kwargs: Any) -> Any:
+    async def async_container_file_content(
+        self, container_id: str, file_id: str, **kwargs: Any
+    ) -> Any:
         files = getattr(getattr(self._get_aclient(), "containers", None), "files", None)
         content = getattr(files, "content", None)
         method = getattr(content, "retrieve", None)
         if not callable(method):
             raise NotImplementedError(
-                "当前 OpenAI SDK 不提供容器文件内容读取资源 "
-                "（containers.files.content.retrieve）。"
+                "当前 OpenAI SDK 不提供容器文件内容读取资源 （containers.files.content.retrieve）。"
             )
         return await self._call_async_sdk_resource(
             method,
@@ -5107,7 +5336,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             operation="OpenAI Eval Run 删除",
         )
 
-    async def async_list_eval_run_output_items(self, eval_id: str, run_id: str, **kwargs: Any) -> Any:
+    async def async_list_eval_run_output_items(
+        self, eval_id: str, run_id: str, **kwargs: Any
+    ) -> Any:
         return await self._call_async_sdk_resource(
             self._get_aclient().evals.runs.output_items.list,
             args=(run_id,),
