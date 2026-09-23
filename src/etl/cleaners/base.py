@@ -3,8 +3,9 @@
 # 遵循修改后的 Apache License 2.0 许可证。详情请参阅项目根目录下的 DIFY_LICENSE 文件。
 
 from abc import ABC, abstractmethod
-from typing import List
+
 from src.models.document import Document
+
 
 class BaseCleaner(ABC):
     """
@@ -13,7 +14,7 @@ class BaseCleaner(ABC):
     """
 
     @abstractmethod
-    def clean(self, documents: List[Document], **kwargs) -> List[Document]:
+    def clean(self, documents: list[Document], **kwargs) -> list[Document]:
         """
         对文档列表中的文本内容进行清洗。
 
@@ -24,4 +25,3 @@ class BaseCleaner(ABC):
         Returns:
             List[Document]: 清洗后的文档对象列表。
         """
-        pass

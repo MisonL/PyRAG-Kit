@@ -1,6 +1,16 @@
 import numpy as np
+import pytest
 
 from src.retrieval.vdb.faiss_store import FaissStore
+
+
+def test_faiss_store_rejects_snapshot_without_embeddings_before_writing_npy(tmp_path):
+    store = FaissStore(file_path=None)
+
+    with pytest.raises(RuntimeError, match="语义索引为空"):
+        store.save_snapshot(str(tmp_path / "snapshot"))
+
+    assert not (tmp_path / "snapshot" / "embeddings.npy").exists()
 
 
 def test_faiss_store_persists_parent_sidecar_snapshot_roundtrip(tmp_path):
@@ -34,3 +44,13 @@ def test_faiss_store_persists_parent_sidecar_snapshot_roundtrip(tmp_path):
     assert reloaded.resolve_parent_content("parent-1") == "parent content"
     assert reloaded.parent_documents["parent-1"]["metadata"]["source"] == "kb.md"
     assert reloaded.documents[0]["metadata"]["parent_id"] == "parent-1"
+
+
+def test_faiss_store_rejects_query_dimension_mismatch():
+    store = FaissStore(file_path=None)
+    store.documents = [{"page_content": "doc", "metadata": {}}]
+    store.embeddings = np.array([[0.0, 0.0]], dtype=np.float32)
+    store._rebuild_indices()
+
+    with pytest.raises(ValueError, match="维度"):
+        store.semantic_search([0.0, 0.0, 0.0])

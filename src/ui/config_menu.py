@@ -1,17 +1,17 @@
-# -*- coding: utf-8 -*-
+from typing import Any
+
 import questionary
 from rich.console import Console
 from rich.panel import Panel
-from typing import Dict, Any, Tuple
 
-from ..utils.config import get_settings, RetrievalMethod # 导入 get_settings 函数
+from ..utils.config import RetrievalMethod
+from ..utils.log_manager import get_module_logger  # 导入日志管理器
 from .display_utils import display_chat_config
-from ..utils.log_manager import get_module_logger # 导入日志管理器
 
 logger = get_module_logger(__name__) # 获取当前模块的日志器
 console = Console()
 
-def edit_retrieval_params(chat_config: Dict[str, Any]) -> None:
+def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
     """编辑检索相关参数。"""
     logger.info("进入检索参数编辑菜单。")
     while True:
@@ -132,9 +132,8 @@ def edit_retrieval_params(chat_config: Dict[str, Any]) -> None:
                 console.print(f"[green]候选过量招募倍率已更新为: {new_multiplier}[/green]")
                 logger.info(f"候选过量招募倍率已更新为: {new_multiplier}")
     # 检索参数的更改不需要重载任何模型
-    return None
 
-def edit_model_params(chat_config: Dict[str, Any]) -> bool:
+def edit_model_params(chat_config: dict[str, Any]) -> bool:
     """编辑模型相关参数。"""
     logger.info("进入模型参数编辑菜单。")
     llm_changed = False
@@ -185,7 +184,7 @@ def edit_model_params(chat_config: Dict[str, Any]) -> bool:
 
     return llm_changed
 
-def launch_config_editor(chat_config: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+def launch_config_editor(chat_config: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
     """
     启动交互式配置编辑器。
     返回一个元组 (llm_needs_reload, updated_config)

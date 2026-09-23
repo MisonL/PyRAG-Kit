@@ -1,27 +1,34 @@
-import pytest
+import sys  # 导入 sys 模块
+from collections.abc import AsyncGenerator, Generator
+from typing import Any
 from unittest.mock import MagicMock, patch
-from typing import Any, Generator, List, AsyncGenerator
-import sys # 导入 sys 模块
 
-from src.utils.config import Settings, get_settings
-from src.providers.__base__.model_provider import LargeLanguageModel, TextEmbeddingModel, RerankModel
-from src.models.document import Document
-from src.utils.config import ModelDetail
-from src.providers.factory import ModelProviderFactory # 在这里导入 ModelProviderFactory
+import pytest
+
+from src.providers.__base__.model_provider import (
+    LargeLanguageModel,
+    RerankModel,
+    TextEmbeddingModel,
+)
+from src.providers.factory import (
+    ModelProviderFactory,  # 在这里导入 ModelProviderFactory
+)
+from src.utils.config import ModelDetail, Settings
+
 
 # Mock 类定义
 class MockLLMProvider(LargeLanguageModel):
     def __init__(self, model_name: str):
         self.model_name = model_name
 
-    def invoke(self, prompt: str, system_prompt: str | None = "You are a helpful assistant.", tools: List[dict[str, Any]] | None = None, stream: bool = True, temperature: float = 0.7) -> Generator[str, None, None]:
+    def invoke(self, prompt: str, system_prompt: str | None = "You are a helpful assistant.", tools: list[dict[str, Any]] | None = None, stream: bool = True, temperature: float = 0.7) -> Generator[str, None, None]:
         """模拟 LLM 聊天响应"""
         if stream:
             yield f"Mock LLM stream response for {self.model_name}"
         else:
             yield f"Mock LLM response for {self.model_name}"
 
-    async def ainvoke(self, prompt: str, system_prompt: str | None = "You are a helpful assistant.", tools: List[dict[str, Any]] | None = None, stream: bool = True, temperature: float = 0.7) -> AsyncGenerator[str, None]:
+    async def ainvoke(self, prompt: str, system_prompt: str | None = "You are a helpful assistant.", tools: list[dict[str, Any]] | None = None, stream: bool = True, temperature: float = 0.7) -> AsyncGenerator[str, None]:
         """模拟异步 LLM 聊天响应"""
         if stream:
             yield f"Mock Async LLM stream response for {self.model_name}"
@@ -67,13 +74,15 @@ def mock_settings():
     mock_embedding_config = ModelDetail(provider="mock_embedding", model_name="mock-embedding-model")
     mock_rerank_config = ModelDetail(provider="mock_rerank", model_name="mock-rerank-model")
     mock_siliconflow_rerank_config = ModelDetail(provider="siliconflow", model_name="mock-siliconflow-rerank-model")
+    mock_qwen_rerank_config = ModelDetail(provider="qwen", model_name="qwen-rerank-model")
 
     mock_settings_instance = MagicMock(spec=Settings)
     mock_settings_instance.llm_configurations = {"default_llm": mock_llm_config}
     mock_settings_instance.embedding_configurations = {"default_embedding": mock_embedding_config}
     mock_settings_instance.rerank_configurations = {
         "default_rerank": mock_rerank_config,
-        "siliconflow_rerank_key": mock_siliconflow_rerank_config
+        "siliconflow_rerank_key": mock_siliconflow_rerank_config,
+        "qwen_rerank_key": mock_qwen_rerank_config,
     }
     mock_settings_instance.siliconflow_api_key = "mock_siliconflow_api_key"
     mock_settings_instance.siliconflow_base_url = "http://mock-siliconflow-base-url.com"
@@ -107,7 +116,9 @@ def patch_settings(mock_settings, monkeypatch):
                 del sys.modules[module_name]
 
         # 重新导入 ModelProviderFactory，确保它加载的是最新的版本
-        from src.providers.factory import ModelProviderFactory as ReloadedModelProviderFactory
+        from src.providers.factory import (
+            ModelProviderFactory as ReloadedModelProviderFactory,
+        )
         
         # 直接模拟 _get_provider_class 方法
         def mock_get_provider_class(provider_name: str):
@@ -115,11 +126,9 @@ def patch_settings(mock_settings, monkeypatch):
                 return MockLLMProvider
             elif provider_name == "mock_embedding":
                 return MockEmbeddingProvider
-            elif provider_name == "mock_rerank":
+            elif provider_name == "mock_rerank" or provider_name == "siliconflow_rerank":
                 return MockRerankProvider
-            elif provider_name == "siliconflow_rerank":
-                return MockRerankProvider
-            elif provider_name == "google":
+            elif provider_name == "google" or provider_name == "qwen":
                 return MockLLMProvider
             else:
                 raise ValueError(f"不支持的模型提供商: {provider_name}")
@@ -143,6 +152,50 @@ def test_get_llm_provider_not_found():
     with pytest.raises(ValueError, match="在LLM配置中未找到key: non_existent_key"):
         ModelProviderFactory.get_llm_provider("non_existent_key")
 
+
+def test_factory_uses_explicit_configuration_mapping():
+    configurations = {"custom": ModelDetail(provider="mock_llm", model_name="custom-model")}
+
+    provider = ModelProviderFactory.get_llm_provider("custom", configurations)
+
+    assert provider.model_name == "custom-model"
+
+
+def test_factory_does_not_pass_fixed_protocol_to_provider_constructor():
+    configurations = {
+        "google-model": ModelDetail(
+            provider="google", model_name="gemini-model", protocol="generate_content"
+        )
+    }
+
+    provider = ModelProviderFactory.get_llm_provider("google-model", configurations)
+
+    assert isinstance(provider, MockLLMProvider)
+    assert provider.model_name == "gemini-model"
+
+
+def test_factory_normalizes_direct_string_protocol_values():
+    provider = ModelProviderFactory._create_provider(
+        "mock_llm",
+        "mock-model",
+        "llm",
+        LargeLanguageModel,
+        protocol="chat",
+    )
+
+    assert isinstance(provider, MockLLMProvider)
+
+
+def test_factory_rejects_options_for_provider_without_options_parameter():
+    with pytest.raises(ValueError, match="不支持 options"):
+        ModelProviderFactory._create_provider(
+            "mock_embedding",
+            "mock-model",
+            "embedding",
+            TextEmbeddingModel,
+            options={"dimensions": 2},
+        )
+
 def test_get_embedding_provider_success():
     """测试成功获取 Embedding 提供商"""
     embedding_provider = ModelProviderFactory.get_embedding_provider("default_embedding")
@@ -153,6 +206,35 @@ def test_get_embedding_provider_not_found():
     """测试获取不存在的 Embedding 提供商时抛出 ValueError"""
     with pytest.raises(ValueError, match="在Embedding配置中未找到key: non_existent_key"):
         ModelProviderFactory.get_embedding_provider("non_existent_key")
+
+
+def test_get_embedding_provider_rejects_llm_only_provider():
+    configurations = {"chat-only": ModelDetail(provider="deepseek", model_name="deepseek-chat")}
+
+    with pytest.raises(TypeError, match="提供商 deepseek 不支持 embedding 能力"):
+        ModelProviderFactory.get_embedding_provider("chat-only", configurations)
+
+
+def test_get_embedding_provider_rejects_protocol_configuration():
+    configurations = {
+        "embedding": ModelDetail(
+            provider="mock_embedding", model_name="embedding-model", protocol="responses"
+        )
+    }
+
+    with pytest.raises(ValueError, match="Embedding 配置不支持 protocol"):
+        ModelProviderFactory.get_embedding_provider("embedding", configurations)
+
+
+def test_get_rerank_provider_rejects_protocol_configuration():
+    configurations = {
+        "rerank": ModelDetail(
+            provider="mock_rerank", model_name="rerank-model", protocol="responses"
+        )
+    }
+
+    with pytest.raises(ValueError, match="Rerank 配置不支持 protocol"):
+        ModelProviderFactory.get_rerank_provider("rerank", configurations)
 
 def test_get_rerank_provider_success():
     """测试成功获取 Rerank 提供商"""
@@ -170,6 +252,11 @@ def test_get_rerank_provider_not_found():
     """测试获取不存在的 Rerank 提供商时抛出 ValueError"""
     with pytest.raises(ValueError, match="在Rerank配置中未找到key: non_existent_key"):
         ModelProviderFactory.get_rerank_provider("non_existent_key")
+
+
+def test_get_rerank_provider_rejects_provider_without_rerank_capability():
+    with pytest.raises(TypeError, match="提供商 qwen 不支持 rerank 能力"):
+        ModelProviderFactory.get_rerank_provider("qwen_rerank_key")
 
 def test_unsupported_provider_type():
     """测试 _get_provider_class 方法处理不支持的提供商名称"""

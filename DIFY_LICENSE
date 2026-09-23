@@ -15,7 +15,11 @@ b. LOGO and copyright information: In the process of using Dify's frontend, you 
 a. The producer can adjust the open-source agreement to be more strict or relaxed as deemed necessary.
 b. Your contributed code may be used for commercial purposes, including but not limited to its cloud business operations.
 
-Apart from the specific conditions mentioned above, all other rights and restrictions follow the Apache License 2.0. Detailed information about the Apache License 2.0 can be found at http://www.apache.org/licenses/LICENSE-2.0.
+Apart from the specific conditions mentioned above, all other rights and restrictions follow the Apache License 2.0.
+
+A copy of the Apache License 2.0 is included in this repository at `licenses/APACHE-2.0.txt`
+and is redistributed with every release bundle, as required by section 4(a) of that license.
+The canonical text is also available at http://www.apache.org/licenses/LICENSE-2.0.
 
 The interactive design of this product is protected by appearance patent.
 

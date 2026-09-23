@@ -44,19 +44,50 @@ cp .env.example .env
 ```
 
 ```dotenv
-OPENAI_API_KEY="sk-xxxxxxxxxxxxxxxxxxxx"
+OPENAI_API_KEY="your-openai-api-key"
 GOOGLE_API_KEY="AIza..."
+# 也可使用 google-genai 官方别名；同时设置时 GOOGLE_API_KEY 优先
+# GEMINI_API_KEY="AIza..."
 ```
 
 `.env` 中的同名键会覆盖 `config.toml`。
+
+Google Vertex AI 使用 Application Default Credentials（ADC）时，不要把凭证对象或密钥内容写入 `config.toml`。
+请在运行环境中完成 `gcloud auth application-default login`，或设置服务账号文件路径，并显式选择 Vertex 模式：
+
+```dotenv
+GOOGLE_GENAI_USE_VERTEXAI="true"
+GOOGLE_CLOUD_PROJECT="your-project-id"
+GOOGLE_CLOUD_LOCATION="us-central1"
+# 可选：改用服务账号文件；文件本身不要提交到仓库
+GOOGLE_APPLICATION_CREDENTIALS="/absolute/path/service-account.json"
+```
+
+没有 `GOOGLE_API_KEY` 时，`GOOGLE_GENAI_USE_VERTEXAI=true` 会让 Provider 使用 Vertex ADC；`ModelDetail.options` 只接受非敏感参数，不能用来保存 `credentials`。
 
 如果您使用 OpenAI 兼容渠道，可以这样配置：
 
 ```dotenv
 OPENAI_API_KEY="sk-..."
-OPENAI_API_BASE="https://apis.iflow.cn/v1"
-DEFAULT_LLM_PROVIDER="iflow-qwen3-max"
+OPENAI_API_BASE="https://api.openai.com/v1"
+DEFAULT_LLM_PROVIDER="openai"
 ```
+
+`.env` 中的 `OPENAI_API_BASE` 会覆盖 `config.toml` 的 `openai_api_base`，适合把流量指向代理、中转或自建网关。
+注意 `provider = "openai"` 的条目都会走这个 Base URL，因此指向网关时，`model_name` 必须是该网关实际提供的模型 ID。
+
+### 旧端点升级提示
+
+配置加载时会对已知失效的旧端点发出显式警告，而不是让请求在运行期失败：
+
+- `qwen_base_url` 为 `https://dashscope.aliyuncs.com/api/v1` 时会提示改为 `compatible-mode/v1`。
+  DashScope 原生 `/api/v1` 本身仍在服务，但它的路径是
+  `/services/aigc/text-generation/generation`，不提供本项目按 OpenAI 兼容协议请求的
+  `{base_url}/chat/completions`。
+- `volc_base_url` 为 `https://maas-api.ml-platform-cn-beijing.volces.com` 时会提示改为
+  `https://ark.cn-beijing.volces.com/api/v3`；旧域名已停止服务。
+
+自建或代理端点不受影响，警告只针对上述精确匹配的旧值。
 
 ## 主要字段
 
@@ -102,7 +133,7 @@ DEFAULT_LLM_PROVIDER="iflow-qwen3-max"
 ```toml
 [llm_configurations.demo]
 provider = "openai"
-model_name = "gpt-4o"
+model_name = "gpt-5.6-sol"
 ```
 
 - `llm_configurations`: 聊天模型
@@ -120,3 +151,17 @@ model_name = "local-hash-256"
 ```
 
 它用于本地可复现验证，不依赖外部 Embedding API。
+
+### 切换 Embedding 需重建快照
+
+活动快照的 `manifest.toml` 会记录构建时的 `embedding_provider` 与 `embedding_model`。
+加载快照时框架会核对两者是否与当前运行配置一致，不一致会显式报错：
+
+```
+活动知识快照的 embedding 配置与当前运行配置不一致:
+快照=<provider>/<model>，当前=<provider>/<model>。请重建知识快照或切换回原 embedding 配置。
+```
+
+这是刻意的硬性检查：不同模型的向量空间不兼容，静默复用旧索引会产出错误的检索结果。
+切换 Embedding 模型（包括同一 provider 内换模型，例如 `text-embedding-004` → `gemini-embedding-2`）
+后必须重建知识快照。

@@ -1,13 +1,14 @@
-import pytest
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from src.etl.pipeline import Pipeline
-from src.etl.extractors.markdown_extractor import MarkdownExtractor
+import pytest
+
 from src.etl.cleaners.basic_cleaner import BasicCleaner
+from src.etl.extractors.markdown_extractor import MarkdownExtractor
+from src.etl.pipeline import Pipeline
 from src.etl.splitters.recursive_text_splitter import RecursiveTextSplitter
 from src.models.document import Document
-from src.utils.config import get_settings # 导入 get_settings 函数
+from src.utils.config import get_settings  # 导入 get_settings 函数
 
 # 用于测试的 Markdown 示例内容
 SAMPLE_MARKDOWN = """
