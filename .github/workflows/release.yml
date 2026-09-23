@@ -95,6 +95,34 @@ jobs:
             echo "version=${version}" >> "${GITHUB_OUTPUT}"
           fi
 
+      - name: Validate version metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.release_meta.outputs.tag }}"
+          version="${{ steps.release_meta.outputs.version }}"
+
+          # 手动 workflow_dispatch 的 tag/version 是手填的，必须与仓库中的
+          # 唯一真源交叉校验：否则会发出一个版本号与产物/说明不符的 release。
+          pyproject_version="$(python -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")"
+          if [ "${version}" != "${pyproject_version}" ]; then
+            echo "版本不匹配: 输入 ${version} vs pyproject.toml ${pyproject_version}" >&2
+            exit 1
+          fi
+
+          expected_tag="v${pyproject_version}"
+          if [ "${tag}" != "${expected_tag}" ]; then
+            echo "标签不匹配: 输入 ${tag} vs 期望 ${expected_tag}" >&2
+            exit 1
+          fi
+
+          # CHANGELOG 必须已有该版本条目（extract_release_notes 也会检查，
+          # 但在这里提前失败能给出更清楚的错误位置）。
+          if ! grep -q "^## \[${pyproject_version}\]" CHANGELOG.md; then
+            echo "CHANGELOG.md 中未找到版本 ${pyproject_version} 的条目。" >&2
+            exit 1
+          fi
+
       - name: Extract release notes
         run: python scripts/extract_release_notes.py --version "${{ steps.release_meta.outputs.version }}" --output RELEASE_NOTES.md
 

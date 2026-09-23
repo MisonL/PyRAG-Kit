@@ -1787,10 +1787,6 @@ class LargeLanguageModel(ABC):
             if _is_provider_resource_method(name, method):
                 setattr(cls, name, _guard_provider_resource_method(method))
 
-    @classmethod
-    def supports(cls, capability: str) -> bool:
-        return capability in cls.capabilities
-
     def _require_provider_resource(
         self, method_name: str, kwargs: Mapping[str, Any] | None = None
     ) -> None:

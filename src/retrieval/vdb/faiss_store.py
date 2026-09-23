@@ -32,8 +32,6 @@ jieba.setLogLevel(jieba.logging.ERROR)
 
 class FaissStore(VectorStoreBase):
     def __init__(self, file_path: str | None = None):
-        import asyncio
-
         self.file_path = file_path
         self.documents: list[dict[str, Any]] = []
         self.embeddings: np.ndarray | None = None
@@ -41,7 +39,6 @@ class FaissStore(VectorStoreBase):
         self._tokenized_docs_cache: list[list[str]] = []
         self.bm25_index: BM25Okapi | None = None
         self.faiss_index: faiss.Index | None = None
-        self.lock = asyncio.Lock()
 
         if self.file_path and os.path.exists(self.file_path):
             self.load(self.file_path)

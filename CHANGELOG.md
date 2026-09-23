@@ -84,6 +84,15 @@
 - 修复 Ark Chat Completions 工具调用缺 `type` 键：`VolcengineProvider._extract_result` 的 Chat Completions 分支只产出 `{"id", "name", "arguments"}`，而同一函数的 Responses 分支与 `openai_compatible.py` 的 `_extract_tool_calls` 都产出契约声明的扁平 `{"id", "type", "name", "arguments"}`（`model_provider.py:343` 与 `docs/user_guide/llm-providers.md:108` 双重写明）。调用方按契约回填 `role=tool` 历史时会配不上；现补 `type`（缺省 `function`）并新增两条钉住该键与逐键对齐 OpenAI 兼容侧的回归测试。
 - 数值配置补齐加载期校验：`log_retention_days`、`kb_chunk_size`、`kb_chunk_overlap`、`kb_child_chunk_size`、`kb_child_chunk_overlap`、`kb_embedding_batch_size`、`chat_vector_weight`、`chat_keyword_weight` 此前接受任意数值，`kb_chunk_size=0` 会一路通过配置校验、直到 langchain 在分片阶段才抛 `chunk_size must be > 0`，负权重会反向加成分数；而 UI 层（`src/ui/config_menu.py`）对权重已有 `0..1` 校验，TOML/env 路径没有，形成不对称。现按字段加 validator，并用 `model_validator` 补上「overlap 必须严格小于 size」这条无法用单字段表达、但会让切分器无法推进的跨字段约束。
 
+- 清理死代码与重复实现（零功能影响，单独一次提交以便审阅）：删除 `config.py` 中零调用的向后兼容层 `get_backward_compatible_configs()`（85 行）及其失效注释；删除 `LargeLanguageModel.supports()`（零调用，但**保留**它读取的 `capabilities`——那是 `factory.capabilities()` 经 `getattr` 读取的活数据）；删除 `volcengine._ARK_CLASSIFICATION_KEYS`（纯冗余，`classify()` 的三个同名形参无法落进 `**kwargs`，真正的校验由内联集合完成且完整）；删除 `faiss_store.FaissStore` 中从未获取的 `asyncio.Lock` 及其函数内局部 import；简化 `anthropic.py` 中条件永不产生可区分行为的恒等 `if/else`。
+- 消除 `openai_compatible.py` 与 `model_provider.field()` 的重复实现：`_field` 与 `field` 逐字节相同却各存一份，且被 143 处调用（`self._field` 28 + `cls._field` 115）。现删除重复定义、统一复用 `field`，并按字母序补入 import。
+- `volcengine` 的 4 个 helper（`_merge_options`/`_validate_model_options`/`_validated_extra_body`/`_merge_extra_body`）此前是 `openai_compatible` 的逐字节副本，现改为委托到后者，只保留一份实现，消除漂移风险。
+- `jina.py` 与 `siliconflow_rerank.py` 是近似副本（行级相似度约 0.78，7 个方法同名，`_get_headers` 逐字节相同），但存在 4 处真实语义差异（`_OPTION_KEYS`、`_base_url` 来源、构造期 base_url 校验、`_parse_response` 的 `results` 校验时机）。**有意保持独立实现**，改在两侧 docstring 中写明差异清单与「改动必须同步」的约束，而不再引入一层抽象。
+- 删除孤儿文件 `logo_ASCII.py`：全仓零引用、不在任何构建/CI 配置中，其 `create_gradient` 与 `main.py` 的同名函数逐字节重复，且未格式化（一旦纳入 `quality.yml` 扫描范围会直接失败）。
+- 移除 4 个从未被 import 的依赖中的 2 个：`langchain` 与 `langchain-community`。保留 `langchain-core`（`langchain-text-splitters` 的必需依赖）与 `requests`（`google-genai`、`tiktoken` 的必需依赖）——它们的「未使用」是传递依赖的正常形态，删除会破坏真实依赖链。
+- Google `tool_choice` 的异常文本在源头脱敏：裸 pydantic `ValidationError` 会把违规取值原文写进 `input_value=...`，而 `types.ToolConfig` 允许的键集里就有 `api_key` 这类凭证形态的键。两个消毒器（`redact_sensitive_text`、`safe_exception_text`）虽然都能拦住，但在拼消息前收口才是纵深防御。
+- `release.yml` 的手动发布路径补交叉校验：`workflow_dispatch` 的 `tag`/`version` 是手填的，此前直接透传，会发出一个版本号与 `pyproject.toml`/`CHANGELOG.md` 不符的 release。现校验 `version` 与 `pyproject.toml` 一致、`tag` 等于 `v{version}`、且 CHANGELOG 已有该版本条目。
+
 ## [1.3.0] - 2026-03-20
 
 ### 运行与配置

@@ -313,18 +313,6 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             "timeout",
         }
     )
-    _ARK_CLASSIFICATION_KEYS = frozenset(
-        {
-            "query",
-            "model",
-            "labels",
-            "user",
-            "extra_headers",
-            "extra_query",
-            "extra_body",
-            "timeout",
-        }
-    )
     _ARK_CONTENT_GENERATION_CREATE_KEYS = frozenset(
         {
             "model",
@@ -732,23 +720,10 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             return await result
         return result
 
-    @staticmethod
-    def _merge_options(request: dict[str, Any], options: dict[str, Any]) -> None:
-        reserved = {"model", "messages", "input", "stream", "instructions", "tools"}
-        overlap = sorted(reserved.intersection(options))
-        if overlap:
-            raise ValueError(f"Provider options 不允许覆盖请求字段: {', '.join(overlap)}")
-        for key, value in options.items():
-            request.setdefault(key, value)
-
-    @staticmethod
-    def _validate_model_options(
-        options: Mapping[str, Any],
-        allowed: frozenset[str],
-        endpoint: str,
-    ) -> None:
-        unknown = {key: value for key, value in options.items() if key not in allowed}
-        reject_unsupported_kwargs(endpoint, unknown)
+    # 以下 4 个 helper 是 OpenAICompatibleProvider 的逐字节副本，改为委托。
+    # 保留本类方法名是因为调用点很多；实现只留一份，避免两边漂移。
+    _merge_options = staticmethod(OpenAICompatibleProvider._merge_options)
+    _validate_model_options = staticmethod(OpenAICompatibleProvider._validate_model_options)
 
     def _request_options(self) -> dict[str, Any]:
         """返回不会误传给 Ark 请求的模型级选项。"""
@@ -765,35 +740,8 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             }
         }
 
-    @staticmethod
-    def _validated_extra_body(
-        value: Any,
-        endpoint: str,
-        reserved: set[str],
-    ) -> dict[str, Any]:
-        if value is None:
-            return {}
-        if not isinstance(value, Mapping):
-            raise ValueError(f"{endpoint} extra_body 必须是对象。")
-        value = validate_secret_free_payload(value, endpoint, "extra_body")
-        overlap = sorted(set(value).intersection(reserved))
-        if overlap:
-            raise ValueError(f"{endpoint} extra_body 不允许覆盖请求字段: {', '.join(overlap)}")
-        return dict(value)
-
-    @staticmethod
-    def _merge_extra_body(
-        configured: Mapping[str, Any] | None,
-        extensions: Mapping[str, Any] | None,
-        endpoint: str,
-    ) -> dict[str, Any]:
-        """合并模型级扩展，拒绝同一字段的静默覆盖。"""
-        configured_values = dict(configured or {})
-        extension_values = dict(extensions or {})
-        overlap = sorted(set(configured_values).intersection(extension_values))
-        if overlap:
-            raise ValueError(f"{endpoint} 模型 options 的扩展字段重复: {', '.join(overlap)}")
-        return {**configured_values, **extension_values}
+    _validated_extra_body = staticmethod(OpenAICompatibleProvider._validated_extra_body)
+    _merge_extra_body = staticmethod(OpenAICompatibleProvider._merge_extra_body)
 
     @staticmethod
     def _convert_responses_format(response_format: dict[str, Any]) -> dict[str, Any]:

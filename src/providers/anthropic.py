@@ -395,9 +395,10 @@ class AnthropicProvider(LargeLanguageModel):
                     )
                 else:
                     converted.append({"type": "image", "source": {"type": "url", "url": image_url}})
-            elif part_type == "tool_result":
-                converted.append(part)
             else:
+                # tool_result 与其它的非文本块都原样透传；此前这里写成
+                # ``elif part_type == "tool_result"`` + 恒等 ``else``，两个分支
+                # 逐字节相同，条件永不产生可区分行为。
                 converted.append(part)
         return converted
 

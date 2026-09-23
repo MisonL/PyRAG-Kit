@@ -1164,7 +1164,12 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             try:
                 return types.ToolConfig(**tool_choice)
             except Exception as exc:  # pydantic ValidationError
-                raise ValueError(f"Google tool_choice 无效: {exc}") from exc
+                # pydantic 会把违规取值原文写进 ``input_value=...``，调用方若直接
+                # ``str(exc)`` 就可能把凭证形态的值带出去。两个消毒器虽然都能
+                # 拦住（见 test_security_boundaries），但在源头收口才是纵深防御。
+                raise ValueError(
+                    f"Google tool_choice 无效: {redact_sensitive_text(str(exc))}"
+                ) from exc
         if isinstance(tool_choice, dict):
             if tool_choice.get("type") == "function":
                 function = tool_choice.get("function", {})

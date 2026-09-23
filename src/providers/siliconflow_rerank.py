@@ -18,8 +18,15 @@ logger = get_module_logger(__name__)
 
 
 class SiliconflowRerankProvider(RerankModel):
-    """
-    SiliconFlow Rerank模型提供商。
+    """SiliconFlow Rerank Provider（HTTP JSON）。
+
+    本类与 ``jina.py`` 是近似副本（行级相似度约 0.78，7 个方法同名，
+    ``_get_headers`` 逐字节相同）。两者**有意保持独立实现**，因为存在 4 处真实
+    语义差异：``_OPTION_KEYS``、``_base_url`` 来源（本类走 settings，Jina 硬编码）、
+    构造期 base_url 校验（本类执行，Jina 不执行）、以及 ``_parse_response`` 里
+    ``results`` 类型校验的时机（本类在 Mapping 循环之后）。
+    **修改任一侧的校验逻辑、payload 构造或响应解析时，必须同步另一侧。**
+
     已注入 CSE 性能传感器与 tenacity 重试机制。
     """
 

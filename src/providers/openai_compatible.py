@@ -19,6 +19,7 @@ from src.providers.__base__.model_provider import (
     close_resource_sync,
     coerce_completion_request,
     content_to_text,
+    field,
     is_retryable_error,
     merge_tool_call_fragment,
     normalize_embedding_vector,
@@ -457,10 +458,10 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         }
 
     def _poll_background_response(self, response: Any, params: Mapping[str, Any]) -> Any:
-        status = self._field(response, "status")
+        status = field(response, "status")
         if status not in {"queued", "in_progress", "pending"}:
             return response
-        response_id = self._field(response, "id")
+        response_id = field(response, "id")
         if not response_id:
             raise RuntimeError("Responses background 响应缺少 id，无法轮询。")
         interval, timeout = self._background_poll_config()
@@ -477,16 +478,16 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             response = retry_sync_call(
                 lambda: self._get_client().responses.retrieve(response_id, **retrieve_kwargs)
             )
-            status = self._field(response, "status")
+            status = field(response, "status")
         return response
 
     async def _poll_background_response_async(
         self, response: Any, params: Mapping[str, Any]
     ) -> Any:
-        status = self._field(response, "status")
+        status = field(response, "status")
         if status not in {"queued", "in_progress", "pending"}:
             return response
-        response_id = self._field(response, "id")
+        response_id = field(response, "id")
         if not response_id:
             raise RuntimeError("Responses background 响应缺少 id，无法轮询。")
         interval, timeout = self._background_poll_config()
@@ -503,7 +504,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             response = await retry_async_call(
                 lambda: self._get_aclient().responses.retrieve(response_id, **retrieve_kwargs)
             )
-            status = self._field(response, "status")
+            status = field(response, "status")
         return response
 
     def _compat_extra_options(self) -> dict[str, Any]:
@@ -1489,30 +1490,24 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             return response_format
         raise ValueError("Responses response_format 仅支持 json_schema 或 json_object。")
 
-    @staticmethod
-    def _field(value: Any, name: str, default: Any = None) -> Any:
-        if isinstance(value, Mapping):
-            return value.get(name, default)
-        return getattr(value, name, default)
-
     @classmethod
     def _extract_response_text(cls, response: Any) -> str:
-        output_text = cls._field(response, "output_text")
+        output_text = field(response, "output_text")
         if isinstance(output_text, str):
             return output_text
 
         chunks: list[str] = []
-        choices = cls._field(response, "choices", []) or []
+        choices = field(response, "choices", []) or []
         for choice in choices:
-            message = cls._field(choice, "message") or cls._field(choice, "delta")
-            text = cls._field(message, "content")
+            message = field(choice, "message") or field(choice, "delta")
+            text = field(message, "content")
             if text:
                 chunks.append(content_to_text(text))
         if chunks:
             return "".join(chunks)
-        for item in cls._field(response, "output", []) or []:
-            for content in cls._field(item, "content", []) or []:
-                text = cls._field(content, "text")
+        for item in field(response, "output", []) or []:
+            for content in field(item, "content", []) or []:
+                text = field(content, "text")
                 if isinstance(text, str):
                     chunks.append(text)
         return "".join(chunks)
@@ -1520,30 +1515,28 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     @classmethod
     def _extract_tool_calls(cls, response: Any) -> list[dict[str, Any]]:
         calls: list[dict[str, Any]] = []
-        choices = cls._field(response, "choices", []) or []
+        choices = field(response, "choices", []) or []
         for choice in choices:
-            message = cls._field(choice, "message") or cls._field(choice, "delta")
-            for call in cls._field(message, "tool_calls", []) or []:
-                function = cls._field(call, "function")
+            message = field(choice, "message") or field(choice, "delta")
+            for call in field(message, "tool_calls", []) or []:
+                function = field(call, "function")
                 calls.append(
                     {
-                        "id": cls._field(call, "id"),
-                        "type": cls._field(call, "type", "function"),
-                        "name": cls._field(function, "name"),
-                        "arguments": normalize_tool_arguments(
-                            cls._field(function, "arguments", "")
-                        ),
+                        "id": field(call, "id"),
+                        "type": field(call, "type", "function"),
+                        "name": field(function, "name"),
+                        "arguments": normalize_tool_arguments(field(function, "arguments", "")),
                     }
                 )
-        for item in cls._field(response, "output", []) or []:
-            if cls._field(item, "type") in {"function_call", "custom_tool_call"}:
+        for item in field(response, "output", []) or []:
+            if field(item, "type") in {"function_call", "custom_tool_call"}:
                 calls.append(
                     {
-                        "id": cls._field(item, "call_id") or cls._field(item, "id"),
-                        "type": cls._field(item, "type"),
-                        "name": cls._field(item, "name"),
+                        "id": field(item, "call_id") or field(item, "id"),
+                        "type": field(item, "type"),
+                        "name": field(item, "name"),
                         "arguments": normalize_tool_arguments(
-                            cls._field(item, "arguments", cls._field(item, "input", ""))
+                            field(item, "arguments", field(item, "input", ""))
                         ),
                     }
                 )
@@ -1551,33 +1544,33 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
 
     @classmethod
     def _extract_usage(cls, response: Any) -> dict[str, Any]:
-        return normalize_usage(cls._field(response, "usage"))
+        return normalize_usage(field(response, "usage"))
 
     @classmethod
     def _extract_reasoning(cls, response: Any) -> str:
         values: list[str] = []
-        choices = cls._field(response, "choices", []) or []
+        choices = field(response, "choices", []) or []
         for choice in choices:
-            message = cls._field(choice, "message") or cls._field(choice, "delta")
+            message = field(choice, "message") or field(choice, "delta")
             for name in ("reasoning_content", "reasoning"):
-                value = cls._field(message, name)
+                value = field(message, name)
                 if isinstance(value, str):
                     values.append(value)
-        for item in cls._field(response, "output", []) or []:
-            if cls._field(item, "type") in {"reasoning", "reasoning_item"}:
-                summary = cls._field(item, "summary")
+        for item in field(response, "output", []) or []:
+            if field(item, "type") in {"reasoning", "reasoning_item"}:
+                summary = field(item, "summary")
                 if isinstance(summary, str):
                     values.append(summary)
                 elif isinstance(summary, (list, tuple)):
                     for entry in summary:
-                        text = cls._field(entry, "text")
+                        text = field(entry, "text")
                         if isinstance(text, str):
                             values.append(text)
-                for content in cls._field(item, "content", []) or []:
-                    text = cls._field(content, "text")
+                for content in field(item, "content", []) or []:
+                    text = field(content, "text")
                     if isinstance(text, str):
                         values.append(text)
-                fallback = cls._field(item, "text")
+                fallback = field(item, "text")
                 if isinstance(fallback, str):
                     values.append(fallback)
         return "".join(values)
@@ -1585,20 +1578,20 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     @classmethod
     def _extract_refusal(cls, response: Any) -> str | None:
         """提取 Chat Completions 与 Responses 的统一拒答文本。"""
-        choices = cls._field(response, "choices", []) or []
+        choices = field(response, "choices", []) or []
         for choice in choices:
-            message = cls._field(choice, "message") or cls._field(choice, "delta")
-            refusal = cls._field(message, "refusal")
+            message = field(choice, "message") or field(choice, "delta")
+            refusal = field(message, "refusal")
             if isinstance(refusal, str) and refusal:
                 return refusal
-        for item in cls._field(response, "output", []) or []:
-            refusal = cls._field(item, "refusal")
+        for item in field(response, "output", []) or []:
+            refusal = field(item, "refusal")
             if isinstance(refusal, str) and refusal:
                 return refusal
-            for content in cls._field(item, "content", []) or []:
-                if cls._field(content, "type") != "refusal":
+            for content in field(item, "content", []) or []:
+                if field(content, "type") != "refusal":
                     continue
-                refusal = cls._field(content, "refusal") or cls._field(content, "text")
+                refusal = field(content, "refusal") or field(content, "text")
                 if isinstance(refusal, str) and refusal:
                     return refusal
         return None
@@ -1630,7 +1623,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     def _chat_response_error_detail(cls, response: Any) -> str | None:
         """提取兼容网关常见的顶层业务错误字段。"""
         for name in ("error", "msg", "message", "detail", "reason", "code", "error_code"):
-            value = cls._field(response, name)
+            value = field(response, name)
             if value is None or value == "":
                 continue
             if name == "error":
@@ -1654,14 +1647,14 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         字段仍必须显式失败。
         """
         detail = cls._chat_response_error_detail(response)
-        status = cls._field(response, "status")
-        if detail is not None and cls._field(response, "error") is not None:
+        status = field(response, "status")
+        if detail is not None and field(response, "error") is not None:
             raise RuntimeError(f"{provider} 返回错误: {detail}")
         if cls._chat_status_is_error(status):
             suffix = f": {detail}" if detail else "。"
             raise RuntimeError(f"{provider} 返回业务错误 (status={status}){suffix}")
 
-        choices = cls._field(response, "choices")
+        choices = field(response, "choices")
         if allow_empty_choices:
             if choices is None and detail is not None:
                 raise RuntimeError(f"{provider} 返回错误: {detail}")
@@ -1687,11 +1680,11 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 response,
                 provider=f"{getattr(self, '_provider', 'OpenAI-compatible')} Chat Completions",
             )
-        choices = self._field(response, "choices", []) or []
+        choices = field(response, "choices", []) or []
         finish_reason = (
-            self._field(response, "status")
+            field(response, "status")
             if self._protocol == "responses"
-            else self._field(choices[0], "finish_reason")
+            else field(choices[0], "finish_reason")
             if choices
             else None
         )
@@ -1700,7 +1693,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             tool_calls=self._extract_tool_calls(response),
             usage=self._extract_usage(response),
             finish_reason=finish_reason,
-            response_id=self._field(response, "id"),
+            response_id=field(response, "id"),
             refusal=self._extract_refusal(response),
             reasoning=self._extract_reasoning(response),
             raw=response,
@@ -1730,11 +1723,11 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 response,
                 provider=f"{getattr(self, '_provider', 'OpenAI-compatible')} Chat Completions",
             )
-        choices = self._field(response, "choices", []) or []
+        choices = field(response, "choices", []) or []
         finish_reason = (
-            self._field(response, "status")
+            field(response, "status")
             if self._protocol == "responses"
-            else self._field(choices[0], "finish_reason")
+            else field(choices[0], "finish_reason")
             if choices
             else None
         )
@@ -1743,7 +1736,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             tool_calls=self._extract_tool_calls(response),
             usage=self._extract_usage(response),
             finish_reason=finish_reason,
-            response_id=self._field(response, "id"),
+            response_id=field(response, "id"),
             refusal=self._extract_refusal(response),
             reasoning=self._extract_reasoning(response),
             raw=response,
@@ -1753,23 +1746,23 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     def _chat_stream_events(cls, chunk: Any) -> list[StreamEvent]:
         raise_for_stream_error_event(chunk, "Chat Completions")
         cls._raise_for_chat_response_error(chunk, allow_empty_choices=True)
-        choices = cls._field(chunk, "choices", []) or []
+        choices = field(chunk, "choices", []) or []
         usage = cls._extract_usage(chunk)
         if not choices:
             return [StreamEvent(type="usage", usage=usage, raw=chunk)] if usage else []
         choice = choices[0]
-        delta = cls._field(choice, "delta")
-        text = content_to_text(cls._field(delta, "content", ""))
-        reasoning = cls._field(delta, "reasoning_content") or cls._field(delta, "reasoning") or ""
-        refusal = cls._field(delta, "refusal")
-        tool_calls = cls._field(delta, "tool_calls", []) or []
-        finish_reason = cls._field(choice, "finish_reason")
+        delta = field(choice, "delta")
+        text = content_to_text(field(delta, "content", ""))
+        reasoning = field(delta, "reasoning_content") or field(delta, "reasoning") or ""
+        refusal = field(delta, "refusal")
+        tool_calls = field(delta, "tool_calls", []) or []
+        finish_reason = field(choice, "finish_reason")
         events: list[StreamEvent] = []
 
         if isinstance(refusal, str) and refusal:
             events.append(StreamEvent(type="refusal_delta", refusal=refusal, raw=chunk))
 
-        response_id = cls._field(chunk, "id")
+        response_id = field(chunk, "id")
         if text:
             events.append(
                 StreamEvent(
@@ -1790,16 +1783,16 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             )
         if tool_calls:
             for position, call in enumerate(tool_calls):
-                function = cls._field(call, "function")
+                function = field(call, "function")
                 events.append(
                     StreamEvent(
                         type="tool_call_delta",
                         tool_call={
-                            "id": cls._field(call, "id"),
-                            "index": cls._field(call, "index", position),
-                            "type": cls._field(call, "type", "function"),
-                            "name": cls._field(function, "name"),
-                            "arguments": cls._field(function, "arguments", ""),
+                            "id": field(call, "id"),
+                            "index": field(call, "index", position),
+                            "type": field(call, "type", "function"),
+                            "name": field(function, "name"),
+                            "arguments": field(function, "arguments", ""),
                         },
                         response_id=response_id,
                         raw=chunk,
@@ -1812,7 +1805,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                     type="finish",
                     usage=usage,
                     finish_reason=finish_reason,
-                    response_id=cls._field(chunk, "id"),
+                    response_id=field(chunk, "id"),
                     raw=chunk,
                 )
             )
@@ -1833,15 +1826,15 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     def _response_tool_keys(cls, event: Any, item: Any = None) -> list[Any]:
         """返回 Responses 工具事件可用的稳定关联键。"""
         item = item if item is not None else event
-        item_id = cls._field(event, "item_id")
+        item_id = field(event, "item_id")
         if item_id is None:
-            item_id = cls._field(item, "id")
-        output_index = cls._field(event, "output_index")
+            item_id = field(item, "id")
+        output_index = field(event, "output_index")
         if output_index is None:
-            output_index = cls._field(item, "output_index")
-        call_id = cls._field(event, "call_id")
+            output_index = field(item, "output_index")
+        call_id = field(event, "call_id")
         if call_id is None:
-            call_id = cls._field(item, "call_id")
+            call_id = field(item, "call_id")
         keys: list[Any] = []
         for prefix, value in (
             ("item_id", item_id),
@@ -1864,24 +1857,24 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         metadata: dict[Any, dict[str, Any]],
     ) -> None:
         """记录 output_item.added 中后续 delta/done 事件需要的工具元数据。"""
-        item = cls._field(event, "item") or event
-        item_type = cls._field(item, "type")
+        item = field(event, "item") or event
+        item_type = field(item, "type")
         if item_type not in {"function_call", "custom_tool_call"}:
             return
-        item_id = cls._field(item, "id") or cls._field(event, "item_id")
-        call_id = cls._field(item, "call_id") or cls._field(event, "call_id")
-        output_index = cls._field(event, "output_index")
+        item_id = field(item, "id") or field(event, "item_id")
+        call_id = field(item, "call_id") or field(event, "call_id")
+        output_index = field(event, "output_index")
         if output_index is None:
-            output_index = cls._field(item, "output_index")
+            output_index = field(item, "output_index")
         values: dict[str, Any] = {
             "id": call_id or item_id,
             "call_id": call_id,
             "index": output_index,
             "type": item_type,
-            "name": cls._field(item, "name"),
+            "name": field(item, "name"),
         }
         for field_name in ("arguments", "input"):
-            value = cls._field(item, field_name)
+            value = field(item, field_name)
             if value is not None:
                 values["arguments"] = normalize_tool_arguments(value)
                 break
@@ -1919,13 +1912,13 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         error_provider: str = "Responses API",
         response_error_handler: Any | None = None,
     ) -> StreamEvent | None:
-        event_type = cls._field(event, "type", "")
+        event_type = field(event, "type", "")
         if event_type == "response.output_item.added":
             if tool_metadata is not None:
                 cls._remember_response_tool_metadata(event, tool_metadata)
             return None
         if event_type in {"response.output_text.delta", "response.refusal.delta"}:
-            delta = cls._field(event, "delta")
+            delta = field(event, "delta")
             is_refusal = event_type.endswith("refusal.delta")
             return StreamEvent(
                 type="refusal_delta" if is_refusal else "text_delta",
@@ -1934,7 +1927,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 raw=event,
             )
         if event_type in {"response.reasoning_summary_text.delta", "response.reasoning_text.delta"}:
-            delta = cls._field(event, "delta")
+            delta = field(event, "delta")
             return StreamEvent(
                 type="reasoning_delta", reasoning=delta if isinstance(delta, str) else "", raw=event
             )
@@ -1946,9 +1939,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 "type",
                 "custom_tool_call" if "custom_tool_call_input" in event_type else "function_call",
             )
-            item_id = cls._field(event, "item_id")
-            call_id = cls._field(event, "call_id") or metadata.get("call_id")
-            output_index = cls._field(event, "output_index")
+            item_id = field(event, "item_id")
+            call_id = field(event, "call_id") or metadata.get("call_id")
+            output_index = field(event, "output_index")
             if output_index is None:
                 output_index = metadata.get("index")
             return StreamEvent(
@@ -1961,12 +1954,10 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                     # ``role=tool`` 时就会配不上。
                     "id": call_id or item_id or metadata.get("id"),
                     "call_id": call_id,
-                    "index": output_index
-                    if output_index is not None
-                    else cls._field(event, "index"),
+                    "index": output_index if output_index is not None else field(event, "index"),
                     "type": item_type,
-                    "name": cls._field(event, "name") or metadata.get("name"),
-                    "arguments": normalize_tool_arguments(cls._field(event, "delta", "")),
+                    "name": field(event, "name") or metadata.get("name"),
+                    "arguments": normalize_tool_arguments(field(event, "delta", "")),
                 },
                 raw=event,
             )
@@ -1975,9 +1966,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             "response.function_call_arguments.done",
             "response.custom_tool_call_input.done",
         }:
-            item = cls._field(event, "item")
+            item = field(event, "item")
             metadata = cls._response_tool_metadata(event, tool_metadata, item)
-            item_type = cls._field(item, "type") if item is not None else None
+            item_type = field(item, "type") if item is not None else None
             item_type = item_type or metadata.get("type")
             if (
                 item_type in {"function_call", "custom_tool_call"}
@@ -1985,17 +1976,15 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 or "custom_tool_call_input" in event_type
             ):
                 call_id = (
-                    cls._field(item, "call_id")
-                    or cls._field(event, "call_id")
-                    or metadata.get("call_id")
+                    field(item, "call_id") or field(event, "call_id") or metadata.get("call_id")
                 )
-                output_index = cls._field(event, "output_index")
+                output_index = field(event, "output_index")
                 if output_index is None:
                     output_index = metadata.get("index")
                 argument_value: Any = None
                 for source in (item, event):
                     for field_name in ("arguments", "input"):
-                        value = cls._field(source, field_name)
+                        value = field(source, field_name)
                         if value is not None:
                             argument_value = value
                             break
@@ -2011,18 +2000,14 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                     # 回填 ``role=tool`` 时就会配不上。上面解析出的 ``call_id``
                     # 才是权威来源。
                     "id": call_id
-                    or cls._field(item, "id")
-                    or cls._field(event, "item_id")
+                    or field(item, "id")
+                    or field(event, "item_id")
                     or metadata.get("id"),
-                    "index": output_index
-                    if output_index is not None
-                    else cls._field(event, "index"),
+                    "index": output_index if output_index is not None else field(event, "index"),
                     "type": item_type
                     if item_type in {"function_call", "custom_tool_call"}
                     else "function_call",
-                    "name": cls._field(item, "name")
-                    or cls._field(event, "name")
-                    or metadata.get("name"),
+                    "name": field(item, "name") or field(event, "name") or metadata.get("name"),
                     "arguments": normalize_tool_arguments(argument_value),
                 }
                 if call_id is not None:
@@ -2040,9 +2025,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             "response.failed",
             "response.cancelled",
         }:
-            response = cls._field(event, "response") or event
+            response = field(event, "response") or event
             usage = cls._extract_usage(response)
-            status = cls._field(response, "status")
+            status = field(response, "status")
             if status in {"failed", "incomplete", "cancelled"}:
                 handler = response_error_handler or cls._raise_for_response_error
                 handler(response)
@@ -2052,7 +2037,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 type="finish",
                 usage=usage,
                 finish_reason=status,
-                response_id=cls._field(response, "id"),
+                response_id=field(response, "id"),
                 raw=event,
             )
         return None
@@ -2163,7 +2148,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             ):
                 if terminal_seen:
                     continue
-                event_type = self._field(event, "type", "")
+                event_type = field(event, "type", "")
                 converted = self._responses_stream_event(event, response_tool_metadata)
                 if converted:
                     if converted.type == "finish":
@@ -2254,7 +2239,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             ):
                 if terminal_seen:
                     continue
-                event_type = self._field(event, "type", "")
+                event_type = field(event, "type", "")
                 converted = self._responses_stream_event(event, response_tool_metadata)
                 if converted:
                     if converted.type == "finish":
@@ -2402,30 +2387,30 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     def _error_message(cls, error: Any, default: str) -> str:
         if isinstance(error, str) and error:
             return error
-        message = cls._field(error, "message")
+        message = field(error, "message")
         if message:
             return str(message)
-        code = cls._field(error, "code")
+        code = field(error, "code")
         if code:
             return f"{code}"
         return default
 
     @classmethod
     def _raise_for_response_error(cls, response: Any) -> None:
-        error = cls._field(response, "error")
+        error = field(response, "error")
         if error:
             # 与 _raise_for_chat_response_error 对齐：服务端消息常回显请求头或
             # URL，异常文本会进日志与终端，是本项目凭证最容易泄漏的出口。
             message = redact_sensitive_text(cls._error_message(error, "未知错误。"))
             raise RuntimeError(f"Responses API 返回错误: {message}")
 
-        status = cls._field(response, "status")
+        status = field(response, "status")
         if status not in {"failed", "incomplete", "cancelled"}:
             return
 
         if status == "incomplete":
-            details = cls._field(response, "incomplete_details")
-            reason = cls._field(details, "reason")
+            details = field(response, "incomplete_details")
+            reason = field(details, "reason")
             detail = f"原因: {reason}" if reason else "未提供原因。"
         else:
             detail = "未提供原因。"
@@ -2433,9 +2418,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
 
     @classmethod
     def _stream_delta(cls, event: Any) -> str:
-        event_type = cls._field(event, "type", "")
+        event_type = field(event, "type", "")
         if event_type in {"response.output_text.delta", "response.refusal.delta"}:
-            delta = cls._field(event, "delta")
+            delta = field(event, "delta")
             return delta if isinstance(delta, str) else ""
         if event_type in {"error", "response.error"}:
             raise_for_stream_error_event(event, "Responses API")
@@ -2445,7 +2430,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             "response.incomplete",
             "response.cancelled",
         }:
-            response = cls._field(event, "response") or event
+            response = field(event, "response") or event
             cls._raise_for_response_error(response)
             if event_type != "response.completed":
                 raise RuntimeError(f"Responses API 收到终止事件: {event_type}。")
@@ -2458,9 +2443,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 lambda: self._get_client().responses.create(**request),
                 lambda event: raise_for_stream_error_event(event, self._provider),
             ):
-                event_type = self._field(event, "type", "")
+                event_type = field(event, "type", "")
                 if event_type == "response.refusal.delta":
-                    refusal = self._field(event, "delta")
+                    refusal = field(event, "delta")
                     if refusal:
                         raise RuntimeError(f"{self._provider} Responses 返回拒答: {refusal}")
                 delta = self._stream_delta(event)
@@ -2489,9 +2474,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 lambda: self._get_aclient().responses.create(**request),
                 lambda event: raise_for_stream_error_event(event, self._provider),
             ):
-                event_type = self._field(event, "type", "")
+                event_type = field(event, "type", "")
                 if event_type == "response.refusal.delta":
-                    refusal = self._field(event, "delta")
+                    refusal = field(event, "delta")
                     if refusal:
                         raise RuntimeError(f"{self._provider} Responses 返回拒答: {refusal}")
                 delta = self._stream_delta(event)
@@ -2620,10 +2605,10 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 refusal = self._extract_refusal(response)
                 if refusal:
                     raise RuntimeError(f"{self._provider} Chat Completions 返回拒答: {refusal}")
-                choices = self._field(response, "choices", []) or []
+                choices = field(response, "choices", []) or []
                 if choices:
-                    message = self._field(choices[0], "message")
-                    content = self._field(message, "content")
+                    message = field(choices[0], "message")
+                    content = field(message, "content")
                     if content:
                         yield content_to_text(content)
 
@@ -2751,10 +2736,10 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 refusal = self._extract_refusal(response)
                 if refusal:
                     raise RuntimeError(f"{self._provider} Chat Completions 返回拒答: {refusal}")
-                choices = self._field(response, "choices", []) or []
+                choices = field(response, "choices", []) or []
                 if choices:
-                    message = self._field(choices[0], "message")
-                    content = self._field(message, "content")
+                    message = field(choices[0], "message")
+                    content = field(message, "content")
                     if content:
                         yield content_to_text(content)
 
@@ -3182,7 +3167,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             kwargs=params,
             operation="OpenAI Responses 输入 token 统计",
         )
-        value = self._field(response, "input_tokens")
+        value = field(response, "input_tokens")
         if value is None:
             raise RuntimeError("OpenAI token count 响应缺少 input_tokens。")
         return int(value)
@@ -4368,7 +4353,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             kwargs=params,
             operation="OpenAI Responses 输入 token 统计",
         )
-        value = self._field(response, "input_tokens")
+        value = field(response, "input_tokens")
         if value is None:
             raise RuntimeError("OpenAI token count 响应缺少 input_tokens。")
         return int(value)
