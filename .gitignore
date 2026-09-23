@@ -60,3 +60,9 @@ config.toml
 
 # 缓存目录
 .cache/
+
+# 会话/审查中间产物（本地工作文件，不入库）
+# HANDOFF.md 可能含 API Key、令牌等敏感信息，只作为本地交接备忘。
+HANDOFF.md
+# 审查过程生成的复核报告（快照哈希命名，属于一次性产物）
+.review-*.html
