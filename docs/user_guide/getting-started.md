@@ -92,4 +92,4 @@ uv run python -m scripts.embed_knowledge_base --mode standard
 **常用命令:**
 
 *   在聊天界面输入 `/config` 可以随时打开动态配置菜单，切换模型或调整检索参数。
-*   输入 `/quit` 或 `exit` 可以安全地退出程序。
+*   输入 `/quit`（或按 `Ctrl+C` / `Ctrl+D`）可以安全地退出程序。

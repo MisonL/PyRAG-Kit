@@ -58,7 +58,7 @@
 
 ### 测试与文档
 
-- 新增 Provider 协议适配、SDK 能力、凭证边界、Rerank 契约与失败语义回归测试；测试总数增至 1061。新增断言经红绿验证（回退对应源码后测试变红）；其中一部分是**反向守卫**——回退源码不会变红，需要定向变异（例如「让守卫连 Ark 一起拒」）才能验证，这类断言守的是「不能过度收紧」，同样有区分度。
+- 新增 Provider 协议适配、SDK 能力、凭证边界、Rerank 契约与失败语义回归测试；测试总数增至 1088。新增断言经红绿验证（回退对应源码后测试变红）；其中一部分是**反向守卫**——回退源码不会变红，需要定向变异（例如「让守卫连 Ark 一起拒」）才能验证，这类断言守的是「不能过度收紧」，同样有区分度。
 - 修复三处测试有效性缺陷：掩码尾部可见片段的断言用 `startswith("[REDACTED]")`，而掩码前缀在任何实现下都会被替换成 `[REDACTED]`，该断言恒真——尾部片段原样泄漏时也能通过，改为全文相等；短纯字母凭证的 7 个用例里有 4 个取值 ≥12 字符，旧规则本就能命中、对被测属性零区分度，改为真正短于 12 字符的值并断言值本身被替换；掩码线性度用例用单次采样配 100ms 阈值，实测本机 p99.9 即到 100ms、满载时更高，会间歇误报，改为放大规模到线性与二次相差三个数量级、取多轮最小值。
 - 为活动快照的 embedding 兼容性检测补充回归测试：快照记录的 embedding provider 或模型名与当前运行配置不一致时必须显式失败，避免用错向量空间后静默产出错误检索结果。
 - 引入 Ruff、Bandit 与 MyPy 到开发依赖，并补齐对应配置；新增 `.github/workflows/quality.yml`，在 PR 与 `main` 推送时执行格式化检查、lint、类型检查、安全扫描与完整测试，此前这些工具只在本地手动运行。
@@ -67,6 +67,16 @@
 - 核对各渠道官方现状并刷新配置示例：Google Embedding 改用 `gemini-embedding-2`（`text-embedding-004` 已于 2026-01-14 退役），OpenAI 改用 `gpt-5.6-*`（`gpt-3.5-turbo` 于 2026-10-23 退役），Anthropic 改用 `claude-sonnet-4-6`（`claude-3-5-sonnet-20240620` 已于 2025-10-28 退役），DeepSeek 改用 `deepseek-v4-pro`/`deepseek-v4-flash`（`deepseek-chat` 已于 2026-07-24 退役），火山改用 `doubao-seed-2-0-lite-260428` 与 `doubao-embedding-text-240715`（`doubao-pro-32k`、`bge-large-zh` 已不在方舟模型列表），Qwen 改用 `qwen3.8-max`/`qwen3.7-plus`，SiliconFlow 改用 `Qwen/Qwen3.5-27B`/`deepseek-ai/DeepSeek-V3.2`（复核发现 `Qwen/Qwen3-8B` 已不在该平台在售列表，其 Qwen 对话模型现从 Qwen3.5-27B 起步），Grok 改用 `grok-4.6`（`llama3-70b-8192` 实为 Groq 的 ID，不属于 xAI），Ollama 改用 `llama3.1`/`gemma3`。示例配置的键名同步改为与模型一致，模型内置默认值一并更新；内置 embedding 与 rerank 兜底值此前含无效 ID（Google 的裸名 `embedding-001`、SiliconFlow 不存在的 `alibaba/` 命名空间与已下线的 `bge-reranker-large`、Ollama 的 `llama3`），现分别改为 `gemini-embedding-2`、`BAAI/bge-large-zh-v1.5`、`BAAI/bge-reranker-v2-m3` 与 `llama3.1`。
 - 需要重建知识库快照：`gemini-embedding-2` 与 `text-embedding-004` 的向量空间不兼容，旧 FAISS 索引不能复用。火山的 `doubao-embedding-text-240715` 已于 2025-12-26 停止新购（EOM），且已不在方舟「向量化能力」模型列表中；官方下线公告给出的迁移目标是 `doubao-embedding-vision-251215`，该模型同时接受纯文本输入，但它按 `/api/v3/embeddings/multimodal` 提供，与本项目使用的文本 `embeddings.create` 路径不同，迁移前需实测。embedding 模型只有 EOM 阶段、不涉及 EOS，存量接入点不受影响，因此示例配置暂未改动该值。
 - 修复 Anthropic 采样字段弃用识别：家族名不再限定 `opus`/`sonnet`/`haiku`，覆盖 5 代新增的 `claude-fable-5`、`claude-mythos-5` 等命名；此前这些模型会被透传 `temperature`/`top_p`/`top_k`，而 Python SDK v1.0+ 已移除这些参数，请求会直接失败。
+
+### 审查修复
+
+- 恢复 `src/etl/splitters/recursive_text_splitter.py` 的 Dify 移植声明头。该文件在引入 tiktoken 与层级分片的重写中被误删头部，此后 `sync dify rag hierarchical retrieval` 又向这个已无头的文件移植了父子分片逻辑，导致文件含 Dify 衍生代码却没有版权与许可证声明，与 `AGENTS.md` 的合规要求及 Apache 2.0 第 4(b) 条不符。
+- Responses 错误出口补齐脱敏：`_raise_for_response_error` 此前把服务端消息直接拼进异常，而同一适配器的 Chat Completions 出口已经过 `redact_sensitive_text`。服务端错误常回显请求头或 URL，异常文本会进日志与终端，是凭证最容易泄漏的出口，现两个出口行为一致。
+- 修复召回测试 Excel 记录的落盘位置：`ExcelLogger` 硬编码相对路径 `data/logs`，而文本日志使用经 `ROOT_DIR` 解析的 `settings.log_path`。相对路径基于 CWD，从仓库外运行程序时两者会分叉，Excel 记录落到当前工作目录。现默认复用 `settings.log_path`。
+- `capability_report` 与 `protocol_status` 对齐角色语义：前者在 embedding/rerank 角色下仍报告 `server_verified_protocols` 并接纳运行期登记，而后者对同一输入显式报错。协议只适用于 LLM 角色，两个诊断入口现给出相同结论。
+- 补充重排乱序路径与重排契约的回归测试：既有替身恒返回 `[0]`（恒等置换），`_rerank_if_needed` 的重排与按分数降序排序从未被执行，`_validate_rerank_output` 的布尔混入与越界 index 分支也无覆盖。
+- 修复无断言测试：`test_rerank_accepts_top_n_larger_than_document_count` 只调用 `_validate_inputs` 而无断言，即使行为变更也不会失败；现补断言并新增 `top_n` 非法值（含 `bool` 混入）的参数化用例。
+- 文档校正：`REFACTORING_PLAN.md` 标注为 v1.2.0 历史归档并修正三处与现状不符的表述（`PipelineManager` 实为 `Pipeline`、依赖应声明在 `pyproject.toml`、当时配置格式为 `config.ini`）；`README.md` 移除已退役的模型举例、修正 `/config` 可调项描述、补全 `src/` 目录树、把许可说明指向实际存在的许可证文件；`getting-started.md` 移除不存在的 `exit` 退出方式；`developer-guide.md` 补全目录树。
 
 ## [1.3.0] - 2026-03-20
 

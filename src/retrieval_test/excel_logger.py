@@ -6,6 +6,7 @@ from typing import Any
 from openpyxl import Workbook  # type: ignore[import-untyped]
 from openpyxl.worksheet.worksheet import Worksheet  # type: ignore[import-untyped]
 
+from ..utils.config import get_settings
 from ..utils.log_manager import get_module_logger
 
 logger = get_module_logger(__name__)
@@ -16,13 +17,17 @@ class ExcelLogger:
     一个用于将召回测试结果记录到 Excel 文件的日志记录器。
     """
 
-    def __init__(self, log_dir: str = "data/logs"):
+    def __init__(self, log_dir: str | None = None):
         """
         初始化 ExcelLogger。
 
         Args:
-            log_dir (str): 存储日志文件的目录。
+            log_dir (str | None): 存储日志文件的目录。省略时使用
+                ``Settings.log_path``，与文本日志落在同一处；否则两者会
+                因相对路径基于 CWD、绝对路径基于 ROOT_DIR 而分叉。
         """
+        if log_dir is None:
+            log_dir = get_settings().log_path
         # 确保日志目录存在
         os.makedirs(log_dir, exist_ok=True)
 

@@ -398,11 +398,15 @@ class ModelProviderFactory:
         # `protocols` describes LLM wire protocols. Embedding and Rerank use
         # their own endpoint contracts and must not inherit chat protocol names.
         protocols = sorted(info.get("protocols", set())) if normalized_role == "llm" else []
-        verified = set(info.get("server_verified_protocols", set()))
+        # 与 protocol_status 对齐：非 llm 角色的协议不适用，其 server_verified
+        # 登记既不能被报告，也不能被 _runtime_verified_protocols 接纳。
+        verified = (
+            set(info.get("server_verified_protocols", set())) if normalized_role == "llm" else set()
+        )
         verified.update(
             cls._runtime_verified_protocols(
                 options,
-                set(info.get("protocols", set())),
+                set(info.get("protocols", set())) if normalized_role == "llm" else set(),
                 resolved,
             )
         )

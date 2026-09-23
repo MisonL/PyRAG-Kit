@@ -251,3 +251,42 @@ def test_provider_map_modules_are_importable(provider_name, module_name, class_n
     provider_class = getattr(module, class_name)
 
     assert provider_class is not None, provider_name
+
+
+@pytest.mark.parametrize(
+    ("response", "match"),
+    [
+        ({"error": {"message": "bad key sk-FAKE0000badkey1234567890"}}, "Responses API 返回错误"),
+        (
+            {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "bad key sk-FAKE0000badkey1234567890"},
+            },
+            "响应状态为 incomplete",
+        ),
+    ],
+)
+def test_responses_error_path_redacts_server_message(response, match):
+    """Responses 错误出口与 Chat Completions 出口必须同样脱敏。
+
+    服务端错误消息常回显请求头或 URL；异常文本会进日志与终端，是本项目
+    凭证最容易泄漏的出口。此前 Responses 分支直接拼接原始消息。
+    """
+    with pytest.raises(RuntimeError, match=match) as excinfo:
+        OpenAICompatibleProvider._raise_for_response_error(response)
+
+    assert "sk-FAKE0000badkey1234567890" not in str(excinfo.value)
+    assert "[REDACTED]" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("status", ["failed", "cancelled"])
+def test_responses_error_path_reports_status_without_message(status):
+    """失败/取消状态不含服务端消息，仍须显式报错而非静默返回。"""
+    with pytest.raises(RuntimeError, match=f"响应状态为 {status}"):
+        OpenAICompatibleProvider._raise_for_response_error({"status": status})
+
+
+@pytest.mark.parametrize("status", ["completed", "in_progress", None])
+def test_responses_error_path_passes_through_when_not_terminal_failure(status):
+    """非失败状态不是错误，不得抛异常。"""
+    assert OpenAICompatibleProvider._raise_for_response_error({"status": status}) is None

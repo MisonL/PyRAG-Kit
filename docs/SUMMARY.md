@@ -12,4 +12,4 @@
 ## 开发者文档
 
 * [开发者指南](./developer_docs/developer-guide.md)
-* [重构与演进路线图](./developer_docs/REFACTORING_PLAN.md)
+* [重构与演进路线图（历史归档）](./developer_docs/REFACTORING_PLAN.md)

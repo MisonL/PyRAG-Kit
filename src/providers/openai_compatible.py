@@ -2406,7 +2406,10 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     def _raise_for_response_error(cls, response: Any) -> None:
         error = cls._field(response, "error")
         if error:
-            raise RuntimeError(f"Responses API 返回错误: {cls._error_message(error, '未知错误。')}")
+            # 与 _raise_for_chat_response_error 对齐：服务端消息常回显请求头或
+            # URL，异常文本会进日志与终端，是本项目凭证最容易泄漏的出口。
+            message = redact_sensitive_text(cls._error_message(error, "未知错误。"))
+            raise RuntimeError(f"Responses API 返回错误: {message}")
 
         status = cls._field(response, "status")
         if status not in {"failed", "incomplete", "cancelled"}:
@@ -2418,7 +2421,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             detail = f"原因: {reason}" if reason else "未提供原因。"
         else:
             detail = "未提供原因。"
-        raise RuntimeError(f"Responses API 响应状态为 {status}: {detail}")
+        raise RuntimeError(f"Responses API 响应状态为 {status}: {redact_sensitive_text(detail)}")
 
     @classmethod
     def _stream_delta(cls, event: Any) -> str:

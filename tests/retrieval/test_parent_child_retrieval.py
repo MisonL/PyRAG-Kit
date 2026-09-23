@@ -445,3 +445,87 @@ def test_retrieve_documents_rrf_keeps_results_under_default_threshold(monkeypatc
     assert results
     assert results[0]["page_content"] == "parent content"
     assert results[0]["metadata"]["parent_id"] == "parent-1"
+
+
+def _rerank_session_config(top_k):
+    return SimpleNamespace(
+        rerank_enabled=True,
+        active_rerank_configuration="siliconflow",
+        top_k=top_k,
+        rerank_configurations={
+            "siliconflow": SimpleNamespace(provider="siliconflow", model_name="rerank")
+        },
+    )
+
+
+def test_rerank_reorders_documents_by_returned_index_and_score(monkeypatch):
+    """provider 返回乱序 index 时，结果必须按 index 重排并按分数降序。
+
+    既有用例的替身恒返回 ``[0]``（恒等置换），重排与 ``sorted(reverse=True)``
+    从未被执行，因此这条路径长期无守卫。
+    """
+    service = RetrievalService(vector_store=object(), embedding_service=object())
+    provider = MagicMock()
+
+    async def fake_arerank(_query, _documents, top_n):
+        assert top_n == 3
+        return [2, 0, 1], [0.9, 0.5, 0.3]
+
+    provider.arerank.side_effect = fake_arerank
+    monkeypatch.setattr(
+        "src.services.retrieval_service.ModelProviderFactory.get_rerank_provider",
+        MagicMock(return_value=provider),
+    )
+    documents = [
+        {"page_content": "doc-a", "score": 0.1, "metadata": {}},
+        {"page_content": "doc-b", "score": 0.2, "metadata": {}},
+        {"page_content": "doc-c", "score": 0.3, "metadata": {}},
+    ]
+
+    reranked = asyncio.run(
+        service._rerank_if_needed("query", documents, _rerank_session_config(top_k=3))
+    )
+
+    assert [doc["page_content"] for doc in reranked] == ["doc-c", "doc-a", "doc-b"]
+    assert [doc["score"] for doc in reranked] == [0.9, 0.5, 0.3]
+    # 原列表不得被就地修改
+    assert [doc["page_content"] for doc in documents] == ["doc-a", "doc-b", "doc-c"]
+
+
+def test_rerank_output_order_follows_scores_not_provider_order(monkeypatch):
+    """provider 若按 index 升序返回但分数递减，最终顺序仍应由分数决定。"""
+    service = RetrievalService(vector_store=object(), embedding_service=object())
+    provider = MagicMock()
+
+    async def fake_arerank(_query, _documents, top_n):
+        return [0, 1, 2], [0.1, 0.9, 0.4]
+
+    provider.arerank.side_effect = fake_arerank
+    monkeypatch.setattr(
+        "src.services.retrieval_service.ModelProviderFactory.get_rerank_provider",
+        MagicMock(return_value=provider),
+    )
+    documents = [{"page_content": f"doc-{name}", "score": 0.0, "metadata": {}} for name in "abc"]
+
+    reranked = asyncio.run(
+        service._rerank_if_needed("query", documents, _rerank_session_config(top_k=3))
+    )
+
+    assert [doc["page_content"] for doc in reranked] == ["doc-b", "doc-c", "doc-a"]
+
+
+@pytest.mark.parametrize(
+    ("indices", "scores", "match"),
+    [
+        ([True], [0.9], "index 无效"),
+        ([0], [True], "score 无效"),
+        ([0, 0], [0.9, 0.8], "重复 index"),
+        ([3], [0.9], "index 无效"),
+        ([-1], [0.9], "index 无效"),
+        ([0], [float("inf")], "有限数值"),
+    ],
+)
+def test_validate_rerank_output_rejects_invalid_provider_results(indices, scores, match):
+    """契约失败必须是显式异常，而不是让错误顺序静默进入检索结果。"""
+    with pytest.raises(RuntimeError, match=match):
+        RetrievalService._validate_rerank_output(indices, scores, document_count=3)
