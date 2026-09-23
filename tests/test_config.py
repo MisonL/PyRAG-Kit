@@ -78,30 +78,39 @@ def test_settings_model_validation():
 
 
 @pytest.mark.parametrize(
-    ("field_name", "bad_value"),
+    ("field_name", "bad_value", "expected_message"),
     [
-        ("log_retention_days", -5),
-        ("log_retention_days", 0),
-        ("kb_chunk_size", 0),
-        ("kb_chunk_size", -100),
-        ("kb_chunk_overlap", -1),
-        ("kb_child_chunk_size", 0),
-        ("kb_child_chunk_overlap", -1),
-        ("kb_embedding_batch_size", 0),
-        ("kb_embedding_batch_size", -1),
-        ("chat_vector_weight", -1.0),
-        ("chat_vector_weight", 5.0),
-        ("chat_keyword_weight", 2.0),
+        ("log_retention_days", -5, "log_retention_days 必须是大于等于 1 的整数"),
+        ("log_retention_days", 0, "log_retention_days 必须是大于等于 1 的整数"),
+        ("kb_chunk_size", 0, "kb_chunk_size/kb_child_chunk_size/kb_embedding_batch_size"),
+        ("kb_chunk_size", -100, "kb_chunk_size/kb_child_chunk_size/kb_embedding_batch_size"),
+        ("kb_chunk_overlap", -1, "kb_chunk_overlap/kb_child_chunk_overlap 必须是非负整数"),
+        ("kb_child_chunk_size", 0, "kb_chunk_size/kb_child_chunk_size/kb_embedding_batch_size"),
+        ("kb_child_chunk_overlap", -1, "kb_chunk_overlap/kb_child_chunk_overlap 必须是非负整数"),
+        ("kb_embedding_batch_size", 0, "kb_chunk_size/kb_child_chunk_size/kb_embedding_batch_size"),
+        (
+            "kb_embedding_batch_size",
+            -1,
+            "kb_chunk_size/kb_child_chunk_size/kb_embedding_batch_size",
+        ),
+        ("chat_vector_weight", -1.0, "chat_vector_weight/chat_keyword_weight 必须在 0 到 1 之间"),
+        ("chat_vector_weight", 5.0, "chat_vector_weight/chat_keyword_weight 必须在 0 到 1 之间"),
+        ("chat_keyword_weight", 2.0, "chat_vector_weight/chat_keyword_weight 必须在 0 到 1 之间"),
     ],
 )
-def test_numeric_settings_reject_illegal_values(field_name, bad_value):
+def test_numeric_settings_reject_illegal_values(field_name, bad_value, expected_message):
     """数值字段的非法值必须在加载期报错，而不是拖到分片/检索期。
 
     ``kb_chunk_size=0`` 此前会一路通过配置校验，直到 langchain 在分片阶段
     才抛 ``chunk_size must be > 0``；负权重会反向加成分数。UI 层
     （``src/ui/config_menu.py``）已有 0..1 校验，TOML/env 路径此前没有。
+
+    断言用**该 validator 独有的消息片段**，而不是 ``match=field_name``：跨字段
+    的 ``model_validator`` 报错文本里也会出现 ``kb_chunk_size`` 等字段名（例如
+    「kb_chunk_overlap 必须小于 kb_chunk_size。」），用字段名匹配会让这些用例在
+    被保护的 validator 被删除后依然变绿（假绿）。
     """
-    with pytest.raises(ValidationError, match=field_name):
+    with pytest.raises(ValidationError, match=expected_message):
         Settings(**{field_name: bad_value})
 
 
@@ -113,11 +122,95 @@ def test_chunk_overlap_must_be_strictly_smaller_than_chunk_size():
         Settings(kb_child_chunk_size=50, kb_child_chunk_overlap=50)
 
 
+@pytest.mark.parametrize(
+    ("field_name", "bad_value"),
+    [
+        ("chat_top_k", 10**9),
+        ("chat_top_k", 10**18),
+        ("retrieval_candidate_multiplier", 10**9),
+        ("retrieval_candidate_multiplier", 10**18),
+    ],
+)
+def test_retrieval_sizes_reject_unbounded_values(field_name, bad_value):
+    """检索规模必须有上界。
+
+    ``effective_top_k = chat_top_k * retrieval_candidate_multiplier`` 直通
+    ``faiss_index.search()``，FAISS 不报错也不截断：实测 ``chat_top_k=10**9``
+    会被接受，单次查询真实分配约 3.6 GB 数组、RSS 涨 10.3 GB 并挂起 8.4 秒。
+    """
+    with pytest.raises(ValidationError, match=field_name):
+        Settings(**{field_name: bad_value})
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "log_retention_days",
+        "kb_chunk_size",
+        "kb_child_chunk_size",
+        "kb_embedding_batch_size",
+        "kb_chunk_overlap",
+        "kb_child_chunk_overlap",
+        "chat_top_k",
+        "retrieval_candidate_multiplier",
+        "chat_vector_weight",
+        "chat_keyword_weight",
+        "chat_score_threshold",
+        "chat_temperature",
+    ],
+)
+def test_int_and_float_settings_reject_bool(field_name):
+    """``True``/``False`` 不得被当作 1/0 静默接受。
+
+    Python 里 ``bool`` 是 ``int`` 的子类，不做 ``isinstance(value, bool)`` 短路
+    的话 ``Settings(chat_top_k=True)`` 会静默变成 ``1``。这类配置错误应显式报错。
+    """
+    with pytest.raises(ValidationError, match=field_name):
+        Settings(**{field_name: True})
+
+
+def test_child_chunk_size_cannot_exceed_parent_chunk_size():
+    """子分片不得大于父分片，否则层级结构静默退化为一层。
+
+    实测 ``kb_chunk_size=300, kb_child_chunk_size=1500`` 被接受后，父块数从 2
+    涨到 10（每个父块只产出 1 个子块），「先粗后细」的父子检索意图失效。
+    """
+    with pytest.raises(ValidationError, match="kb_child_chunk_size"):
+        Settings(kb_chunk_size=300, kb_child_chunk_size=1500)
+    with pytest.raises(ValidationError, match="kb_child_chunk_size"):
+        Settings(kb_chunk_size=100, kb_child_chunk_size=100)
+    # 相等也应拒绝：与 overlap<size 同理，层级需要严格的大小关系。
+    with pytest.raises(ValidationError, match="kb_child_chunk_size"):
+        Settings(kb_chunk_size=500, kb_child_chunk_size=500)
+
+
+def test_hybrid_weights_cannot_both_be_zero():
+    """两个融合权重不得同时为 0，否则检索结果被静默全部丢弃。
+
+    ``retrieval_service._weight_tuple()`` 在 ``total <= 0`` 时返回 (0.0, 0.0)，
+    所有候选得分为 0；再叠加 weighted 策略启用阈值过滤（默认 0.4），
+    结果是空列表且无任何报错。
+    """
+    with pytest.raises(ValidationError, match="不能同时为 0"):
+        Settings(chat_vector_weight=0.0, chat_keyword_weight=0.0)
+
+
+def test_hybrid_weights_single_zero_is_still_allowed():
+    """只有一个为 0 是合法配置（纯向量检索 / 纯关键词检索）。"""
+    assert Settings(chat_vector_weight=0.0, chat_keyword_weight=1.0).chat_vector_weight == 0.0
+    assert Settings(chat_vector_weight=1.0, chat_keyword_weight=0.0).chat_keyword_weight == 0.0
+
+
 def test_numeric_settings_accept_legal_boundary_values():
-    """合法边界值必须仍然可用，避免校验过紧。"""
+    """合法边界值必须仍然可用，避免校验过紧。
+
+    注意 ``kb_child_chunk_size`` 必须是**严格小于** ``kb_chunk_size``：层级分片
+    需要这个严格关系，越小越退化。实测 ``parent=child=1`` 时不同父块数等于分块数
+    （30/30），即每个父块只产出一个子块，与 ``child > parent`` 一样退化为一层。
+    """
     settings = Settings(
         log_retention_days=1,
-        kb_chunk_size=1,
+        kb_chunk_size=2,
         kb_chunk_overlap=0,
         kb_child_chunk_size=1,
         kb_child_chunk_overlap=0,
@@ -126,6 +219,7 @@ def test_numeric_settings_accept_legal_boundary_values():
         chat_keyword_weight=1.0,
     )
     assert settings.kb_chunk_overlap == 0
+    assert settings.kb_child_chunk_size == 1
     assert settings.chat_vector_weight == 0.0
     assert settings.chat_keyword_weight == 1.0
 

@@ -2472,7 +2472,10 @@ def test_ark_chat_completions_tool_calls_carry_type_key():
                     tool_calls=[
                         SimpleNamespace(
                             id="call-1",
-                            type="function",
+                            # 故意用非 "function" 的 type：夹具若写 "function"，
+                            # 硬编码 "function" 的变异体与透传 call.type 输出相同，
+                            # 测试对「值是否真来自 SDK」零区分度。
+                            type="custom_tool_call",
                             function=SimpleNamespace(name="lookup", arguments='{"id": 1}'),
                         )
                     ],
@@ -2489,12 +2492,40 @@ def test_ark_chat_completions_tool_calls_carry_type_key():
 
     assert len(result.tool_calls) == 1
     call = result.tool_calls[0]
-    assert call["type"] == "function"
+    # 必须是 SDK 回传的原值，而不是被硬编码成 "function"
+    assert call["type"] == "custom_tool_call"
     assert set(call) == {"id", "type", "name", "arguments"}
 
     # 与 OpenAI 兼容侧逐键对齐，防止两条路径再次分叉。
     oai_calls = OpenAICompatibleProvider._extract_tool_calls(response)
     assert call == oai_calls[0]
+
+    # 交叉断言必须也覆盖「缺 type 时两侧各自的默认值」：夹具若显式给了 type，
+    # 上面的对齐只验证透传路径，两条路径的 default 一旦分叉（例如一侧被改成
+    # "function_MUTATED"）测试仍然全绿。
+    missing_type = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None,
+                    tool_calls=[
+                        SimpleNamespace(
+                            id="call-1",
+                            function=SimpleNamespace(name="lookup", arguments='{"id": 1}'),
+                        )
+                    ],
+                ),
+                finish_reason="tool_calls",
+            )
+        ],
+        usage=None,
+        output=None,
+        output_text=None,
+    )
+    assert (
+        VolcengineProvider._extract_result(missing_type).tool_calls[0]
+        == OpenAICompatibleProvider._extract_tool_calls(missing_type)[0]
+    )
 
 
 def test_ark_chat_completions_tool_calls_default_type_to_function():

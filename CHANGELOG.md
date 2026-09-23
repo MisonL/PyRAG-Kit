@@ -93,6 +93,16 @@
 - Google `tool_choice` 的异常文本在源头脱敏：裸 pydantic `ValidationError` 会把违规取值原文写进 `input_value=...`，而 `types.ToolConfig` 允许的键集里就有 `api_key` 这类凭证形态的键。两个消毒器（`redact_sensitive_text`、`safe_exception_text`）虽然都能拦住，但在拼消息前收口才是纵深防御。
 - `release.yml` 的手动发布路径补交叉校验：`workflow_dispatch` 的 `tag`/`version` 是手填的，此前直接透传，会发出一个版本号与 `pyproject.toml`/`CHANGELOG.md` 不符的 release。现校验 `version` 与 `pyproject.toml` 一致、`tag` 等于 `v{version}`、且 CHANGELOG 已有该版本条目。
 
+- 检索规模补齐上界：`chat_top_k` 此前只校验下界，而 `effective_top_k = chat_top_k * retrieval_candidate_multiplier` 会直通 `faiss_index.search()`，FAISS 既不报错也不截断。实测 `chat_top_k=10**9` 被接受，单次查询真实分配约 3.6 GB 数组、进程 RSS 涨 10.3 GB 并挂起 8.4 秒。现限制 `chat_top_k ≤ 10000`、`retrieval_candidate_multiplier ≤ 100`。
+- 补齐父子分片的层级约束：`kb_child_chunk_size >= kb_chunk_size` 此前被静默接受，实测 `parent=child=300` 时不同父块数等于分块数（15/15），即每个父块只产出一个子块，「先粗后细」的父子检索退化为单层。现要求子分片严格小于父分片——与既有的 `overlap < size` 同属无法用单字段 validator 表达的约束。
+- 混合检索权重不得同时为 0：`retrieval_service._weight_tuple()` 在 `total <= 0` 时返回 `(0.0, 0.0)`，所有候选得分为 0，再叠加 `weighted` 策略启用阈值过滤（默认 0.4）会导致**检索结果被全部丢弃且无任何报错**。单个权重为 0 仍合法（纯向量 / 纯关键词检索）。
+- 修复布尔值绕过数值校验的真因：`bool` 是 `int` 的子类，而 pydantic 的 lax 模式会在 `field_validator` **之前**把 `True` 强转成 `1`，因此原有的 6 处 `isinstance(value, bool)` guard 全部是**不可达的死代码**——实测 `Settings(chat_top_k=True)`、`log_retention_days=True`、`chat_vector_weight=True` 等 10 个字段均被静默接受为 `1`/`1.0`。现给这些 validator 加 `mode="before"` 让 guard 真正生效，并新增 `_coerce_number()` 统一处理 `mode="before"` 下收到的原始输入（字符串数值来自 `.env`/TOML，必须继续支持）。
+- `chat_temperature` 与 `retrieval_candidate_multiplier` 的 validator 补上同样的布尔短路（两者此前也用 `float(v)`/`int(v)` 静默接受 `True`）。
+- 修复 `.env.example` 的默认渠道覆盖：`DEFAULT_LLM_PROVIDER="openai"` 是生效的环境变量，而环境变量优先于 `config.toml`，因此按示例原样复制后 `default_llm_provider` 被改成 `openai`、覆盖了 TOML 里的 `google`，导致 14 条模型配置因密钥为空串在运行期失败（而 `default_embedding_provider=local-hash`、`default_vector_store=faiss` 都选了零凭证通道，证明零凭证默认可行）。现改为注释并说明原因。
+- 修复三例「假绿」测试：`test_numeric_settings_reject_illegal_values` 原先用 `match=field_name` 断言，而跨字段 `model_validator` 的报错文本里也含 `kb_chunk_size` 等字段名（「kb_chunk_overlap 必须小于 kb_chunk_size。」），删除被保护的 `validate_positive_sizes` 后这 3 例仍然全绿。现改为断言各 validator **独有的消息片段**，变异验证下失败数从 2 提升到 5。
+- 补强 Ark `tool_calls` 的 `type` 回归测试：夹具原先写 `type="function"`，与硬编码值相同，因此把透传改成硬编码 `"function"` 的变异体无法被捕获（零区分度）。现夹具改用非 `"function"` 的取值，并新增一条覆盖「缺 `type` 时两侧默认值对齐」的交叉断言——此前断言只覆盖显式传值路径，两条路径的 default 一旦分叉测试仍全绿。
+- 新增 12 例布尔短路测试，覆盖 `log_retention_days`、`kb_chunk_size`、`kb_chunk_overlap`、`chat_top_k`、`retrieval_candidate_multiplier`、`chat_vector_weight`、`chat_score_threshold`、`chat_temperature` 等字段拒绝 `True`。
+
 ## [1.3.0] - 2026-03-20
 
 ### 运行与配置

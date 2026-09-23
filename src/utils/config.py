@@ -141,6 +141,38 @@ class ModelDetail(BaseModel):
 # =================================================================
 
 
+# 检索规模的上界。不是洁癖：``effective_top_k = chat_top_k *
+# retrieval_candidate_multiplier`` 直通 ``faiss_index.search()``，FAISS 既不报错
+# 也不截断。实测 ``chat_top_k=10**9`` 单次查询分配约 3.6 GB 数组、RSS 涨
+# 10.3 GB、耗时 8.4 秒。10_000 远超任何真实场景（默认 top_k=5 × multiplier=3）。
+_MAX_RETRIEVAL_TOP_K = 10_000
+_MAX_RETRIEVAL_MULTIPLIER = 100
+
+
+def _coerce_number(value: Any, field_label: str) -> int | float:
+    """把 ``mode="before"`` 收到的原始输入转成数值。
+
+    ``mode="before"`` 的 validator 拿到的是**未经 pydantic 强转**的原始值：
+    ``.env``/TOML 来源是字符串（``"5"``），Python 调用方可能是 ``int``/``float``，
+    而 ``bool`` 是 ``int`` 的子类（``int(True) == 1``）必须显式拒绝，否则
+    ``Settings(chat_top_k=True)`` 会静默变成 ``1``。
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{field_label} 不能是布尔值 {value!r}。")
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            return int(text)
+        except ValueError:
+            try:
+                return float(text)
+            except ValueError as exc:
+                raise ValueError(f"无法把 {field_label} 的 {value!r} 转换为数值。") from exc
+    raise ValueError(f"{field_label} 必须是数值，但得到 {type(value).__name__}。")
+
+
 class Settings(BaseSettings):
     """
     定义整个应用的配置，使用Pydantic进行类型校验和分层加载。
@@ -301,53 +333,86 @@ class Settings(BaseSettings):
     )
 
     # --- [VALIDATORS] ---
-    @field_validator("chat_top_k")
+    @field_validator("chat_top_k", mode="before")
     @classmethod
-    def validate_chat_top_k(cls, value: int) -> int:
-        if isinstance(value, bool) or value < 1:
-            raise ValueError("chat_top_k 必须是大于等于 1 的整数。")
-        return value
+    def validate_chat_top_k(cls, value: Any) -> int:
+        # 上界不是洁癖：effective_top_k = chat_top_k * retrieval_candidate_multiplier
+        # 会直通 faiss_index.search()，FAISS 不报错也不截断。实测 chat_top_k=10**9
+        # 时单次查询真实分配约 3.6 GB 数组、RSS 涨 10.3 GB 并挂起 8.4 秒。
+        number = _coerce_number(value, "chat_top_k")
+        if isinstance(number, float) and not number.is_integer():
+            raise ValueError(f"chat_top_k 必须是整数，但得到 {number}。")
+        number = int(number)
+        if not 1 <= number <= _MAX_RETRIEVAL_TOP_K:
+            raise ValueError(f"chat_top_k 必须是 1 到 {_MAX_RETRIEVAL_TOP_K} 之间的整数。")
+        return number
 
-    @field_validator("chat_score_threshold")
+    @field_validator("chat_score_threshold", mode="before")
     @classmethod
-    def validate_chat_score_threshold(cls, value: float) -> float:
-        if isinstance(value, bool) or not 0 <= value <= 1:
+    def validate_chat_score_threshold(cls, value: Any) -> float:
+        number = float(_coerce_number(value, "chat_score_threshold"))
+        if not 0 <= number <= 1:
             raise ValueError("chat_score_threshold 必须在 0 到 1 之间。")
-        return value
+        return number
 
-    @field_validator("log_retention_days")
+    @field_validator("log_retention_days", mode="before")
     @classmethod
-    def validate_log_retention_days(cls, value: int) -> int:
-        if isinstance(value, bool) or value < 1:
+    def validate_log_retention_days(cls, value: Any) -> int:
+        number = _coerce_number(value, "log_retention_days")
+        if isinstance(number, float) and not number.is_integer():
+            raise ValueError(f"log_retention_days 必须是整数，但得到 {number}。")
+        number = int(number)
+        if number < 1:
             raise ValueError("log_retention_days 必须是大于等于 1 的整数。")
-        return value
+        return number
 
     @field_validator(
         "kb_chunk_size",
         "kb_child_chunk_size",
         "kb_embedding_batch_size",
+        mode="before",
     )
     @classmethod
-    def validate_positive_sizes(cls, value: int) -> int:
-        if isinstance(value, bool) or value < 1:
+    def validate_positive_sizes(cls, value: Any) -> int:
+        number = _coerce_number(value, "kb_chunk_size/kb_child_chunk_size/kb_embedding_batch_size")
+        if isinstance(number, float) and not number.is_integer():
+            raise ValueError(
+                "kb_chunk_size/kb_child_chunk_size/kb_embedding_batch_size 必须是整数。"
+            )
+        number = int(number)
+        if number < 1:
             raise ValueError(
                 "kb_chunk_size/kb_child_chunk_size/kb_embedding_batch_size 必须是大于等于 1 的整数。"
             )
-        return value
+        return number
 
-    @field_validator("kb_chunk_overlap", "kb_child_chunk_overlap")
+    @field_validator("kb_chunk_overlap", "kb_child_chunk_overlap", mode="before")
     @classmethod
-    def validate_non_negative_overlap(cls, value: int) -> int:
-        if isinstance(value, bool) or value < 0:
+    def validate_non_negative_overlap(cls, value: Any) -> int:
+        number = _coerce_number(value, "kb_chunk_overlap/kb_child_chunk_overlap")
+        if isinstance(number, float) and not number.is_integer():
+            raise ValueError("kb_chunk_overlap/kb_child_chunk_overlap 必须是整数。")
+        number = int(number)
+        if number < 0:
             raise ValueError("kb_chunk_overlap/kb_child_chunk_overlap 必须是非负整数。")
-        return value
+        return number
 
-    @field_validator("chat_vector_weight", "chat_keyword_weight")
+    @field_validator("chat_vector_weight", "chat_keyword_weight", mode="before")
     @classmethod
-    def validate_hybrid_weights(cls, value: float) -> float:
-        if isinstance(value, bool) or not 0 <= value <= 1:
+    def validate_hybrid_weights(cls, value: Any) -> float:
+        number = float(_coerce_number(value, "chat_vector_weight/chat_keyword_weight"))
+        if not 0 <= number <= 1:
             raise ValueError("chat_vector_weight/chat_keyword_weight 必须在 0 到 1 之间。")
-        return value
+        return number
+
+    @model_validator(mode="after")
+    def validate_retrieval_size_bounds(self) -> "Settings":
+        """检索规模必须有上界，否则单次查询就能耗尽内存。"""
+        if self.retrieval_candidate_multiplier > _MAX_RETRIEVAL_MULTIPLIER:
+            raise ValueError(
+                f"retrieval_candidate_multiplier 必须不超过 {_MAX_RETRIEVAL_MULTIPLIER}。"
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_overlap_smaller_than_size(self) -> "Settings":
@@ -360,6 +425,37 @@ class Settings(BaseSettings):
             raise ValueError("kb_chunk_overlap 必须小于 kb_chunk_size。")
         if self.kb_child_chunk_overlap >= self.kb_child_chunk_size:
             raise ValueError("kb_child_chunk_overlap 必须小于 kb_child_chunk_size。")
+        return self
+
+    @model_validator(mode="after")
+    def validate_child_chunk_size_not_larger_than_parent(self) -> "Settings":
+        """子分片不得大于父分片，否则层级结构静默退化为一层。
+
+        实测 ``kb_chunk_size=300, kb_child_chunk_size=1500`` 被接受后，父块数
+        从 2 涨到 10（每个父块只产出 1 个子块），「先粗后细」的父子检索意图
+        失效，且没有任何报错。同属无法用单字段 validator 表达的约束。
+        """
+        # 相等同样要拒：实测 parent=child=300 时不同父块数 == 分块数（15/15），
+        # 即每个父块只产出一个子块，层级与 child>parent 一样退化为一层。
+        if self.kb_child_chunk_size >= self.kb_chunk_size:
+            raise ValueError(
+                "kb_child_chunk_size 必须小于 kb_chunk_size（子分片不得大于或等于父分片）。"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_hybrid_weights_not_both_zero(self) -> "Settings":
+        """两个融合权重不得同时为 0，否则检索结果被静默全部丢弃。
+
+        ``retrieval_service._weight_tuple()`` 在 ``total <= 0`` 时返回
+        ``(0.0, 0.0)``，所有候选得分为 0；再叠加 ``weighted`` 策略会启用阈值
+        过滤（默认 ``chat_score_threshold=0.4``），结果是空列表且无任何报错。
+        单个为 0 是合法的（纯向量 / 纯关键词检索）。
+        """
+        if self.chat_vector_weight == 0 and self.chat_keyword_weight == 0:
+            raise ValueError(
+                "chat_vector_weight 与 chat_keyword_weight 不能同时为 0，否则检索结果会被全部丢弃。"
+            )
         return self
 
     @field_validator("log_level", mode="before")
@@ -392,6 +488,9 @@ class Settings(BaseSettings):
     @classmethod
     def validate_chat_temperature(cls, v: Any) -> float:
         """验证聊天温度在 0.0 到 1.0 之间。"""
+        # ``bool`` 是 ``int`` 的子类，``float(True) == 1.0`` 会被静默接受。
+        if isinstance(v, bool):
+            raise ValueError(f"聊天温度必须是数字，不能是布尔值 {v!r}。")
         try:
             value = float(v)
         except (ValueError, TypeError) as exc:
@@ -461,6 +560,9 @@ class Settings(BaseSettings):
     @classmethod
     def validate_retrieval_candidate_multiplier(cls, v: Any) -> int:
         """验证检索候选过量招募倍率。"""
+        # ``bool`` 是 ``int`` 的子类，``int(True) == 1`` 会被静默接受。
+        if isinstance(v, bool):
+            raise ValueError(f"检索候选倍率必须是整数，不能是布尔值 {v!r}。")
         try:
             value = int(v)
         except (ValueError, TypeError) as exc:
