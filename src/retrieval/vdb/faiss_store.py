@@ -67,12 +67,25 @@ class FaissStore(VectorStoreBase):
             return f"{source_hint}\n{page_content}"
         return page_content
 
+    @staticmethod
+    def _build_bm25_index(tokenized_docs: list[list[str]]) -> BM25Okapi | None:
+        """构造 BM25 索引；空语料返回 None 而不是让 rank_bm25 除零。
+
+        ``BM25._initialize`` 计算 ``avgdl = num_doc / self.corpus_size``，
+        语料为空时直接 ``ZeroDivisionError``。``load_snapshot`` 会从
+        ``lexical.index`` 读回 ``[]``（空快照或手工构造的目录），旧实现
+        在此崩溃且不报「快照为空」这个真实原因。
+        """
+        if not tokenized_docs:
+            return None
+        return BM25Okapi(tokenized_docs)
+
     def _rebuild_indices(self) -> None:
         if self.documents:
             self._tokenized_docs_cache = [
                 list(jieba.cut(self._build_index_text(doc))) for doc in self.documents
             ]
-            self.bm25_index = BM25Okapi(self._tokenized_docs_cache)
+            self.bm25_index = self._build_bm25_index(self._tokenized_docs_cache)
         else:
             self._tokenized_docs_cache = []
             self.bm25_index = None
@@ -178,11 +191,31 @@ class FaissStore(VectorStoreBase):
         doc_scores = self.bm25_index.get_scores(tokenized_query)
         top_indices = np.argsort(doc_scores)[::-1]
 
+        # 分数可能整片为 0，而不是「最高分是 0」。rank_bm25 的 idf 是
+        # ``log(N - n + 0.5) - log(n + 0.5)``，且只对 ``idf < 0`` 做 epsilon
+        # 浮动——当某个词**恰好**出现在一半文档里（``n == N/2``）时 idf 恰为
+        # 0，不属于「负」因此不被浮动，该词在所有文档上的分数就全是 0。
+        # 查询词根本不在语料里时同样全 0。
+        #
+        # 此时旧实现（``if score <= 0: break``）静默返回空列表，且区分不了
+        # 下面两种完全不同的情况：
+        #   (a) 该词无判别力 / 语料里没有这个词 —— 空结果本身说得通；
+        #   (b) 排名里混着正分文档，只是 0 分文档排在前面把循环提前 break ——
+        #       这是丢结果。
+        # 因此先看全局最高分：最高分 <= 0 直接返回空（并在 debug 里说明原因），
+        # 否则按分数降序收集，遇 0 分只跳过该条、不终止。
+        if doc_scores.size == 0 or float(doc_scores[top_indices[0]]) <= 0:
+            logger.debug(
+                "关键词检索无有效分数（查询词可能不在语料中，或恰好出现在一半文档里"
+                " 导致 BM25 idf 为 0），返回空结果。"
+            )
+            return []
+
         results: list[dict[str, Any]] = []
         for index in top_indices:
             score = float(doc_scores[index])
             if score <= 0:
-                break
+                continue
             document = deepcopy(self.documents[index])
             document["score"] = score
             results.append(document)
@@ -275,7 +308,7 @@ class FaissStore(VectorStoreBase):
         if lexical_path.exists():
             with lexical_path.open("rb") as file:
                 self._tokenized_docs_cache = pickle.load(file)  # nosec B301
-            self.bm25_index = BM25Okapi(self._tokenized_docs_cache)
+            self.bm25_index = self._build_bm25_index(self._tokenized_docs_cache)
         else:
             self._rebuild_indices()
         self._normalize_loaded_documents()

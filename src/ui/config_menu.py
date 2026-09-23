@@ -4,7 +4,11 @@ import questionary
 from rich.console import Console
 from rich.panel import Panel
 
-from ..utils.config import RetrievalMethod
+from ..utils.config import (
+    _MAX_RETRIEVAL_MULTIPLIER,
+    _MAX_RETRIEVAL_TOP_K,
+    RetrievalMethod,
+)
 from ..utils.log_manager import get_module_logger  # 导入日志管理器
 from .display_utils import display_chat_config
 
@@ -67,9 +71,11 @@ def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
                 logger.info(f"检索模式已更新为: {new_method}")
 
         elif choice == "top_k":
+            # 上界与 SessionConfig/Settings 的守卫一致：此处不挡，非法值会一路
+            # 走到 faiss_index.search()，FAISS 既不报错也不截断。
             new_top_k = questionary.text(
-                f"输入新的Top K值 (当前: {current_top_k}):",
-                validate=lambda text: text.isdigit() and int(text) > 0,
+                f"输入新的Top K值 (1-{_MAX_RETRIEVAL_TOP_K}, 当前: {current_top_k}):",
+                validate=lambda text: text.isdigit() and 1 <= int(text) <= _MAX_RETRIEVAL_TOP_K,
                 default=str(current_top_k),
             ).ask()
             if new_top_k:
@@ -136,8 +142,10 @@ def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
 
         elif choice == "candidate_multiplier":
             new_multiplier = questionary.text(
-                f"输入候选过量招募倍率 (当前: {current_candidate_multiplier}):",
-                validate=lambda text: text.isdigit() and int(text) >= 1,
+                f"输入候选过量招募倍率 (1-{_MAX_RETRIEVAL_MULTIPLIER}, 当前: {current_candidate_multiplier}):",
+                validate=lambda text: (
+                    text.isdigit() and 1 <= int(text) <= _MAX_RETRIEVAL_MULTIPLIER
+                ),
                 default=str(current_candidate_multiplier),
             ).ask()
             if new_multiplier:

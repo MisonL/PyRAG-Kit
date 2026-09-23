@@ -69,7 +69,19 @@ class Chatbot:
             vector_store=self.vector_store,
             embedding_service=EmbeddingService(self.run_config),
         )
-        self.console.print("[green]知识快照加载成功。[/green]")
+        # 不能无条件报「加载成功」：没有任何快照/旧版 pkl 时 store 是空的
+        # （documents=0、faiss_index=None），用户会先看到成功再看到永远是
+        # 「无相关文档」，把构建缺失误诊成检索质量差。
+        chunk_count = len(getattr(self.vector_store, "documents", []) or [])
+        if chunk_count:
+            self.console.print(f"[green]知识快照加载成功，共 {chunk_count} 个分块。[/green]")
+        else:
+            self.console.print(
+                "[bold yellow]未找到可用的知识快照，检索将始终返回空结果。[/bold yellow]"
+            )
+            self.console.print(
+                "[yellow]请先在主菜单执行「知识库文档向量化处理」构建快照。[/yellow]"
+            )
 
     def reload_llm(self) -> bool:
         previous_model = self.llm_model

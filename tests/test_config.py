@@ -80,8 +80,8 @@ def test_settings_model_validation():
 @pytest.mark.parametrize(
     ("field_name", "bad_value", "expected_message"),
     [
-        ("log_retention_days", -5, "log_retention_days 必须是大于等于 1 的整数"),
-        ("log_retention_days", 0, "log_retention_days 必须是大于等于 1 的整数"),
+        ("log_retention_days", -5, "log_retention_days 必须是 1 到 3650 之间的整数"),
+        ("log_retention_days", 0, "log_retention_days 必须是 1 到 3650 之间的整数"),
         ("kb_chunk_size", 0, "kb_chunk_size/kb_child_chunk_size/kb_embedding_batch_size"),
         ("kb_chunk_size", -100, "kb_chunk_size/kb_child_chunk_size/kb_embedding_batch_size"),
         ("kb_chunk_overlap", -1, "kb_chunk_overlap/kb_child_chunk_overlap 必须是非负整数"),
@@ -584,3 +584,101 @@ def test_get_settings_reports_non_credential_validation_errors(isolated_config):
 
     with pytest.raises(ValueError, match="chat_top_k"):
         get_settings()
+
+
+# ── 回归：数值解析不得宽松放行「看起来成功」的形态 ──
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "1_0",  # Python 下划线分组：int("1_0") == 10、float("1_0") == 10.0
+        "+7",  # 正号：float("+7") == 7.0
+        "0x10",  # 十六进制
+        "inf",
+        "-inf",
+        "nan",
+        "1 500",
+        "1,500",
+        "",
+        "abc",
+    ],
+)
+def test_numeric_settings_reject_non_decimal_string_forms(raw):
+    """字符串数值只接受十进制字面量，不放行下划线分组/正号/十六进制/非有限值。
+
+    ``int()`` 与 ``float()`` 都接受 ``"1_0"`` 这类 Python 字面量形态
+    （``int("1_0") == 10``、``float("1_0") == 10.0``），配置里写错时会被静默
+    读成另一个数——安静的成功正是本项目反复踩到的模式，因此在解析前先做形状校验。
+    """
+    with pytest.raises(ValidationError, match="无法把 kb_chunk_size"):
+        Settings(kb_chunk_size=raw)
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [("1500", 1500), (" 1500 ", 1500), ("2000", 2000), ("1500\n", 1500)],
+)
+def test_numeric_settings_accept_decimal_integer_strings(raw, expected):
+    """收紧不能误伤：正常十进制字符串（含首尾空白）仍必须可用。
+
+    取值都避开既有的交叉约束 ``kb_chunk_overlap < kb_chunk_size``：overlap 默认
+    150，所以 ``kb_chunk_size="1"`` 会被它拒绝，与本次形状校验无关。
+    """
+    assert Settings(kb_chunk_size=raw).kb_chunk_size == expected
+
+
+def test_numeric_settings_accept_scientific_notation_for_float_fields():
+    """float 字段仍接受科学计数法——这是合法的十进制字面量。"""
+    assert Settings(chat_score_threshold="1e-1").chat_score_threshold == pytest.approx(0.1)
+    assert Settings(chat_temperature="1e0").chat_temperature == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    "field_name,bad_value",
+    [
+        ("log_retention_days", 10**400),
+        ("kb_chunk_size", 10**400),
+        ("kb_child_chunk_size", 10**400),
+        ("kb_embedding_batch_size", 10**400),
+        ("log_retention_days", "1" + "0" * 400),
+        ("kb_chunk_size", "1" + "0" * 400),
+    ],
+)
+def test_integer_settings_reject_overflow_magnitudes(field_name, bad_value):
+    """溢出量级的整数必须在加载期拒绝，而不是拖到运算期。
+
+    实测修复前 ``log_retention_days=10**400`` 与 ``kb_chunk_size=10**400``
+    都被接受（这两个字段当时只有下界），直到日期减法／内存申请才炸。
+    """
+    with pytest.raises(ValidationError, match=field_name):
+        Settings(**{field_name: bad_value})
+
+
+def test_score_threshold_overflow_is_a_validation_error_not_overflow_error():
+    """``float(10**400)`` 抛的是裸 ``OverflowError``；它**不是** ``ValidationError``，
+    会穿透 ``get_settings`` 的 ``except`` 变成未脱敏 traceback。因此范围判断必须在
+    转 float 之前完成。
+
+    这里用 ``Settings`` 直接断言异常类型：``get_settings`` 不接受 kwargs（它从
+    TOML/env 取值），无法注入这种量级的值，而两条路径共用同一个 validator。
+    """
+    for bad in (10**400, "1" + "0" * 400):
+        with pytest.raises(ValidationError, match="chat_score_threshold") as excinfo:
+            Settings(chat_score_threshold=bad)
+        assert not isinstance(excinfo.value.__cause__, OverflowError)
+
+
+def test_get_settings_wraps_settings_error_from_unparseable_env_list(monkeypatch, isolated_config):
+    """列表类 env 字段写错时 pydantic-settings 抛 ``SettingsError``，它继承
+    ``ValueError`` 但**不是** ``ValidationError``，原先的 handler 接不住，用户看到
+    的是解释器默认 handler 打出的多屏 traceback。现在必须变成一行脱敏消息。
+    """
+    monkeypatch.setenv("KB_SPLITTER_SEPARATORS", "###")
+    get_settings.cache_clear()
+
+    with pytest.raises(ValueError, match="配置解析失败") as excinfo:
+        get_settings()
+
+    get_settings.cache_clear()
+    assert "kb_splitter_separators" in str(excinfo.value)

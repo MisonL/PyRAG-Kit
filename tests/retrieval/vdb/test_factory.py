@@ -1,3 +1,4 @@
+import json
 import sys
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -157,10 +158,22 @@ def _write_snapshot(root, snapshot_id, provider, model):
         chunk_count=1,
     )
     (snapshot_dir / "manifest.toml").write_text(manifest.to_toml(), encoding="utf-8")
-    # 快照目录校验要求这一组文件同时存在；兼容性检测发生在 load_snapshot 之前，
-    # 所以这里只需占位内容，不参与断言。
-    for name in ("chunks.pkl", "parents.pkl", "semantic.index", "embeddings.npy", "stats.json"):
-        (snapshot_dir / name).write_bytes(b"")
+    # 快照目录校验除了「文件齐全」还要求 chunks.pkl 与 embeddings.npy 的行数自洽
+    # （见 SnapshotRepository._validate_snapshot_row_counts），因此这里写最小但
+    # 可解析的内容：1 个分块 + 1 行向量。兼容性检测本身发生在 load_snapshot 之前，
+    # 这些内容不参与断言。
+    import pickle
+
+    import numpy as np
+
+    with (snapshot_dir / "chunks.pkl").open("wb") as file:
+        pickle.dump([{"page_content": "占位分块", "metadata": {"source": "placeholder.md"}}], file)
+    np.save(snapshot_dir / "embeddings.npy", np.zeros((1, 4), dtype=np.float32))
+    (snapshot_dir / "parents.pkl").write_bytes(b"")
+    (snapshot_dir / "semantic.index").write_bytes(b"")
+    (snapshot_dir / "stats.json").write_text(
+        json.dumps({"chunk_count": 1}, ensure_ascii=False), encoding="utf-8"
+    )
     (Path(root) / "ACTIVE_SNAPSHOT").write_text(snapshot_id, encoding="utf-8")
     return snapshot_dir
 

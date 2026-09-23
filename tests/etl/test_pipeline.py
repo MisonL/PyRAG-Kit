@@ -136,20 +136,36 @@ def test_recursive_text_splitter():
         splitter = RecursiveTextSplitter(mode="char")  # 实例化时强制用 char 模式
 
         # 使用一个更长的文本来测试分割和重叠
-        # 调整文本内容，使其在 chunk_size=20, chunk_overlap=5 的情况下能被分割成两部分
+        # 注意断言的是「每个块都不超过 chunk_size」而不是某个固定的块数：
+        # 旧断言要求恰好 2 块，但第 1 块长 22 字符、已经超过 chunk_size=20——
+        # 也就是说这条断言把「chunk_size 失效」当成了期望行为。分隔符表补上 ""
+        # 兜底后长句会被真正切开，块数随之变化。
         long_text = "这是一个非常长的句子，需要被正确地切分开来。\n\n这是第二部分。"
         doc = Document(content=long_text, metadata={"source": "test.txt"})
 
         # split 方法期望 List[Document] 作为输入
         split_docs = splitter.split([doc])
 
-        assert len(split_docs) == 2, "文本应该被分割成两部分"
-        # 验证第一部分的内容
-        assert split_docs[0].content == "这是一个非常长的句子，需要被正确地切分开来。"
-        # 验证第二部分的内容
-        assert split_docs[1].content == "这是第二部分。"
+        assert split_docs, "分割结果不应为空"
+        for chunk in split_docs:
+            assert len(chunk.content) <= test_chunk_size, (
+                f"分片长度 {len(chunk.content)} 超过 chunk_size={test_chunk_size}: "
+                f"{chunk.content!r}"
+            )
+        # 内容不得丢失：所有分片的并集必须覆盖原文的每一个非空白字符。
+        # 不能用「拼接后等于原文」——chunk_overlap=5 的设计就是让相邻块共享
+        # 5 个字符，拼接必然重复，那是正确行为而不是丢失。
+        covered = "".join(chunk.content for chunk in split_docs)
+        for char in long_text.replace("\n", "").replace(" ", ""):
+            assert char in covered, f"字符 {char!r} 在所有分片中都找不到"
+        assert split_docs[0].content.startswith("这是一个非常长的句子"), (
+            f"首块应保留原文开头，实际为 {split_docs[0].content!r}"
+        )
+        assert split_docs[-1].content.endswith("这是第二部分。"), (
+            f"末块应保留原文结尾，实际为 {split_docs[-1].content!r}"
+        )
         # 验证元数据
-        assert split_docs[0].metadata["source"] == "test.txt"
+        assert all(chunk.metadata["source"] == "test.txt" for chunk in split_docs)
 
     finally:
         # 恢复原始配置

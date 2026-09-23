@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import pickle  # nosec B403 - 仅用于读取应用自管的本地快照文件
 import shutil
 import tomllib
 import uuid
@@ -68,6 +70,15 @@ class SnapshotRepository:
         return KnowledgeSnapshotManifest.from_mapping(data)
 
     def validate_snapshot_dir(self, snapshot_dir: Path) -> None:
+        """校验快照文件齐全**且三个数据源的行数自洽**。
+
+        只查文件存在性是不够的：实测手工构造 ``documents=3`` 而
+        ``embeddings=(2,4)``（``faiss_index.ntotal=2``）的 store，
+        ``save_snapshot`` 正常落盘、本方法通过、加载后也不报错——不一致被
+        完整持久化。之后 ``semantic_search`` 拿 ``indices`` 去索引
+        ``self.documents`` 会越界，而报错现场离真正的原因（写入时就不一致）
+        很远。这里在加载/切换快照的入口就把三者对齐。
+        """
         required_files = [
             snapshot_dir / "manifest.toml",
             snapshot_dir / "chunks.pkl",
@@ -79,3 +90,64 @@ class SnapshotRepository:
         missing_files = [str(path.name) for path in required_files if not path.exists()]
         if missing_files:
             raise FileNotFoundError(f"知识快照不完整，缺少文件: {', '.join(missing_files)}")
+
+        self._validate_snapshot_row_counts(snapshot_dir)
+
+    @staticmethod
+    def _validate_snapshot_row_counts(snapshot_dir: Path) -> None:
+        """确认 chunks / embeddings / 向量索引三者的行数一致。
+
+        读取全部走本地受信快照目录（与 ``FaissStore.load_snapshot`` 同一
+        前提），且只取形状不取内容语义。
+        """
+        import numpy as np
+
+        # 解析失败要转成「快照不自洽」的 ValueError：这里是加载入口，抛裸的
+        # EOFError/UnpicklingError 会让调用方看到与真实原因无关的异常类型
+        # （测试里就复现过：占位空文件 chunks.pkl -> EOFError）。
+        try:
+            with (snapshot_dir / "chunks.pkl").open("rb") as file:
+                chunks = pickle.load(file)  # nosec B301 - 应用自管的快照目录
+        except Exception as exc:
+            raise ValueError(
+                f"知识快照不自洽：chunks.pkl 无法解析（{type(exc).__name__}）。"
+                " 快照可能在写入或复制过程中被截断，请重建。"
+            ) from exc
+
+        try:
+            embeddings = np.load(snapshot_dir / "embeddings.npy")
+        except Exception as exc:
+            raise ValueError(
+                f"知识快照不自洽：embeddings.npy 无法解析（{type(exc).__name__}）。"
+                " 快照可能在写入或复制过程中被截断，请重建。"
+            ) from exc
+
+        chunk_count = len(chunks) if chunks is not None else 0
+        if embeddings.ndim != 2:
+            raise ValueError(f"知识快照的 embeddings.npy 不是二维数组: ndim={embeddings.ndim}。")
+        embedding_rows = int(embeddings.shape[0])
+
+        if chunk_count != embedding_rows:
+            raise ValueError(
+                "知识快照不自洽：分块数与向量数不一致。"
+                f" chunks.pkl={chunk_count}，embeddings.npy={embedding_rows}。"
+                " 快照可能在写入或复制过程中被截断，请重建。"
+            )
+
+        stats_path = snapshot_dir / "stats.json"
+        try:
+            with stats_path.open("rb") as file:
+                stats = json.load(file)
+        except Exception as exc:
+            raise ValueError(
+                f"知识快照不自洽：stats.json 无法解析（{type(exc).__name__}）。"
+                " 快照可能在写入或复制过程中被截断，请重建。"
+            ) from exc
+        if not isinstance(stats, dict):
+            raise ValueError("知识快照不自洽：stats.json 的顶层不是对象。")
+        declared = stats.get("chunk_count")
+        if declared is not None and int(declared) != chunk_count:
+            raise ValueError(
+                "知识快照不自洽：stats.json 的 chunk_count 与实际分块数不一致。"
+                f" stats.json={declared}，chunks.pkl={chunk_count}。"
+            )

@@ -1,4 +1,6 @@
 import functools
+import math
+import re
 import sys
 import tomllib
 import warnings
@@ -21,6 +23,7 @@ from pydantic_settings import (
     PydanticBaseSettingsSource,
     SettingsConfigDict,
 )
+from pydantic_settings.exceptions import SettingsError
 
 from src.utils.security import redact_sensitive_text, validate_secret_free_options
 
@@ -146,7 +149,32 @@ class ModelDetail(BaseModel):
 # 也不截断。实测 ``chat_top_k=10**9`` 单次查询分配约 3.6 GB 数组、RSS 涨
 # 10.3 GB、耗时 8.4 秒。10_000 远超任何真实场景（默认 top_k=5 × multiplier=3）。
 _MAX_RETRIEVAL_TOP_K = 10_000
+# 日志保留天数与分片/批处理规模的上界。两者原来都无上界，实测
+# ``log_retention_days=10**400``、``kb_chunk_size=10**400`` 均被接受，
+# 直到真正参与运算（日期减法、内存申请）才炸。
+_MAX_LOG_RETENTION_DAYS = 3650
+_MAX_KB_CHUNK_TOKENS = 1_000_000
 _MAX_RETRIEVAL_MULTIPLIER = 100
+
+
+# 十进制数值字面量：可选负号、可选小数点、可选指数。不含下划线分组（``1_0``）、
+# 不含正号（``+7``）、不含十六进制（``0x10``）。Python 的 ``int()``/``float()``
+# 都会接受它们（``int("1_0") == 10``、``float("1_0") == 10.0``、
+# ``float("+7") == 7.0``），静默读出一个「看起来成功」的错值，因此这里先做形状
+# 校验再交给 ``float()`` 解析。
+_DECIMAL_LITERAL_PATTERN = re.compile(r"-?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
+
+
+def _parse_int_literal(text: str) -> int | None:
+    """严格解析十进制整数字面量，不做科学计数法/下划线/正号的宽松放行。
+
+    只接受 ``[0-9]+``（可带前导负号）。``"1_0"`` 被静默读成 10 这类安静的
+    成功正是本项目反复踩到的模式，所以宁愿在这里明确拒绝。
+    """
+    digits = text.removeprefix("-")
+    if digits and all(char in "0123456789" for char in digits):
+        return int(text)
+    return None
 
 
 def _coerce_number(value: Any, field_label: str) -> int | float:
@@ -156,6 +184,11 @@ def _coerce_number(value: Any, field_label: str) -> int | float:
     ``.env``/TOML 来源是字符串（``"5"``），Python 调用方可能是 ``int``/``float``，
     而 ``bool`` 是 ``int`` 的子类（``int(True) == 1``）必须显式拒绝，否则
     ``Settings(chat_top_k=True)`` 会静默变成 ``1``。
+
+    字符串只接受十进制数值字面量：``"1500"``、``"0.4"``、``"1e3"``。不接受
+    ``"0x10"``（十六进制）与 ``"inf"``/``"nan"``（非有限值由各 validator 的
+    ``math.isfinite`` 或上下界负责，但让 ``float()`` 接住它们会得到
+    ``inf`` 这类「成功解析出的非法值」，不如直接在这里当解析失败处理）。
     """
     if isinstance(value, bool):
         raise ValueError(f"{field_label} 不能是布尔值 {value!r}。")
@@ -163,13 +196,18 @@ def _coerce_number(value: Any, field_label: str) -> int | float:
         return value
     if isinstance(value, str):
         text = value.strip()
+        parsed_int = _parse_int_literal(text)
+        if parsed_int is not None:
+            return parsed_int
+        if not _DECIMAL_LITERAL_PATTERN.fullmatch(text):
+            raise ValueError(f"无法把 {field_label} 的 {value!r} 转换为数值。")
         try:
-            return int(text)
-        except ValueError:
-            try:
-                return float(text)
-            except ValueError as exc:
-                raise ValueError(f"无法把 {field_label} 的 {value!r} 转换为数值。") from exc
+            number = float(text)
+        except ValueError as exc:
+            raise ValueError(f"无法把 {field_label} 的 {value!r} 转换为数值。") from exc
+        if not math.isfinite(number):
+            raise ValueError(f"{field_label} 必须是有限数值，但得到 {value!r}。")
+        return number
     raise ValueError(f"{field_label} 必须是数值，但得到 {type(value).__name__}。")
 
 
@@ -350,10 +388,15 @@ class Settings(BaseSettings):
     @field_validator("chat_score_threshold", mode="before")
     @classmethod
     def validate_chat_score_threshold(cls, value: Any) -> float:
-        number = float(_coerce_number(value, "chat_score_threshold"))
+        number = _coerce_number(value, "chat_score_threshold")
+        # 先做范围判断再转 float：``float(10**400)`` 抛的是裸 ``OverflowError``，
+        # 它不是 ``ValidationError``，会穿透 ``get_settings`` 的 ``except`` 变成
+        # 未脱敏的 traceback。范围判断对任意大的 int 都能给出正常结论。
+        if not isinstance(number, (int, float)) or isinstance(number, bool):
+            raise ValueError(f"chat_score_threshold 必须是数值，但得到 {value!r}。")
         if not 0 <= number <= 1:
-            raise ValueError("chat_score_threshold 必须在 0 到 1 之间。")
-        return number
+            raise ValueError(f"chat_score_threshold 必须在 0 到 1 之间，但得到 {value!r}。")
+        return float(number)
 
     @field_validator("log_retention_days", mode="before")
     @classmethod
@@ -362,8 +405,12 @@ class Settings(BaseSettings):
         if isinstance(number, float) and not number.is_integer():
             raise ValueError(f"log_retention_days 必须是整数，但得到 {number}。")
         number = int(number)
-        if number < 1:
-            raise ValueError("log_retention_days 必须是大于等于 1 的整数。")
+        # 上界不是洁癖：无上界时 10**400 会被接受（实测），而它接下来会被交给
+        # 日期运算做 ``today - timedelta(days=N)``，直接 OverflowError。
+        if not 1 <= number <= _MAX_LOG_RETENTION_DAYS:
+            raise ValueError(
+                f"log_retention_days 必须是 1 到 {_MAX_LOG_RETENTION_DAYS} 之间的整数。"
+            )
         return number
 
     @field_validator(
@@ -380,9 +427,13 @@ class Settings(BaseSettings):
                 "kb_chunk_size/kb_child_chunk_size/kb_embedding_batch_size 必须是整数。"
             )
         number = int(number)
-        if number < 1:
+        # 上界不是洁癖：无上界时 10**400 会被接受（实测），随后分片/批处理会把它
+        # 当成真实规模去申请内存。tiktoken 编码前的分片上限取 100 万 token，比任何
+        # 现实文档都宽，但仍挡住溢出量级。
+        if not 1 <= number <= _MAX_KB_CHUNK_TOKENS:
             raise ValueError(
-                "kb_chunk_size/kb_child_chunk_size/kb_embedding_batch_size 必须是大于等于 1 的整数。"
+                "kb_chunk_size/kb_child_chunk_size/kb_embedding_batch_size"
+                f" 必须是 1 到 {_MAX_KB_CHUNK_TOKENS} 之间的整数。"
             )
         return number
 
@@ -810,6 +861,12 @@ def get_settings() -> Settings:
         return Settings()
     except ValidationError as exc:
         raise ValueError(_redacted_settings_error(exc)) from None
+    except SettingsError as exc:
+        # pydantic-settings 在解析复杂字段（list/dict）时抛的是 SettingsError，
+        # 它继承 ValueError 但**不是** ValidationError，因此上面那个分支接不住。
+        # 实测 ``KB_SPLITTER_SEPARATORS='###'``（非 JSON 形态）走的正是这条路，
+        # 用户看到的是解释器默认 handler 打出的多屏 traceback，而不是脱敏消息。
+        raise ValueError(f"配置解析失败 - {redact_sensitive_text(str(exc))}") from None
 
 
 def _redacted_settings_error(exc: ValidationError) -> str:
