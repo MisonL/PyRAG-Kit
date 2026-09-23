@@ -103,6 +103,26 @@
 - 补强 Ark `tool_calls` 的 `type` 回归测试：夹具原先写 `type="function"`，与硬编码值相同，因此把透传改成硬编码 `"function"` 的变异体无法被捕获（零区分度）。现夹具改用非 `"function"` 的取值，并新增一条覆盖「缺 `type` 时两侧默认值对齐」的交叉断言——此前断言只覆盖显式传值路径，两条路径的 default 一旦分叉测试仍全绿。
 - 新增 12 例布尔短路测试，覆盖 `log_retention_days`、`kb_chunk_size`、`kb_chunk_overlap`、`chat_top_k`、`retrieval_candidate_multiplier`、`chat_vector_weight`、`chat_score_threshold`、`chat_temperature` 等字段拒绝 `True`。
 
+- 修复分片在「分隔符耗尽」时完全失效：LangChain 的 `RecursiveCharacterTextSplitter._split_text` 走到 `if not new_separators: final_chunks.append(s)` 是原样追加、不再按 `chunk_size` 切，而默认配置 `kb_splitter_separators = ["###"]` 只有一项匹配项、`new_separators` 直接为空，于是**任何不含 `###` 的文档整篇变成一个块**。实测 `chunk_size=1500` 时 3600 token 的纯列表文本产出单个 3599 token 块；对真实知识库 39 个文件扫描，34 个产出超限块（子块上限 300，实测最坏 4595）。现让分隔符表统一以 `""` 收尾，兜底只在前面所有分隔符都不匹配时生效——含 `###` 的文档切分结果不变（实测 3 块/最大 252 字符）。
+- 修复分片开头标点被直接删除：`_strip_leading_punctuation` 用 `re.sub(r"^[\s.。]+", "", text)` 删除开头连续的空白与句号。当分隔符本身就是句号时，`keep_separator=True` 会把上一句的句号留在下一个分片开头，于是那个句号被永久丢弃（实测 843 字符分成 15 块后只剩 829，丢失 1.66%）；整篇以句号开头的输入更会被判空并 `continue`，产出 0 个块。现改为替换为等长空格，句中信息一字不丢。
+- 给知识快照的 pickle 加载补上来源边界：快照内的 `chunks.pkl`/`parents.pkl`/`lexical.index` 都是 pickle，反序列化即执行代码，而 `AGENTS.md` 要求「只从本项目生成的本地快照或明确受信的 legacy 文件加载」——此前代码不做任何来源校验，`load_snapshot(dir)` 接受任意目录、`load(path)` 接受任意路径、`FaissStore(file_path=...)` 还会隐式加载。现新增 `resolve_within()`/`ensure_trusted_source()`（两侧先 `resolve()` 再比归属，符号链接逃逸会被拦下；信任根为空时一律拒绝），并要求 `load_snapshot` 满足三件事：目录在信任根内、目录本身不是符号链接、`ACTIVE_SNAPSHOT` 标记指向的就是该目录。第三条是关键——仅「在 root 之下」不足以证明目录可用，未激活或半成品目录同样在 root 之下。
+- 快照 manifest 补上 schema 版本准入：`load_manifest` 此前只 `str(data["schema_version"])` 解析、不比对，未知版本被静默接受并照着当前代码解释，而 v1→v2 调整过分块与 embedding 的落盘结构，这样会得到错误结果而不是报错。现版本不符即拒绝，消息给出快照版本与当前版本。版本判断放在 `load_manifest` 而非 `from_mapping`，后者保持纯解析。
+- 快照完整性校验补上数据源自洽：`validate_snapshot_dir` 此前只查文件**存在性**。实测 `documents=3` 而 `embeddings=(2,4)`（`faiss_index.ntotal=2`）的 store 能正常落盘、通过校验、加载后零报错，之后 `semantic_search` 拿 `indices` 索引 `self.documents` 才越界。现在校验 chunks / embeddings / `stats.json` 三者行数一致，并把截断文件的解析失败（原先裸 `EOFError`）归类为「快照不自洽」。
+- 修复 legacy 导入失败后的临时目录残留：`factory.py` 的 legacy 分支此前没有 `KnowledgeBuildService.build` 那样的 `finalized`/`finally` 结构，`create_temp_snapshot_dir` 之后任何失败都会在快照根留下 `.tmp-legacy-*` 并随时间累积。现照搬同一结构，并把 `validate_snapshot_dir(temp_dir)` 提到 `finalize_snapshot` **之前**——finalize 会更新 `ACTIVE_SNAPSHOT`，校验放到它后面就只剩「坏快照已经被激活」这一种收场方式。
+- 修复 `SessionConfig` 完全无校验：`Settings` 只在启动时校验一次，而 UI 与库调用方经 `__setitem__` 写入的 `SessionConfig` 此前不校验任何字段。实测 `chat_config["top_k"] = 10**9` 能一路走到 `faiss_index.search()`（实测 `10**6` 时就已按满槽位分配并耗时 1.56 秒），同时接受 `vector_weight=-5`、`retrieval_method='totally-invalid'`、`score_threshold=None`。现为 9 个标量字段补上校验器注册表，并加结构断言防止漏登记——漏登记会静默回落为无校验，且不会让任何行为测试变红。
+- 修复关键词检索的静默空结果：`keyword_search` 用 `if score <= 0: break`，既分不清「该词无判别力」与「0 分文档排在前面把正分结果截断」，又在分数整片为 0 时静默返回空列表。rank_bm25 的 idf 是 `log(N-n+0.5) - log(n+0.5)` 且只对 `idf < 0` 做 epsilon 浮动，某个词**恰好**出现在一半文档里（`n == N/2`）时 idf 恰为 0、不属于「负」因此不被浮动，该词分数就全是 0。现先看全局最高分，再按分数降序收集、0 分只跳过不终止。
+- 修复空语料导致的 BM25 崩溃：`load_snapshot` 从 `lexical.index` 读回 `[]` 时 `BM25Okapi` 在 `avgdl = num_doc / corpus_size` 处抛 `ZeroDivisionError`。现空语料返回 `None` 并在 `keyword_search` 里短路，不再崩溃。
+- 给嵌入向量矩阵补上有限性校验：`_as_float32_matrix` 此前只校验维度、非空与行数，NaN/inf 会被接受并写入 FAISS（`ntotal` 正常增加），直到查询时才以 3.4e38 的哨兵距离暴露出来，届时已无法定位是哪个文档坏了；`1e300` 还会先触发 `RuntimeWarning: overflow encountered in cast` 静默溢出为 inf。现对齐 `retrieval_service` 既有的 `math.isfinite` 校验。
+- 移除退出钩子的无条件删除：`cleanup_temp_files()` 已在 `atexit` 注册、每次程序正常退出都对 `settings.cache_path` 执行 `shutil.rmtree`，但删除前没有任何安全判断，而 `cache_path` 是用户可配置项且校验只做相对路径转绝对路径。实测 `Settings(cache_path="/")`、`"/etc"`、`"/usr"`、`"~"`、`"/var"`、`"/System"`、`"../.."` 全部被接受，随后整个目录被删掉——不可逆的数据丢失，触发条件只是「配置文件写错一个值」。现拒绝文件系统根目录、家目录本身与常见系统目录，判定只看「是否危险」而不看目录名（用户可能有意把缓存放到 `data/cache`）。该缺陷不在任何一轮审查报告里，是靠盘点「从未被测试引用的生产模块」找到的。
+- 修复配置数值解析的宽松放行：`_coerce_number` 的 `int()`/`float()` 会接受 `"1_0"`、`"+7"`、`"0x10"`（`int("1_0") == 10`、`float("1_0") == 10.0`），把写错的配置静默读成另一个数。现先做十进制字面量形状校验。同时修复 `chat_score_threshold=10**400` 抛裸 `OverflowError`（它不是 `ValidationError`，会穿透 `get_settings` 的 `except` 变成未脱敏 traceback），把范围判断移到转 float 之前。
+- 给无上界的数值字段补上界：`log_retention_days`、`kb_chunk_size`、`kb_child_chunk_size`、`kb_embedding_batch_size` 此前只有下界，实测 `10**400` 全部被接受，直到参与运算（日期减法、内存申请）才炸。
+- 修复列表类 env 字段的未处理异常：`KB_SPLITTER_SEPARATORS='###'`（非 JSON 形态）抛的是 pydantic-settings 的 `SettingsError`，它继承 `ValueError` 但**不是** `ValidationError`，原 handler 接不住，用户看到的是解释器默认 handler 打出的多屏 traceback。现转成一行脱敏消息。
+- 修复发布包 ZIP 分支对悬空符号链接的裸崩溃：`ZipFile.write` 会解引用符号链接去取元数据，目标缺失时抛的是不带任何线索的 `FileNotFoundError`，而 tar.gz 分支对同一目录完全正常——两分支行为不一致，且在 Windows（唯一的 zip 目标）上表现为难以归因的构建失败。现归档前显式检查并列出全部悬空路径。经本地 `--target macos-x64 --validate` 实测，真实产物内符号链接 0 个，该检查在当前构建下属纯防御性。
+- 修复 `_initialize_vector_store` 的虚假成功提示：没有快照时 store 为空（`documents=0`、`faiss_index=None`），却仍打印「知识快照加载成功。」，让用户先看到成功再看到永远是「无相关文档」，把构建缺失误诊成检索质量差。现按实际分块数区分提示。
+- UI 的 `top_k` 与 `retrieval_candidate_multiplier` 输入补上界：两处 validator 此前只校验下界，接受任意大的值后再交给 `SessionConfig`。
+- 收紧 pytest 的警告过滤：`pytest.ini` 原先用全局 `ignore::UserWarning` / `ignore::DeprecationWarning`，把四个快速迭代的 SDK 升级警告和本项目自身的警告一起静音（实测同一探针用例在全局忽略下静默通过、在 `-W error::UserWarning` 下失败）。现改为按第三方 module 前缀限定，并新增断言守住本仓库配置加载路径不产生这两类警告。
+- 补齐此前完全空缺的测试覆盖：legacy 导入路径（含失败清理）、`archive_bundle`（此前零测试）、`cleanup_temp_files`（atexit 删除路径，失败后果不可逆）、以及 pickle 信任边界的 6 类拒绝用例与合法路径成功用例。测试总数增至 1262。
+
 ## [1.3.0] - 2026-03-20
 
 ### 运行与配置
