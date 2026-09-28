@@ -1246,6 +1246,14 @@ def normalize_tool_arguments(value: Any) -> str:
         raise ValueError("工具调用 arguments 必须可序列化为 JSON。") from exc
 
 
+# 流式工具调用的 ``type`` 在两条协议上取值不同，且都可合法地表示「函数调用」：
+# Chat Completions 与各家的 OpenAI 兼容流式片段用 ``function``（见
+# ``merge_tool_call_fragment`` 的默认值与各 provider 的片段构造），Responses 用
+# ``function_call``。校验与转换都必须把两者等价看待，否则 ``function`` 会绕过
+# 下面的 JSON 判据，半截参数被当作完整工具调用交付给调用方。
+_FUNCTION_TOOL_CALL_TYPES = frozenset({"function", "function_call"})
+
+
 def validate_complete_tool_call(tool_call: Mapping[str, Any], provider: str) -> dict[str, Any]:
     """校验流式工具调用在发送 completed 事件前已经完整。"""
     name = tool_call.get("name")
@@ -1257,7 +1265,7 @@ def validate_complete_tool_call(tool_call: Mapping[str, Any], provider: str) -> 
     # empty input. Function calls still require a complete JSON arguments value.
     if tool_type != "custom_tool_call" and (arguments is None or arguments == ""):
         raise RuntimeError(f"{provider} 工具调用 {name} 缺少完整 arguments，流提前结束。")
-    if tool_type == "function_call" and isinstance(arguments, str):
+    if tool_type in _FUNCTION_TOOL_CALL_TYPES and isinstance(arguments, str):
         try:
             json.loads(arguments)
         except json.JSONDecodeError as exc:

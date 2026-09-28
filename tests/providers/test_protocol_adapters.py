@@ -1640,6 +1640,190 @@ def test_openai_chat_stream_events_propagate_refusal_delta():
     assert events[0].refusal == "不能处理"
 
 
+def test_openai_chat_stream_rejects_incomplete_tool_call_arguments():
+    """Chat Completions 的工具调用 type 是 ``function``，半截 JSON 必须被拦下。
+
+    Chat Completions 的流式片段只带 ``type: "function"``（Responses 用的是
+    ``function_call``），因此 ``validate_complete_tool_call`` 的 JSON 判据若不
+    把 ``function`` 算作函数调用，半截参数会被当作完整调用交付给调用方。
+    """
+
+    def chunk(arguments, finish_reason=None, tool_calls=None):
+        if tool_calls is None:
+            tool_calls = [
+                SimpleNamespace(
+                    id="call-1",
+                    index=0,
+                    function=SimpleNamespace(name="lookup", arguments=arguments),
+                )
+            ]
+        return SimpleNamespace(
+            id="chat-1",
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(content=None, tool_calls=tool_calls),
+                    finish_reason=finish_reason,
+                )
+            ],
+            usage=None,
+            model="chat-model",
+        )
+
+    accumulator: dict[object, dict[str, object]] = {}
+    completed: set[object] = set()
+    with pytest.raises(RuntimeError, match="不是完整 JSON"):
+        for event in [
+            *OpenAICompatibleProvider._chat_stream_events(chunk('{"id":')),
+            *OpenAICompatibleProvider._chat_stream_events(chunk(None, "tool_calls", [])),
+        ]:
+            OpenAICompatibleProvider._chat_completion_events(event, accumulator, completed)
+
+
+def test_openai_chat_stream_accepts_complete_tool_call_arguments():
+    """对照组：完整 JSON 必须仍然照常交付。"""
+
+    def chunk(arguments, finish_reason=None, tool_calls=None):
+        if tool_calls is None:
+            tool_calls = [
+                SimpleNamespace(
+                    id="call-1",
+                    index=0,
+                    function=SimpleNamespace(name="lookup", arguments=arguments),
+                )
+            ]
+        return SimpleNamespace(
+            id="chat-1",
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(content=None, tool_calls=tool_calls),
+                    finish_reason=finish_reason,
+                )
+            ],
+            usage=None,
+            model="chat-model",
+        )
+
+    accumulator: dict[object, dict[str, object]] = {}
+    completed: set[object] = set()
+    delivered = []
+    for event in [
+        *OpenAICompatibleProvider._chat_stream_events(chunk('{"id":1}')),
+        *OpenAICompatibleProvider._chat_stream_events(chunk(None, "tool_calls", [])),
+    ]:
+        for emitted in OpenAICompatibleProvider._chat_completion_events(
+            event, accumulator, completed
+        ):
+            if emitted.type == "tool_call_completed":
+                delivered.append(emitted.tool_call)
+
+    assert [call["arguments"] for call in delivered] == ['{"id":1}']
+
+
+def test_google_stream_rejects_incomplete_tool_call_arguments():
+    """Google 的流式片段同样是 ``type: "function"``。"""
+    accumulator: dict[object, dict[str, object]] = {
+        ("index", 0): {
+            "id": "call-1",
+            "index": 0,
+            "type": "function",
+            "name": "lookup",
+            "arguments": '{"order_id":',
+        }
+    }
+
+    with pytest.raises(RuntimeError, match="不是完整 JSON"):
+        GoogleProvider._complete_stream_tool_calls(accumulator, set(), "resp-1", None)
+
+
+def test_anthropic_stream_rejects_incomplete_tool_call_arguments():
+    """Anthropic 的流式片段同样是 ``type: "function"``。"""
+
+    raw_events = [
+        SimpleNamespace(
+            type="content_block_start",
+            index=0,
+            content_block=SimpleNamespace(type="tool_use", id="toolu-1", name="lookup", input={}),
+        ),
+        SimpleNamespace(
+            type="content_block_delta",
+            index=0,
+            delta=SimpleNamespace(type="input_json_delta", partial_json='{"id":'),
+        ),
+        SimpleNamespace(type="message_delta", delta=SimpleNamespace(stop_reason="tool_use")),
+        SimpleNamespace(type="message_stop"),
+    ]
+
+    class ClientManager:
+        def __enter__(self):
+            return iter(raw_events)
+
+        def __exit__(self, *_exc):
+            return False
+
+    provider = object.__new__(AnthropicProvider)
+    provider._model_name = "claude-model"
+    provider._options = {}
+    provider._get_client = lambda: SimpleNamespace(
+        messages=SimpleNamespace(stream=lambda **_params: ClientManager())
+    )
+
+    with pytest.raises(RuntimeError, match="不是完整 JSON"):
+        list(provider.stream_events(CompletionRequest(prompt="hello")))
+
+
+def test_ark_chat_stream_rejects_incomplete_tool_call_arguments():
+    """Ark Chat Completions 的流式片段同样是 ``type: "function"``。"""
+
+    class Completions:
+        def create(self, **_request):
+            return iter(
+                [
+                    SimpleNamespace(
+                        id="chat-1",
+                        choices=[
+                            SimpleNamespace(
+                                delta=SimpleNamespace(
+                                    content=None,
+                                    tool_calls=[
+                                        SimpleNamespace(
+                                            id="call-1",
+                                            index=0,
+                                            function=SimpleNamespace(
+                                                name="lookup", arguments='{"id":'
+                                            ),
+                                        )
+                                    ],
+                                ),
+                                finish_reason=None,
+                            )
+                        ],
+                        usage=None,
+                        model="ark-model",
+                    ),
+                    SimpleNamespace(
+                        id="chat-1",
+                        choices=[
+                            SimpleNamespace(
+                                delta=SimpleNamespace(content=None, tool_calls=None),
+                                finish_reason="tool_calls",
+                            )
+                        ],
+                        usage=None,
+                        model="ark-model",
+                    ),
+                ]
+            )
+
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "ark-model"
+    provider._protocol = "chat"
+    provider._options = {"server_verified_protocols": ["chat"]}
+    provider._get_client = lambda: SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+
+    with pytest.raises(RuntimeError, match="不是完整 JSON"):
+        list(provider.stream_events(CompletionRequest(prompt="hello")))
+
+
 def test_openai_chat_stream_events_preserve_parallel_tool_calls():
     chunk = SimpleNamespace(
         id="chat-1",

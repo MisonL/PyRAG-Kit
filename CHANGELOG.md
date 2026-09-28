@@ -17,6 +17,7 @@
 
 ## [Unreleased]
 
+- **补齐流式工具调用「完整 JSON」判据对 `type` 两种取值的覆盖**：流式工具调用的 `type` 在两条协议上取值不同，且都可合法表示函数调用——Chat Completions 与各家 OpenAI 兼容片段用 `function`（`merge_tool_call_fragment` 的补默认值、`openai_compatible`／`volcengine`／`anthropic`／`google` 的片段构造都写这个值），Responses 用 `function_call`。而 `validate_complete_tool_call` 的 JSON 判据只认 `function_call`，默认值也是它：`function` 于是既不缺参数（非空串）也跳过 JSON 校验。实测四条真实流式路径（`OpenAI Chat Completions`、`Google Gemini`、`Anthropic Messages`、`Ark Chat Completions`）传半截 JSON（`'{"order_id":'`）时，`tool_call_completed` 事件把这段半截文本原样交给调用方、无任何报错——调用方随后拿它去 `json.loads` 才失败，或更糟：把不完整的参数当成完整调用执行。`function` 与 `function_call` 现按同一集合等价处理（新增 `_FUNCTION_TOOL_CALL_TYPES`），并顺带补上 `AnthropicProvider.stream_events`／`astream_events` **完全缺失**的交付前校验——其余三个 provider 的同类路径都调了 `validate_complete_tool_call`，只有 Anthropic 的两条（同步与异步）直接 `yield` 累积结果，所以它在修复判据之前连「缺参数」都不拦。`custom_tool_call` 的任意文本语义保持不变。
 ### 修复
 
 - **修复 provider key 与配置映射的形态校验**（三处，同一缺陷类）：

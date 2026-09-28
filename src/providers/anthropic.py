@@ -33,6 +33,7 @@ from src.providers.__base__.model_provider import (
     retry_async_stream_context,
     retry_sync_call,
     retry_sync_stream_context,
+    validate_complete_tool_call,
     validate_secret_free_options,
     validate_secret_free_request_overrides,
 )
@@ -1228,6 +1229,12 @@ class AnthropicProvider(LargeLanguageModel):
                     elif converted.type == "finish":
                         for key, tool_call in tool_calls.items():
                             if key not in completed_tool_calls:
+                                # 与 openai_compatible / google / volcengine 的
+                                # 交付前校验保持一致：Anthropic 的流式片段同样不带
+                                # ``type``（由 merge_tool_call_fragment 补成
+                                # ``function``），若不在这里校验，半截 JSON 会被
+                                # 当作完整工具调用交给调用方。
+                                validate_complete_tool_call(tool_call, "Anthropic Messages")
                                 completed_tool_calls.add(key)
                                 yield StreamEvent(
                                     type="tool_call_completed",
@@ -1315,6 +1322,12 @@ class AnthropicProvider(LargeLanguageModel):
                     elif converted.type == "finish":
                         for key, tool_call in tool_calls.items():
                             if key not in completed_tool_calls:
+                                # 与 openai_compatible / google / volcengine 的
+                                # 交付前校验保持一致：Anthropic 的流式片段同样不带
+                                # ``type``（由 merge_tool_call_fragment 补成
+                                # ``function``），若不在这里校验，半截 JSON 会被
+                                # 当作完整工具调用交给调用方。
+                                validate_complete_tool_call(tool_call, "Anthropic Messages")
                                 completed_tool_calls.add(key)
                                 yield StreamEvent(
                                     type="tool_call_completed",
