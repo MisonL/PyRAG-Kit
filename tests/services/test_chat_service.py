@@ -602,3 +602,120 @@ def test_rerank_provider_lookup_rejects_non_mapping_configurations(bad_configura
 
     with pytest.raises(ValueError, match="rerank_configurations"):
         asyncio.run(service.retrieve("查询", config))
+
+
+# ── 回归：rerank 配置**取值**的形态校验 ──
+#
+# `_get_rerank_provider` 取 `configurations[key]` 后：
+#   * `getattr(detail, "provider", "")` 只是有默认值，**不校验类型**——该值会进
+#     `cache_key` 元组，非可哈希形态在 `self._rerank_providers.get(cache_key)`
+#     处抛裸 `TypeError: unhashable type: 'list'`；
+#   * detail 本身不是 `ModelDetail`（dict／None／int）时，
+#     `ModelProviderFactory.get_rerank_provider` 里的 `config.provider` 抛裸
+#     `AttributeError`。
+# 两者来源都是可直写的 `session_config.rerank_configurations`（映射的**值**），
+# 而 `rerank_enabled=True` 时每次检索都会走到。
+@pytest.mark.parametrize("bad_provider", [["p"], {"p": 1}, {1, 2}], ids=["list", "dict", "set"])
+def test_rerank_provider_lookup_rejects_unhashable_provider_field(bad_provider):
+    """`detail.provider` 不可哈希时必须给 ``ValueError``，不是裸 ``TypeError``。
+
+    `ModelDetail` 是 pydantic 模型，**构造**时会拒绝非字符串的 provider，但
+    普通属性没有赋值守卫（`validate_assignment` 未开）——实测
+    `detail.provider = ["p"]` 直接成功。因此这条路径是可达的。
+    """
+    from src.utils.config import ModelDetail
+
+    class _Store:
+        def semantic_search(self, _query_embedding, _top_k):
+            return [{"page_content": "内容", "metadata": {"source": "a.md"}, "score": 0.9}]
+
+    detail = ModelDetail(provider="siliconflow", model_name="m")
+    detail.provider = bad_provider
+
+    service, config = _retrieval_service_with_store(_Store())
+    config["rerank_enabled"] = True
+    object.__setattr__(config, "rerank_configurations", {"siliconflow": detail})
+
+    with pytest.raises(ValueError, match="provider"):
+        asyncio.run(service.retrieve("查询", config))
+
+
+@pytest.mark.parametrize(
+    "bad_detail", [{"provider": "siliconflow"}, None, 5, "x"], ids=["dict", "None", "int", "str"]
+)
+def test_rerank_provider_lookup_rejects_non_detail_value(bad_detail):
+    """配置值不是 `ModelDetail` 时必须给 ``ValueError``，不是裸 ``AttributeError``。"""
+
+    class _Store:
+        def semantic_search(self, _query_embedding, _top_k):
+            return [{"page_content": "内容", "metadata": {"source": "a.md"}, "score": 0.9}]
+
+    service, config = _retrieval_service_with_store(_Store())
+    config["rerank_enabled"] = True
+    object.__setattr__(config, "rerank_configurations", {"siliconflow": bad_detail})
+
+    with pytest.raises(ValueError, match="rerank_configurations"):
+        asyncio.run(service.retrieve("查询", config))
+
+
+@pytest.mark.parametrize("bad_model_name", [["m"], {"m": 1}, {1, 2}], ids=["list", "dict", "set"])
+def test_rerank_provider_lookup_rejects_unhashable_model_name(bad_model_name):
+    """`detail.model_name` 不可哈希时必须给 ``ValueError``，不是裸 ``TypeError``。
+
+    它与 `provider` 同进 `cache_key` 元组，同样只有 `getattr` 的默认值、没有
+    类型判据——实测 `detail.model_name = ["m"]` 直接成功（`ModelDetail` 未开
+    `validate_assignment`）。
+    """
+    from src.utils.config import ModelDetail
+
+    class _Store:
+        def semantic_search(self, _query_embedding, _top_k):
+            return [{"page_content": "内容", "metadata": {"source": "a.md"}, "score": 0.9}]
+
+    detail = ModelDetail(provider="siliconflow", model_name="m")
+    detail.model_name = bad_model_name
+
+    service, config = _retrieval_service_with_store(_Store())
+    config["rerank_enabled"] = True
+    object.__setattr__(config, "rerank_configurations", {"siliconflow": detail})
+
+    with pytest.raises(ValueError, match="model_name"):
+        asyncio.run(service.retrieve("查询", config))
+
+
+def test_rerank_provider_lookup_rejects_deleted_provider_attribute():
+    """`del detail.provider` 后必须给 ``ValueError``。
+
+    `getattr(detail, "provider", "")` 只兜「属性缺失」，兜出来的空串会把「属性
+    没了」伪装成「provider 名为空」，一路带到工厂再抛裸 ``AttributeError``。
+    """
+    from src.utils.config import ModelDetail
+
+    class _Store:
+        def semantic_search(self, _query_embedding, _top_k):
+            return [{"page_content": "内容", "metadata": {"source": "a.md"}, "score": 0.9}]
+
+    detail = ModelDetail(provider="siliconflow", model_name="m")
+    del detail.provider
+
+    service, config = _retrieval_service_with_store(_Store())
+    config["rerank_enabled"] = True
+    object.__setattr__(config, "rerank_configurations", {"siliconflow": detail})
+
+    with pytest.raises(ValueError, match="provider"):
+        asyncio.run(service.retrieve("查询", config))
+
+
+def test_rerank_provider_lookup_still_reports_missing_key():
+    """收紧不能误伤：key 真的不存在时保持原有「未找到 key」的 ``ValueError``。"""
+
+    class _Store:
+        def semantic_search(self, _query_embedding, _top_k):
+            return [{"page_content": "内容", "metadata": {"source": "a.md"}, "score": 0.9}]
+
+    service, config = _retrieval_service_with_store(_Store())
+    config["rerank_enabled"] = True
+    object.__setattr__(config, "rerank_configurations", {})
+
+    with pytest.raises(ValueError, match="未找到key"):
+        asyncio.run(service.retrieve("查询", config))

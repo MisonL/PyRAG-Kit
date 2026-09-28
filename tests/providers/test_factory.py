@@ -343,3 +343,79 @@ def test_get_llm_provider_still_reports_missing_key():
     """收紧不能误伤：合法的字符串 key 照常给出原有消息。"""
     with pytest.raises(ValueError, match="在LLM配置中未找到key: nope"):
         ModelProviderFactory.get_llm_provider("nope", {})
+
+
+# ── 回归：provider 配置**取值**的形态校验 ──
+#
+# `_get_model_detail` 只做 `provider_key not in configurations` 的**成员**判定，
+# 然后把 `configurations[provider_key]` 原样返回。键在、值不可用（`None`／dict／
+# int）时不会走「未找到key」分支，`None` 一路带到三个入口的 `config.provider`，
+# 在那里抛裸 `AttributeError`——它不是 `ValueError`，穿透
+# `Chatbot.reload_llm` 的 `except ValueError` 分类。
+# 值来源是 `SessionConfig.llm_configurations` 等可直写映射。
+
+
+@pytest.mark.parametrize(
+    "bad_detail", [None, 5, "x", {"provider": "deepseek"}], ids=["None", "int", "str", "dict"]
+)
+def test_get_llm_provider_rejects_non_detail_value_readably(bad_detail):
+    """配置取值不是 `ModelDetail` 时必须给 ``ValueError``，不是裸 ``AttributeError``。"""
+    with pytest.raises(ValueError, match="llm_configurations"):
+        ModelProviderFactory.get_llm_provider("k", {"k": bad_detail})
+
+
+def test_get_embedding_provider_rejects_non_detail_value_readably():
+    """Embedding 与 LLM 走同一 helper，判据必须一致。"""
+    with pytest.raises(ValueError, match="embedding_configurations"):
+        ModelProviderFactory.get_embedding_provider("k", {"k": None})
+
+
+def test_get_rerank_provider_rejects_non_detail_value_readably():
+    """Rerank 同上。"""
+    with pytest.raises(ValueError, match="rerank_configurations"):
+        ModelProviderFactory.get_rerank_provider("k", {"k": None})
+
+
+def test_get_llm_provider_still_accepts_valid_explicit_configuration():
+    """收紧不能误伤：合法的 ``ModelDetail`` 照常返回实例。"""
+    configurations = {"k": ModelDetail(provider="mock_llm", model_name="m")}
+
+    provider = ModelProviderFactory.get_llm_provider("k", configurations)
+
+    assert provider.model_name == "m"
+
+
+# ── 回归：provider 配置**容器**形态的校验 ──
+#
+# `_get_model_detail` 直接写 `provider_key not in configurations`。取值不可迭代
+# 时抛裸 `TypeError: argument of type 'int' is not iterable`；是字符串时走**子串**
+# 判定（`"k" in "k"` 为真），随后 `"k"["k"]` 抛
+# `TypeError: string indices must be integers`。两者都不是 `ValueError`。
+# 取值来自可直写的 `SessionConfig.llm_configurations`，经 `Chatbot.reload_llm`
+# 原样传到这里。
+
+
+@pytest.mark.parametrize(
+    "bad_configurations", [5, "x", 10**4301, object()], ids=["int", "str", "huge-int", "object"]
+)
+def test_get_llm_provider_rejects_non_mapping_configurations_readably(bad_configurations):
+    """配置容器不是映射时必须给 ``ValueError``，不是裸 ``TypeError``。"""
+    with pytest.raises(ValueError, match="llm_configurations"):
+        ModelProviderFactory.get_llm_provider("k", bad_configurations)
+
+
+def test_get_embedding_and_rerank_providers_share_the_mapping_guard():
+    """Embedding／Rerank 走同一 helper，判据必须一致。"""
+    with pytest.raises(ValueError, match="embedding_configurations"):
+        ModelProviderFactory.get_embedding_provider("k", 5)
+    with pytest.raises(ValueError, match="rerank_configurations"):
+        ModelProviderFactory.get_rerank_provider("k", 5)
+
+
+def test_get_llm_provider_still_accepts_a_plain_dict():
+    """收紧不能误伤：普通 ``dict`` 仍是合法映射。"""
+    configurations = {"k": ModelDetail(provider="mock_llm", model_name="m")}
+
+    provider = ModelProviderFactory.get_llm_provider("k", configurations)
+
+    assert provider.model_name == "m"

@@ -916,3 +916,45 @@ def test_display_chat_config_renders_known_keys():
     console = Console(file=StringIO(), width=200)
 
     display_chat_config(console, _chat_config_for("google"))
+
+
+# ── 回归：被激活的配置**取值**不可用时也必须报 ValueError ──
+#
+# ``_require_model_detail`` 只做 ``key not in configurations`` 的成员判定，然后
+# 把 ``configurations[key]`` 原样返回。键在、值不可用（``None``／dict／int）时
+# 不会走「未找到key」分支，``None`` 一路带到三个调用点的
+# ``..._model_details.provider``，在那里抛裸 ``AttributeError``。
+# 值来源与键同源，都是可直写的配置映射（``SessionConfig`` 的
+# ``_VALIDATORS`` 明确不登记 ``*_configurations``）。
+
+
+@pytest.mark.parametrize(
+    "bad_detail", [None, 5, "x", {"provider": "google"}], ids=["None", "int", "str", "dict"]
+)
+def test_display_chat_config_rejects_unusable_active_llm_detail(bad_detail):
+    console = Console(file=StringIO(), width=200)
+    config = _chat_config_for("google")
+    config["llm_configurations"] = {"google": bad_detail}
+
+    with pytest.raises(ValueError, match="LLM配置"):
+        display_chat_config(console, config)
+
+
+@pytest.mark.parametrize(
+    "bad_detail", [None, 5, "x", {"provider": "google"}], ids=["None", "int", "str", "dict"]
+)
+def test_display_chat_config_rejects_unusable_active_rerank_detail(bad_detail):
+    console = Console(file=StringIO(), width=200)
+    config = _chat_config_for("google", active_rerank="siliconflow", rerank_enabled=True)
+    config["rerank_configurations"] = {"siliconflow": bad_detail}
+
+    with pytest.raises(ValueError, match="Rerank配置"):
+        display_chat_config(console, config)
+
+
+def test_display_chat_config_still_renders_valid_details():
+    """收紧不能误伤：合法的 ``ModelDetail`` 照常渲染。"""
+    console = Console(file=StringIO(), width=200)
+    config = _chat_config_for("google", active_rerank="siliconflow", rerank_enabled=True)
+
+    display_chat_config(console, config)

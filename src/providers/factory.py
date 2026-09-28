@@ -15,6 +15,7 @@ from src.utils.config import (  # 导入 get_settings 函数
     ModelDetail,
     ModelProtocol,
     get_settings,
+    require_detail_attributes,
     safe_repr,
 )
 from src.utils.log_manager import get_module_logger  # 导入日志管理器
@@ -519,7 +520,18 @@ class ModelProviderFactory:
     ) -> ModelDetail:
         if configurations is None:
             configurations = getattr(get_settings(), settings_field)
-        # 形态必须在成员判断**之前**收敛：``key not in dict`` 对不可哈希的取值抛
+        # 容器形态要**先**判：``provider_key not in configurations`` 对不可迭代的
+        # 取值抛裸 ``TypeError: argument of type 'int' is not iterable``，而字符串
+        # 容器会走**子串**判定（``"k" in "k"`` 为真），随后
+        # ``"k"["k"]`` 抛 ``TypeError: string indices must be integers``。两条都
+        # 不是 ``ValueError``。取值来自可直写的 ``SessionConfig.llm_configurations``，
+        # 经 ``Chatbot.reload_llm`` 原样传到这里。
+        if not isinstance(configurations, Mapping):
+            raise ValueError(
+                f"{settings_field} 必须是配置映射，但得到 {type(configurations).__name__}。"
+                f" 请检查 {role_label} 的当前配置项。"
+            )
+        # 键形态同样要在成员判断**之前**收敛：``key not in dict`` 对不可哈希的取值抛
         # 裸 ``TypeError: unhashable type: 'list'``（不是 ``ValueError``，穿透
         # ``Chatbot.reload_llm`` 的 ``except Exception`` 分类与上游的
         # ``except ValueError``），而消息里的 f-string 对位数超限的整数抛
@@ -535,7 +547,21 @@ class ModelProviderFactory:
         if provider_key not in configurations:
             logger.error(f"在{role_label}配置中未找到key: {provider_key}")
             raise ValueError(f"在{role_label}配置中未找到key: {provider_key}")
-        return configurations[provider_key]
+        # 取值的形态也要在这里收敛：``key in mapping`` 只证明**键**在，不证明值
+        # 可用。``{"k": None}`` 的键确实存在，于是不会走上面「未找到key」的分支，
+        # 而是把 ``None`` 原样返回给调用方——三个入口紧接着都读 ``config.provider``
+        # 等属性，在那里抛裸 ``AttributeError``（不是 ``ValueError``，穿透
+        # ``Chatbot.reload_llm`` 的 ``except ValueError`` 分类）。
+        # 值来源是 ``SessionConfig.llm_configurations`` 等可直写映射。
+        detail = configurations[provider_key]
+        require_detail_attributes(
+            detail,
+            ("provider", "model_name", "protocol", "options"),
+            field=settings_field,
+            key=provider_key,
+            role_label=role_label,
+        )
+        return detail
 
     @staticmethod
     def get_llm_provider(

@@ -13,6 +13,7 @@ from ..utils.config import (  # 导入 get_settings 函数
     ROOT_DIR,
     get_settings,
     is_double_convertible,
+    require_detail_attributes,
     safe_repr,
 )
 from ..utils.log_manager import get_module_logger  # 导入日志管理器
@@ -261,7 +262,7 @@ def document_score(document: Any, default: float = 0.0) -> float:
 
 
 def _require_model_detail(configurations: Any, key: Any, role_label: str) -> Any:
-    """按 key 取模型详情，缺失时抛带指引的 ``ValueError``。
+    """按 key 取模型详情，缺失或取值不可用时抛带指引的 ``ValueError``。
 
     原先直接写 ``configurations[key]``，而 ``default_llm_provider``／
     ``default_rerank_provider``／``active_*_configuration`` **没有任何
@@ -272,6 +273,13 @@ def _require_model_detail(configurations: Any, key: Any, role_label: str) -> Any
     看到「知识快照加载成功」，紧接着会话终止。同一个 key 走
     ``ModelProviderFactory._get_model_detail`` 得到的是
     ``ValueError("在…配置中未找到key: …")``，错误分类本就该一致。
+
+    成员判定只证明**键**在，不证明**值**可用：``{"k": None}`` 的键确实存在，
+    于是不会走上面那条分支，``None`` 被原样返回给三个调用点，而它们紧接着都读
+    ``..._model_details.provider``／``.model_name``——实测
+    ``chat_config["rerank_configurations"] = {"siliconflow": None}`` 时在此抛裸
+    ``AttributeError``（不是 ``ValueError``）。取值来源与键同源，都是可直写的
+    配置映射，因此在这里一并收敛。
     """
     if not isinstance(configurations, Mapping) or key not in configurations:
         available = (
@@ -281,7 +289,15 @@ def _require_model_detail(configurations: Any, key: Any, role_label: str) -> Any
             f"在{role_label}配置中未找到key: {safe_repr(key)}。可选值: {available}。"
             " 请检查 config.toml 里的 default_*_provider 与 *_configurations 是否对应。"
         )
-    return configurations[key]
+    detail = configurations[key]
+    require_detail_attributes(
+        detail,
+        ("provider", "model_name"),
+        field=f"{role_label}配置",
+        key=key,
+        role_label=role_label,
+    )
+    return detail
 
 
 def display_chat_config(console: Console, chat_config: dict[str, Any]):

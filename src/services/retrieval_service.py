@@ -22,6 +22,7 @@ from src.utils.config import (
     RetrievalMethod,
     is_double_convertible,
     parse_decimal_int,
+    require_detail_attributes,
     safe_repr,
     to_finite_float,
 )
@@ -171,6 +172,24 @@ class HybridReranker:
             keyword_rrf = 1.0 / (self.rrf_k + keyword_rank) if keyword_rank > 0 else 0.0
             doc["score"] = vector_weight * semantic_rrf + keyword_weight * keyword_rrf
         return sorted(scored_documents, key=lambda item: item["score"], reverse=True)
+
+
+def _is_hashable(value: Any) -> bool:
+    """判断取值能否作为 ``cache_key`` 元组的一项。
+
+    ``cache_key`` 会喂给 ``self._rerank_providers``（普通 ``dict``），元组里每
+    一项都要可哈希，否则在 ``dict.get`` 处抛裸 ``TypeError: unhashable type:
+    'list'``——它不是 ``ValueError``，穿透调用方的错误分类。
+
+    判据用**可哈希**而不是 ``isinstance(..., str)``：这些字段只是用来区分缓存
+    条目，非字符串但可哈希的取值（整数、元组）本来就能正常工作，按类型收窄会
+    误伤它们；位数超限的整数是可哈希的，不必在此拦截。
+    """
+    try:
+        hash(value)
+    except TypeError:
+        return False
+    return True
 
 
 def _stable_fingerprint(value: Any) -> str:
@@ -679,7 +698,49 @@ class RetrievalService:
                 "rerank_configurations 必须是配置映射，"
                 f"但得到 {type(configurations).__name__}。 请检查 rerank 配置项。"
             )
-        detail = configurations.get(provider_key) if configurations is not None else None
+        # 配置**取值**的形态同样要判，三个失败面：
+        #   * detail 不提供 ``provider``／``model_name``（``None``／dict／int，
+        #     或属性被 ``del`` 掉）——``ModelProviderFactory.get_rerank_provider``
+        #     里的 ``config.provider`` 抛裸 ``AttributeError``；
+        #   * ``provider`` 非可哈希——它进 ``cache_key`` 元组，在
+        #     ``self._rerank_providers.get(...)`` 处抛裸
+        #     ``TypeError: unhashable type: 'list'``；
+        #   * ``model_name`` 非可哈希——同上。
+        # 来源是 ``session_config.rerank_configurations`` 的值，可直写。
+        #
+        # 判据用 ``provider_key in configurations`` 而**不是** ``detail is not None``：
+        # 「key 不存在」与「key 存在但取值是 ``None``」是两件事。后者在工厂里走
+        # ``configurations[key]`` 拿到 ``None``（键确实在），于是不报「未找到 key」，
+        # 直接在 ``config.provider`` 上抛裸 ``AttributeError``。只有按成员判定才能
+        # 把两者分开：前者保持原有「未找到 key」的 ``ValueError``，后者是形态错误。
+        detail: Any = None
+        provider_field = ""
+        if configurations is not None and provider_key in configurations:
+            detail = configurations[provider_key]
+            # 属性**存在性**先判：``getattr`` 的默认值只挡缺失、不挡类型，
+            # ``del detail.provider`` 兜出的空串会把「属性没了」伪装成
+            # 「provider 名为空」，一路带到工厂再抛 ``AttributeError``。
+            require_detail_attributes(
+                detail,
+                ("provider", "model_name"),
+                field="rerank_configurations",
+                key=provider_key,
+                role_label="Rerank",
+            )
+            provider_field = detail.provider
+            if not isinstance(provider_field, str):
+                raise ValueError(
+                    f"rerank 配置 {provider_key} 的 provider 必须是字符串，"
+                    f"但得到 {safe_repr(provider_field)}。"
+                )
+            # ``model_name`` 同样进 ``cache_key`` 元组（``detail.model_name =
+            # ["m"]`` 实测直接成功，会在这里抛裸 ``TypeError: unhashable type``）。
+            model_name = detail.model_name
+            if not _is_hashable(model_name):
+                raise ValueError(
+                    f"rerank 配置 {provider_key} 的 model_name 必须是可哈希的取值，"
+                    f"但得到 {safe_repr(model_name)}。"
+                )
         options = getattr(detail, "options", {}) if detail is not None else {}
         try:
             options_fingerprint = json.dumps(
@@ -703,7 +764,7 @@ class RetrievalService:
             options_fingerprint = _stable_fingerprint(options)
         cache_key = (
             provider_key,
-            getattr(detail, "provider", ""),
+            provider_field,
             getattr(detail, "model_name", ""),
             options_fingerprint,
         )

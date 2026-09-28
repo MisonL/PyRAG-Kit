@@ -1,4 +1,13 @@
-# 更新日志
+### 修复
+
+- **补齐配置映射「取值」与「容器」两处形态校验**（同一缺陷类，`llm_configurations`／`embedding_configurations`／`rerank_configurations` 三个角色同源）：
+  - **取值不可用**：`key in mapping` 只证明**键**在，不证明**值**可用。`{"k": None}` 的键确实存在，于是 `ModelProviderFactory._get_model_detail` 不会走「未找到key」那条分支，而是把 `None` 原样返回给调用方；三个入口紧接着都读 `config.provider`，在那里抛裸 `AttributeError: 'NoneType' object has no attribute 'provider'`——它不是 `ValueError`，穿透 `Chatbot.reload_llm` 的 `except ValueError` 分类。取值来源是 `SessionConfig.llm_configurations` 等可直写映射（`_VALIDATORS` 明确不登记这几个字段）。现新增 `require_detail_attributes` 统一收敛，三处调用点（工厂、`RetrievalService._get_rerank_provider`、`display_utils._require_model_detail`）共用。**判据用属性存在性而不是 `isinstance(detail, ModelDetail)`**：使用方只要求取值提供这几个属性，按具体类型收窄会把仓库里用 `SimpleNamespace` 构造的等价配置一并拒掉（实测一次按类型收窄让 17 个既有用例变红）。
+  - **容器不可迭代**：`_get_model_detail` 直接写 `provider_key not in configurations`。取值不可迭代时抛裸 `TypeError: argument of type 'int' is not iterable`；是字符串时走**子串**判定（`"k" in "k"` 为真），随后 `"k"["k"]` 抛 `TypeError: string indices must be integers`。两者都不是 `ValueError`。取值经 `Chatbot.reload_llm` 从 `session_config.llm_configurations` 原样传到这里。
+- **修复 `RetrievalService._get_rerank_provider` 对 rerank 缓存键两个分量的形态假设**：
+  - `provider`／`model_name` 此前只经 `getattr(..., "")` 取值，有默认值但**没有类型判据**。`ModelDetail` 是 pydantic 模型、**构造**时会拒绝非字符串，但普通属性没有赋值守卫（`validate_assignment` 未开）——实测 `detail.provider = ["p"]` 与 `detail.model_name = ["m"]` 都直接成功。两者都进 `cache_key` 元组，在 `self._rerank_providers.get(...)` 处抛裸 `TypeError: unhashable type: 'list'`。
+  - 属性被 `del` 掉时（实测 `del detail.provider` 成功）`getattr` 兜出的空串会把「属性没了」伪装成「provider 名为空」，一路带到工厂再抛 `AttributeError`。
+  - 新增 `_is_hashable`：判据用**可哈希**而不是 `isinstance(..., str)`，非字符串但可哈希的取值（整数、元组）本来就能正常工作，按类型收窄会误伤；位数超限的整数是可哈希的，不必在此拦截。
+- **修复注释里的 `type:` 被 mypy 当成类型注释**：`#     type: 'list'``；` 这类行在 Python 解析器看来是普通注释（`ast.parse`／`ruff`／`compileall` 全部通过、测试全绿），但 mypy 会把紧跟缩进后的 `type:` 识别为**类型注释**（PEP 484 风格）并去解析其后的内容，于是报 `Invalid syntax` 且**阻断整个项目的类型检查**（`errors prevented further checking`）。本次是写注释时踩到的，改动只是把该行拆成两句。记录在此是因为该类行的失败模式很隐蔽：语法错误只在 mypy 出现，其余工具全绿。
 
 所有此项目的显著更改都将记录在此文件中。
 

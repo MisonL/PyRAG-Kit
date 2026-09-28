@@ -309,6 +309,41 @@ def safe_repr(value: Any, *, limit: int = 80) -> str:
     return text
 
 
+_DETAIL_ATTRIBUTE_MISSING = object()
+
+
+def require_detail_attributes(
+    detail: Any,
+    attributes: tuple[str, ...],
+    *,
+    field: str,
+    key: Any,
+    role_label: str,
+) -> None:
+    """校验模型配置的**取值**具备使用方要读的属性，否则抛可读的 ``ValueError``。
+
+    ``llm_configurations``／``rerank_configurations`` 声明为
+    ``dict[str, ModelDetail]``，但 ``SessionConfig`` 的 ``_VALIDATORS`` 明确不登记
+    它们（注释写明「按原样写入，由使用方负责其内部结构」）。于是 ``key in
+    mapping`` 只证明**键**在，不证明**值**可用：``{"k": None}`` 的键确实存在，
+    取值被原样交给使用方，调用方的 ``config.provider`` 抛裸 ``AttributeError``
+    ——它不是 ``ValueError``，会穿透调用方按 ``ValueError`` 做的错误分类。
+
+    判据用**属性存在性**而不是 ``isinstance(detail, ModelDetail)``：使用方只要求
+    取值提供这几个属性，任何具备它们的对象都能正常工作（仓库里的测试就用
+    ``SimpleNamespace`` 构造等价配置）。按具体类型收窄会把可用的配置一并拒掉。
+
+    属性存在但取值为 ``None`` 不在这里判——``None`` 是否能用作 provider 名、
+    模型名由各使用方按自己的判据处理。
+    """
+    for attribute in attributes:
+        if getattr(detail, attribute, _DETAIL_ATTRIBUTE_MISSING) is _DETAIL_ATTRIBUTE_MISSING:
+            raise ValueError(
+                f"{field} 中 {safe_repr(key)} 的取值必须是提供 {attribute} 属性的模型配置，"
+                f"但得到 {type(detail).__name__}。 请检查 {role_label} 的当前配置项。"
+            )
+
+
 def to_finite_float(value: Any) -> float | None:
     """把数值收敛成有限 ``float``；不能安全转换时返回 ``None``，**绝不抛异常**。
 
