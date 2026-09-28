@@ -17,14 +17,18 @@ from src.providers.__base__.model_provider import (
     close_resource_sync,
     coerce_completion_request,
     content_to_text,
+    enum_field,
     extract_system_prompt,
     field,
     iterate_async,
     merge_tool_call_fragment,
+    normalize_client_retries,
+    normalize_client_timeout,
     normalize_messages,
     normalize_usage,
     raise_for_stream_error_event,
     reject_unsupported_kwargs,
+    require_token_count,
     retry_async_call,
     retry_async_stream_context,
     retry_sync_call,
@@ -33,10 +37,11 @@ from src.providers.__base__.model_provider import (
     validate_secret_free_request_overrides,
 )
 from src.providers.resources import AnthropicResources, AsyncAnthropicResources
-from src.utils.config import get_settings
+from src.utils.config import get_settings, is_double_convertible, safe_repr, to_finite_float
 from src.utils.log_manager import get_module_logger
 from src.utils.security import (
     redact_sensitive_text,
+    safe_exception_text,
     validate_secret_free_payload,
     validate_secret_free_resource_kwargs,
 )
@@ -98,6 +103,12 @@ class AnthropicProvider(LargeLanguageModel):
     def __init__(self, model_name: str, options: dict[str, Any] | None = None):
         self._model_name = model_name
         self._options = validate_secret_free_options(options, "Anthropic")
+        # 客户端构造参数在配置边界就校验。``timeout``／``max_retries`` 会被原样
+        # 透传给 ``anthropic.Anthropic(...)``，而 SDK 不校验：实测
+        # ``max_retries=-1`` 让 SDK 的重试循环 ``range(max_retries + 1)`` 一次都不
+        # 执行，HTTP 请求数为 **0**，最终抛 ``RuntimeError: could not resolve
+        # response (should never happen)``；``10**400`` 则等价于无限重试。
+        self._normalized_client_options = self._normalize_client_options(self._options)
         settings = get_settings()
         self._api_key = settings.anthropic_api_key
 
@@ -117,26 +128,43 @@ class AnthropicProvider(LargeLanguageModel):
     def async_resources(self) -> AsyncAnthropicResources:
         return AsyncAnthropicResources(self)
 
+    @classmethod
+    def _normalize_client_options(cls, options: Mapping[str, Any]) -> dict[str, Any]:
+        """校验并规范化客户端构造参数（``timeout``／``max_retries``）。
+
+        判据与 OpenAI 兼容渠道、Ark 渠道一致，三个渠道共用
+        ``normalize_client_retries`` 与 ``is_double_convertible``，不再各写一份。
+        """
+        normalized: dict[str, Any] = {}
+        if "timeout" in options:
+            timeout = options["timeout"]
+            if hasattr(timeout, "connect"):
+                # httpx.Timeout：SDK 接受，且无法用 TOML 表达，原样保留。
+                normalized["timeout"] = timeout
+            else:
+                normalized["timeout"] = normalize_client_timeout(
+                    timeout, "Anthropic", "options.timeout"
+                )
+        if "max_retries" in options:
+            normalized["max_retries"] = normalize_client_retries(
+                options["max_retries"], "Anthropic"
+            )
+        return normalized
+
     def _get_client(self) -> anthropic.Anthropic:
         if self._client is None:
             validate_secret_free_options(self._options, "Anthropic")
-            client_options = {
-                key: value
-                for key, value in self._options.items()
-                if key in {"timeout", "max_retries"}
-            }
-            self._client = anthropic.Anthropic(api_key=self._api_key, **client_options)
+            self._client = anthropic.Anthropic(
+                api_key=self._api_key, **self._normalized_client_options
+            )
         return self._client
 
     def _get_aclient(self) -> anthropic.AsyncAnthropic:
         if self._aclient is None:
             validate_secret_free_options(self._options, "Anthropic")
-            client_options = {
-                key: value
-                for key, value in self._options.items()
-                if key in {"timeout", "max_retries"}
-            }
-            self._aclient = anthropic.AsyncAnthropic(api_key=self._api_key, **client_options)
+            self._aclient = anthropic.AsyncAnthropic(
+                api_key=self._api_key, **self._normalized_client_options
+            )
         return self._aclient
 
     @staticmethod
@@ -189,10 +217,11 @@ class AnthropicProvider(LargeLanguageModel):
         if getattr(self, "_options", {}).get("allow_deprecated_sampling") is True:
             return value
         if name == "temperature":
-            try:
-                numeric = float(value)
-            except (TypeError, ValueError) as exc:
-                raise ValueError("Anthropic temperature 必须是数字。") from exc
+            # ``float(10**400)`` 抛 ``OverflowError``——它不是 ``ValueError``，
+            # 因此不能只 catch ``(TypeError, ValueError)``。
+            numeric = to_finite_float(value)
+            if numeric is None:
+                raise ValueError("Anthropic temperature 必须是数字。")
             if numeric in {0.7, 1.0}:
                 # 0.7 is the application's historical default; 1.0 is the
                 # backwards-compatible server value. Omitting either avoids a
@@ -200,10 +229,9 @@ class AnthropicProvider(LargeLanguageModel):
                 return None
             raise ValueError("当前 Claude 模型不支持该 temperature；请省略该字段或使用 1.0。")
         if name == "top_p":
-            try:
-                numeric = float(value)
-            except (TypeError, ValueError) as exc:
-                raise ValueError("Anthropic top_p 必须是数字。") from exc
+            numeric = to_finite_float(value)
+            if numeric is None:
+                raise ValueError("Anthropic top_p 必须是数字。")
             if numeric >= 0.99:
                 return None
             raise ValueError(
@@ -215,6 +243,18 @@ class AnthropicProvider(LargeLanguageModel):
         configured = getattr(self, "_options", {}).get("max_tokens")
         if configured is not None:
             if isinstance(configured, bool) or not isinstance(configured, (int, float)):
+                raise ValueError("Anthropic options.max_tokens 必须是正整数。")
+            # 有限性必须先判，再 ``int()``：``inf`` 让 ``int()`` 抛
+            # ``OverflowError: cannot convert float infinity to integer``，
+            # ``nan`` 抛 ``ValueError: cannot convert float NaN to integer``——
+            # 两者都**不是**本方法承诺的「必须是正整数」消息，而且
+            # ``OverflowError`` 连 ``except ValueError`` 都接不住。实测
+            # ``options.max_tokens = inf`` 正是这种收场，而同为非法取值的
+            # ``1.5``／``0``／``-1`` 都能得到带指引的消息。
+            # 判据用 ``is_double_convertible`` 而不是 ``math.isfinite``：后者对
+            # 超出双精度范围的整数自己就抛 ``OverflowError``（实测
+            # ``math.isfinite(10**400)`` 抛错），拿它当守卫等于没有守卫。
+            if not is_double_convertible(configured):
                 raise ValueError("Anthropic options.max_tokens 必须是正整数。")
             configured_int = int(configured)
             if configured_int <= 0 or configured_int != configured:
@@ -323,6 +363,8 @@ class AnthropicProvider(LargeLanguageModel):
             raise ValueError("Anthropic tool_choice 必须是字符串或对象。")
         choice = dict(tool_choice)
         choice_type = choice.get("type")
+        if not isinstance(choice_type, str):
+            choice_type = None
         if choice_type in {"auto", "any", "none"}:
             return choice
         if choice_type == "tool":
@@ -356,6 +398,8 @@ class AnthropicProvider(LargeLanguageModel):
                 converted.append(part)
                 continue
             part_type = part.get("type")
+            if not isinstance(part_type, str):
+                part_type = None
             if part_type in {"text", "input_text"}:
                 converted.append({"type": "text", "text": part.get("text", "")})
             elif part_type in {"image_url", "input_image"}:
@@ -776,7 +820,7 @@ class AnthropicProvider(LargeLanguageModel):
         reasoning = "".join(
             field(block, "thinking", "") or ""
             for block in blocks
-            if field(block, "type") in {"thinking", "redacted_thinking"}
+            if enum_field(block, "type") in {"thinking", "redacted_thinking"}
         )
         tool_calls = [
             {
@@ -802,11 +846,20 @@ class AnthropicProvider(LargeLanguageModel):
             stop_details = field(response, "stop_details") or field(
                 response, "refusal_stop_details"
             )
-            details_type = field(stop_details, "type")
+            details_type = enum_field(stop_details, "type")
             if stop_reason == "refusal" or details_type == "refusal":
                 explanation = field(stop_details, "explanation")
                 category = field(stop_details, "category")
-                refusal = str(explanation or category or "Anthropic 请求被安全策略拒绝")
+                # 两处拒答详情同理（见 ``_refusal_text``）：``explanation`` 与
+                # ``category`` 都来自服务端 JSON，裸 ``str()`` 会在超大整数上抛
+                # ``ValueError: Exceeds the limit``。后果比崩溃更糟——这是**安全
+                # 拦截**的信号，抛异常会让一次本该显式上报的拒答变成一条与安全
+                # 策略无关的整数转换错误。取值为空时仍给默认文案。
+                refusal = (
+                    cls._refusal_detail(explanation)
+                    or cls._refusal_detail(category)
+                    or "Anthropic 请求被安全策略拒绝"
+                )
         return CompletionResult(
             text=text,
             tool_calls=tool_calls,
@@ -909,9 +962,47 @@ class AnthropicProvider(LargeLanguageModel):
             if text:
                 yield text
 
+    @staticmethod
+    def _refusal_detail(value: Any) -> str:
+        """收敛 ``stop_details`` 里的拒答详情取值；空值返回空串。
+
+        与 ``_refusal_text`` 同一判据，差别只在**空值语义**：``stop_details`` 的
+        ``explanation``／``category`` 可以合法缺失（两者都没有时调用方会给默认
+        文案），所以 ``None`` 返回空串而不是「非字符串就给描述」——否则一个缺失
+        的 ``explanation`` 会渲染成 ``"None"`` 并挡住后面的 ``category``。
+        """
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        return safe_repr(value)
+
+    @staticmethod
+    def _refusal_text(value: Any) -> str:
+        """把服务端返回的拒答取值收敛成字符串。
+
+        ``refusal`` 来自服务端 JSON（``content_block`` 或 ``delta`` 里的字段），
+        形态不受本地控制。原写法是
+        ``value if isinstance(value, str) else str(value or "")``——非字符串走裸
+        ``str()``，而 JSON 里一个超大整数字面量（``10**4301``）会让它撞上 CPython
+        的整数位数上限，抛 ``ValueError: Exceeds the limit``。
+
+        这个异常发生在**流式解析**过程中（``_iterate_stream_events`` 的生成器
+        里）：用户已经看到部分输出，随后拿到一条与「服务端拒答」毫无关系的整数
+        转换错误；而同一函数对 ``42`` 正常转成 ``"42"``、对 ``None`` 给出 ``""``，
+        只有位数超限的那一个炸——收场方式取决于取值的**大小**而不是形态。
+
+        非字符串一律给可读描述而不是空串：空串会让调用方以为「没有拒答」。
+        """
+        if isinstance(value, str):
+            return value
+        if value is None:
+            return ""
+        return safe_repr(value)
+
     @classmethod
     def _stream_event(cls, event: Any, response_id: str | None = None) -> StreamEvent | None:
-        event_type = field(event, "type", "")
+        event_type = enum_field(event, "type")
         if event_type == "message_start":
             message = field(event, "message")
             message_id = field(message, "id") or response_id
@@ -919,12 +1010,12 @@ class AnthropicProvider(LargeLanguageModel):
             return StreamEvent(type="start", usage=usage, response_id=message_id, raw=event)
         if event_type == "content_block_start":
             block = field(event, "content_block")
-            block_type = field(block, "type")
+            block_type = enum_field(block, "type")
             if block_type == "refusal" or field(block, "refusal"):
                 refusal = field(block, "refusal") or field(block, "text") or field(block, "reason")
                 return StreamEvent(
                     type="refusal_delta",
-                    refusal=refusal if isinstance(refusal, str) else str(refusal or ""),
+                    refusal=cls._refusal_text(refusal),
                     response_id=response_id,
                     raw=event,
                 )
@@ -960,7 +1051,7 @@ class AnthropicProvider(LargeLanguageModel):
             return None
         if event_type == "content_block_delta":
             delta = field(event, "delta")
-            delta_type = field(delta, "type")
+            delta_type = enum_field(delta, "type")
             if delta_type == "text_delta":
                 return StreamEvent(
                     type="text_delta",
@@ -979,7 +1070,7 @@ class AnthropicProvider(LargeLanguageModel):
                 refusal = field(delta, "refusal") or field(delta, "text") or field(delta, "reason")
                 return StreamEvent(
                     type="refusal_delta",
-                    refusal=refusal if isinstance(refusal, str) else str(refusal or ""),
+                    refusal=cls._refusal_text(refusal),
                     response_id=response_id,
                     raw=event,
                 )
@@ -999,11 +1090,20 @@ class AnthropicProvider(LargeLanguageModel):
             delta = field(event, "delta")
             reason = field(delta, "stop_reason")
             stop_details = field(delta, "stop_details") or field(delta, "refusal_stop_details")
-            details_type = field(stop_details, "type")
+            details_type = enum_field(stop_details, "type")
             if reason == "refusal" or details_type == "refusal":
                 explanation = field(stop_details, "explanation")
                 category = field(stop_details, "category")
-                refusal = str(explanation or category or "Anthropic 请求被安全策略拒绝")
+                # 两处拒答详情同理（见 ``_refusal_text``）：``explanation`` 与
+                # ``category`` 都来自服务端 JSON，裸 ``str()`` 会在超大整数上抛
+                # ``ValueError: Exceeds the limit``。后果比崩溃更糟——这是**安全
+                # 拦截**的信号，抛异常会让一次本该显式上报的拒答变成一条与安全
+                # 策略无关的整数转换错误。取值为空时仍给默认文案。
+                refusal = (
+                    cls._refusal_detail(explanation)
+                    or cls._refusal_detail(category)
+                    or "Anthropic 请求被安全策略拒绝"
+                )
                 return StreamEvent(
                     type="refusal_delta",
                     refusal=refusal,
@@ -1014,7 +1114,7 @@ class AnthropicProvider(LargeLanguageModel):
                 return StreamEvent(
                     type="finish",
                     usage=usage,
-                    finish_reason=str(reason),
+                    finish_reason=cls._refusal_text(reason),
                     response_id=response_id,
                     raw=event,
                 )
@@ -1392,10 +1492,7 @@ class AnthropicProvider(LargeLanguageModel):
         if request.timeout is not None:
             params["timeout"] = request.timeout
         response = self._get_client().messages.count_tokens(**params)
-        value = field(response, "input_tokens")
-        if value is None:
-            raise RuntimeError("Anthropic token count 响应缺少 input_tokens。")
-        return int(value)
+        return require_token_count(field(response, "input_tokens"), "Anthropic", "input_tokens")
 
     def beta_create(self, request: CompletionRequest | None = None, **kwargs: Any) -> Any:
         """调用 Anthropic Beta Messages，保留 Beta 专属参数转发能力。"""
@@ -1476,10 +1573,9 @@ class AnthropicProvider(LargeLanguageModel):
         if request.timeout is not None:
             params["timeout"] = request.timeout
         response = self._get_client().beta.messages.count_tokens(**params)
-        value = field(response, "input_tokens")
-        if value is None:
-            raise RuntimeError("Anthropic Beta token count 响应缺少 input_tokens。")
-        return int(value)
+        return require_token_count(
+            field(response, "input_tokens"), "Anthropic Beta", "input_tokens"
+        )
 
     def beta_stream(self, request: CompletionRequest | None = None, **kwargs: Any) -> Any:
         """返回 Anthropic Beta Messages 流式上下文管理器。"""
@@ -1607,10 +1703,7 @@ class AnthropicProvider(LargeLanguageModel):
         response = await self._resolve_async_result(
             self._get_aclient().messages.count_tokens(**params)
         )
-        value = field(response, "input_tokens")
-        if value is None:
-            raise RuntimeError("Anthropic token count 响应缺少 input_tokens。")
-        return int(value)
+        return require_token_count(field(response, "input_tokens"), "Anthropic", "input_tokens")
 
     async def async_beta_create(
         self, request: CompletionRequest | None = None, **kwargs: Any
@@ -1697,10 +1790,9 @@ class AnthropicProvider(LargeLanguageModel):
         response = await self._resolve_async_result(
             self._get_aclient().beta.messages.count_tokens(**params)
         )
-        value = field(response, "input_tokens")
-        if value is None:
-            raise RuntimeError("Anthropic Beta token count 响应缺少 input_tokens。")
-        return int(value)
+        return require_token_count(
+            field(response, "input_tokens"), "Anthropic Beta", "input_tokens"
+        )
 
     def async_beta_stream(self, request: CompletionRequest | None = None, **kwargs: Any) -> Any:
         """返回 AsyncAnthropic Beta 流式上下文管理器。"""
@@ -1935,7 +2027,7 @@ class AnthropicProvider(LargeLanguageModel):
             duration = time.perf_counter() - start_time
             logger.info(f"Anthropic LLM ({self._model_name}) 调用完成，耗时: {duration:.2f}s")
         except Exception as e:
-            error_text = redact_sensitive_text(str(e))
+            error_text = safe_exception_text(e)
             logger.exception(
                 "Anthropic LLM (%s) 出错: %s",
                 self._model_name,
@@ -2010,7 +2102,7 @@ class AnthropicProvider(LargeLanguageModel):
             duration = time.perf_counter() - start_time
             logger.info(f"Anthropic LLM ({self._model_name}) 异步调用完成，耗时: {duration:.2f}s")
         except Exception as e:
-            error_text = redact_sensitive_text(str(e))
+            error_text = safe_exception_text(e)
             logger.exception(
                 "Anthropic LLM (%s) 异步出错: %s",
                 self._model_name,

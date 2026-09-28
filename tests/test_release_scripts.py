@@ -1,8 +1,12 @@
 import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
 from scripts.build_binary_release import (
+    APP_NAME,
+    APP_ROOT_FILES,
     PACKAGE_FILES,
     prepare_runtime_layout,
     stage_bundle,
@@ -12,14 +16,146 @@ from scripts.build_binary_release import (
 from scripts.extract_release_notes import extract_section
 
 
+@pytest.fixture
+def bpe_source(monkeypatch, tmp_path):
+    """给 BPE 预置一个自给的源文件，使测试不依赖宿主机缓存也不联网。
+
+    ``stage_tiktoken_cache`` 的源路径由 ``TIKTOKEN_CACHE_DIR`` 决定，缺失时
+    会联网下载——两者都会让单元测试依赖外部状态（宿主机恰好有缓存时绿、
+    CI 上无缓存时红）。这里预置一份内容可辨的夹具文件并指向它。
+    """
+    cache_dir = tmp_path / "_bpe_source"
+    cache_dir.mkdir()
+    monkeypatch.setenv("TIKTOKEN_CACHE_DIR", str(cache_dir))
+    monkeypatch.delenv("DATA_GYM_CACHE_DIR", raising=False)
+    monkeypatch.setattr(
+        "scripts.build_binary_release._download_tiktoken_blob",
+        lambda: pytest.fail("本测试不应联网下载 BPE"),
+    )
+    return cache_dir
+
+
 def test_prepare_runtime_layout_creates_placeholder_directories(tmp_path):
+    """运行时目录必须建在冻结应用自己的根目录下。
+
+    冻结时 ``resolve_app_root()`` 返回可执行文件所在目录，也就是
+    ``bundle_root / APP_NAME``；默认相对路径（``knowledge_base``、
+    ``data/kb``、``data/logs``）都解析到那里。建在 ``bundle_root`` 上会留下
+    一个应用永远不读的死目录，用户按 README 放文档只会拿到
+    ``FileNotFoundError``。
+    """
     prepare_runtime_layout(tmp_path)
 
-    assert (tmp_path / "data" / "kb").is_dir()
-    assert (tmp_path / "data" / "logs").is_dir()
-    placeholder = tmp_path / "knowledge_base" / "README.md"
+    app_root = tmp_path / APP_NAME
+    assert (app_root / "data" / "kb").is_dir()
+    assert (app_root / "data" / "logs").is_dir()
+    placeholder = app_root / "knowledge_base" / "README.md"
     assert placeholder.is_file()
     assert "Markdown" in placeholder.read_text(encoding="utf-8")
+    # 包根不能残留同名死目录，否则用户会继续把文档放错位置。
+    assert not (tmp_path / "knowledge_base").exists()
+
+
+def _tiktoken_cache_key() -> str:
+    import hashlib
+
+    from scripts.build_binary_release import TIKTOKEN_BLOB_URL
+
+    return hashlib.sha1(TIKTOKEN_BLOB_URL.encode(), usedforsecurity=False).hexdigest()
+
+
+def test_stage_tiktoken_cache_copies_verified_blob(tmp_path, monkeypatch, bpe_source):
+    """预置进包的 BPE 必须通过 sha256 校验，且落在 tiktoken 的查找键名下。"""
+    import hashlib
+
+    from scripts.build_binary_release import (
+        TIKTOKEN_BLOB_SHA256,
+        TIKTOKEN_CACHE_DIRNAME,
+        stage_tiktoken_cache,
+    )
+
+    payload = b"x" * 32
+    monkeypatch.setattr(
+        "scripts.build_binary_release.TIKTOKEN_BLOB_SHA256", hashlib.sha256(payload).hexdigest()
+    )
+    (bpe_source / _tiktoken_cache_key()).write_bytes(payload)
+
+    app_root = tmp_path / "app"
+    stage_tiktoken_cache(app_root)
+
+    staged = app_root / TIKTOKEN_CACHE_DIRNAME / _tiktoken_cache_key()
+    assert staged.read_bytes() == payload
+    # 键名必须与 tiktoken 的查找算法一致，否则运行时命中不到。
+    assert staged.name == _tiktoken_cache_key()
+    assert TIKTOKEN_BLOB_SHA256  # 常量存在且非空
+
+
+def test_stage_tiktoken_cache_rejects_corrupted_blob(tmp_path, monkeypatch, bpe_source):
+    """内容与声明哈希不符时必须失败，坏数据不能进发布包。"""
+    from scripts.build_binary_release import stage_tiktoken_cache
+
+    (bpe_source / _tiktoken_cache_key()).write_bytes(b"corrupted")
+
+    with pytest.raises(RuntimeError, match="校验失败"):
+        stage_tiktoken_cache(tmp_path / "app")
+
+
+def test_remove_runtime_residue_clears_logs_and_cache(tmp_path):
+    """自检产生的日志与缓存必须被清掉，占位目录本身要保留。"""
+    from scripts.build_binary_release import APP_NAME, CACHE_DIRNAME, remove_runtime_residue
+
+    bundle_root = tmp_path / "PyRAG-Kit-1.4.0-linux-x64"
+    app_root = bundle_root / APP_NAME
+    logs = app_root / "data" / "logs"
+    logs.mkdir(parents=True)
+    (logs / "app_log_2026-09-24.log").write_text("build-time residue", encoding="utf-8")
+    cache = app_root / CACHE_DIRNAME
+    cache.mkdir()
+    (cache / "tmpfile").write_text("x", encoding="utf-8")
+
+    remove_runtime_residue(bundle_root)
+
+    assert list(logs.iterdir()) == []
+    assert not cache.exists()
+    # 占位目录本身要保留，用户解压后应看到空的 knowledge_base/ 与 data/。
+    assert logs.is_dir()
+
+
+def test_bundle_version_matches_pyproject(tmp_path, monkeypatch):
+    """产物自报版本必须与 pyproject.toml 一致。
+
+    版本号有两个消费方：发布包**文件名**来自 ``pyproject.toml``（构建脚本
+    读取），而横幅与自检输出来自 ``main.py``。构建脚本把版本写进包内
+    ``VERSION.txt``，``main.py`` 优先读它——若读的位置不对（例如按
+    ``__file__`` 找，冻结后会落到 ``_internal/``），就会静默退回兜底值，
+    包名与横幅不一致而自检只 grep "smoke test ok" 时照样通过。
+    """
+    from scripts.build_binary_release import APP_NAME, load_version
+
+    app_root = tmp_path / APP_NAME
+    app_root.mkdir(parents=True)
+    (app_root / "VERSION.txt").write_text("9.9.9\n", encoding="utf-8")
+
+    project_root = Path(__file__).resolve().parent.parent
+    # 冻结时 resolve_app_root() 取可执行文件所在目录；源码模式取 __file__ 的
+    # 祖父目录。这里在导入 main 之前把该函数打桩成目标目录，等价于冻结分支。
+    script = (
+        "import sys\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "from pathlib import Path\n"
+        "import src.utils.config as cfg\n"
+        "cfg.resolve_app_root = lambda: Path(sys.argv[2])\n"
+        "import main\n"
+        "print(main.VERSION)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(project_root), str(app_root)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout.strip() == "9.9.9"
+    assert load_version() != "9.9.9"
 
 
 def test_extract_section_returns_version_content():
@@ -72,7 +208,9 @@ def test_validate_target_environment_rejects_cross_architecture():
         validate_target_environment("macos-arm64", system="Darwin", machine="x86_64")
 
 
-def test_stage_bundle_copies_package_files_including_subdirectories(monkeypatch, tmp_path):
+def test_stage_bundle_copies_package_files_including_subdirectories(
+    monkeypatch, tmp_path, bpe_source
+):
     """PACKAGE_FILES 含子目录路径（licenses/APACHE-2.0.txt）。
 
     ``shutil.copy2`` 不会创建父目录，缺了 mkdir 会在打包时抛
@@ -91,6 +229,19 @@ def test_stage_bundle_copies_package_files_including_subdirectories(monkeypatch,
         source.parent.mkdir(parents=True, exist_ok=True)
         source.write_text("content", encoding="utf-8")
 
+    for relative in APP_ROOT_FILES:
+        source = tmp_path / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("content", encoding="utf-8")
+
+    import hashlib
+
+    payload = b"stub-bpe"
+    monkeypatch.setattr(
+        "scripts.build_binary_release.TIKTOKEN_BLOB_SHA256", hashlib.sha256(payload).hexdigest()
+    )
+    (bpe_source / _tiktoken_cache_key()).write_bytes(payload)
+
     bundle_root = stage_bundle("linux-x64", "1.4.0")
 
     assert bundle_root.name == "PyRAG-Kit-1.4.0-linux-x64"
@@ -98,6 +249,11 @@ def test_stage_bundle_copies_package_files_including_subdirectories(monkeypatch,
         assert (bundle_root / relative).is_file(), relative
     # 子目录路径必须真的落在子目录里，而不是被拍平。
     assert (bundle_root / "licenses" / "APACHE-2.0.txt").parent.name == "licenses"
+    # 配置示例必须落在 app 真正读取的位置（ROOT_DIR == bundle_root/APP_NAME），
+    # 放在包根会被静默忽略。
+    for relative in APP_ROOT_FILES:
+        assert (bundle_root / APP_NAME / relative).is_file(), relative
+        assert not (bundle_root / relative).exists(), relative
 
 
 # ── 回归：ZIP 分支对悬空符号链接的确定行为 ──
@@ -180,3 +336,76 @@ def test_find_dangling_symlinks_ignores_valid_links_and_files(tmp_path):
     (bundle_root / "dangling").symlink_to("nowhere.txt")
 
     assert [path.name for path in find_dangling_symlinks(bundle_root)] == ["dangling"]
+
+
+# ── 回归：``HIDDEN_IMPORTS`` 必须覆盖 provider 注册表里的每个模块 ──
+#
+# 十三个 provider 模块**没有任何静态导入路径**——它们只经
+# ``importlib.import_module(provider_info["module"])`` 按运行时字符串加载
+# （``src/providers/factory.py``）。PyInstaller 的静态分析看不见这一层，
+# 因此 ``HIDDEN_IMPORTS`` 是它们在冻结包里能否被找到的**唯一**依据。
+#
+# 两个清单分处两个文件，各自演化：往注册表里加一个 provider 而忘了同步
+# ``HIDDEN_IMPORTS``，构建照常通过（PyInstaller 不报错）、``--validate`` 照常
+# 通过（自检不实例化任何 provider），用户在那个渠道上拿到的是
+# ``ModuleNotFoundError``。这与 ``tiktoken_ext.openai_public`` 当初漏收是同一个
+# 失效模式——只是那次被发现了，这次没有守卫。
+
+
+def test_hidden_imports_cover_every_registered_provider_module():
+    """注册表里的每个模块都必须出现在 ``HIDDEN_IMPORTS`` 里。"""
+    from scripts.build_binary_release import HIDDEN_IMPORTS
+    from src.providers.factory import ModelProviderFactory
+
+    registered = {info["module"] for info in ModelProviderFactory._provider_map.values()}
+    missing = sorted(registered - set(HIDDEN_IMPORTS))
+
+    assert not missing, (
+        f"以下 provider 模块已注册但未列入 HIDDEN_IMPORTS，冻结包中将无法导入: {missing}"
+    )
+
+
+def test_hidden_imports_has_no_stale_provider_entries():
+    """反向守卫：``HIDDEN_IMPORTS`` 不得残留已不存在的模块名。
+
+    只查一个方向的话，注册表删掉一个 provider 后清单里的旧名字会一直留着，
+    而 PyInstaller 对不存在的 hidden import 只是警告——清单会慢慢失真，等到
+    真需要它覆盖某个模块时已经没人信它了。
+    """
+    from scripts.build_binary_release import HIDDEN_IMPORTS
+    from src.providers.factory import ModelProviderFactory
+
+    registered = {info["module"] for info in ModelProviderFactory._provider_map.values()}
+    stale = sorted(
+        name
+        for name in HIDDEN_IMPORTS
+        if name.startswith("src.providers.") and name not in registered
+    )
+
+    assert not stale, f"HIDDEN_IMPORTS 里的 provider 模块已不在注册表中: {stale}"
+
+
+def test_registered_provider_modules_have_no_static_import_path():
+    """确认这些模块确实只靠 ``importlib`` 加载——这正是需要 HIDDEN_IMPORTS 的原因。
+
+    若哪天某个 provider 被静态导入了，这条用例会失败，提示该模块已不再依赖
+    ``HIDDEN_IMPORTS``（清单可以相应精简）。这是对上面两条守卫前提的校验：
+    前提不成立时它们守的是一个不存在的问题。
+    """
+    import re
+    import subprocess
+
+    from src.providers.factory import ModelProviderFactory
+
+    for module in sorted({info["module"] for info in ModelProviderFactory._provider_map.values()}):
+        result = subprocess.run(
+            ["grep", "-rn", f"import {module}", "--include=*.py", "src", "scripts", "main.py"],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=Path(__file__).resolve().parent.parent,
+        )
+        # factory.py 里的是 ``"module": "src.providers.x"`` 字符串，不是 import 语句
+        hits = [line for line in result.stdout.splitlines() if "factory.py" not in line]
+        assert not hits, f"{module} 出现了静态导入，HIDDEN_IMPORTS 不再是它唯一的发现途径: {hits}"
+    assert re.search(r"importlib\.import_module", Path("src/providers/factory.py").read_text())

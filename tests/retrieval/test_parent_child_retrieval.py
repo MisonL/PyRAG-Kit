@@ -529,3 +529,28 @@ def test_validate_rerank_output_rejects_invalid_provider_results(indices, scores
     """契约失败必须是显式异常，而不是让错误顺序静默进入检索结果。"""
     with pytest.raises(RuntimeError, match=match):
         RetrievalService._validate_rerank_output(indices, scores, document_count=3)
+
+
+# ---------------------------------------------------------------------------
+# 超出双精度范围的整数
+# ---------------------------------------------------------------------------
+#
+# provider 的 score 来自网络 JSON，里面出现一个超大整数字面量就足以让
+# ``float(score)`` 抛 ``OverflowError``——它不是 ``ValueError``，原实现里的
+# ``except (TypeError, ValueError)`` 接不住，于是本该是 ``RuntimeError``
+# 的契约失败变成了裸异常。
+#
+# 参数 id 必须显式给出：``10**4301`` 超过 ``sys.get_int_max_str_digits()``，
+# pytest 自动生成 id 时调 ``str(val)`` 会自己抛 ``ValueError``。
+_BEYOND_DOUBLE_INTS = [
+    pytest.param(10**400, id="400digits"),
+    pytest.param(-(10**400), id="negative-400digits"),
+    pytest.param(10**4301, id="4301digits-over-int-max-str-digits"),
+]
+
+
+@pytest.mark.parametrize("score", _BEYOND_DOUBLE_INTS)
+def test_validate_rerank_output_rejects_scores_beyond_double_range(score):
+    """超出双精度范围的 score 必须报成 ``RuntimeError``，不是 ``OverflowError``。"""
+    with pytest.raises(RuntimeError, match="超出双精度范围"):
+        RetrievalService._validate_rerank_output([0], [score], document_count=2)

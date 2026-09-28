@@ -7,6 +7,43 @@ from logging.handlers import RotatingFileHandler
 from src.utils.config import get_settings
 from src.utils.security import redact_sensitive_text
 
+# 日志目录不可写时，降级 warning 只打一次。
+#
+# ``get_module_logger`` 被 20 多个模块在 import 期调用，每个模块都会走一遍
+# 文件 handler 的创建。若各自打一条，只读安装下用户会看到一长串重复的
+# 「无法写入日志目录」，把真正的问题埋掉。
+_DEGRADED_WARNING_EMITTED = False
+
+# 本应用写出的日志文件名前缀。写入（``_build_rotating_handler``）与清理
+# （``cleanup_old_logs``）共用同一份定义，避免清理规则与命名规则各自演化。
+APP_LOG_PREFIX = "app_log"
+CHAT_LOG_PREFIX = "chat_log"
+# 清理认 ``<前缀>_<YYYY-MM-DD>.log`` 以及它经 ``RotatingFileHandler`` 轮转出来的
+# 备份 ``<前缀>_<YYYY-MM-DD>.log.<序号>``。
+#
+# 备份后缀是必需的，不是锦上添花：写入侧用 ``RotatingFileHandler(maxBytes=1MB,
+# backupCount=5)``，单个文件超过 1 MB 就轮转出 ``.log.1`` ~ ``.log.5``。旧模式
+# 以 ``$`` 结尾，那些备份**一个都不匹配**，于是「清理旧日志」只删掉主文件，
+# 把绝大部分体积留在盘上——实测造一批 30 天前的日志（主文件 + 5 个备份），
+# 清理后仍剩 83% 的字节。而 ``log_path`` 是用户可配置项，指向磁盘时这份残留
+# 会一直累积。
+#
+# 后缀限定为 ``.`` + 数字：``RotatingFileHandler`` 的备份名就是
+# ``baseFilename + "." + 序号``（``doRollover`` 里 ``dfn = self.rotation_filename(
+# self.baseFilename + "." + str(i))``），不会产生其它形态。
+_LOG_FILENAME_PATTERN = re.compile(
+    rf"^(?:{APP_LOG_PREFIX}|{CHAT_LOG_PREFIX})_(\d{{4}}-\d{{2}}-\d{{2}})\.log(?:\.\d+)?$"
+)
+
+
+def _warn_once(logger: logging.Logger, message: str, *args: object) -> None:
+    """只在首次调用时发出降级 warning。"""
+    global _DEGRADED_WARNING_EMITTED
+    if _DEGRADED_WARNING_EMITTED:
+        return
+    _DEGRADED_WARNING_EMITTED = True
+    logger.warning(message, *args)
+
 
 class RedactingFormatter(logging.Formatter):
     """在格式化完整 traceback 后脱敏，避免异常链泄漏凭证。
@@ -45,9 +82,6 @@ def get_chat_logger() -> logging.Logger:
     # 避免重复添加处理器
     if not logger.handlers:
         current_settings = get_settings()
-        log_dir = current_settings.log_path
-        if not os.path.exists(log_dir):
-            os.makedirs(log_dir)
 
         # 控制台处理器
         console_handler = logging.StreamHandler()
@@ -56,17 +90,18 @@ def get_chat_logger() -> logging.Logger:
         logger.addHandler(console_handler)
 
         # 文件处理器 (每天一个文件，最大 1MB，保留 5 个文件)
-        log_file_name = f"chat_log_{datetime.now().astimezone().strftime('%Y-%m-%d')}.log"
-        file_path = os.path.join(log_dir, log_file_name)
-        file_handler = RotatingFileHandler(
-            file_path,
-            maxBytes=1 * 1024 * 1024,  # 1 MB
-            backupCount=5,
-            encoding="utf-8",
-        )
-        file_formatter = RedactingFormatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-        file_handler.setFormatter(file_formatter)
-        logger.addHandler(file_handler)
+        # 与 ``get_module_logger`` 同理：日志目录不可写时降级为仅控制台，
+        # 不因诊断能力缺失而中断查询。
+        try:
+            file_handler = _build_rotating_handler(current_settings.log_path, CHAT_LOG_PREFIX)
+        except (OSError, ValueError) as exc:
+            # ``ValueError`` 也要接：``os.makedirs`` 对含 NUL 字节的路径抛
+            # ``ValueError: embedded null byte``（**不是** ``OSError``）。配置层的
+            # ``resolve_path`` 现在已拒绝 NUL，这里是纵深防御——路径字段有六个，
+            # 任何一条来源将来都可能再引入这个形态。
+            _warn_once(logger, "无法写入日志目录，本次运行的日志仅输出到控制台: %s", exc)
+        else:
+            logger.addHandler(file_handler)
 
     return logger
 
@@ -83,9 +118,6 @@ def get_module_logger(name: str) -> logging.Logger:
     # 避免重复添加处理器
     if not logger.handlers:
         current_settings = get_settings()
-        log_dir = current_settings.log_path
-        if not os.path.exists(log_dir):
-            os.makedirs(log_dir)
 
         # 控制台处理器
         console_handler = logging.StreamHandler()
@@ -96,21 +128,50 @@ def get_module_logger(name: str) -> logging.Logger:
         logger.addHandler(console_handler)
 
         # 文件处理器 (每天一个文件，最大 1MB，保留 5 个文件)
-        log_file_name = f"app_log_{datetime.now().astimezone().strftime('%Y-%m-%d')}.log"
-        file_path = os.path.join(log_dir, log_file_name)
-        file_handler = RotatingFileHandler(
-            file_path,
-            maxBytes=1 * 1024 * 1024,  # 1 MB
-            backupCount=5,
-            encoding="utf-8",
-        )
-        file_formatter = RedactingFormatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s"
-        )
-        file_handler.setFormatter(file_formatter)
-        logger.addHandler(file_handler)
+        #
+        # 本函数在模块导入期就会被调用（``src/utils/cleanup.py`` 顶层的
+        # ``get_module_logger(__name__)``），而默认的 ``log_path`` 解析到
+        # 应用根目录之下。安装在 ``/opt``、``/Applications``、
+        # ``C:\Program Files`` 这类只读位置时，``makedirs`` 会抛
+        # ``PermissionError``，把整个进程挡在 import 阶段——连入口的脱敏
+        # 边界都还没建立。日志属于可选的诊断能力，不可写时降级为仅控制台，
+        # 而不是让程序无法启动。
+        try:
+            file_handler = _build_rotating_handler(
+                current_settings.log_path, APP_LOG_PREFIX, with_location=True
+            )
+        except (OSError, ValueError) as exc:
+            # ``ValueError`` 也要接：``os.makedirs`` 对含 NUL 字节的路径抛
+            # ``ValueError: embedded null byte``（**不是** ``OSError``），因此
+            # 只接 ``OSError`` 时这条降级路径会被绕过——而本函数在**模块导入期**
+            # 就被 ``cleanup.py`` 调用，异常会让 ``import main`` 直接失败。
+            # 配置层的 ``resolve_path`` 现在已拒绝 NUL，这里是纵深防御。
+            _warn_once(logger, "无法写入日志目录，本次运行仅输出到控制台: %s", exc)
+        else:
+            logger.addHandler(file_handler)
 
     return logger
+
+
+def _build_rotating_handler(log_dir: str, prefix: str, *, with_location: bool = False):
+    """构建按天滚动的文件处理器；目录不可创建/不可写时抛 ``OSError``。
+
+    含 NUL 字节的路径抛的是 ``ValueError``（不是 ``OSError``），调用方两者都接。
+    """
+    os.makedirs(log_dir, exist_ok=True)
+    log_file_name = f"{prefix}_{datetime.now().astimezone().strftime('%Y-%m-%d')}.log"
+    file_handler = RotatingFileHandler(
+        os.path.join(log_dir, log_file_name),
+        maxBytes=1 * 1024 * 1024,  # 1 MB
+        backupCount=5,
+        encoding="utf-8",
+    )
+    if with_location:
+        pattern = "%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s"
+    else:
+        pattern = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    file_handler.setFormatter(RedactingFormatter(pattern))
+    return file_handler
 
 
 def cleanup_old_logs():
@@ -126,26 +187,26 @@ def cleanup_old_logs():
 
     now = datetime.now().astimezone()
 
-    # 获取所有日志文件
-    log_files = [f for f in os.listdir(log_dir) if f.endswith(".log")]
-
-    for filename in log_files:
+    # 只清理本应用写出的日志。
+    #
+    # 这里原先匹配「目录下所有 *.log，且文件名含任意 YYYY-MM-DD」，而
+    # ``log_path`` 是用户可配置项：把它指向共享目录（``/var/log``、某个
+    # 挂载的日志盘）时，退出钩子会连带删掉别的程序与用户的日志——实测
+    # ``nginx_access_2020-01-01.log``、``postgres_2020-01-01.log`` 乃至
+    # ``backup_2020-01-01.log`` 都被删掉，且 ``rmtree`` 之外的这个删除同样
+    # 不可逆。现在要求文件名严格等于本应用的命名形态
+    # （``app_log_<日期>.log`` / ``chat_log_<日期>.log``），与写入侧同源。
+    for filename in os.listdir(log_dir):
+        match = _LOG_FILENAME_PATTERN.match(filename)
+        if not match:
+            # 别的程序或用户的文件：不是本应用的清理对象，也不值得每个都告警。
+            continue
         file_path = os.path.join(log_dir, filename)
         try:
-            # 从文件名中解析日期，例如 "chat_log_2023-10-26.log" 或 "app_log_2023-10-26.log"
-            match = re.search(r"(\d{4}-\d{2}-\d{2})", filename)
-            if match:
-                file_date_str = match.group(1)
-                file_date = datetime.strptime(file_date_str, "%Y-%m-%d").replace(tzinfo=now.tzinfo)
-
-                if (now - file_date).days > log_retention_days:
-                    os.remove(file_path)
-                    get_module_logger(__name__).info(f"已删除旧日志文件: {filename}")
-            else:
-                # 如果文件名不符合日期模式，也记录一下，但不删除
-                get_module_logger(__name__).warning(
-                    f"日志文件名不符合日期模式，跳过清理: {filename}"
-                )
+            file_date = datetime.strptime(match.group(1), "%Y-%m-%d").replace(tzinfo=now.tzinfo)
+            if (now - file_date).days > log_retention_days:
+                os.remove(file_path)
+                get_module_logger(__name__).info(f"已删除旧日志文件: {filename}")
         except Exception:  # noqa: BLE001 - cleanup continues independently per file
             get_module_logger(__name__).exception("清理日志文件 %s 时出错", filename)
 

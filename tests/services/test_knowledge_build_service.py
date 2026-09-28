@@ -70,3 +70,73 @@ def test_build_validates_temp_snapshot_before_activation(tmp_path, monkeypatch):
     assert (previous_snapshot / "keep.txt").read_text(encoding="utf-8") == "保留"
     assert not (snapshot_root / "kb-new").exists()
     assert not (snapshot_root / ".tmp-kb-new").exists()
+
+
+def test_build_reports_which_file_is_not_utf8(tmp_path, monkeypatch):
+    """非 UTF-8 文件的错误消息必须带上**是哪个文件**。
+
+    ``UnicodeDecodeError`` 自带的消息只有字节偏移，而知识库目录通常有几十个
+    文件；用户面对「程序运行期间发生错误」加一串偏移量无从下手。这里断言消息
+    里出现了出问题的那个文件名，并且临时快照目录不残留。
+    """
+    knowledge_base = tmp_path / "knowledge_base"
+    knowledge_base.mkdir()
+    (knowledge_base / "正常文档.md").write_text("# 正常\n\n正文", encoding="utf-8")
+    (knowledge_base / "损坏的文档.md").write_bytes(b"\xff\xfe invalid \xc3\x28")
+
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_root.mkdir()
+
+    run_config = _RunConfig(knowledge_base, snapshot_root)
+    monkeypatch.setattr(
+        "src.services.knowledge_build_service.Pipeline.from_file_path",
+        lambda *args, **kwargs: _EmptyPipeline(),
+    )
+    embedding_service = SimpleNamespace(
+        embedding_provider_key="local-hash",
+        embedding_model_detail=SimpleNamespace(model_name="local-hash-32"),
+    )
+    service = KnowledgeBuildService(
+        run_config,
+        _IncompleteVectorStore(),
+        embedding_service,
+        SnapshotRepository(run_config),
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        asyncio.run(service.build("standard"))
+
+    message = str(excinfo.value)
+    assert "损坏的文档.md" in message, f"错误消息里没有出问题的文件名: {message}"
+    assert "UTF-8" in message
+    assert not list(snapshot_root.glob(".tmp-*")), "失败后临时快照目录必须被清理"
+
+
+def test_build_still_accepts_utf8_knowledge_base(tmp_path, monkeypatch):
+    """收紧不能误伤：全是 UTF-8 的知识库照常构建。"""
+    knowledge_base = tmp_path / "knowledge_base"
+    knowledge_base.mkdir()
+    (knowledge_base / "文档.md").write_text("# 标题\n\n正文", encoding="utf-8")
+
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_root.mkdir()
+
+    run_config = _RunConfig(knowledge_base, snapshot_root)
+    monkeypatch.setattr(
+        "src.services.knowledge_build_service.Pipeline.from_file_path",
+        lambda *args, **kwargs: _EmptyPipeline(),
+    )
+    embedding_service = SimpleNamespace(
+        embedding_provider_key="local-hash",
+        embedding_model_detail=SimpleNamespace(model_name="local-hash-32"),
+    )
+    service = KnowledgeBuildService(
+        run_config,
+        _IncompleteVectorStore(),
+        embedding_service,
+        SnapshotRepository(run_config),
+    )
+
+    # 空分片会被 ``_IncompleteVectorStore`` 判为不完整快照，说明文件读取这一步过了。
+    with pytest.raises(FileNotFoundError, match="知识快照不完整"):
+        asyncio.run(service.build("standard"))

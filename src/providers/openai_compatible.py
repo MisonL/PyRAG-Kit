@@ -1,6 +1,5 @@
 import asyncio
 import inspect
-import math
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Generator, Iterator, Mapping
 from typing import Any, ClassVar, cast
@@ -19,9 +18,12 @@ from src.providers.__base__.model_provider import (
     close_resource_sync,
     coerce_completion_request,
     content_to_text,
+    enum_field,
     field,
     is_retryable_error,
     merge_tool_call_fragment,
+    normalize_client_retries,
+    normalize_client_timeout,
     normalize_embedding_vector,
     normalize_messages,
     normalize_responses_input,
@@ -29,6 +31,7 @@ from src.providers.__base__.model_provider import (
     normalize_usage,
     raise_for_stream_error_event,
     reject_unsupported_kwargs,
+    require_token_count,
     retry_async_call,
     retry_async_stream,
     retry_sync_call,
@@ -41,10 +44,17 @@ from src.providers.resources import (
     AsyncOpenAICompatibleResources,
     OpenAICompatibleResources,
 )
-from src.utils.config import get_settings
+from src.utils.config import (
+    _MAX_EMBEDDING_DIMENSION,
+    get_settings,
+    is_double_convertible,
+    parse_decimal_int,
+    safe_repr,
+)
 from src.utils.log_manager import get_module_logger
 from src.utils.security import (
     redact_sensitive_text,
+    safe_exception_text,
     validate_secret_free_payload,
     validate_secret_free_resource_args,
     validate_secret_free_resource_kwargs,
@@ -234,6 +244,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         self._provider = provider
         self._protocol = self._normalize_protocol(protocol)
         self._options = validate_secret_free_options(options, provider)
+        # 客户端构造参数在配置边界就校验：非法取值不能拖到首次发请求时才暴露，
+        # 那时错误形态与「配置写错了」无关（见 ``_normalize_client_options``）。
+        self._normalized_client_options = self._normalize_client_options(self._options)
         self._server_verified_protocols = self._normalize_verified_protocols(
             self._options.get("server_verified_protocols", ())
         )
@@ -245,9 +258,14 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
 
         self._api_key = getattr(settings, api_key_name, None)
         self._base_url = getattr(settings, base_url_name, None)
+        # 记下取值**实际来自哪个字段**，错误消息据此命名：openai 渠道的现行
+        # 字段是旧名 ``openai_api_base``（``openai_base_url`` 在 ``Settings`` 里
+        # 并不存在），只报 ``base_url_name`` 会把用户指向一个不存在的配置项。
+        base_url_source = base_url_name
         if self._base_url is None:
             # OpenAI 旧配置字段使用 `openai_api_base`，继续兼容现有配置文件。
-            self._base_url = getattr(settings, f"{settings_prefix}_api_base", None)
+            base_url_source = f"{settings_prefix}_api_base"
+            self._base_url = getattr(settings, base_url_source, None)
 
         if provider in ["ollama", "lm-studio"] and not self._api_key:
             self._api_key = "no-key-required"
@@ -255,6 +273,27 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         if not self._api_key:
             logger.error(f"{provider} API Key 未设置。")
             raise ValueError(f"{api_key_name} is required for {provider}")
+
+        # 空串／纯空白必须与「未配置」区分开，两者此前被混为一谈：
+        #
+        # ``getattr`` 只在**键缺失**时返回默认值，而这两个字段的默认值非空、
+        # ``.env`` 里又带着 ``OPENAI_API_BASE``，因此「显式置空」会得到空串而
+        # 不是 ``None``——下面那个 ``is None`` 的回落分支不触发。随后
+        # ``openai.OpenAI(base_url="")`` 得到 ``URL('')``，请求 URL 变成相对
+        # 路径 ``chat/completions``（没有主机名），失败信息与「地址配错」毫无
+        # 关系；``"   "`` 更会被 SDK 编码成 ``%20%20%20/``。
+        #
+        # ``None`` 是**未配置**，必须继续放行——openai 渠道依赖 SDK 自带的默认
+        # 地址（实测默认客户端为 ``https://api.openai.com/v1/``），所以这里只拒绝
+        # 字符串形态的空值，不把 falsy 一律拒掉。
+        if isinstance(self._base_url, str) and not self._base_url.strip():
+            logger.error(f"{provider} Base URL 配置为空。")
+            raise ValueError(
+                f"{base_url_source} 不能为空字符串（得到 {self._base_url!r}）。"
+                " 空值会让请求落到没有主机名的相对路径上；"
+                "如需使用默认地址，请删除该配置项而不是置空。"
+            )
+
         if provider != "openai" and not self._base_url:
             logger.error(f"{provider} Base URL 未设置。")
             raise ValueError(f"{base_url_name} is required for {provider}")
@@ -273,7 +312,16 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
 
     @staticmethod
     def _normalize_protocol(protocol: str) -> str:
-        normalized = str(protocol).strip().lower().replace("-", "_")
+        # 非字符串显式拒绝：``str(10**4301)`` 撞上 CPython 的整数位数上限，抛的是
+        # ``ValueError: Exceeds the limit``——既没有「哪个参数错了」，也没有「可选
+        # 值是什么」。协议名只能是字符串，其余形态都说明调用方传错了参数。用
+        # ``safe_repr`` 而不是裸取值插值：下面那条消息里也要插值同一个取值。
+        if not isinstance(protocol, str):
+            raise ValueError(
+                f"OpenAI 兼容渠道的协议必须是字符串，但得到 {safe_repr(protocol)}。"
+                " 可选值: chat_completions, responses"
+            )
+        normalized = protocol.strip().lower().replace("-", "_")
         if normalized in {"chat", "completion", "chat_completion", "chat_completions"}:
             return "chat_completions"
         if normalized in {"response", "responses"}:
@@ -298,27 +346,59 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             normalized.add(cls._normalize_protocol(value))
         return frozenset(normalized)
 
+    @classmethod
+    def _normalize_client_options(cls, options: Mapping[str, Any]) -> dict[str, Any]:
+        """校验并规范化客户端构造参数（``timeout``／``max_retries``）。
+
+        这两个键在 ``_get_client`` 里被原样透传给 ``openai.OpenAI(...)``，而 SDK
+        对它们不做任何校验——非法取值要到实际发请求时才以形态各异的错误暴露。
+        ``max_retries=-1`` 尤其隐蔽：SDK 的重试循环是 ``range(max_retries + 1)``，
+        负数让请求**一次都不发出**，最终抛 SDK 内部的 ``AssertionError``。
+
+        这里与 Ark 渠道的 ``_normalize_client_options`` 保持同一套判据，差别只在
+        ``timeout``：Ark SDK 接受 ``httpx.Timeout`` 对象，openai SDK 同样接受，
+        因此两边都保留该形态。
+        """
+        normalized: dict[str, Any] = {}
+        if "timeout" in options:
+            timeout = options["timeout"]
+            if hasattr(timeout, "connect"):
+                # httpx.Timeout：SDK 接受，且无法用 TOML 表达，原样保留。
+                normalized["timeout"] = timeout
+            else:
+                normalized["timeout"] = normalize_client_timeout(
+                    timeout, "OpenAI 兼容渠道", "options.timeout"
+                )
+        if "max_retries" in options:
+            normalized["max_retries"] = normalize_client_retries(
+                options["max_retries"], "OpenAI 兼容渠道"
+            )
+        return normalized
+
+    def _client_options(self) -> dict[str, Any]:
+        """返回已校验的客户端构造参数，结果缓存在实例上。
+
+        校验放在 ``__init__`` 期执行（见那里的 ``_normalize_client_options``），
+        这里只做缓存读取；懒构造客户端的路径因此不会重复校验，也不会在校验失败
+        时留下「部分构造」的客户端。
+        """
+        return dict(getattr(self, "_normalized_client_options", {}) or {})
+
     def _get_client(self) -> openai.OpenAI:
         if self._client is None:
-            client_options = {
-                key: value
-                for key, value in self._options.items()
-                if key in {"timeout", "max_retries"}
-            }
             self._client = openai.OpenAI(
-                api_key=self._api_key, base_url=self._base_url, **client_options
+                api_key=self._api_key,
+                base_url=self._base_url,
+                **self._client_options(),
             )
         return self._client
 
     def _get_aclient(self) -> openai.AsyncOpenAI:
         if self._aclient is None:
-            client_options = {
-                key: value
-                for key, value in self._options.items()
-                if key in {"timeout", "max_retries"}
-            }
             self._aclient = openai.AsyncOpenAI(
-                api_key=self._api_key, base_url=self._base_url, **client_options
+                api_key=self._api_key,
+                base_url=self._base_url,
+                **self._client_options(),
             )
         return self._aclient
 
@@ -433,17 +513,20 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             "background_timeout",
             options.get("responses_poll_timeout", 300.0),
         )
+        # ``math.isfinite(float(x))`` 对超出双精度范围的整数自己就抛
+        # ``OverflowError``（**不是** ``ValueError``，会穿透调用方的
+        # ``except ValueError``），因此先判可转换性再比较。
         if (
             isinstance(interval, bool)
             or not isinstance(interval, (int, float))
-            or not math.isfinite(float(interval))
+            or not is_double_convertible(interval)
             or interval <= 0
         ):
             raise ValueError("Responses background_poll_interval 必须是正数。")
         if (
             isinstance(timeout, bool)
             or not isinstance(timeout, (int, float))
-            or not math.isfinite(float(timeout))
+            or not is_double_convertible(timeout)
             or timeout <= 0
         ):
             raise ValueError("Responses background_timeout 必须是正数。")
@@ -458,7 +541,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         }
 
     def _poll_background_response(self, response: Any, params: Mapping[str, Any]) -> Any:
-        status = field(response, "status")
+        status = enum_field(response, "status")
         if status not in {"queued", "in_progress", "pending"}:
             return response
         response_id = field(response, "id")
@@ -478,13 +561,13 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             response = retry_sync_call(
                 lambda: self._get_client().responses.retrieve(response_id, **retrieve_kwargs)
             )
-            status = field(response, "status")
+            status = enum_field(response, "status")
         return response
 
     async def _poll_background_response_async(
         self, response: Any, params: Mapping[str, Any]
     ) -> Any:
-        status = field(response, "status")
+        status = enum_field(response, "status")
         if status not in {"queued", "in_progress", "pending"}:
             return response
         response_id = field(response, "id")
@@ -504,7 +587,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             response = await retry_async_call(
                 lambda: self._get_aclient().responses.retrieve(response_id, **retrieve_kwargs)
             )
-            status = field(response, "status")
+            status = enum_field(response, "status")
         return response
 
     def _compat_extra_options(self) -> dict[str, Any]:
@@ -702,7 +785,32 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             f"{getattr(self, '_provider', 'OpenAI-compatible')} Embedding 模型 options",
             {key: value for key, value in options.items() if key not in allowed},
         )
-        return {key: value for key, value in options.items() if key in supported}
+        normalized = {key: value for key, value in options.items() if key in supported}
+        if "dimensions" in normalized:
+            normalized["dimensions"] = self._validate_embedding_dimensions(normalized["dimensions"])
+        return normalized
+
+    @staticmethod
+    def _validate_embedding_dimensions(value: Any) -> int:
+        """校验 ``options.dimensions``，拒绝越界、非整数与超大字面量。
+
+        这个值从 ``config.toml`` 直达请求体，此前**完全没有校验**：实测
+        ``-1``、``0``、``"abc"``、``1.5``、``True`` 全部原样发给远端，由服务端
+        返回语义不明的 400；``10**4301`` 更糟——它在 ``json.dumps`` 编码请求体
+        时才抛「整数转字符串超限」，错误消息与 embedding 参数毫无关联。
+        项目里 ``_MAX_EMBEDDING_DIMENSION`` 早就是这个量的上界（``local_hash``
+        与 ``embedding_service`` 都在用），provider 边界漏了同一判据。
+        """
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                f"Embedding options.dimensions 必须是整数，但得到 {safe_repr(value)}。"
+            )
+        if not 1 <= value <= _MAX_EMBEDDING_DIMENSION:
+            raise ValueError(
+                f"Embedding options.dimensions 必须在 1 到 {_MAX_EMBEDDING_DIMENSION} 之间，"
+                f"但得到 {safe_repr(value)}。"
+            )
+        return value
 
     @staticmethod
     def _validate_embedding_kwargs(kwargs: Mapping[str, Any]) -> None:
@@ -1529,7 +1637,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                     }
                 )
         for item in field(response, "output", []) or []:
-            if field(item, "type") in {"function_call", "custom_tool_call"}:
+            if enum_field(item, "type") in {"function_call", "custom_tool_call"}:
                 calls.append(
                     {
                         "id": field(item, "call_id") or field(item, "id"),
@@ -1557,7 +1665,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 if isinstance(value, str):
                     values.append(value)
         for item in field(response, "output", []) or []:
-            if field(item, "type") in {"reasoning", "reasoning_item"}:
+            if enum_field(item, "type") in {"reasoning", "reasoning_item"}:
                 summary = field(item, "summary")
                 if isinstance(summary, str):
                     values.append(summary)
@@ -1606,8 +1714,13 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         normalized = str(status).strip().lower()
         if not normalized:
             return False
-        if normalized.isdigit():
-            return int(normalized) >= 400
+        # 解析走 ``parse_decimal_int``：这个方法在**解析网关响应**的路径上，
+        # 一个形态奇怪的 status 值不能让错误分类本身崩掉——那会把「网关返回了
+        # 业务错误」变成一条解析异常。``int()`` 抛错的情形有两类：非十进制数字
+        # 字符，以及位数超过 ``sys.get_int_max_str_digits()``。
+        parsed_status = parse_decimal_int(normalized)
+        if parsed_status is not None:
+            return parsed_status >= 400
         return normalized in {
             "error",
             "failed",
@@ -1628,7 +1741,10 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 continue
             if name == "error":
                 return redact_sensitive_text(cls._error_message(value, "未知错误。"))
-            return redact_sensitive_text(str(value))
+            # ``str(value)`` 对 4301 位整数抛 ``ValueError``——这些字段
+            # （``code``／``error_code``／``status``…）正是网关最容易回显
+            # 大整数的地方。
+            return redact_sensitive_text(safe_repr(value))
         return None
 
     @classmethod
@@ -1647,12 +1763,18 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         字段仍必须显式失败。
         """
         detail = cls._chat_response_error_detail(response)
+        # 这里**不能**用 ``enum_field``：``status`` 随后要进
+        # ``_chat_status_is_error`` 做 ``>= 400`` 的数值比较，收敛成空串会让
+        # 数字型业务错误（``{"status": 503}``）漏判。形态防护放在插值处。
         status = field(response, "status")
         if detail is not None and field(response, "error") is not None:
             raise RuntimeError(f"{provider} 返回错误: {detail}")
         if cls._chat_status_is_error(status):
             suffix = f": {detail}" if detail else "。"
-            raise RuntimeError(f"{provider} 返回业务错误 (status={status}){suffix}")
+            # ``status`` 来自网关 JSON，可以是任意大整数：``f"{10**4300}"`` 抛
+            # ``ValueError: Exceeds the limit (4300 digits)``，于是「网关返回了
+            # 业务错误」变成「整数转字符串超限」。
+            raise RuntimeError(f"{provider} 返回业务错误 (status={safe_repr(status)}){suffix}")
 
         choices = field(response, "choices")
         if allow_empty_choices:
@@ -1858,7 +1980,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     ) -> None:
         """记录 output_item.added 中后续 delta/done 事件需要的工具元数据。"""
         item = field(event, "item") or event
-        item_type = field(item, "type")
+        item_type = enum_field(item, "type")
         if item_type not in {"function_call", "custom_tool_call"}:
             return
         item_id = field(item, "id") or field(event, "item_id")
@@ -1912,7 +2034,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         error_provider: str = "Responses API",
         response_error_handler: Any | None = None,
     ) -> StreamEvent | None:
-        event_type = field(event, "type", "")
+        event_type = enum_field(event, "type")
         if event_type == "response.output_item.added":
             if tool_metadata is not None:
                 cls._remember_response_tool_metadata(event, tool_metadata)
@@ -1968,7 +2090,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         }:
             item = field(event, "item")
             metadata = cls._response_tool_metadata(event, tool_metadata, item)
-            item_type = field(item, "type") if item is not None else None
+            item_type = enum_field(item, "type") if item is not None else None
             item_type = item_type or metadata.get("type")
             if (
                 item_type in {"function_call", "custom_tool_call"}
@@ -2027,7 +2149,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         }:
             response = field(event, "response") or event
             usage = cls._extract_usage(response)
-            status = field(response, "status")
+            status = enum_field(response, "status")
             if status in {"failed", "incomplete", "cancelled"}:
                 handler = response_error_handler or cls._raise_for_response_error
                 handler(response)
@@ -2148,7 +2270,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             ):
                 if terminal_seen:
                     continue
-                event_type = field(event, "type", "")
+                event_type = enum_field(event, "type")
                 converted = self._responses_stream_event(event, response_tool_metadata)
                 if converted:
                     if converted.type == "finish":
@@ -2239,7 +2361,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             ):
                 if terminal_seen:
                     continue
-                event_type = field(event, "type", "")
+                event_type = enum_field(event, "type")
                 converted = self._responses_stream_event(event, response_tool_metadata)
                 if converted:
                     if converted.type == "finish":
@@ -2389,10 +2511,13 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             return error
         message = field(error, "message")
         if message:
-            return str(message)
+            # ``message`` 来自网关 JSON，可能是任意大整数或容器：
+            # ``str(10**4301)`` 自己抛 ``ValueError: Exceeds the limit``，
+            # 于是「报告网关错误」这一步改抛与错误内容无关的异常。
+            return safe_repr(message) if not isinstance(message, str) else message
         code = field(error, "code")
         if code:
-            return f"{code}"
+            return safe_repr(code) if not isinstance(code, str) else code
         return default
 
     @classmethod
@@ -2404,21 +2529,21 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             message = redact_sensitive_text(cls._error_message(error, "未知错误。"))
             raise RuntimeError(f"Responses API 返回错误: {message}")
 
-        status = field(response, "status")
+        status = enum_field(response, "status")
         if status not in {"failed", "incomplete", "cancelled"}:
             return
 
         if status == "incomplete":
             details = field(response, "incomplete_details")
             reason = field(details, "reason")
-            detail = f"原因: {reason}" if reason else "未提供原因。"
+            detail = f"原因: {safe_repr(reason)}" if reason else "未提供原因。"
         else:
             detail = "未提供原因。"
         raise RuntimeError(f"Responses API 响应状态为 {status}: {redact_sensitive_text(detail)}")
 
     @classmethod
     def _stream_delta(cls, event: Any) -> str:
-        event_type = field(event, "type", "")
+        event_type = enum_field(event, "type")
         if event_type in {"response.output_text.delta", "response.refusal.delta"}:
             delta = field(event, "delta")
             return delta if isinstance(delta, str) else ""
@@ -2443,7 +2568,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 lambda: self._get_client().responses.create(**request),
                 lambda event: raise_for_stream_error_event(event, self._provider),
             ):
-                event_type = field(event, "type", "")
+                event_type = enum_field(event, "type")
                 if event_type == "response.refusal.delta":
                     refusal = field(event, "delta")
                     if refusal:
@@ -2474,7 +2599,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 lambda: self._get_aclient().responses.create(**request),
                 lambda event: raise_for_stream_error_event(event, self._provider),
             ):
-                event_type = field(event, "type", "")
+                event_type = enum_field(event, "type")
                 if event_type == "response.refusal.delta":
                     refusal = field(event, "delta")
                     if refusal:
@@ -2617,7 +2742,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 f"{self._provider} LLM ({self._model_name}) 调用完成，耗时: {duration:.2f}s"
             )
         except Exception as e:
-            error_text = redact_sensitive_text(str(e))
+            error_text = safe_exception_text(e)
             logger.exception(
                 "%s LLM (%s) 出错: %s",
                 self._provider,
@@ -2748,7 +2873,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 f"{self._provider} LLM ({self._model_name}) 异步调用完成，耗时: {duration:.2f}s"
             )
         except Exception as e:
-            error_text = redact_sensitive_text(str(e))
+            error_text = safe_exception_text(e)
             logger.exception(
                 "%s LLM (%s) 异步出错: %s",
                 self._provider,
@@ -2806,7 +2931,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             logger.info(f"{self._provider} 嵌入 ({self._model_name}) 完成，耗时: {duration:.2f}s")
             return embeddings
         except Exception as e:
-            error_text = redact_sensitive_text(str(e))
+            error_text = safe_exception_text(e)
             logger.exception(
                 "%s 嵌入 (%s) 出错: %s",
                 self._provider,
@@ -2866,7 +2991,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             )
             return embeddings
         except Exception as e:
-            error_text = redact_sensitive_text(str(e))
+            error_text = safe_exception_text(e)
             logger.exception(
                 "%s 嵌入 (%s) 异步出错: %s",
                 self._provider,
@@ -3167,10 +3292,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             kwargs=params,
             operation="OpenAI Responses 输入 token 统计",
         )
-        value = field(response, "input_tokens")
-        if value is None:
-            raise RuntimeError("OpenAI token count 响应缺少 input_tokens。")
-        return int(value)
+        return require_token_count(field(response, "input_tokens"), "OpenAI", "input_tokens")
 
     def create_vector_store(self, **kwargs: Any) -> Any:
         return self._call_sdk_resource(
@@ -4353,10 +4475,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             kwargs=params,
             operation="OpenAI Responses 输入 token 统计",
         )
-        value = field(response, "input_tokens")
-        if value is None:
-            raise RuntimeError("OpenAI token count 响应缺少 input_tokens。")
-        return int(value)
+        return require_token_count(field(response, "input_tokens"), "OpenAI", "input_tokens")
 
     async def async_create_vector_store(self, **kwargs: Any) -> Any:
         return await self._call_async_sdk_resource(

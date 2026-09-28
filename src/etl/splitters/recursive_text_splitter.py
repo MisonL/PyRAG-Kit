@@ -5,12 +5,13 @@
 import re
 import uuid
 from collections.abc import Callable
+from typing import Any
 
 import tiktoken
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from src.models.document import Document
-from src.utils.config import get_settings
+from src.utils.config import get_settings, safe_repr
 from src.utils.log_manager import get_module_logger
 
 from .base import BaseSplitter
@@ -42,14 +43,39 @@ class RecursiveTextSplitter(BaseSplitter):
             mode (str): 分割模式，可选 "char" 或 "token"。
             encoding_name (str): tiktoken 编码名称。
         """
-        if structure_mode not in {"standard", "hierarchical"}:
-            raise ValueError(f"不支持的结构模式: {structure_mode}")
+        # 两条守卫缺一不可：
+        # * 集合成员判断对不可哈希的值抛 ``TypeError: unhashable type``——调用方
+        #   可以传列表/字典，异常类型与「模式不支持」无关。
+        # * 消息里插值 ``{structure_mode}`` 自己会抛：``str(10**4301)`` 撞上
+        #   CPython 的整数位数上限，用户看到 ``Exceeds the limit (4300 digits)``。
+        if not isinstance(structure_mode, str) or structure_mode not in {
+            "standard",
+            "hierarchical",
+        }:
+            raise ValueError(f"不支持的结构模式: {safe_repr(structure_mode)}")
+        # ``mode`` 原先完全没有校验，直接赋值后在 ``_get_length_function`` 里只判
+        # ``== "token"``：任何拼错/大小写不符/非字符串的取值都**静默退回 char
+        # 模式**。实测 ``"Token"``／``"tokens"``／``None``／``["token"]`` 全部得到
+        # char 分片——``chunk_size=1500`` 于是意味着 1500 **字符**而不是 1500
+        # token，中文下每 token 约一字，分片规模与配置意图不符且无任何提示。
+        # 这违反 AGENTS.md「不用静默回退或占位结果掩盖失败」。
+        if not isinstance(mode, str) or mode not in {"token", "char"}:
+            raise ValueError(f"不支持的分割模式: {safe_repr(mode)}，只接受 'token' 或 'char'。")
         self.mode = mode
         self.structure_mode = structure_mode
-        self.parent_chunk_size = parent_chunk_size
-        self.parent_chunk_overlap = parent_chunk_overlap
-        self.child_chunk_size = child_chunk_size
-        self.child_chunk_overlap = child_chunk_overlap
+        # 尺寸参数的形态守卫。原先只做比较（``_validate_hierarchical_sizes``），
+        # 于是 ``child_chunk_size='300'`` 构造成功、到 split 时才抛
+        # ``TypeError: '>=' not supported between instances of 'int' and 'str'``；
+        # ``child_chunk_overlap=['x']`` 同理。契约是同文件的 ``ValueError``，
+        # 而 ``TypeError`` 不是——调用方的错误分类接不住它。
+        self.parent_chunk_size = self._require_optional_size(parent_chunk_size, "parent_chunk_size")
+        self.parent_chunk_overlap = self._require_optional_size(
+            parent_chunk_overlap, "parent_chunk_overlap", minimum=0
+        )
+        self.child_chunk_size = self._require_optional_size(child_chunk_size, "child_chunk_size")
+        self.child_chunk_overlap = self._require_optional_size(
+            child_chunk_overlap, "child_chunk_overlap", minimum=0
+        )
         self.parent_documents: dict[str, dict[str, object]] = {}
         self._encoder = tiktoken.get_encoding(encoding_name)
         logger.info(
@@ -60,11 +86,63 @@ class RecursiveTextSplitter(BaseSplitter):
         )
         self._init_splitter()
 
+    @staticmethod
+    def _require_optional_size(value: Any, label: str, *, minimum: int = 1) -> int | None:
+        """把可选的尺寸参数收敛成 ``int``；非法形态抛 ``ValueError``。
+
+        ``None`` 表示「用 settings 的值」，照常放行。``bool`` 是 ``int`` 子类，
+        ``True`` 会静默变成 ``1``——与 ``_coerce_number`` 同源的判据。
+        """
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{label} 必须是整数，但得到 {safe_repr(value)}。")
+        if value < minimum:
+            # 与上面那条同为「值本身非法」，消息里的取值同样要经 ``safe_repr``。
+            # 裸 ``{value}`` 在**负的**超大整数上抛
+            # ``ValueError: Exceeds the limit``：能走到这个分支的正是
+            # ``value < minimum`` 成立的取值，而位数超限的整数里只有负的才满足
+            # 它（``10**4301 >= 1`` 不成立，直接返回）。实测
+            # ``parent_chunk_size=-(10**4301)`` 时用户看到的是整数转换错误，而不是
+            # 「必须大于等于 1」。
+            raise ValueError(f"{label} 必须大于等于 {minimum}，但得到 {safe_repr(value)}。")
+        return value
+
     def _get_length_function(self) -> Callable[[str], int]:
         """根据模式返回长度计算函数。"""
         if self.mode == "token":
             return lambda x: len(self._encoder.encode(x))
         return len
+
+    # 分隔符表的长度上界。LangChain 的 ``RecursiveCharacterTextSplitter._split_text``
+    # 按分隔符表**递归**：每一层为「剩余分隔符」再开一次调用。实测 1500 个分隔符
+    # 抛 ``RecursionError: maximum recursion depth exceeded``——它不是
+    # ``ValueError``，穿透调用方的错误分类与脱敏。表来自用户可写的
+    # ``kb_splitter_separators``（TOML 数组），``Settings`` 的 validator 只做
+    # ``str -> list`` 拆分、没有长度上界。
+    #
+    # 上界取 64：真实配置是个位数（默认只有 ``["###"]``），而 LangChain 每层只
+    # 消耗一个分隔符，64 层远在递归上限之内，同时挡住「配置写错成超长数组」。
+    _MAX_SEPARATORS = 64
+
+    @staticmethod
+    def _require_separators(separators: Any) -> list[str]:
+        """校验分隔符表的形态与长度，返回原列表。
+
+        ``None`` 交给调用方按 settings 兜底；这里只管非 ``None`` 的取值。
+        """
+        if not isinstance(separators, list):
+            raise ValueError(f"分隔符表必须是列表，但得到 {safe_repr(separators)}。")
+        for item in separators:
+            if not isinstance(item, str):
+                raise ValueError(f"分隔符表的每一项都必须是字符串，但得到 {safe_repr(item)}。")
+        if len(separators) > RecursiveTextSplitter._MAX_SEPARATORS:
+            raise ValueError(
+                f"分隔符表最多 {RecursiveTextSplitter._MAX_SEPARATORS} 项，"
+                f"但得到 {len(separators)} 项。分隔符表按项递归切分，过长的表会"
+                "在切分时抛 RecursionError。"
+            )
+        return separators
 
     @staticmethod
     def _with_fallback_separator(separators: list[str]) -> list[str]:
@@ -92,20 +170,78 @@ class RecursiveTextSplitter(BaseSplitter):
         """根据当前配置初始化内部分割器。"""
         current_settings = get_settings()
         self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=self.parent_chunk_size or current_settings.kb_chunk_size,
+            # ``is not None`` 而不是 ``or``：``or`` 把 ``0`` 当假值兜底成 settings
+            # 的值（实际用 1500），而 ``_validate_hierarchical_sizes`` 用的是
+            # ``is not None``、会保留 0 参与比较——于是「校验的值」与「用的值」
+            # 不是同一个，实测 ``parent_chunk_size=0, child_chunk_size=300`` 报出
+            # 「parent=0」，而真正生效的是 1500。上面的形态守卫现在会先拒掉 0，
+            # 这里同步对齐语义，避免两处判据再次分叉。
+            chunk_size=self.parent_chunk_size
+            if self.parent_chunk_size is not None
+            else current_settings.kb_chunk_size,
             chunk_overlap=self.parent_chunk_overlap
             if self.parent_chunk_overlap is not None
             else current_settings.kb_chunk_overlap,
-            separators=self._with_fallback_separator(current_settings.kb_splitter_separators),
+            separators=self._with_fallback_separator(
+                self._require_separators(current_settings.kb_splitter_separators)
+            ),
             length_function=self._get_length_function(),
             is_separator_regex=False,
         )
         logger.info(
             "文本分割器已就绪: chunk_size=%s, mode=%s, structure=%s",
-            self.parent_chunk_size or current_settings.kb_chunk_size,
+            self.parent_chunk_size
+            if self.parent_chunk_size is not None
+            else current_settings.kb_chunk_size,
             self.mode,
             self.structure_mode,
         )
+
+    def _validate_hierarchical_sizes(self) -> None:
+        """层级模式下校验子分片与父分片的尺寸关系。
+
+        这两条约束原先写在 ``Settings`` 的 model_validator 里，但**模式不在
+        Settings 里**——它是分片时的运行时参数（``build(splitter_structure_mode)``
+        或 CLI 的 ``--mode``）。无条件校验的后果是一组「standard 下完全合法」的
+        取值连配置都加载不了：实测 ``kb_chunk_size=100, kb_child_chunk_size=300``
+        被 ``ValidationError`` 拒绝，而 standard 模式只调用普通分片器
+        （``_split_standard_documents``），子分片器的参数根本不参与。
+
+        放在这里判定同时保证了「校验的正是真正会用到的参数」：层级分支一定会
+        构造子分片器，非层级分支一定不会。
+
+        * ``child_size >= chunk_size``：层级结构静默退化为一层。实测
+          ``kb_chunk_size=300, kb_child_chunk_size=1500`` 被接受后父块数从 2 涨到
+          10（每个父块只产出 1 个子块）；相等同理（parent=child=300 时不同父块数
+          == 分块数，15/15）。
+        * ``child_overlap >= child_size``：子分片器无法推进（得到空分片或死循环）。
+        """
+        settings = get_settings()
+        child_size = (
+            self.child_chunk_size
+            if self.child_chunk_size is not None
+            else settings.kb_child_chunk_size
+        )
+        child_overlap = (
+            self.child_chunk_overlap
+            if self.child_chunk_overlap is not None
+            else settings.kb_child_chunk_overlap
+        )
+        parent_size = (
+            self.parent_chunk_size if self.parent_chunk_size is not None else settings.kb_chunk_size
+        )
+        if child_overlap >= child_size:
+            raise ValueError(
+                "kb_child_chunk_overlap 必须小于 kb_child_chunk_size，"
+                f"但得到 overlap={safe_repr(child_overlap)}、size={safe_repr(child_size)}。"
+                " 相等会让子分片器无法推进。"
+            )
+        if child_size >= parent_size:
+            raise ValueError(
+                "kb_child_chunk_size 必须小于 kb_chunk_size（子分片不得大于或等于父分片），"
+                f"但得到 child={safe_repr(child_size)}、parent={safe_repr(parent_size)}。"
+                " 否则层级结构静默退化为一层。"
+            )
 
     def _build_child_splitter(self) -> RecursiveCharacterTextSplitter:
         """构建子分片器。"""
@@ -119,7 +255,9 @@ class RecursiveTextSplitter(BaseSplitter):
                 if self.child_chunk_overlap is not None
                 else current_settings.kb_child_chunk_overlap
             ),
-            separators=self._with_fallback_separator(current_settings.kb_splitter_separators),
+            separators=self._with_fallback_separator(
+                self._require_separators(current_settings.kb_splitter_separators)
+            ),
             length_function=self._get_length_function(),
             is_separator_regex=False,
         )
@@ -136,10 +274,22 @@ class RecursiveTextSplitter(BaseSplitter):
         829 字符，丢失 1.66%。最坏情况整篇都是句号分隔符时，全部分片都可能被判为空
         并 ``continue`` 掉，产出 0 个块。
 
-        现在只规范化边界空白：把开头的句号替换为等长空格再 strip，句中信息
-        一字不改，也不会再产生「内容全被删掉因此该块被跳过」的路径。
+        现在只规范化边界空白：把开头的**空白**替换为等长空格再 strip，标点一字
+        不动。句中信息一字不改，也不会再产生「内容全被删掉因此该块被跳过」的路径。
+
+        上一版写的是 ``re.sub(r"^[\s.。]+", lambda m: " " * len(m.group()), text)``
+        ——看似「替换而不是删除」，实则与旧实现**逐字符等价**：被替换的字符集
+        （空白 + ``.`` + ``。``）恰好等于随后 ``strip()`` 会删掉的字符集，替换成
+        空格后立刻又被 strip 掉。实测 3 万条随机输入零差异，``"。" * 200`` 依然
+        产出 0 块、``separators=["。"]`` 下依然丢 2.9% 的字符。因此那条 CHANGELOG
+        声称的「句中信息一字不丢」当时并不成立。
+
+        现在**只**匹配空白。句号属于正文——当分隔符本身就是 ``。`` 时，
+        ``keep_separator=True`` 会把上一句的句号留在下一个分片开头，删掉它
+        就是丢掉用户内容；而 ``。`` 本身是有意义的分隔信息，保留它才能让分片
+        拼接回原文。
         """
-        text = re.sub(r"^[\s.。]+", lambda match: " " * len(match.group()), text)
+        text = re.sub(r"^\s+", lambda match: " " * len(match.group()), text)
         return text.strip()
 
     def _split_standard_documents(self, documents: list[Document]) -> list[Document]:
@@ -151,6 +301,7 @@ class RecursiveTextSplitter(BaseSplitter):
             langchain_chunks = self.text_splitter.create_documents(
                 [doc.content], metadatas=[doc.metadata]
             )
+            chunks_before = len(all_chunks)
             for i, chunk in enumerate(langchain_chunks):
                 chunk_content = self._strip_leading_punctuation(chunk.page_content)
                 if not chunk_content:
@@ -164,11 +315,10 @@ class RecursiveTextSplitter(BaseSplitter):
                 chunk_metadata["token_count"] = len(self._encoder.encode(chunk_content))
                 all_chunks.append(Document(content=chunk_content, metadata=chunk_metadata))
 
-            logger.debug(
-                "文档 '%s' 分割完成，生成 %s 个块。",
-                doc.metadata.get("source", "未知来源"),
-                len(langchain_chunks),
-            )
+            # 日志必须报**实际收录**的块数：原先写的是 ``len(langchain_chunks)``
+            # （过滤前的数量），一份被整段判空的文档会显示「生成 8 个块」而实际
+            # 贡献 0 个——日志反过来掩盖了问题。
+            self._report_document_chunks(doc, len(all_chunks) - chunks_before)
         return all_chunks
 
     def split_hierarchical(self, documents: list[Document]) -> list[Document]:
@@ -217,13 +367,32 @@ class RecursiveTextSplitter(BaseSplitter):
                     all_chunks.append(Document(content=child_content, metadata=child_metadata))
                     doc_chunk_count += 1
 
-            logger.debug(
-                "文档 '%s' 层级分割完成，生成 %s 个块。",
-                doc.metadata.get("source", "未知来源"),
-                doc_chunk_count,
-            )
+            self._report_document_chunks(doc, doc_chunk_count, hierarchical=True)
 
         return all_chunks
+
+    @staticmethod
+    def _report_document_chunks(
+        doc: Document, produced: int, *, hierarchical: bool = False
+    ) -> None:
+        r"""记录单篇文档**实际收录**的块数。
+
+        原先标准分支记的是 ``len(langchain_chunks)``——过滤**前**的数量。一份
+        被整段判空的文档会显示「生成 8 个块」而实际贡献 0 个，日志反过来掩盖了
+        问题。
+
+        ``produced == 0`` 只可能出现在原文（按 ``\s`` 语义）为空时：过滤条件是
+        「该块去掉首尾空白后为空」，若所有块都被滤掉，则所有块都是空白，即原文
+        只有空白。实测对 16 种输入 × 5 组分隔符 × 3 组尺寸 × 2 种结构组合做笛卡尔
+        扫描，没有出现「原文有非空白内容却产出 0 块」的情形——因此这里不为它写
+        警告分支（写不到的死代码只会让人误以为有防护）。
+        """
+        source = doc.metadata.get("source", "未知来源")
+        if produced:
+            stage = "层级分割" if hierarchical else "分割"
+            logger.debug("文档 '%s' %s完成，生成 %s 个块。", source, stage, produced)
+        else:
+            logger.debug("文档 '%s' 清洗后为空，跳过。", source)
 
     def split(self, documents: list[Document], **kwargs) -> list[Document]:
         """
@@ -236,6 +405,7 @@ class RecursiveTextSplitter(BaseSplitter):
         self.parent_documents = {}
 
         if self.structure_mode == "hierarchical":
+            self._validate_hierarchical_sizes()
             all_chunks = self.split_hierarchical(documents)
         else:
             all_chunks = self._split_standard_documents(documents)

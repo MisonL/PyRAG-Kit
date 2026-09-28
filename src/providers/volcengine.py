@@ -1,5 +1,4 @@
 import inspect
-import math
 from collections.abc import AsyncGenerator, Collection, Generator, Mapping
 from typing import Any
 
@@ -15,9 +14,12 @@ from src.providers.__base__.model_provider import (
     close_resource_sync,
     coerce_completion_request,
     content_to_text,
+    enum_field,
     field,
     is_retryable_error,
     merge_tool_call_fragment,
+    normalize_client_retries,
+    normalize_client_timeout,
     normalize_embedding_vector,
     normalize_messages,
     normalize_responses_input,
@@ -25,6 +27,7 @@ from src.providers.__base__.model_provider import (
     normalize_usage,
     raise_for_stream_error_event,
     reject_unsupported_kwargs,
+    require_token_count,
     retry_async_call,
     retry_async_stream,
     retry_sync_call,
@@ -35,7 +38,7 @@ from src.providers.__base__.model_provider import (
 )
 from src.providers.openai_compatible import OpenAICompatibleProvider
 from src.providers.resources import ArkResources, AsyncArkResources
-from src.utils.config import get_settings
+from src.utils.config import get_settings, is_double_convertible, safe_repr
 from src.utils.log_manager import get_module_logger
 from src.utils.security import validate_secret_free_payload
 
@@ -85,7 +88,7 @@ _ARK_BUILTIN_TOOL_ITEM_TYPES = frozenset(
 def _ark_responses_has_builtin_tool_items(response: Any) -> bool:
     """判断响应里是否含 Ark 内置工具的调用项。"""
     for item in field(response, "output", []) or []:
-        if field(item, "type") in _ARK_BUILTIN_TOOL_ITEM_TYPES:
+        if enum_field(item, "type") in _ARK_BUILTIN_TOOL_ITEM_TYPES:
             return True
     return False
 
@@ -101,7 +104,7 @@ def _ark_responses_output_text(response: Any) -> str:
     chunks: list[str] = []
     for item in field(response, "output", []) or []:
         for content in field(item, "content", []) or []:
-            if field(content, "type") not in {"output_text", "text"}:
+            if enum_field(content, "type") not in {"output_text", "text"}:
                 continue
             piece = field(content, "text")
             if isinstance(piece, str):
@@ -463,6 +466,13 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         }
     )
 
+    # Classification 资源支持的请求参数。与 ``classify()`` 的内联白名单同源，
+    # 抽成常量是为了让动态路径（``resources.classification.create(...)``）能
+    # 复用同一判据——此前它完全绕过 Facade 的白名单与凭证扫描。
+    _ARK_CLASSIFICATION_KEYS = frozenset(
+        {"user", "extra_headers", "extra_query", "extra_body", "timeout"}
+    )
+
     capabilities = frozenset(
         {
             "chat",
@@ -490,7 +500,15 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
     def __init__(
         self, model_name: str, protocol: str = "ark", options: dict[str, Any] | None = None
     ):
-        normalized = str(protocol).strip().lower().replace("-", "_")
+        # 非字符串显式拒绝：``str(10**4301)`` 撞上 CPython 的整数位数上限，抛的是
+        # ``ValueError: Exceeds the limit``，与「协议名不支持」完全无关。协议名只
+        # 能是字符串。
+        if not isinstance(protocol, str):
+            raise ValueError(
+                f"Volcengine 的协议必须是字符串，但得到 {safe_repr(protocol)}。"
+                " 可选值: ark/chat_completions、responses"
+            )
+        normalized = protocol.strip().lower().replace("-", "_")
         if normalized in {"ark", "chat", "chat_completion", "chat_completions"}:
             self._protocol = "chat_completions"
         elif normalized in {"response", "responses"}:
@@ -554,43 +572,30 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         normalized = dict(options)
         if "timeout" in normalized:
             value = normalized["timeout"]
-            if isinstance(value, bool):
-                raise ValueError("Volcengine options.timeout 必须是正数。")
-            if isinstance(value, str):
-                try:
-                    value = float(value.strip())
-                except ValueError as exc:
-                    raise ValueError("Volcengine options.timeout 必须是正数。") from exc
-            if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
-                # httpx.Timeout is accepted by the Ark SDK but cannot be
-                # represented in TOML. Preserve such explicit SDK objects.
-                if not hasattr(value, "connect"):
-                    raise ValueError("Volcengine options.timeout 必须是正数或 httpx.Timeout。")
-            elif float(value) <= 0:
-                raise ValueError("Volcengine options.timeout 必须是正数。")
+            # httpx.Timeout 被 Ark SDK 接受，但无法用 TOML 表达，原样保留。
+            if hasattr(value, "connect"):
+                normalized["timeout"] = value
             else:
-                normalized["timeout"] = float(value)
+                # Ark 渠道一直接受数字字符串（``.env`` 来源本来就以字符串到达），
+                # 这里保留该行为，再交给共享 helper 做上界与有限性判断。其余三个
+                # 渠道的既有契约是拒绝字符串，故不做统一。
+                if isinstance(value, str):
+                    try:
+                        value = float(value.strip())
+                    except ValueError as exc:
+                        raise ValueError("Volcengine options.timeout 必须是正数。") from exc
+                normalized["timeout"] = normalize_client_timeout(
+                    value, "Volcengine", "options.timeout"
+                )
 
         if "max_retries" in normalized:
-            value = normalized["max_retries"]
-            if isinstance(value, bool):
-                raise ValueError("Volcengine options.max_retries 必须是大于等于 0 的整数。")
-            if isinstance(value, str):
-                text = value.strip()
-                try:
-                    parsed = int(text)
-                except ValueError as exc:
-                    raise ValueError(
-                        "Volcengine options.max_retries 必须是大于等于 0 的整数。"
-                    ) from exc
-                if text not in {str(parsed), f"+{parsed}"}:
-                    raise ValueError("Volcengine options.max_retries 必须是大于等于 0 的整数。")
-                value = parsed
-            elif isinstance(value, float) and math.isfinite(value) and value.is_integer():
-                value = int(value)
-            if not isinstance(value, int) or value < 0:
-                raise ValueError("Volcengine options.max_retries 必须是大于等于 0 的整数。")
-            normalized["max_retries"] = value
+            # 走与 OpenAI 兼容渠道同一个 helper：两边都是 SDK 的客户端构造参数，
+            # 判据必须一致。此前的内联实现**没有上界**，实测 ``max_retries`` 写成
+            # ``10**400`` 会被原样接受并传给 Ark SDK（``client.max_retries`` 就是
+            # 那个 401 位整数），而 SDK 的重试循环按该值决定次数，等价于无限重试。
+            normalized["max_retries"] = normalize_client_retries(
+                normalized["max_retries"], "Volcengine"
+            )
 
         if "region" in normalized:
             value = normalized["region"]
@@ -670,6 +675,23 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         带着 ``instructions`` 与 ``caching={"type": "enabled"}`` 直接发出。
         """
         segments = method_name.split(".")
+        if "classification" in segments:
+            # AGENTS.md 要求 Ark Classification 资源「需通过显式 Facade/入口
+            # 调用，不能把缺少资源挂载静默当成成功」。Facade 侧已用
+            # ``_get_classification_resource()`` 做到（SDK 未挂载时抛带指引的
+            # ``NotImplementedError``），但动态路径此前既不过该 Facade、也不做
+            # 参数白名单，实测 ``resources.classification.create(恶意字段=1)``
+            # 一路放行，最终拿到的是 SDK 内部的
+            # ``AttributeError: 'Ark' object has no attribute 'classification'``。
+            # 这里让动态路径与 Facade 受同一约束。
+            self._require_classification_resource(method_name)
+            if kwargs:
+                self._validate_resource_kwargs(
+                    "Classification",
+                    dict(kwargs),
+                    self._ARK_CLASSIFICATION_KEYS,
+                )
+            return
         if (
             "responses" in segments
             or method_name.endswith("_response")
@@ -700,6 +722,22 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
                 "请在 provider options 中显式配置 "
                 "server_verified_protocols=['responses']。"
             )
+
+    def _require_classification_resource(self, operation: str) -> None:
+        """阻止未挂载的 Ark Classification 请求以 SDK 内部错误收场。
+
+        与 ``_require_responses_resource`` 同一目的：动态路径
+        （``resources.classification.create(...)``）不经过 Facade，若不在这里
+        显式检查，资源缺失会退化成
+        ``AttributeError: 'Ark' object has no attribute 'classification'``——
+        用户拿不到「该资源未挂载」这个可定位的结论。这里主动构造一次资源，
+        让 ``_get_classification_resource`` 的 ``NotImplementedError`` 成为
+        唯一出口。
+        """
+        try:
+            self._get_classification_resource()
+        except NotImplementedError as exc:
+            raise NotImplementedError(f"Ark {operation}: {exc}") from exc
 
     def _get_client(self) -> Any:
         if self._client is None:
@@ -824,7 +862,12 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
                 return aliases[normalized]
             raise ValueError(f"Ark Responses 不支持 tool_choice: {tool_choice}")
         if isinstance(tool_choice, dict):
-            if tool_choice.get("type") == "function":
+            choice_type = tool_choice.get("type")
+            # 来自调用方的 dict，形态不受控：``in {...}`` 对 list/dict 抛
+            # ``TypeError``，而本函数的契约是 ``ValueError``。
+            if not isinstance(choice_type, str):
+                choice_type = None
+            if choice_type == "function":
                 function = tool_choice.get("function", tool_choice)
                 if not isinstance(function, Mapping):
                     raise ValueError("Ark Responses 的 function tool_choice 必须是对象。")
@@ -832,7 +875,7 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
                 if not name:
                     raise ValueError("Ark Responses 的 function tool_choice 缺少 name。")
                 return {"type": "function", "name": name}
-            if tool_choice.get("type") in {"mcp", "web_search", "knowledge_search"}:
+            if choice_type in {"mcp", "web_search", "knowledge_search"}:
                 return dict(tool_choice)
         raise ValueError("Ark Responses 的 tool_choice 必须是 auto、none、required 或工具对象。")
 
@@ -1344,10 +1387,12 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         def positive_finite(value: float | None, name: str) -> float | None:
             if value is None:
                 return None
+            # 先判可转换性：``math.isfinite(float(x))`` 对超出双精度范围的整数
+            # 自己就抛 ``OverflowError``（**不是** ``ValueError``）。
             if (
                 isinstance(value, bool)
                 or not isinstance(value, (int, float))
-                or not math.isfinite(float(value))
+                or not is_double_convertible(value)
                 or float(value) <= 0
             ):
                 raise ValueError(f"Ark 文件等待的 {name} 必须是有限正数。")
@@ -1420,7 +1465,7 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             # 覆盖 Chat Completions 分支已经取到的内容。
             text = _ark_responses_output_text(response)
         for item in field(response, "output", []) or []:
-            item_type = field(item, "type")
+            item_type = enum_field(item, "type")
             if item_type in {"function_call", "custom_tool_call"}:
                 calls.append(
                     {
@@ -1445,7 +1490,7 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             if isinstance(candidate_refusal, str) and candidate_refusal:
                 refusal = candidate_refusal
         for item in field(response, "output", []) or []:
-            if field(item, "type") in {"reasoning", "reasoning_item"}:
+            if enum_field(item, "type") in {"reasoning", "reasoning_item"}:
                 summary = field(item, "summary")
                 if isinstance(summary, str):
                     reasoning += summary
@@ -1520,7 +1565,10 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         if status == "incomplete":
             details = field(response, "incomplete_details")
             reason = field(details, "reason", "unknown")
-            raise RuntimeError(f"Ark Responses 响应不完整: {reason}")
+            # ``reason`` 来自网关 JSON，形态不受控：``f"{10**4300}"`` 抛
+            # ``ValueError: Exceeds the limit``，于是「响应不完整」这条错误
+            # 被替换成与原因无关的位数错误。
+            raise RuntimeError(f"Ark Responses 响应不完整: {safe_repr(reason)}")
         if status == "cancelled":
             raise RuntimeError("Ark Responses 请求已取消")
 
@@ -1669,7 +1717,7 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             ):
                 if terminal_seen:
                     continue
-                event_type = field(event, "type", "")
+                event_type = enum_field(event, "type")
                 converted = self._responses_stream_event(event, response_tool_metadata)
                 if converted:
                     if converted.type == "finish":
@@ -1769,7 +1817,7 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             ):
                 if terminal_seen:
                     continue
-                event_type = field(event, "type", "")
+                event_type = enum_field(event, "type")
                 converted = self._responses_stream_event(event, response_tool_metadata)
                 if converted:
                     if converted.type == "finish":
@@ -2366,7 +2414,15 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         values = field(response, "data", []) or []
         if not values:
             raise RuntimeError("Ark tokenization 响应缺少 data。")
-        return sum(int(field(item, "total_tokens", 0)) for item in values)
+        # 与其余七个 token 计数入口（``require_token_count``）保持同一契约：
+        # 此前写成 ``int(field(item, "total_tokens", 0))``，于是 ``"abc"`` 抛裸
+        # ``ValueError``、``None`` 抛裸 ``TypeError``、位数超限的数字串抛与 token
+        # 计数无关的位数错误，且消息里连字段名都没有。``0`` 默认值也不合适——
+        # 缺字段时静默算成 0 个 token，把「响应不完整」报成「没有 token」。
+        return sum(
+            require_token_count(field(item, "total_tokens"), "Ark", "total_tokens")
+            for item in values
+        )
 
     def multimodal_embed(self, inputs: Any, **kwargs: Any) -> Any:
         self._validate_resource_kwargs(
@@ -2708,7 +2764,15 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         values = field(response, "data", []) or []
         if not values:
             raise RuntimeError("Ark tokenization 响应缺少 data。")
-        return sum(int(field(item, "total_tokens", 0)) for item in values)
+        # 与其余七个 token 计数入口（``require_token_count``）保持同一契约：
+        # 此前写成 ``int(field(item, "total_tokens", 0))``，于是 ``"abc"`` 抛裸
+        # ``ValueError``、``None`` 抛裸 ``TypeError``、位数超限的数字串抛与 token
+        # 计数无关的位数错误，且消息里连字段名都没有。``0`` 默认值也不合适——
+        # 缺字段时静默算成 0 个 token，把「响应不完整」报成「没有 token」。
+        return sum(
+            require_token_count(field(item, "total_tokens"), "Ark", "total_tokens")
+            for item in values
+        )
 
     async def async_multimodal_embed(self, inputs: Any, **kwargs: Any) -> Any:
         self._validate_resource_kwargs(

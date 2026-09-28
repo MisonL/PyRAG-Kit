@@ -134,3 +134,116 @@ def test_jina_rerank_requests_documents_by_default():
     payload = provider._prepare_payload("query", ["document"], 1)
 
     assert payload["return_documents"] is True
+
+
+# ---------------------------------------------------------------------------
+# 超出双精度范围的整数
+# ---------------------------------------------------------------------------
+#
+# ``math.isfinite(x)`` 与 ``float(x)`` 对**任意大的 Python int** 都会先尝试
+# 转成 C double，超出 ``DBL_MAX``（约 1.8e308）时抛
+# ``OverflowError: int too large to convert to float``。
+#
+# 这不是学术边界：``config.toml`` 的整数是**无上界**的 TOML 整数，``tomllib``
+# 原样解析成 Python int；``options`` 又是文档指定的扩展入口。实测
+# ``[rerank_configurations.x.options] timeout = <401 位十进制整数>`` 让
+# ``JinaProvider._request_timeout`` 抛裸 ``OverflowError``。
+#
+# 后果比「报错难看」严重：这些方法承诺抛 ``ValueError``，而调用方
+# （``retrieval_service`` 的校验链、``get_settings`` 的 ``except ValueError``
+# 兜底、``questionary`` 的 validator 契约）都只接 ``ValueError``。
+# ``OverflowError`` 是 ``ArithmeticError`` 的子类，**不是** ``ValueError``，
+# 于是它穿透所有既有守卫，冒到解释器默认 handler。
+#
+# 参数 id 必须显式给出：``10**4301`` 超过 ``sys.get_int_max_str_digits()``，
+# pytest 为它自动生成 id 时调 ``str(val)`` 会自己抛 ``ValueError``，测试在
+# **收集阶段**就崩掉。
+_BEYOND_DOUBLE_INTS = [
+    pytest.param(10**400, id="400digits"),
+    pytest.param(-(10**400), id="negative-400digits"),
+    pytest.param(10**4301, id="4301digits-over-int-max-str-digits"),
+]
+
+
+@pytest.mark.parametrize("timeout", _BEYOND_DOUBLE_INTS)
+@pytest.mark.parametrize("provider_type", [JinaProvider, SiliconflowRerankProvider])
+def test_rerank_timeout_beyond_double_range_is_explicit(provider_type, timeout):
+    """超出双精度范围的 ``timeout`` 必须报成「必须是正数」，而不是 ``OverflowError``。"""
+    provider = object.__new__(provider_type)
+    provider._options = {"timeout": timeout}
+
+    with pytest.raises(ValueError, match="timeout.*正数"):
+        provider._request_timeout()
+
+
+@pytest.mark.parametrize("score", _BEYOND_DOUBLE_INTS)
+@pytest.mark.parametrize("provider_type", [JinaProvider, SiliconflowRerankProvider])
+def test_rerank_response_score_beyond_double_range_is_explicit(provider_type, score):
+    """响应里的超大整数得分必须报成 ``RuntimeError``，而不是 ``OverflowError``。
+
+    ``_parse_response`` 的契约是「形态异常一律 ``RuntimeError``」，原实现的
+    ``except (KeyError, TypeError, ValueError)`` 接不住 ``OverflowError``。
+    """
+    provider = object.__new__(provider_type)
+
+    with pytest.raises(RuntimeError, match="relevance_score"):
+        provider._parse_response([{"index": 0, "relevance_score": score}], ["one"])
+
+
+# ``_parse_response`` 的契约是「形态异常一律 ``RuntimeError``」。原实现在下面
+# 这个位置上用了 ``res["relevance_score"]``——它**不在**那个
+# ``except (KeyError, TypeError, ValueError)`` 的覆盖范围内（那段只包
+# ``float(...)``），于是缺字段的响应项让契约漏成裸
+# ``KeyError: 'relevance_score'``。调用方的错误分类与日志脱敏都按
+# ``RuntimeError`` 写，接不住 ``KeyError``。
+#
+# 上面的 ``test_rerank_invalid_score_is_explicit`` 覆盖不到这条：它的探针
+# （``"not-a-number"``／``nan``／``inf``）**都带** ``relevance_score`` 键，
+# 走的正是 ``float()`` 那条被 ``try`` 包住的路径。缺字段是另一条分支。
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"index": 0},
+        {"index": 0, "document": {"text": "one"}},
+        {"document": {"text": "one"}},
+    ],
+    ids=["index-only", "index-and-document", "document-only"],
+)
+@pytest.mark.parametrize("provider_type", [JinaProvider, SiliconflowRerankProvider])
+def test_rerank_missing_score_is_explicit(provider_type, item):
+    """缺少 ``relevance_score`` 的结果项必须报成 ``RuntimeError``。
+
+    响应来自网络 JSON，任何服务器或网关都可能省略这个字段——实测修复前抛的是
+    裸 ``KeyError``，而本方法的文档承诺是 ``RuntimeError``。
+    """
+    provider = object.__new__(provider_type)
+
+    with pytest.raises(RuntimeError, match="relevance_score"):
+        provider._parse_response([item], ["one"])
+
+
+@pytest.mark.parametrize("provider_type", [JinaProvider, SiliconflowRerankProvider])
+def test_rerank_parse_response_never_leaks_a_bare_key_error(provider_type):
+    """推广：任意畸形响应都不得漏出 ``KeyError``。
+
+    上面那条钉住已知的那个字段；这条用一批形态各异的条目断言「绝不漏出
+    ``KeyError``」——那类异常只可能来自本函数自己的字典下标，不可能来自契约。
+    """
+    provider = object.__new__(provider_type)
+    probes = [
+        [{}],
+        [{"index": 0}],
+        [{"document": {"text": "one"}}],
+        [{"index": 0, "document": {"text": "one"}}],
+        [{"index": 1}],
+        [{"document": "one"}],
+        [{"relevance_score": 0.5}],
+    ]
+
+    for probe in probes:
+        try:
+            provider._parse_response(probe, ["one"])
+        except RuntimeError:
+            pass
+        except BaseException as exc:
+            raise AssertionError(f"{probe!r} 抛出了 {type(exc).__name__}: {exc}") from exc

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import inspect
 import json
 import math
@@ -15,11 +16,25 @@ from src.providers.factory import ModelProviderFactory
 from src.retrieval.vdb.base import VectorStoreBase
 from src.runtime.contracts import SessionConfig
 from src.services.embedding_service import EmbeddingService
-from src.utils.config import RetrievalMethod
+from src.ui.display_utils import coerce_score, document_content
+from src.utils.config import (
+    _MAX_RETRIEVAL_CANDIDATES,
+    RetrievalMethod,
+    is_double_convertible,
+    parse_decimal_int,
+    safe_repr,
+    to_finite_float,
+)
 from src.utils.log_manager import get_module_logger
 
 logger = get_module_logger(__name__)
 DEFAULT_RRF_K = 60.0
+
+# RRF 分母里 rank 的上界。``rrf_k + rank`` 是实际参与浮点运算的派生值，两者各自
+# 都能表示成 double 而和不能，因此 rank 需要一个能让和落在 double 范围内的界。
+# 检索结果数远小于它（``chat_top_k`` 上界 2000，候选倍数上界 100），因此这个界
+# 只可能被畸形数据触及，不会限制任何真实场景。
+_MAX_RRF_RANK = 10**9
 
 
 class HybridReranker:
@@ -32,10 +47,36 @@ class HybridReranker:
     ):
         self.vector_weight = vector_weight
         self.keyword_weight = keyword_weight
+        # 先判类型再调 ``.strip()``：非字符串取值抛 ``AttributeError``，而本类
+        # 的契约是 ``ValueError``（``SessionConfig._validate_fusion_strategy``
+        # 与 ``RecursiveTextSplitter.structure_mode`` 都已按同一判据修过）。
+        # 本类是公开边界，``SessionConfig`` 之外还有库调用方。
+        if not isinstance(fusion_strategy, str):
+            raise ValueError(f"不支持的混合检索融合策略: {safe_repr(fusion_strategy)}")
         self.fusion_strategy = fusion_strategy.strip().lower()
-        self.rrf_k = rrf_k
+        # ``rrf_k`` 必须有下界：它是 RRF 分母 ``rrf_k + rank`` 的一部分，
+        # ``rrf_k = -rank`` 时抛 ``ZeroDivisionError``（实测 ``rrf_k=-60`` 配
+        # ``semantic_rank=60``）。非有限值与超大整数同样要拦——``rrf_k=nan``
+        # 会让每个得分都是 ``nan``，而 ``nan`` 与分数阈值的比较恒为 False，
+        # 整批结果被静默丢弃；``rrf_k=10**400`` 抛裸 ``OverflowError``（它不是
+        # ``ValueError``，穿透全部 ``except ValueError`` 分类）。
+        #
+        # 上界取 ``is_double_convertible``：``rrf_k`` 只作为分母出现，任何能
+        # 表示成 C double 的正数都是安全的。
+        if (
+            isinstance(rrf_k, bool)
+            or not isinstance(rrf_k, (int, float))
+            or not is_double_convertible(rrf_k)
+        ):
+            raise ValueError(f"rrf_k 必须是有限数值，但得到 {safe_repr(rrf_k)}。")
+        if float(rrf_k) <= 0:
+            raise ValueError(
+                f"rrf_k 必须是正数，但得到 {safe_repr(rrf_k)}。"
+                " 它作为 RRF 的分母 ``rrf_k + rank``，非正数会导致除零或负权重。"
+            )
+        self.rrf_k = float(rrf_k)
         if self.fusion_strategy not in {"rrf", "weighted"}:
-            raise ValueError(f"不支持的混合检索融合策略: {fusion_strategy}")
+            raise ValueError(f"不支持的混合检索融合策略: {safe_repr(fusion_strategy)}")
 
     @staticmethod
     def _normalize_scores(scores: list[float]) -> list[float]:
@@ -54,16 +95,56 @@ class HybridReranker:
         return self._rrf_rerank(documents)
 
     def _weight_tuple(self) -> tuple[float, float]:
-        total = self.vector_weight + self.keyword_weight
-        if total <= 0:
-            return 0.0, 0.0
+        """返回归一化后的 (向量权重, 关键词权重)。
+
+        两个权重同时为零时显式报错而不是返回 ``(0.0, 0.0)``：后者会让每个
+        文档得分都是 0.0，再被分数阈值全部过滤，表现为「检索无结果」而非
+        配置错误。这是所有构造路径的最后一道兜底（``Settings`` 与
+        ``SessionConfig`` 各自也有校验，但库调用方可能绕过两者直接构造）。
+        """
+        # 判据用 ``is_double_convertible`` 而不是 ``math.isfinite``：后者对超出
+        # C double 的整数**自己就抛** ``OverflowError``（实测 ``math.isfinite(10**400)``
+        # 抛错），拿它当守卫等于没有守卫。这是本方法作为「所有构造路径的最后一道
+        # 兜底」必须自己守住的——库调用方可以绕过 ``Settings`` 与 ``SessionConfig``
+        # 直接构造 ``HybridReranker``。
+        if not is_double_convertible(self.vector_weight) or not is_double_convertible(
+            self.keyword_weight
+        ):
+            raise ValueError(
+                "混合检索的 vector_weight 与 keyword_weight 必须是和为正的有限数值，"
+                f"但得到 vector_weight={safe_repr(self.vector_weight)}、"
+                f"keyword_weight={safe_repr(self.keyword_weight)}。"
+            )
+        # ``total`` 是**派生值**，必须自己判一次可转换性：两个权重各自都在
+        # double 范围内（上面那两处 ``is_double_convertible`` 放行），但它们的
+        # **和**可以超出——实测 ``HybridReranker(10**308, 10**308)`` 构造成功，
+        # 随后任意一次 ``rerank()`` 在 ``math.isfinite(total)`` 上抛
+        # ``OverflowError``（``int`` 太大转不成 float）。该异常是
+        # ``ArithmeticError`` 子类而**不是** ``ValueError``，穿透本类调用方的
+        # 全部 ``except ValueError`` 分类，退化为裸 traceback。
+        # 用 ``float()`` 相加而不是直接相加：两个 int 相加得到的是 int，其值
+        # 可以远超 double 范围，下一行的 ``math.isfinite`` 随即抛
+        # ``OverflowError``。先转 float 则溢出表现为 ``inf``，被 ``isfinite``
+        # 正常判为非法，收场是带指引的 ``ValueError``。
+        total = float(self.vector_weight) + float(self.keyword_weight)
+        if not math.isfinite(total) or total <= 0:
+            # ``nan`` 也走这一支：``nan <= 0`` 为 False，不显式判有限性就会
+            # 漏过去，随后每个文档得分都是 ``nan``——排序结果不确定，且
+            # ``nan`` 与分数阈值的比较恒为 False，整批结果被静默丢弃。
+            raise ValueError(
+                "混合检索的 vector_weight 与 keyword_weight 必须是和为正的有限数值，"
+                f"但得到 vector_weight={self.vector_weight!r}、"
+                f"keyword_weight={self.keyword_weight!r}。"
+                " 两个权重同时为 0（或含非有限值）会让所有文档得分都是 0 或 nan，"
+                "再被分数阈值过滤，检索会静默返回空结果。"
+            )
         return self.vector_weight / total, self.keyword_weight / total
 
     def _weighted_rerank(self, documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
         vector_weight, keyword_weight = self._weight_tuple()
         scored_documents = [copy.deepcopy(doc) for doc in documents]
-        keyword_scores = [float(doc.get("keyword_score", 0) or 0) for doc in scored_documents]
-        semantic_scores = [float(doc.get("semantic_score", 0) or 0) for doc in scored_documents]
+        keyword_scores = [coerce_score(doc.get("keyword_score")) for doc in scored_documents]
+        semantic_scores = [coerce_score(doc.get("semantic_score")) for doc in scored_documents]
         normalized_keyword = self._normalize_scores(keyword_scores)
         normalized_semantic = self._normalize_scores(semantic_scores)
         for index, doc in enumerate(scored_documents):
@@ -77,24 +158,294 @@ class HybridReranker:
         vector_weight, keyword_weight = self._weight_tuple()
         scored_documents = [copy.deepcopy(doc) for doc in documents]
         for doc in scored_documents:
-            semantic_rank = int(doc.get("semantic_rank") or 0)
-            keyword_rank = int(doc.get("keyword_rank") or 0)
+            # rank 来自 store 返回的文档（``semantic_rank`` 由本文件写入，但
+            # ``keyword_rank`` 可以是第三方 store 原样带进来的值），因此形态
+            # 不受控。``int()`` 会抛裸 ``ValueError``（非十进制字符或位数超限），
+            # 而 ``rrf_k + rank`` 是**派生值**：两个数各自都能表示成 double，
+            # 其和不能——实测 ``semantic_rank = 10**400`` 让该分母抛
+            # ``OverflowError``，穿透调用方的全部 ``except ValueError`` 分类。
+            # 非正或超范围的 rank 视为「未参与该路检索」，与 0 同一处理。
+            semantic_rank = _coerce_rank(doc.get("semantic_rank"))
+            keyword_rank = _coerce_rank(doc.get("keyword_rank"))
             semantic_rrf = 1.0 / (self.rrf_k + semantic_rank) if semantic_rank > 0 else 0.0
             keyword_rrf = 1.0 / (self.rrf_k + keyword_rank) if keyword_rank > 0 else 0.0
             doc["score"] = vector_weight * semantic_rrf + keyword_weight * keyword_rrf
         return sorted(scored_documents, key=lambda item: item["score"], reverse=True)
 
 
+def _stable_fingerprint(value: Any) -> str:
+    """把任意值渲染成**能区分不同取值**的稳定字符串，且绝不抛异常。
+
+    ``repr()`` 对含超大整数的容器抛 ``ValueError``；``safe_repr`` 虽不抛，但对
+    容器只退回 ``<dict>``／``<list>``，丢掉了区分度——用它做缓存键会让两份不同的
+    ``options`` 撞到同一个 provider 实例。这里递归到叶子：整数走 ``safe_repr``
+    的量级描述，其余保持 ``repr`` 的形态。
+
+    dict／list／tuple／set／frozenset 都会**递归**（集合此前落到 ``repr()``
+    兜底，含超大整数时整个塌成 ``<set>``），并沿当前路径记录容器 ``id`` 以截断
+    自引用环——环上返回 ``<cycle>`` 而不是无限递归。
+
+    非环的**深**嵌套仍受解释器递归深度限制（约 500 层），与修改前的行为一致；
+    ``tomllib`` 在约 900 层解析期就先抛 ``RecursionError``，因此配置来源到不了
+    那个深度。
+    """
+    return _fingerprint(value, set())
+
+
+def _fingerprint(value: Any, seen: set[int]) -> str:
+    """``_stable_fingerprint`` 的递归实现，``seen`` 记录当前路径上的容器身份。
+
+    用「路径上的 id 集合」而不是全局去重：同一个对象在**兄弟**位置出现两次是
+    正常取值（``{"a": shared, "b": shared}``），只有回到**祖先**才是环。
+    """
+    if isinstance(value, dict):
+        if id(value) in seen:
+            return "<cycle>"
+        seen.add(id(value))
+        try:
+            return (
+                "{"
+                + ", ".join(
+                    f"{_fingerprint(k, seen)}: {_fingerprint(v, seen)}" for k, v in value.items()
+                )
+                + "}"
+            )
+        finally:
+            seen.discard(id(value))
+    # 集合也要**递归**，不能落到 ``repr()`` 兜底：集合含位数超限的整数时
+    # ``repr()`` 抛 ``ValueError``，整个集合会塌成 ``<set>``，区分度归零。
+    # 实测 ``options={"x": {10**4301}}`` 与 ``{"x": {10**4302}}`` 都通过
+    # ``validate_secret_free_options``，塌陷后两者得到同一个缓存键——两份不同的
+    # rerank 配置静默复用同一个 provider，比崩溃更糟。
+    #
+    # 排序取稳定顺序：集合本身无序，``repr`` 的顺序还受哈希随机化影响，不排序
+    # 会让**同一个**取值在两次调用间产生不同的指纹（缓存永远命中不了）。
+    # 元素用各自渲染结果的 ``repr`` 排序，避免直接比较不可比较的元素类型。
+    if isinstance(value, (set, frozenset)):
+        if id(value) in seen:
+            return "<cycle>"
+        seen.add(id(value))
+        try:
+            items = sorted(_fingerprint(item, seen) for item in value)
+            prefix = "set" if isinstance(value, set) else "frozenset"
+            return f"{prefix}({{" + ", ".join(items) + "})"
+        finally:
+            seen.discard(id(value))
+    if isinstance(value, (list, tuple)):
+        if id(value) in seen:
+            return "<cycle>"
+        seen.add(id(value))
+        try:
+            return "[" + ", ".join(_fingerprint(item, seen) for item in value) + "]"
+        finally:
+            seen.discard(id(value))
+    try:
+        return repr(value)
+    except (ValueError, RuntimeError, RecursionError):
+        # 只有位数超限的整数会走到这里。``safe_repr`` 的量级描述（「约 N 位
+        # 十进制」）对**同位长**的不同整数是同一个字符串，做缓存键会碰撞；
+        # 补上 ``bit_length`` 与 ``hash`` 使取值可区分。``hash`` 对 int 不经
+        # 十进制转换，不会抛；缓存本身是进程内的，不要求跨进程稳定。
+        if isinstance(value, int):
+            return f"<int:{value.bit_length()}:{hash(value) & 0xFFFFFFFF:08x}>"
+        return f"<{type(value).__name__}>"
+
+
+def _coerce_scale_field(value: Any, label: str) -> int:
+    """把规模字段（``top_k``／候选倍率）收敛成正整数，非法形态给出可读 ``ValueError``。
+
+    ``retrieve`` 直接算 ``max(1, top_k) * max(1, multiplier)``，而
+    ``SessionConfig`` 是公开类、普通属性没有 ``__setattr__`` 守卫（见
+    ``_require_finite_number`` 的 docstring）：嵌入方或携带超大整数的 pickle
+    快照可以把这两个字段直写成任何形态，此时 ``max()`` 抛裸
+    ``TypeError: '>' not supported between instances of 'NoneType' and 'int'``
+    ——而 ``retrieve`` 是**生产入口**（``Chatbot.chat_async`` 每次提问都调它），
+    它的契约是返回文档列表或给出可读错误。
+
+    收敛语义与 ``retrieve`` 里的 ``max(1, ...)`` 一致：非正数视为 1（「至少要
+    取一条」），这与 ``__setitem__`` 的 1 下界不冲突——那里是拒绝写入，这里是
+    读取已有状态时的容错。``bool`` 显式拒绝：``max(1, True)`` 会静默变成 1，
+    而它几乎必然是上游把标志位写进了规模字段。
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{label} 必须是整数，但得到布尔值 {safe_repr(value)}。")
+    if isinstance(value, int):
+        # 位数上界：``top_k × multiplier`` 要送进 ``faiss_index.search()``，而
+        # FAISS 既不报错也不截断，按 k 分配结果数组。``10**4301`` 这类取值在
+        # 乘积处还会撞上双精度转换，收场各不相同。
+        if value > _MAX_RETRIEVAL_CANDIDATES:
+            raise ValueError(
+                f"{label} 超出合理范围（{safe_repr(value)}），"
+                f"上界 {_MAX_RETRIEVAL_CANDIDATES}。请检查该配置项。"
+            )
+        return max(1, value)
+    raise ValueError(f"{label} 必须是整数，但得到 {safe_repr(value)}。")
+
+
+def _coerce_threshold(value: Any) -> float:
+    """把分数阈值收敛成有限浮点，非法形态给出可读 ``ValueError``。
+
+    ``retrieve`` 直接算 ``coerce_score(...) >= session_config.score_threshold``，
+    而该字段可被直写（见 ``_coerce_scale_field``）。非数值形态抛裸
+    ``TypeError: '>=' not supported between instances of 'float' and 'NoneType'``
+    ——落在 ``retrieve`` 既有的错误分类之外。``bool`` 显式拒绝：``True`` 会静默
+    变成 ``1.0``，看起来像一个真实阈值。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"score_threshold 必须是数值，但得到 {safe_repr(value)}。")
+    number = to_finite_float(value)
+    if number is None:
+        raise ValueError(f"score_threshold 必须是有限数值，但得到 {safe_repr(value)}。")
+    return number
+
+
+def _coerce_rerank_enabled(value: Any) -> bool:
+    """确认 ``rerank_enabled`` 是真正的布尔值。
+
+    原先走 ``if not session_config.rerank_enabled``，真值语义会把 ``None``／``0``／
+    ``[]`` 静默当成「禁用」、把 ``"no"`` 当成「启用」——用户看到的是 rerank 行为
+    与配置不符，而不是一条配置错误。``SessionConfig`` 的校验器要求 ``bool``，
+    这里对直写路径保持同一判据。
+    """
+    if not isinstance(value, bool):
+        raise ValueError(f"rerank_enabled 必须是布尔值，但得到 {safe_repr(value)}。")
+    return value
+
+
+def _coerce_fusion_strategy(value: Any) -> str:
+    """把融合策略收敛成字符串，非法形态给出带字段名的 ``ValueError``。
+
+    ``_should_apply_score_threshold`` 先按它判分支、``HybridReranker`` 再按它
+    选算法；非字符串在后者那里也会被拒，但报错字段名是 ``HybridReranker`` 的
+    参数而非配置项，且只在混合检索路径上才触发。
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"hybrid_fusion_strategy 必须是字符串，但得到 {safe_repr(value)}。")
+    return value
+
+
+def _coerce_rank(value: Any) -> int:
+    """把文档里的 rank 收敛成非负整数，非法形态一律视为 0（未参与该路检索）。
+
+    rank 来自 store 返回的文档，形态不受控。``int(value)`` 有两类失败：非十进制
+    数字字符抛 ``ValueError``，位数超过 ``sys.get_int_max_str_digits()`` 同样抛
+    ``ValueError``。而更大的问题在**下游的派生值**——``rrf_k + rank`` 对超过
+    double 范围的 rank 抛 ``OverflowError``（``ArithmeticError`` 子类，不是
+    ``ValueError``），穿透调用方的错误分类。这里把非法值收敛成 0：它的语义就是
+    「该文档没有在这条检索路径上出现」，与 rank 缺失时一致，不会改变排序结果。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return 0
+    if isinstance(value, str):
+        parsed = parse_decimal_int(value)
+        if parsed is None:
+            return 0
+        value = parsed
+    if not 0 <= value <= _MAX_RRF_RANK:
+        return 0
+    return value
+
+
+def _document_metadata(document: Any) -> dict[str, Any]:
+    """取出文档元数据，非映射时退回空 dict。
+
+    ``document.get("metadata") or {}`` 只挡得住 ``None`` 与空值：**非空的非映射**
+    会原样留下，随后 ``_deduplicate_parent_documents`` 里的 ``.get("parent_id")``
+    抛 ``AttributeError: 'list' object has no attribute 'get'``——而那是检索管线
+    内部，报错现场离「store 返回了什么」很远。
+
+    这里退回空 dict 而不是报错：检索结果可以来自任何 ``VectorStoreBase`` 实现，
+    元数据缺失/异常时仍能按内容检索出结果，比整批失败更有用；形态**类型**上的
+    契约（必须是文档列表）由 ``_require_document_list`` 把关。
+    """
+    if not isinstance(document, dict):
+        return {}
+    metadata = document.get("metadata")
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _require_document_list(results: Any, stage: str) -> list[dict[str, Any]]:
+    """确认检索阶段返回的是「文档映射的列表」。
+
+    ``RetrievalService`` 是三个消费者（聊天 prompt、召回测试表格、聊天详情
+    表格）的共同上游，而检索结果可以来自任何 ``VectorStoreBase`` 实现——抽象
+    基类正是为替换实现而存在的。实测返回 ``None`` 或 ``list[str]`` 的 store 会
+    在这里抛 ``TypeError: 'NoneType' object is not iterable`` 或
+    ``AttributeError: 'str' object has no attribute 'get'``，报错现场离
+    「你的 store 返回了什么」很远；而在下游（``_promote_parent_context`` 等）
+    才炸的话，位置更偏。
+
+    这里统一转成可读的 ``TypeError``：这是**接口契约**问题，不是数据内容问题，
+    因此不静默丢弃不合规的条目——丢弃会让「store 实现错了」表现为「检索结果
+    变少了」。
+    """
+    if not isinstance(results, list):
+        raise TypeError(
+            f"{stage}返回的必须是文档列表，但得到 {type(results).__name__}。"
+            " 请检查 VectorStoreBase 实现是否遵守 semantic_search/keyword_search 的契约。"
+        )
+    for position, document in enumerate(results):
+        if not isinstance(document, dict):
+            raise TypeError(
+                f"{stage}返回的第 {position} 条不是文档映射"
+                f"（{type(document).__name__}）。"
+                " 请检查 VectorStoreBase 实现是否遵守契约。"
+            )
+    return results
+
+
+def _unpack_rerank_result(result: Any) -> tuple[Any, Any]:
+    """把 rerank provider 的返回值解包成 ``(索引, 分数)`` 二元组。
+
+    不能直接写 ``a, b = await provider.arerank(...)``：``None``／单值抛裸
+    ``TypeError``、三元组抛裸 ``ValueError``，而这两条都在
+    ``_validate_rerank_output``（正是「校验 provider 返回值」的边界）**之前**，
+    用户拿到的是「无法解包」而不是「provider 返回值不合法」——错误消息指向
+    解包语法而非真正的契约违反。
+    """
+    if not isinstance(result, (tuple, list)) or len(result) != 2:
+        raise RuntimeError(
+            f"Rerank provider 必须返回 (索引列表, 分数列表) 二元组，但得到 {safe_repr(result)}。"
+        )
+    return result[0], result[1]
+
+
+def _key_text(value: Any) -> str:
+    """把元数据值收敛成去重键的一部分。
+
+    不能直接写 ``str(value)``：元数据来自知识快照，而本项目加载 pickle 格式的
+    快照——pickle 是二进制格式、不受 CPython 十进制位数限制，一个 4301 位的
+    整数让 ``str()`` 抛 ``ValueError: Exceeds the limit``，于是「计算文档去重
+    键」这一步在正要合并检索结果时崩掉。``safe_repr`` 对位数超限的值给出量级
+    描述，键仍然稳定且唯一（同一值总是得到同一描述）。
+    """
+    return value if isinstance(value, str) else safe_repr(value)
+
+
 def _document_key(document: dict[str, Any]) -> str:
-    metadata = document.get("metadata") or {}
+    """返回用于混合合并/去重的文档键。
+
+    优先用 ``chunk_id``／``doc_id``，其次 ``source`` + ``chunk_index``。两者都
+    缺失时**不能只截取内容前缀**：截断会让两份不同的长文档拿到同一个键——
+    实测同来源、前 64 字符相同的两篇文档在 ``_merge_hybrid_results`` 里被并成
+    一条，其中一篇的结果静默消失（``_deduplicate_parent_documents`` 同理，只是
+    那里丢的是得分较低的那篇）。因此这里改用整段内容的摘要：既保持定长，又
+    不因截断而碰撞。
+
+    ``chunk_id`` 在真实快照里恒存在（分片阶段必然写入），所以这一支是兜底
+    路径；但兜底路径同样不能产生错误结果。
+    """
+    metadata = _document_metadata(document)
     chunk_id = metadata.get("chunk_id") or metadata.get("doc_id")
     if chunk_id:
-        return str(chunk_id)
-    source = str(metadata.get("source", ""))
+        return _key_text(chunk_id)
+    source = _key_text(metadata.get("source", ""))
     chunk_index = metadata.get("chunk_index")
     if chunk_index is not None:
-        return f"{source}:{chunk_index}"
-    return f"{source}:{document.get('page_content', '')[:64]}"
+        return f"{source}:{_key_text(chunk_index)}"
+    content = _key_text(document.get("page_content", ""))
+    digest = hashlib.sha256(content.encode("utf-8"), usedforsecurity=False).hexdigest()
+    return f"{source}:{digest}"
 
 
 def _merge_hybrid_results(
@@ -103,19 +454,25 @@ def _merge_hybrid_results(
     merged: dict[str, dict[str, Any]] = {}
     for rank, document in enumerate(semantic_results, start=1):
         merged_doc = copy.deepcopy(document)
-        merged_doc["semantic_score"] = float(merged_doc.get("score", 0) or 0)
+        merged_doc["semantic_score"] = coerce_score(merged_doc.get("score"))
         merged_doc["semantic_rank"] = rank
-        merged_doc["keyword_score"] = float(merged_doc.get("keyword_score", 0) or 0)
+        merged_doc["keyword_score"] = coerce_score(merged_doc.get("keyword_score"))
+        # ``score`` 自身也要收敛：融合路径随后会由 ``HybridReranker`` 重算它，
+        # 但把 ``nan``／``inf``／``dict`` 留在名为 ``score`` 的字段里，等于让
+        # 一个中间产物带着不可用的值往下游走——任何读到它却没过 rerank 的调用方
+        # （或将来调整了顺序的流水线）都会拿到坏分数。
+        merged_doc["score"] = coerce_score(merged_doc.get("score"))
         merged[_document_key(merged_doc)] = merged_doc
     for rank, document in enumerate(keyword_results, start=1):
         key = _document_key(document)
         if key in merged:
-            merged[key]["keyword_score"] = float(document.get("score", 0) or 0)
+            merged[key]["keyword_score"] = coerce_score(document.get("score"))
             merged[key]["keyword_rank"] = rank
         else:
             merged_doc = copy.deepcopy(document)
-            merged_doc["semantic_score"] = float(merged_doc.get("semantic_score", 0) or 0)
-            merged_doc["keyword_score"] = float(document.get("score", 0) or 0)
+            merged_doc["semantic_score"] = coerce_score(merged_doc.get("semantic_score"))
+            merged_doc["keyword_score"] = coerce_score(document.get("score"))
+            merged_doc["score"] = coerce_score(merged_doc.get("score"))
             merged_doc["keyword_rank"] = rank
             merged[key] = merged_doc
     return list(merged.values())
@@ -127,11 +484,29 @@ def _promote_parent_context(
     promoted_documents: list[dict[str, Any]] = []
     for document in documents:
         promoted_doc = copy.deepcopy(document)
-        metadata = promoted_doc.get("metadata") or {}
+        metadata = _document_metadata(promoted_doc)
         parent_content = resolver(metadata.get("parent_id")) if resolver else None
         if parent_content:
-            metadata.setdefault("matched_chunk_content", promoted_doc.get("page_content", ""))
-            promoted_doc["page_content"] = parent_content
+            # 收敛成字符串再写入：``page_content: str`` 是 ``Document`` 的契约
+            # （``src/models/document.py``），``FaissStore._validate_document_shape``
+            # 在快照载入期也按这条校验，而这里此前只判真值、不判类型。
+            #
+            # ``parent_resolver`` 取自 ``getattr(self.vector_store,
+            # "resolve_parent_content", None)``，而 ``VectorStoreBase`` 正是为替换
+            # 实现而存在的——签名声明 ``-> str | None``，第三方实现返回别的形态不会
+            # 被任何地方拦下。实测返回列表让 ``page_content`` 变成 ``['a', 'b']``、
+            # 返回整数变成 ``123``：展示层 ``document_content`` 把它收敛成 ``"N/A"``
+            # （用户看到「无内容」而不是报错），而 prompt 构造对正文做 ``.lower()``
+            # 时抛 ``AttributeError``，检索整体不可用。
+            #
+            # 用 ``_key_text`` 而不是裸 ``str()``：位数超限的整数（pickle 是二进制
+            # 格式、不受十进制位数限制，畸形快照能带进来）会让 ``str()`` 抛
+            # ``ValueError: Exceeds the limit``，而本函数的职责是「把父块内容放进
+            # 正文」，不该在正要成功时崩。``_key_text`` 对这类值给量级描述。
+            parent_text = _key_text(parent_content)
+            if parent_text:
+                metadata.setdefault("matched_chunk_content", promoted_doc.get("page_content", ""))
+                promoted_doc["page_content"] = parent_text
         promoted_doc["metadata"] = metadata
         promoted_documents.append(promoted_doc)
     return promoted_documents
@@ -140,12 +515,12 @@ def _promote_parent_context(
 def _deduplicate_parent_documents(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
     deduplicated: dict[str, dict[str, Any]] = {}
     for document in documents:
-        metadata = document.get("metadata") or {}
+        metadata = _document_metadata(document)
         parent_key = metadata.get("parent_id")
-        key = str(parent_key) if parent_key else _document_key(document)
+        key = _key_text(parent_key) if parent_key else _document_key(document)
         existing = deduplicated.get(key)
-        if existing is None or float(document.get("score", 0) or 0) > float(
-            existing.get("score", 0) or 0
+        if existing is None or coerce_score(document.get("score")) > coerce_score(
+            existing.get("score")
         ):
             deduplicated[key] = copy.deepcopy(document)
     return list(deduplicated.values())
@@ -161,19 +536,43 @@ class RetrievalService:
         self, query: str, session_config: SessionConfig, console: Console | None = None
     ) -> list[dict[str, Any]]:
         retrieval_method = session_config.retrieval_method
-        effective_top_k = max(1, session_config.top_k) * max(
-            1, session_config.retrieval_candidate_multiplier
+        # 形态必须在这里收敛：``SessionConfig`` 的属性可被直写，而 ``max()`` 对
+        # 非数值抛裸 ``TypeError``（详见 ``_coerce_scale_field``）。
+        top_k = _coerce_scale_field(session_config.top_k, "top_k")
+        multiplier = _coerce_scale_field(
+            session_config.retrieval_candidate_multiplier, "retrieval_candidate_multiplier"
         )
+        # 乘积同样要判：两个字段各自合法、乘积越界是既有缺陷类（``Settings`` 与
+        # ``__setitem__`` 都按组合判），这里兜住直写路径。
+        if top_k * multiplier > _MAX_RETRIEVAL_CANDIDATES:
+            raise ValueError(
+                "top_k 与 retrieval_candidate_multiplier 的乘积超出合理范围："
+                f" {top_k} × {multiplier} > {_MAX_RETRIEVAL_CANDIDATES}。"
+                " 请检查这两项配置。"
+            )
+        effective_top_k = top_k * multiplier
+        # 同一类前提的其余字段：都可被直写，读取时统一收敛（详见各 helper）。
+        score_threshold = _coerce_threshold(session_config.score_threshold)
+        rerank_enabled = _coerce_rerank_enabled(session_config.rerank_enabled)
+        fusion_strategy = _coerce_fusion_strategy(session_config.hybrid_fusion_strategy)
         parent_resolver = getattr(self.vector_store, "resolve_parent_content", None)
 
         if retrieval_method == RetrievalMethod.HYBRID_SEARCH:
             semantic_results, keyword_results = await self._gather_hybrid_results(
                 query, effective_top_k
             )
+            # 先校验两路结果的形态，再合并。``_require_document_list`` 原先只在
+            # 合并与 rerank **之后**运行，而 ``_merge_hybrid_results`` 已经对每个
+            # 条目调了 ``.get(...)``——store 返回 ``[None]`` 时抛的是
+            # ``AttributeError: 'NoneType' object has no attribute 'get'``，
+            # 而不是该校验承诺的可定位 ``TypeError``（附带是哪一路出的问题）。
+            # 这也让「坏结果」的收场方式在三条检索路径之间保持一致。
+            _require_document_list(semantic_results, "语义检索")
+            _require_document_list(keyword_results, "关键词检索")
             reranker = HybridReranker(
                 session_config.vector_weight,
                 session_config.keyword_weight,
-                fusion_strategy=session_config.hybrid_fusion_strategy,
+                fusion_strategy=fusion_strategy,
             )
             ranked_results = reranker.rerank(
                 _merge_hybrid_results(semantic_results, keyword_results)
@@ -183,16 +582,25 @@ class RetrievalService:
         else:
             ranked_results = await self._keyword_retrieve(query, effective_top_k)
 
-        if self._should_apply_score_threshold(session_config):
+        ranked_results = _require_document_list(ranked_results, "检索")
+
+        if self._should_apply_score_threshold(session_config, fusion_strategy=fusion_strategy):
             ranked_results = [
-                doc
-                for doc in ranked_results
-                if float(doc.get("score", 0) or 0) >= session_config.score_threshold
+                doc for doc in ranked_results if coerce_score(doc.get("score")) >= score_threshold
             ]
 
         ranked_results = _promote_parent_context(ranked_results, parent_resolver)
         ranked_results = _deduplicate_parent_documents(ranked_results)
-        ranked_results = await self._rerank_if_needed(query, ranked_results, session_config)
+        ranked_results = await self._rerank_if_needed(
+            query, ranked_results, session_config, rerank_enabled=rerank_enabled
+        )
+        # 出口统一把 ``score`` 收敛成有限浮点。三条检索路径的来源不同：
+        # ``FaissStore`` 自己写的是 float，第三方 store 可能是数字字符串或
+        # 其它形态；融合路径会重算 score，而**语义／关键词单路不会**。不收敛的话
+        # 同一份结果会出现「阈值按 0.8 通过、界面显示 0.0000」，而排序、去重与
+        # 展示又各自按不同规则解释它。这里让出口的契约只有一种形态。
+        for document in ranked_results:
+            document["score"] = coerce_score(document.get("score"))
         return ranked_results[: max(1, session_config.top_k)]
 
     async def _gather_hybrid_results(
@@ -252,6 +660,25 @@ class RetrievalService:
         provider_key: str,
         configurations: Mapping[str, Any] | None = None,
     ) -> RerankModel:
+        # key 形态必须在 ``.get()`` **之前**收敛：``provider_key`` 来自可直写的
+        # ``session_config.active_rerank_configuration``，不可哈希的取值在
+        # ``dict.get`` 处就抛裸 ``TypeError: unhashable type: 'list'``——早于
+        # ``ModelProviderFactory`` 的守卫，工厂那一侧的修复覆盖不到这条路径。
+        # 位数超限的整数在下面构造 ``cache_key`` 的元组里同样要过哈希，但那种
+        # 情况 ``hash`` 不抛，真正的失败在下游消息插值处，一并在这里拦掉。
+        if not isinstance(provider_key, str):
+            raise ValueError(
+                "active_rerank_configuration 必须是字符串，"
+                f"但得到 {safe_repr(provider_key)}。 请检查 rerank 配置项。"
+            )
+        # ``configurations`` 的形态同样要判：它来自可直写的
+        # ``session_config.rerank_configurations``，非映射时 ``.get`` 抛裸
+        # ``AttributeError: 'int' object has no attribute 'get'``。
+        if configurations is not None and not isinstance(configurations, Mapping):
+            raise ValueError(
+                "rerank_configurations 必须是配置映射，"
+                f"但得到 {type(configurations).__name__}。 请检查 rerank 配置项。"
+            )
         detail = configurations.get(provider_key) if configurations is not None else None
         options = getattr(detail, "options", {}) if detail is not None else {}
         try:
@@ -259,7 +686,21 @@ class RetrievalService:
                 options or {}, sort_keys=True, default=str, separators=(",", ":")
             )
         except (TypeError, ValueError):
-            options_fingerprint = repr(options)
+            # 兜底也必须用 ``safe_repr``：``repr(options)`` 抛的是**同一个**
+            # ``ValueError``（位数超限），于是这里成了「正要兜底时再抛一次」。
+            # 可达性已确认：``ModelDetail.options`` 是 ``dict[str, Any]``，
+            # ``validate_secret_free_options`` 只查敏感键名、不做递归数值校验，
+            # 实测 ``ModelDetail(..., options={"x": 10**4301})`` 被接受，随后
+            # ``rerank_enabled=True`` 时每次检索都在构造缓存键处崩。
+            #
+            # ``json.dumps(default=str)`` 拦不住这类值：``default=`` 只对
+            # **未知类型**生效，``int`` 是已知类型，直接走 ``int.__repr__``。
+            #
+            # 这里不能直接用 ``safe_repr(options)``：它对渲染失败的**容器**只
+            # 退回 ``<dict>``，那会让所有含超大整数的 options 得到同一个缓存键，
+            # 不同配置静默复用同一个 provider 实例——比崩溃更糟。逐元素渲染既
+            # 保住区分度，又不抛。
+            options_fingerprint = _stable_fingerprint(options)
         cache_key = (
             provider_key,
             getattr(detail, "provider", ""),
@@ -332,25 +773,45 @@ class RetrievalService:
                 await result
 
     async def _rerank_if_needed(
-        self, query: str, ranked_results: list[dict[str, Any]], session_config: SessionConfig
+        self,
+        query: str,
+        ranked_results: list[dict[str, Any]],
+        session_config: SessionConfig,
+        *,
+        rerank_enabled: bool | None = None,
     ) -> list[dict[str, Any]]:
-        if not session_config.rerank_enabled or not ranked_results:
+        """按需重排。
+
+        ``rerank_enabled`` 由调用方传入**已收敛**的布尔：``retrieve`` 已经在
+        检索开始前校验过（早于任何检索工作，失败更快），这里再读一次原属性会
+        绕过那道校验——该字段可被直写。真值语义会把 ``None``／``0``／``[]``
+        静默当成「禁用」、把 ``"no"`` 当成「启用」（见
+        ``_coerce_rerank_enabled``）。默认 ``None`` 时自行收敛，供库调用方直接
+        调本方法的场景使用。
+        """
+        enabled = (
+            _coerce_rerank_enabled(session_config.rerank_enabled)
+            if rerank_enabled is None
+            else rerank_enabled
+        )
+        if not enabled or not ranked_results:
             return ranked_results
 
         rerank_provider = self._get_rerank_provider(
             session_config.active_rerank_configuration,
             session_config.rerank_configurations,
         )
-        docs_to_rerank = [doc.get("page_content", "") for doc in ranked_results]
+        # 内容形态由 ``document_content`` 收敛：直接取 ``page_content`` 会把
+        # ``None``／``42`` 这类值交给 provider，由它的 ``_validate_inputs`` 抛
+        # 「documents 必须全部是字符串」——错误信息指向 provider 的参数，而真正
+        # 的原因是上游 store 返回了形态异常的文档。在这里收敛更靠近原因。
+        docs_to_rerank = [document_content(doc, "") for doc in ranked_results]
         # Keep the requested output bounded by the available candidates after
         # thresholding and parent de-duplication.
         rerank_top_n = max(1, min(session_config.top_k, len(docs_to_rerank)))
-        reranked_indices, reranked_scores = await rerank_provider.arerank(
-            query, docs_to_rerank, top_n=rerank_top_n
-        )
+        rerank_result = await rerank_provider.arerank(query, docs_to_rerank, top_n=rerank_top_n)
         reranked_indices, reranked_scores = self._validate_rerank_output(
-            reranked_indices,
-            reranked_scores,
+            *_unpack_rerank_result(rerank_result),
             document_count=len(ranked_results),
         )
         reranked_docs: list[dict[str, Any]] = []
@@ -392,6 +853,12 @@ class RetrievalService:
             seen_indices.add(index)
             if isinstance(score, bool):
                 raise RuntimeError(f"Rerank provider 返回的 score 无效: index={index}。")
+            # ``float(10**400)`` 抛 ``OverflowError``——它不是 ``ValueError``，
+            # 因此下面这个 ``except`` 接不住。provider 返回值来自网络 JSON，
+            # 里面出现一个超大整数字面量就足以走到这里。先判双精度范围，
+            # 把它收敛成本方法承诺的 ``RuntimeError``。
+            if isinstance(score, int) and not is_double_convertible(score):
+                raise RuntimeError(f"Rerank provider 返回的 score 超出双精度范围: index={index}。")
             try:
                 normalized_score = float(score)
             except (TypeError, ValueError) as exc:
@@ -403,8 +870,19 @@ class RetrievalService:
         return normalized_indices, validated_scores
 
     @staticmethod
-    def _should_apply_score_threshold(session_config: SessionConfig) -> bool:
+    def _should_apply_score_threshold(
+        session_config: SessionConfig, *, fusion_strategy: str | None = None
+    ) -> bool:
+        """RRF 融合的分数是排名倒数之和，与阈值不同量纲，因此跳过阈值过滤。
+
+        ``fusion_strategy`` 由调用方传入**已收敛**的取值：``retrieve`` 已经
+        校验过，这里再读一次原属性会绕过那道校验（该字段可被直写）。
+        """
+        strategy = (
+            fusion_strategy
+            if fusion_strategy is not None
+            else session_config.hybrid_fusion_strategy
+        )
         return not (
-            session_config.retrieval_method == RetrievalMethod.HYBRID_SEARCH
-            and session_config.hybrid_fusion_strategy == "rrf"
+            session_config.retrieval_method == RetrievalMethod.HYBRID_SEARCH and strategy == "rrf"
         )

@@ -46,8 +46,11 @@ def resolve_app_root() -> Path:
 
 
 ROOT_DIR = resolve_app_root()
-# 配置文件路径
+# 配置文件路径。两者都以 ``ROOT_DIR`` 为基准，不用相对路径——相对路径由
+# pydantic-settings 按**进程当前工作目录**解析，而冻结产物的可执行文件目录
+# 与调用者 CWD 通常不同，会让用户放在安装目录旁的配置被静默忽略。
 CONFIG_TOML_PATH = ROOT_DIR / "config.toml"
+ENV_FILE_PATH = ROOT_DIR / ".env"
 
 
 class RetrievalMethod(str, Enum):
@@ -117,7 +120,33 @@ class ModelDetail(BaseModel):
         if isinstance(value, ModelProtocol):
             return value
 
-        normalized = str(value).strip().lower().replace("-", "_")
+        # ``str(value)`` 自己会抛：``str(10**4301)`` 撞上 CPython 的整数位数上限
+        # （``sys.get_int_max_str_digits()``，默认 4300），于是「协议不支持」的
+        # 消息变成 ``Exceeds the limit (4300 digits)``。``protocol`` 是
+        # ``config.toml`` 的字段，TOML 整数无上界，用户写错一个类型就会看到这句
+        # 与协议毫无关系的话。先判类型，非字符串直接给带字段名的消息。
+        # ``str(value)`` 自己会抛：``str(10**4301)`` 撞上 CPython 的整数位数上限
+        # （``sys.get_int_max_str_digits()``，默认 4300），于是「协议不支持」的
+        # 消息变成 ``Exceeds the limit (4300 digits)``。``protocol`` 是
+        # ``config.toml`` 的字段，TOML 整数无上界，用户写错一个类型就会看到这句
+        # 与协议毫无关系的话。先判类型，非字符串直接给带字段名的消息。
+        # ``str(value)`` 对位数超限的整数自己会抛（``str(10**4301)`` 撞上
+        # CPython 的 ``sys.get_int_max_str_digits()``，默认 4300），于是「协议
+        # 不支持」的消息变成 ``Exceeds the limit (4300 digits)``。先判类型，
+        # 非字符串直接给带字段名的消息。
+        #
+        # 这条守卫是**纵深防御**而非配置可达缺陷：``protocol`` 确实来自
+        # ``config.toml``，但 ``tomllib`` 解析 4301 位的整数时自己就抛
+        # ``ValueError``（``get_settings`` 已把它包成「配置解析失败」），位数在
+        # 上限内的非字符串（``5``／``["responses"]``／``true``）原本就能得到正确
+        # 消息。真正能触达的是 Python API 调用方
+        # （``ModelDetail(protocol=10**4301)``），以及未来若换掉 TOML 解析器的
+        # 情形。加它的理由是与同文件其它 validator 的判据保持一致——此前
+        # ``log_level``／路径字段都已显式判类型，只有这里漏了。
+        if not isinstance(value, str):
+            supported = ", ".join(protocol.value for protocol in ModelProtocol)
+            raise ValueError(f"不支持的模型协议: {safe_repr(value)}。可选值: {supported}")
+        normalized = value.strip().lower().replace("-", "_")
         aliases = {
             "chat": ModelProtocol.CHAT_COMPLETIONS,
             "completion": ModelProtocol.CHAT_COMPLETIONS,
@@ -136,7 +165,7 @@ class ModelDetail(BaseModel):
             return alias if alias is not None else ModelProtocol(normalized)
         except ValueError as exc:
             supported = ", ".join(protocol.value for protocol in ModelProtocol)
-            raise ValueError(f"不支持的模型协议: {value}。可选值: {supported}") from exc
+            raise ValueError(f"不支持的模型协议: {safe_repr(value)}。可选值: {supported}") from exc
 
 
 # =================================================================
@@ -147,8 +176,30 @@ class ModelDetail(BaseModel):
 # 检索规模的上界。不是洁癖：``effective_top_k = chat_top_k *
 # retrieval_candidate_multiplier`` 直通 ``faiss_index.search()``，FAISS 既不报错
 # 也不截断。实测 ``chat_top_k=10**9`` 单次查询分配约 3.6 GB 数组、RSS 涨
-# 10.3 GB、耗时 8.4 秒。10_000 远超任何真实场景（默认 top_k=5 × multiplier=3）。
-_MAX_RETRIEVAL_TOP_K = 10_000
+# 10.3 GB、耗时 8.4 秒。
+# 单字段上界与乘积上界必须一致：``top_k`` 单独就不该超过候选总规模，否则
+# 「字段校验通过、组合校验拒绝」会让用户看到自相矛盾的提示。候选总规模取
+# 2_000——实测 dim=1536、k=2000 时峰值 RSS 约 330 MB，而 k=100_000 涨到
+# 1.6 GB。默认值是 5 × 3 = 15，留出约 130 倍余量。
+# 向量维度的上界。``local-hash`` 的维度直接来自用户可写的 ``model_name``
+# 数字后缀（``local-hash-256`` -> 256），而 provider 会**先按该维度分配出完整
+# 向量**再返回：实测配成 ``local-hash-100000000`` 时单次 ``embed_texts(["测试"])``
+# 耗时 136 秒、峰值内存 3.9 GB，按真实知识库 115 个分块算 ``np.vstack`` 需要约
+# 4.3 GB，进程会被 OOM 杀掉而不是得到一条可读的错误。校验必须发生在分配**之前**，
+# 因此 provider 侧也要用这个上界。
+#
+# 现有各家的最大维度是 3072（text-embedding-3-large），65536 留了 20 倍余量，
+# 而 65536 维的 float32 单块只有 256 KB。
+_MAX_EMBEDDING_DIMENSION = 65_536
+
+_MAX_RETRIEVAL_TOP_K = 2_000
+# 候选规模的上界。单看两个字段各自的上界是不够的——真正送进
+# ``faiss_index.search()`` 的是**乘积** ``chat_top_k *
+# retrieval_candidate_multiplier``（见 ``RetrievalService.retrieve``），而
+# FAISS 对超过 ``ntotal`` 的 k 既不报错也不截断，按 k 全量分配。实测
+# dim=1536、k=10**6 时峰值 RSS 涨约 35 GB。默认值是 5 × 3 = 15，这里留出
+# 约 130 倍余量，覆盖「提高 top_k 并同时放大召回候选」的正常调优。
+_MAX_RETRIEVAL_CANDIDATES = 2_000
 # 日志保留天数与分片/批处理规模的上界。两者原来都无上界，实测
 # ``log_retention_days=10**400``、``kb_chunk_size=10**400`` 均被接受，
 # 直到真正参与运算（日期减法、内存申请）才炸。
@@ -165,16 +216,121 @@ _MAX_RETRIEVAL_MULTIPLIER = 100
 _DECIMAL_LITERAL_PATTERN = re.compile(r"-?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
 
 
-def _parse_int_literal(text: str) -> int | None:
-    """严格解析十进制整数字面量，不做科学计数法/下划线/正号的宽松放行。
+def parse_decimal_int(text: str) -> int | None:
+    """解析十进制整数字面量；解析不了返回 ``None``，**绝不抛异常**。
 
-    只接受 ``[0-9]+``（可带前导负号）。``"1_0"`` 被静默读成 10 这类安静的
-    成功正是本项目反复踩到的模式，所以宁愿在这里明确拒绝。
+    只接受十进制数字（可带前导负号），不做科学计数法/下划线/正号的宽松放行：
+    ``int("1_0") == 10``、``int("+7") == 7`` 这类「安静的错值」正是本项目反复
+    踩到的模式，宁愿在这里明确拒绝。
+
+    ``int()`` 会抛 ``ValueError`` 的情形有**两**类，都必须收敛成 ``None``：
+
+    1. 非十进制数字字符。判据用 ``str.isdecimal()`` 而不是 ``str.isdigit()``——
+       后者对 128 个码位为真（``²`` ``①`` ``፩`` ``₅`` …）却让 ``int()`` 抛错。
+    2. 位数超过 ``sys.get_int_max_str_digits()``（CPython 默认 4300 位）。
+       ``"9" * 4301`` 是**合法**的十进制整数，``isdecimal()`` 也为真，但
+       ``int()`` 照样抛 ``ValueError: Exceeds the limit (4300 digits)``。
+
+    只堵住第 1 类是不够的：调用方拿到的仍然是一个可能冒到 prompt_toolkit
+    事件循环或错误分类逻辑里的异常。这里用 ``try/except`` 一次性覆盖两类，
+    不需要硬编码位数上界——``int()`` 抛 ``ValueError`` 本身就是判据。
+
+    返回值是 ``int | None``，调用方据此分支，不必再包一层 ``try``。
     """
-    digits = text.removeprefix("-")
-    if digits and all(char in "0123456789" for char in digits):
-        return int(text)
-    return None
+    if not isinstance(text, str):
+        return None
+    candidate = text.strip()
+    digits = candidate.removeprefix("-")
+    if not digits or not digits.isdecimal():
+        return None
+    try:
+        return int(candidate)
+    except ValueError:
+        return None
+
+
+# ``float()`` 与 ``math.isfinite()`` 对超出 C double 范围的整数都会先尝试转换，
+# 失败时抛 ``OverflowError: int too large to convert to float``。
+#
+# ``OverflowError`` 继承 ``ArithmeticError``，**不是** ``ValueError``。本项目
+# 的数值校验统一以 ``ValueError`` 作为契约（``Settings`` 的 validator、
+# ``SessionConfig`` 的 ``__setitem__``、各 provider 的 options 校验、
+# ``get_settings`` 的 ``except ValueError`` 兜底、questionary 的 validator），
+# 因此 ``OverflowError`` 会穿透**全部**既有守卫，冒到解释器默认 handler。
+#
+# 判据不能写成 ``math.isfinite(x)``：它自己就会抛 ``OverflowError``（实测
+# ``math.isfinite(10**400)`` 抛错），拿它当守卫等于没有守卫。这里先把
+# 「是不是浮点」与「绝对值是否超出双精度」分开判，两者都过了才安全地调
+# ``float()``。用 ``sys.float_info.max`` 做上界而不是硬编码字面量，避免在
+# 极端平台上与 C double 的实际范围脱节。
+_FLOAT_RANGE_BOUND = sys.float_info.max
+
+
+def is_double_convertible(value: Any) -> bool:
+    """``value`` 能否安全地转成 C double（即 ``float(value)`` 不会抛异常）。
+
+    对 ``int`` 判绝对值上界，对 ``float`` 判有限性，其余类型一律返回 ``False``
+    ——它们要么转换不了（``str``/``None``/容器），要么是 ``bool``（``bool`` 是
+    ``int`` 的子类，``float(True) == 1.0`` 会静默变成 1.0，调用方必须显式拒绝）。
+    """
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, int):
+        return -_FLOAT_RANGE_BOUND <= value <= _FLOAT_RANGE_BOUND
+    return False
+
+
+def safe_repr(value: Any, *, limit: int = 80) -> str:
+    """``repr(value)`` 的安全版本，供错误消息使用。
+
+    ``repr`` 自己会抛异常：CPython 的 ``sys.get_int_max_str_digits()``（默认
+    4300）让 ``repr(10**4301)`` 抛 ``ValueError: Exceeds the limit (4300
+    digits)``。校验代码把它拼进消息时，用户看到的是「整数转字符串超限」，
+    而真实原因是「数值非法」——错误消息反过来把异常类型也换掉了
+    （``ValueError`` 变 ``ValueError``，但内容与字段毫无关系）。
+
+    超长输出也一并截断：``repr(10**400)`` 是 401 个字符，一条校验消息不该
+    刷屏。截断只影响显示，判据在调用方，因此不影响正确性。
+    """
+    try:
+        text = repr(value)
+    except (ValueError, RuntimeError, RecursionError):
+        # 走到这里只有一种已知情形：整数的十进制位数超过
+        # ``sys.get_int_max_str_digits()``。``bit_length()`` 不经过十进制
+        # 转换，可以安全地给出量级。
+        if isinstance(value, int):
+            digits = value.bit_length() * 30103 // 100000 + 1  # log10(2) ≈ 0.30103
+            return f"<整数，约 {digits} 位十进制>"
+        return f"<{type(value).__name__}>"
+    if len(text) > limit:
+        return text[: limit - 3] + "..."
+    return text
+
+
+def to_finite_float(value: Any) -> float | None:
+    """把数值收敛成有限 ``float``；不能安全转换时返回 ``None``，**绝不抛异常**。
+
+    接受 ``float()`` 原本接受的三类输入：``int``（含超出双精度范围的，此时返回
+    ``None`` 而不是抛 ``OverflowError``）、``float``（非有限返回 ``None``）、以及
+    数字字符串。字符串必须继续接受——调用方此前走的就是 ``float(v)``，
+    ``.env``/TOML 来源本来就以字符串形态到达。
+
+    返回 ``None`` 的语义是「这个值不能当有限浮点用」，调用方据此抛自己的
+    ``ValueError``（各处的字段名与措辞不同，消息由调用方决定）。
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+    if not is_double_convertible(value):
+        return None
+    return float(value)
 
 
 def _coerce_number(value: Any, field_label: str) -> int | float:
@@ -191,22 +347,22 @@ def _coerce_number(value: Any, field_label: str) -> int | float:
     ``inf`` 这类「成功解析出的非法值」，不如直接在这里当解析失败处理）。
     """
     if isinstance(value, bool):
-        raise ValueError(f"{field_label} 不能是布尔值 {value!r}。")
+        raise ValueError(f"{field_label} 不能是布尔值 {safe_repr(value)}。")
     if isinstance(value, (int, float)):
         return value
     if isinstance(value, str):
         text = value.strip()
-        parsed_int = _parse_int_literal(text)
+        parsed_int = parse_decimal_int(text)
         if parsed_int is not None:
             return parsed_int
         if not _DECIMAL_LITERAL_PATTERN.fullmatch(text):
-            raise ValueError(f"无法把 {field_label} 的 {value!r} 转换为数值。")
+            raise ValueError(f"无法把 {field_label} 的 {safe_repr(value)} 转换为数值。")
         try:
             number = float(text)
         except ValueError as exc:
-            raise ValueError(f"无法把 {field_label} 的 {value!r} 转换为数值。") from exc
+            raise ValueError(f"无法把 {field_label} 的 {safe_repr(value)} 转换为数值。") from exc
         if not math.isfinite(number):
-            raise ValueError(f"{field_label} 必须是有限数值，但得到 {value!r}。")
+            raise ValueError(f"{field_label} 必须是有限数值，但得到 {safe_repr(value)}。")
         return number
     raise ValueError(f"{field_label} 必须是数值，但得到 {type(value).__name__}。")
 
@@ -393,9 +549,11 @@ class Settings(BaseSettings):
         # 它不是 ``ValidationError``，会穿透 ``get_settings`` 的 ``except`` 变成
         # 未脱敏的 traceback。范围判断对任意大的 int 都能给出正常结论。
         if not isinstance(number, (int, float)) or isinstance(number, bool):
-            raise ValueError(f"chat_score_threshold 必须是数值，但得到 {value!r}。")
+            raise ValueError(f"chat_score_threshold 必须是数值，但得到 {safe_repr(value)}。")
         if not 0 <= number <= 1:
-            raise ValueError(f"chat_score_threshold 必须在 0 到 1 之间，但得到 {value!r}。")
+            raise ValueError(
+                f"chat_score_threshold 必须在 0 到 1 之间，但得到 {safe_repr(value)}。"
+            )
         return float(number)
 
     @field_validator("log_retention_days", mode="before")
@@ -440,18 +598,45 @@ class Settings(BaseSettings):
     @field_validator("kb_chunk_overlap", "kb_child_chunk_overlap", mode="before")
     @classmethod
     def validate_non_negative_overlap(cls, value: Any) -> int:
+        """overlap 必须落在 ``[0, _MAX_KB_CHUNK_TOKENS)``。
+
+        上界与 ``kb_chunk_size`` 同源而不是各写一个数：overlap 的语义是「相邻
+        分片重叠的 token 数」，它必须**小于** chunk_size，而 chunk_size 的上界
+        就是 ``_MAX_KB_CHUNK_TOKENS``，因此这里取同一个常量作上界。
+
+        缺上界是**配置可达**的：``config.toml`` 写
+        ``kb_child_chunk_overlap = 10**400``（401 位，``tomllib`` 照常解析）会被
+        ``Settings`` 静默接受（实测），配置加载成功，直到分片期才在
+        ``RecursiveTextSplitter._validate_hierarchical_sizes`` 抛错——报错现场
+        离写错的配置很远，而且消息里会打出整个 401 位数字。上界把这类错误拉回
+        配置加载期，与同文件其它数值字段（``kb_chunk_size``／``chat_top_k``／
+        ``retrieval_candidate_multiplier``）一致。
+        """
         number = _coerce_number(value, "kb_chunk_overlap/kb_child_chunk_overlap")
         if isinstance(number, float) and not number.is_integer():
             raise ValueError("kb_chunk_overlap/kb_child_chunk_overlap 必须是整数。")
         number = int(number)
         if number < 0:
             raise ValueError("kb_chunk_overlap/kb_child_chunk_overlap 必须是非负整数。")
+        if number >= _MAX_KB_CHUNK_TOKENS:
+            raise ValueError(
+                "kb_chunk_overlap/kb_child_chunk_overlap 必须小于 "
+                f"{_MAX_KB_CHUNK_TOKENS}（分片重叠必须小于分片上限）。"
+            )
         return number
 
     @field_validator("chat_vector_weight", "chat_keyword_weight", mode="before")
     @classmethod
     def validate_hybrid_weights(cls, value: Any) -> float:
-        number = float(_coerce_number(value, "chat_vector_weight/chat_keyword_weight"))
+        # ``float(10**400)`` 抛 ``OverflowError``（**不是** ``ValueError``），
+        # 会穿透 ``get_settings`` 的全部三个 handler。``to_finite_float`` 内部
+        # 先判双精度范围，越界时返回 ``None``。
+        number = to_finite_float(_coerce_number(value, "chat_vector_weight/chat_keyword_weight"))
+        if number is None:
+            raise ValueError(
+                "chat_vector_weight/chat_keyword_weight 必须是有限数值，"
+                f"但得到 {safe_repr(value)}。"
+            )
         if not 0 <= number <= 1:
             raise ValueError("chat_vector_weight/chat_keyword_weight 必须在 0 到 1 之间。")
         return number
@@ -462,6 +647,16 @@ class Settings(BaseSettings):
         if self.retrieval_candidate_multiplier > _MAX_RETRIEVAL_MULTIPLIER:
             raise ValueError(
                 f"retrieval_candidate_multiplier 必须不超过 {_MAX_RETRIEVAL_MULTIPLIER}。"
+            )
+        # 两个字段各自合法，乘积仍可能失控：10_000 × 100 = 10**6 会让 FAISS
+        # 按 100 万条分配（实测 dim=1536 时峰值 RSS 约 35 GB）。约束必须落在
+        # 乘积上——这才是真正送进 search() 的值。
+        candidates = self.chat_top_k * self.retrieval_candidate_multiplier
+        if candidates > _MAX_RETRIEVAL_CANDIDATES:
+            raise ValueError(
+                f"chat_top_k × retrieval_candidate_multiplier 不能超过 "
+                f"{_MAX_RETRIEVAL_CANDIDATES}，但得到 {candidates}。"
+                " 两者相乘才是实际送入向量检索的候选规模，过大会一次性申请巨量内存。"
             )
         return self
 
@@ -474,24 +669,16 @@ class Settings(BaseSettings):
         """
         if self.kb_chunk_overlap >= self.kb_chunk_size:
             raise ValueError("kb_chunk_overlap 必须小于 kb_chunk_size。")
-        if self.kb_child_chunk_overlap >= self.kb_child_chunk_size:
-            raise ValueError("kb_child_chunk_overlap 必须小于 kb_child_chunk_size。")
-        return self
-
-    @model_validator(mode="after")
-    def validate_child_chunk_size_not_larger_than_parent(self) -> "Settings":
-        """子分片不得大于父分片，否则层级结构静默退化为一层。
-
-        实测 ``kb_chunk_size=300, kb_child_chunk_size=1500`` 被接受后，父块数
-        从 2 涨到 10（每个父块只产出 1 个子块），「先粗后细」的父子检索意图
-        失效，且没有任何报错。同属无法用单字段 validator 表达的约束。
-        """
-        # 相等同样要拒：实测 parent=child=300 时不同父块数 == 分块数（15/15），
-        # 即每个父块只产出一个子块，层级与 child>parent 一样退化为一层。
-        if self.kb_child_chunk_size >= self.kb_chunk_size:
-            raise ValueError(
-                "kb_child_chunk_size 必须小于 kb_chunk_size（子分片不得大于或等于父分片）。"
-            )
+        # 子分片的两条关系（``child_overlap < child_size``、
+        # ``child_size < chunk_size``）**不在这里判**：它们只在层级模式下有
+        # 意义，而模式是分片时的运行时参数（``build(splitter_structure_mode)``／
+        # CLI 的 ``--mode``），``Settings`` 看不到。无条件拒绝会让一组
+        # 「standard 下完全合法」的取值连配置都加载不了——用户只想用 standard，
+        # 却必须先改掉用不到的字段（实测 ``kb_chunk_size=100,
+        # kb_child_chunk_size=300`` 被拒，而 standard 模式根本不构造子分片器）。
+        #
+        # 判定移到 ``RecursiveTextSplitter._validate_hierarchical_sizes()``，
+        # 那里模式已知、且与真正使用这些参数的位置一致。
         return self
 
     @model_validator(mode="after")
@@ -511,8 +698,18 @@ class Settings(BaseSettings):
 
     @field_validator("log_level", mode="before")
     @classmethod
-    def validate_log_level(cls, v: str) -> str:
-        """验证日志级别是否有效。"""
+    def validate_log_level(cls, v: Any) -> str:
+        """验证日志级别是否有效。
+
+        ``config.toml`` 的 TOML 值可以是任意类型，因此必须先确认是字符串再调
+        ``.upper()``：原实现直接 ``v.upper()``，``log_level = 123`` 抛的是裸
+        ``AttributeError: 'int' object has no attribute 'upper'``——它不是
+        ``ValueError`` 的子类，会穿透 ``get_settings`` 的全部三个 handler。这个
+        字段尤其要紧：它在**模块导入期**就被 ``log_manager.get_module_logger``
+        读取，早于任何入口的 ``try``，连脱敏边界都还没建立。
+        """
+        if not isinstance(v, str):
+            raise ValueError(f"log_level 必须是字符串，但得到 {safe_repr(v)}。")
         valid_levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
         if v.upper() not in valid_levels:
             raise ValueError(f"无效的日志级别: {v}. 必须是 {', '.join(valid_levels)} 中的一个。")
@@ -541,11 +738,13 @@ class Settings(BaseSettings):
         """验证聊天温度在 0.0 到 1.0 之间。"""
         # ``bool`` 是 ``int`` 的子类，``float(True) == 1.0`` 会被静默接受。
         if isinstance(v, bool):
-            raise ValueError(f"聊天温度必须是数字，不能是布尔值 {v!r}。")
-        try:
-            value = float(v)
-        except (ValueError, TypeError) as exc:
-            raise ValueError(f"无法将聊天温度 '{v}' 转换为数字。") from exc
+            raise ValueError(f"聊天温度必须是数字，不能是布尔值 {safe_repr(v)}。")
+        # ``float(10**400)`` 抛的是 ``OverflowError``——它**不是** ``ValueError``，
+        # 因此下面这个 ``except`` 接不住，裸异常会穿透 ``get_settings`` 的
+        # 全部三个 handler。判据用 ``to_finite_float``（内部先判双精度范围）。
+        value = to_finite_float(v)
+        if value is None:
+            raise ValueError(f"无法将聊天温度 {safe_repr(v)} 转换为数字。")
 
         if not (0.0 <= value <= 1.0):
             raise ValueError(f"聊天温度必须在 0.0 到 1.0 之间，但得到 {value}。")
@@ -613,14 +812,31 @@ class Settings(BaseSettings):
         """验证检索候选过量招募倍率。"""
         # ``bool`` 是 ``int`` 的子类，``int(True) == 1`` 会被静默接受。
         if isinstance(v, bool):
-            raise ValueError(f"检索候选倍率必须是整数，不能是布尔值 {v!r}。")
+            raise ValueError(f"检索候选倍率必须是整数，不能是布尔值 {safe_repr(v)}。")
+        # ``inf`` 有**两条**独立入口，缺任何一条都会让程序以裸 traceback 退出：
+        #
+        # 1. ``config.toml`` 写 ``retrieval_candidate_multiplier = inf``——合法
+        #    TOML，``tomllib`` 原样解析成 ``float('inf')``。下面这条 ``isfinite``
+        #    守卫在第一行就把它挡住，给出「必须是整数，但得到 inf」这种能直接定位
+        #    到字段的消息；同文件的 ``chat_top_k``／``log_retention_days``／
+        #    ``kb_chunk_size`` 都有等价的前置守卫。
+        # 2. 其它非有限数值类型（``Decimal('Infinity')`` 等，只能从 Python 调用方
+        #    传入）。它们不是 ``float``，走不进上面那条守卫，由 ``int()`` 抛
+        #    ``OverflowError``——它是 ``ArithmeticError`` 子类而**不是**
+        #    ``ValueError``，必须在下面显式列出，否则穿透 ``get_settings`` 的全部
+        #    三个 handler。
+        #
+        # 两条都必要：删掉守卫会让 ``inf`` 的报错变成泛化的转换失败；删掉
+        # ``OverflowError`` 会让第二条路径裸崩。两条路径各有回归测试。
+        if isinstance(v, float) and not math.isfinite(v):
+            raise ValueError(f"检索候选倍率必须是整数，但得到 {safe_repr(v)}。")
         try:
             value = int(v)
-        except (ValueError, TypeError) as exc:
-            raise ValueError(f"无法将检索候选倍率 '{v}' 转换为整数。") from exc
+        except (ValueError, TypeError, OverflowError) as exc:
+            raise ValueError(f"无法将检索候选倍率 '{safe_repr(v)}' 转换为整数。") from exc
 
         if value < 1:
-            raise ValueError(f"检索候选倍率必须大于等于 1，但得到 {value}。")
+            raise ValueError(f"检索候选倍率必须大于等于 1，但得到 {safe_repr(value)}。")
         return value
 
     @field_validator("kb_splitter_separators", mode="before")
@@ -671,10 +887,47 @@ class Settings(BaseSettings):
         "knowledge_base_path", "pkl_path", "snapshot_root", "log_path", "cache_path", mode="before"
     )
     @classmethod
-    def resolve_path(cls, v: str) -> str:
-        """将相对路径解析为绝对路径。"""
-        if not v:
-            return v
+    def resolve_path(cls, v: Any, info: ValidationInfo) -> str:
+        """将相对路径解析为绝对路径。
+
+        非字符串必须显式拒绝：``Path(123)`` 抛的是裸
+        ``TypeError: expected str, bytes or os.PathLike object, not int``，
+        而 ``TypeError`` **不是** ``ValueError``，会穿透 ``get_settings`` 的全部
+        三个 handler，用户看到的是解释器默认 handler 打出的多帧裸 traceback
+        （实测 23 帧），其中没有任何字段名。
+        """
+        if not isinstance(v, str):
+            raise ValueError(f"{info.field_name} 必须是字符串，但得到 {safe_repr(v)}。")
+        # 空值必须显式拒绝，不能原样返回。此处原为 ``if not v: return v``，而
+        # ``Path("")`` 在求值期等价于 ``Path(".")``——**运行时的当前工作目录**。
+        # 两个后果：
+        #
+        # 1. 信任根扩到 CWD。``FaissStore.load_snapshot`` 拿 ``snapshot_root`` 当
+        #    pickle 的来源信任根（``AGENTS.md`` 要求快照只从本项目生成的文件
+        #    加载），实测 ``SNAPSHOT_ROOT=""`` 时信任根落在仓库根目录，在其中放
+        #    一个带 ``ACTIVE_SNAPSHOT`` 标记的目录即可让加载被接受，边界等于
+        #    不存在。
+        # 2. 行为随 CWD 漂移。默认值（如 ``data/kb``）走下面的 ``ROOT_DIR`` 分支、
+        #    不随 CWD 变，而空值原样返回后由 ``Path()`` 在求值期绑定到 CWD——同一
+        #    份配置在仓库内与仓库外运行会指向不同目录。
+        #
+        # 纯空白一并拒绝：``Path("   ")`` 会解析成一个名为空格的**真实目录**，
+        # 没有任何合法用途。路径字段的默认值都是非空相对路径，用户「不想设」时
+        # 应删掉该键回落默认值，而不是写成空串。
+        if not v.strip():
+            raise ValueError(
+                f"{info.field_name} 不能为空。"
+                " 空值会解析成当前工作目录，使路径随运行位置漂移；"
+                "如需使用默认值，请删除该配置项而不是置空。"
+            )
+        # NUL 字节也必须显式拒绝：``os.makedirs``／``open`` 对它抛
+        # ``ValueError: embedded null byte``——**不是** ``OSError``，因此下游那些
+        # 「目录不可写就降级」的 ``except OSError`` 全部接不住。实测
+        # ``config.toml`` 写 ``log_path = "/tmp/a\u0000b"``（TOML 的 ``\u0000``
+        # 转义）时，``cleanup.py`` 在**模块导入期**调用 ``get_module_logger``，
+        # 程序连 ``run_cli`` 都到不了就崩。路径里出现 NUL 没有任何合法用途。
+        if "\x00" in v:
+            raise ValueError(f"{info.field_name} 不能包含 NUL 字节。")
         path = Path(v)
         if path.is_absolute():
             return str(path)
@@ -699,7 +952,8 @@ class Settings(BaseSettings):
         )
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        # 见 ``ENV_FILE_PATH`` 的说明：与 ``CONFIG_TOML_PATH`` 同源。
+        env_file=str(ENV_FILE_PATH),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
@@ -867,6 +1121,31 @@ def get_settings() -> Settings:
         # 实测 ``KB_SPLITTER_SEPARATORS='###'``（非 JSON 形态）走的正是这条路，
         # 用户看到的是解释器默认 handler 打出的多屏 traceback，而不是脱敏消息。
         raise ValueError(f"配置解析失败 - {redact_sensitive_text(str(exc))}") from None
+    except tomllib.TOMLDecodeError as exc:
+        # ``config.toml`` 语法错走的是 ``load_toml_config`` 里的 ``tomllib.load``，
+        # pydantic-settings 把该异常原样放出来。``TOMLDecodeError`` 继承
+        # ``ValueError``，但既不是 ``ValidationError`` 也不是 ``SettingsError``，
+        # 上面两个分支都接不住——实测 import 期（``get_module_logger`` ->
+        # ``get_settings``）直接抛裸 traceback，35 帧全打在终端上，早于任何入口
+        # 的 ``try``。作为对照，同一份文件里字段**取值**非法时得到的是 11 帧的
+        # 脱敏消息。同属「配置写错」，收场方式不该有两种。
+        #
+        # 消息里保留行号与列号：用户靠它定位是哪一行写坏了。tomllib 的消息只含
+        # 位置与原因，不回显该行的内容，因此不涉及凭证回显；仍走一次脱敏以防
+        # 上游改动，成本可忽略。
+        raise ValueError(f"配置解析失败 - {redact_sensitive_text(str(exc))}") from None
+    except ValueError as exc:
+        # ``tomllib`` 解析 ``config.toml`` 时还有一类失败**不是**
+        # ``TOMLDecodeError``：整数位数超过 ``sys.get_int_max_str_digits()``
+        # （CPython 默认 4300 位）时，``_parser`` 内部直接 ``int()`` 并让
+        # ``ValueError`` 穿出来。实测 ``chat_top_k = "9" * 4301`` 得到的是
+        # 36 帧裸 traceback，消息只有 "Exceeds the limit (4300 digits)..."——
+        # 既没有「配置解析失败」前缀，也没说是哪个文件写坏了，而同样属于
+        # 「配置写错」的语法错是 5 帧带前缀的消息。这一支兜住它。
+        #
+        # 放在最后：``ValidationError``／``SettingsError``／``TOMLDecodeError``
+        # 都继承 ``ValueError``，顺序颠倒会让前面的分支永远接不到。
+        raise ValueError(f"配置解析失败 - {redact_sensitive_text(str(exc))}") from None
 
 
 def _redacted_settings_error(exc: ValidationError) -> str:
@@ -874,13 +1153,25 @@ def _redacted_settings_error(exc: ValidationError) -> str:
 
     直接重抛 ``ValidationError`` 会让 pydantic 再包一层，原始报告的
     ``input_value`` 会以嵌套形式重复出现；这里逐条取 ``loc`` 与 ``msg``
-    重建，只保留定位信息和校验原因，并把值整体交给 ``redact_sensitive_text``。
+    重建，只保留定位信息和校验原因。``msg`` 与 ``input`` **两者**都交给
+    ``redact_sensitive_text``：validator 的消息里常常回显原始取值，
+    只脱敏 ``input`` 会留下明文出口。
     """
     lines = []
     for error in exc.errors():
         location = ".".join(str(part) for part in error.get("loc", ()))
-        message = str(error.get("msg", "校验失败"))
-        value = redact_sensitive_text(str(error.get("input")))
+        # ``msg`` 也必须脱敏：validator 普遍把**原始取值**写进消息
+        # （``f"无效的日志级别: {value}"``），因此只处理 ``input`` 会留下一条
+        # 明文出口。实测 ``CHAT_TEMPERATURE=sk-live-...`` 时消息里原样带着该
+        # 凭证，而这条消息经 ``get_settings`` 的 handler 抛出后进终端与日志
+        # ——正是本函数 docstring 声称要挡住的那一类。
+        message = redact_sensitive_text(str(error.get("msg", "校验失败")))
+        # 用 ``safe_repr`` 而不是 ``str()``：``input`` 是 pydantic 记下的原始
+        # 输入值，可以是任意大的整数。实测 ``Settings(chat_top_k=10**4301)``
+        # （库调用方与测试都走这条构造路径）让**报告校验失败**这一步自己抛
+        # ``ValueError: Exceeds the limit``——用户看到的是位数上限错误，而真正
+        # 的问题是 ``chat_top_k`` 越界。
+        value = redact_sensitive_text(safe_repr(error.get("input")))
         lines.append(f"{location}: {message} (input={value})" if location else f"{message}")
     return "配置校验失败 - " + "; ".join(lines) if lines else "配置校验失败"
 

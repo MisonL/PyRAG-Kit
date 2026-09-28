@@ -31,6 +31,7 @@ from tenacity import (
     wait_exponential,
 )
 
+from src.utils.config import is_double_convertible, parse_decimal_int, safe_repr
 from src.utils.security import (
     validate_secret_free_options as _validate_secret_free_options,
 )
@@ -517,8 +518,18 @@ def _responses_has_content(value: Any) -> bool:
 
 
 def _responses_provider_variant(provider: str) -> str:
-    """规范化 Responses 目标 SDK 变体。"""
-    normalized = str(provider).strip().lower().replace("-", "_")
+    """规范化 Responses 目标 SDK 变体。
+
+    非字符串收敛成 ``"openai"`` 而不是抛错：本函数只做**分流**（Ark 还是
+    OpenAI 变体），调用方在两条路径上都会继续做各自的取值校验。此前写
+    ``str(provider)``，``10**4301`` 撞上 CPython 的整数位数上限抛
+    ``ValueError: Exceeds the limit``——一个纯粹的分流判断不该产生与协议无关的
+    整数转换错误，而且它抛在 ``_normalize_responses_native_item`` 的入口，会让
+    本该给出的「字段类型不对」消息变成这条。
+    """
+    if not isinstance(provider, str):
+        return "openai"
+    normalized = provider.strip().lower().replace("-", "_")
     return "ark" if normalized in {"ark", "volcengine", "volc_engine"} else "openai"
 
 
@@ -690,10 +701,12 @@ def _responses_content_part(
             raise ValueError(f"{location}.file_id 必须是字符串。")
         if not video_url and not video_file_id:
             raise ValueError(f"{location} 缺少 video_url 或 file_id。")
+        # 先判可转换性：``math.isfinite(float(x))`` 对超出双精度范围的整数
+        # 自己就抛 ``OverflowError``（**不是** ``ValueError``）。
         if fps is not None and (
             isinstance(fps, bool)
             or not isinstance(fps, (int, float))
-            or not math.isfinite(float(fps))
+            or not is_double_convertible(fps)
         ):
             raise ValueError(f"{location}.fps 必须是有限数字。")
         converted_video: dict[str, Any] = {"type": "input_video"}
@@ -782,7 +795,7 @@ def _responses_content_part(
         allowed_details = {"auto", "low", "high"}
         if variant == "openai":
             allowed_details.add("original")
-        if source["detail"] not in allowed_details:
+        if not isinstance(source["detail"], str) or source["detail"] not in allowed_details:
             allowed = "、".join(sorted(allowed_details))
             raise ValueError(f"{location}.detail 必须是 {allowed}。")
         converted_input_image: dict[str, Any] = {"type": "input_image", "detail": source["detail"]}
@@ -827,7 +840,12 @@ def _responses_content_part(
                 raise ValueError(f"{location}.{key} 必须是字符串。")
         converted = {"type": "input_file"}
         if source.get("detail") is not None:
-            if variant != "openai" or source["detail"] not in {"auto", "low", "high"}:
+            detail_value = source["detail"]
+            if (
+                variant != "openai"
+                or not isinstance(detail_value, str)
+                or detail_value not in {"auto", "low", "high"}
+            ):
                 raise ValueError(f"{location}.detail 不受 {variant.title()} Responses SDK 支持。")
             converted["detail"] = source["detail"]
         for key in ("file_id", "file_data", "file_url", "filename"):
@@ -847,7 +865,12 @@ def _responses_content_part(
             raise ValueError(f"{location} 缺少 file_id、file_data 或 file_url。")
         converted = {"type": "input_file"}
         if source.get("detail") is not None:
-            if variant != "openai" or source["detail"] not in {"auto", "low", "high"}:
+            detail_value = source["detail"]
+            if (
+                variant != "openai"
+                or not isinstance(detail_value, str)
+                or detail_value not in {"auto", "low", "high"}
+            ):
                 raise ValueError(f"{location}.detail 不受 {variant.title()} Responses SDK 支持。")
             converted["detail"] = source["detail"]
         for key in ("file_id", "file_data", "file_url", "filename"):
@@ -1247,7 +1270,29 @@ def normalize_embedding_vector(value: Any) -> list[float]:
     if hasattr(value, "tolist"):
         value = value.tolist()
     if isinstance(value, (list, tuple)):
-        return [float(item) for item in value]
+        # ``float(item)`` 对超出双精度范围的整数抛 ``OverflowError``——它不是
+        # ``ValueError``，会穿透 ``EmbeddingService`` 的 ``except ValueError``
+        # 与 provider 的错误分类逻辑。SDK 返回的 JSON 里出现一个 401 位整数
+        # 就足以走到这里，因此逐项先判可转换性。
+        #
+        # 只收敛 ``OverflowError``，不改变既有契约：``inf``/``nan`` 在此仍照旧
+        # 转成 ``inf``/``nan`` 交给下游——``EmbeddingService`` 会显式拒绝非有限
+        # 向量（``np.isfinite`` 检查），而 base64 分支（``struct.unpack``）本来
+        # 就可能产出 ``inf``。在这里另加一道有限性拒绝会让两个分支的契约不一致。
+        converted: list[float] = []
+        for index, item in enumerate(value):
+            # 只拦「超出双精度范围的 int」——它是 ``OverflowError`` 的唯一来源。
+            # ``inf``/``nan`` 照旧放行：base64 分支（``struct.unpack``）本来就
+            # 可能产出它们，有限性由下游 ``EmbeddingService`` 统一拒绝，在这里
+            # 另加一道会让两个分支的契约不一致。
+            if (
+                isinstance(item, int)
+                and not isinstance(item, bool)
+                and not is_double_convertible(item)
+            ):
+                raise ValueError(f"Embedding 向量第 {index} 项超出双精度范围: {safe_repr(item)}。")
+            converted.append(float(item))
+        return converted
     if isinstance(value, (bytes, bytearray, memoryview)):
         encoded = bytes(value)
     elif isinstance(value, str):
@@ -1271,6 +1316,167 @@ def field(value: Any, name: str, default: Any = None) -> Any:
     return getattr(value, name, default)
 
 
+def enum_field(value: Any, name: str) -> str:
+    """读取**用于集合成员判断**的枚举字段，非字符串一律收敛成 ``""``。
+
+    为什么需要它：``field(x, "type") in {"a", "b"}`` 对 ``list``/``dict`` 抛
+    ``TypeError: unhashable type``。这些值来自网关 JSON（openai SDK 对 SSE
+    chunk 的未知顶层字段用 ``extra="allow"`` 原样保留，实测一个
+    ``{"type": ["error"]}`` 就能构造出来），而调用方按 ``ValueError`` /
+    ``RuntimeError`` 分类错误——于是「网关返回了形态异常的事件」变成裸
+    ``TypeError``，日志脱敏与错误分类都接不住。
+
+    收敛成 ``""`` 而不是抛错，是因为这些站点的语义是「**不是**我认识的事件就
+    跳过」：未知类型本来就走 else 分支，空串落在同一个分支上，行为不变。
+    """
+    candidate = field(value, name, "")
+    return candidate if isinstance(candidate, str) else ""
+
+
+def require_token_count(value: Any, provider: str, field_name: str) -> int:
+    """把 SDK 返回的 token 计数收敛成非负整数。
+
+    八个 provider 方法（Anthropic 同步/异步 × 普通/Beta、Google 同步/异步、
+    OpenAI Responses 同步/异步）此前都写成「判 ``None`` 后直接 ``int(value)``」。
+    那只挡住了缺字段：SDK 或兼容网关返回 ``"abc"``、``1.5``、``[1]`` 或位数超限
+    的数字串时，``int()`` 抛的是裸 ``ValueError``／``TypeError``／位数超限错误，
+    与「token 计数」这件事无关，调用方也拿不到是哪个字段出的问题。
+
+    非负整数是这份数据的真实契约：token 计数不可能为负，也不可能带小数。
+    """
+    if value is None:
+        raise RuntimeError(f"{provider} token count 响应缺少 {field_name}。")
+    if isinstance(value, bool):
+        raise RuntimeError(
+            f"{provider} token count 响应的 {field_name} 不是整数: {safe_repr(value)}。"
+        )
+    if isinstance(value, str):
+        parsed = parse_decimal_int(value)
+        if parsed is None:
+            raise RuntimeError(
+                f"{provider} token count 响应的 {field_name} 不是整数: {safe_repr(value)}。"
+            )
+        numeric = parsed
+    elif isinstance(value, (int, float)):
+        if isinstance(value, float) and (not math.isfinite(value) or not value.is_integer()):
+            raise RuntimeError(
+                f"{provider} token count 响应的 {field_name} 不是整数: {safe_repr(value)}。"
+            )
+        numeric = int(value)
+    else:
+        raise RuntimeError(
+            f"{provider} token count 响应的 {field_name} 不是整数（{type(value).__name__}）。"
+        )
+    if numeric < 0:
+        raise RuntimeError(
+            f"{provider} token count 响应的 {field_name} 不能为负: {safe_repr(numeric)}。"
+        )
+    return numeric
+
+
+# 客户端级重试次数的上界。
+#
+# SDK 的重试循环是 ``range(max_retries + 1)``（openai SDK 的
+# ``_request``；Ark SDK 是等价的递归 ``_retry_request``），因此这个值直接决定
+# 一次请求在故障时最多发出多少次。给它上界有两个理由：``config.toml`` 的 TOML
+# 整数**无上界**，不设界时 ``max_retries = 10**400`` 会被原样接受并存进 SDK
+# 客户端（实测 ``client.max_retries`` 确实是那个 401 位整数），网络故障下等价于
+# 无限重试；而一个合理的重试上限本来就是配置项该有的约束，不是可以取到天文
+# 数字的量。
+_MAX_CLIENT_RETRIES = 100
+
+# 客户端级请求超时（秒）的上界。
+#
+# 与 ``max_retries`` 同属「透传给 SDK、SDK 自己不校验」的一类，但失效方式不同：
+# 超时值本身再大也只是「等到天荒地老」，真正的崩点在**派生值**上。Google 的
+# ``_build_http_options`` 把秒换算成毫秒（``int(timeout * 1000)``）交给
+# ``types.HttpOptions``，而 ``int()`` 对超过 ``DBL_MAX`` 的浮点抛
+# ``OverflowError``——它是 ``ArithmeticError`` 的子类，穿透项目全部以
+# ``ValueError`` 为契约的 handler（``get_settings``、chat 主循环、questionary
+# validator），以裸 traceback 终止会话。实测 ``config.toml`` 写
+# ``timeout = 1e306`` 即可：配置加载成功、provider 构造成功，首次提问才炸。
+#
+# 这个上界取一天：超时是「多久算失败」的判定，没有任何真实场景需要等更久，
+# 而它同时把换算后的毫秒值（86400000）约束在安全整数区间内。
+_MAX_CLIENT_TIMEOUT_SECONDS = 86_400.0
+
+
+def normalize_client_timeout(value: Any, provider: str, field_name: str) -> float:
+    """把客户端级 ``timeout`` 收敛成 ``0`` 到 ``_MAX_CLIENT_TIMEOUT_SECONDS`` 的秒数。
+
+    必须在构造期校验，而不是交给 SDK：SDK 对 ``timeout`` 不做任何检查，非法
+    取值要到发请求时才以形态各异的错误暴露。
+
+    * **非正数**（``0``／``-1``）：httpx 会立刻超时，请求形同未发。
+    * **超大值**：不只是「等得久」。凡是在该值上再做算术的下游都会炸——
+      Google SDK 的毫秒换算抛 ``OverflowError``，而 ``OverflowError`` 不是
+      ``ValueError``，穿透项目所有错误边界。实测 ``1e306`` 即触发。
+    * **非数字**（``"abc"``／``True``）：SDK 原样存进客户端，直到比较超时时
+      才抛 ``TypeError``，报错点离配置处很远。
+
+    只接受 ``int``／``float``，不接受字符串字面量：超时是数值型配置，三个渠道
+    （Google、Anthropic、OpenAI 兼容）原本就拒绝 ``"30"``，这条契约由
+    ``test_google_request_timeout_must_be_finite_and_positive`` 固定。
+    """
+    # ``is_double_convertible`` 是这里唯一正确的守卫：它先判类型，再对 ``int``
+    # 判绝对值上界、对 ``float`` 判有限性。直接写 ``float(value)`` 会引入同一个
+    # 失效模式——``float(10**400)`` 抛 ``OverflowError``（**不是**
+    # ``ValueError``），本函数就成了「正要拒绝非法值时改抛别的异常」。它同时
+    # 挡住 ``bool``（``int`` 子类，``True`` 会静默变成 1.0）与 ``str``。
+    if not is_double_convertible(value):
+        raise ValueError(f"{provider} {field_name} 必须是正数。")
+    numeric = float(value)
+    if numeric <= 0:
+        raise ValueError(f"{provider} {field_name} 必须是正数。")
+    if numeric > _MAX_CLIENT_TIMEOUT_SECONDS:
+        raise ValueError(
+            f"{provider} {field_name} 不能超过 {_MAX_CLIENT_TIMEOUT_SECONDS:.0f} 秒，"
+            f"但得到 {safe_repr(value)}。"
+        )
+    return numeric
+
+
+def normalize_client_retries(value: Any, provider: str) -> int:
+    """把客户端级 ``max_retries`` 收敛成 ``0`` 到 ``_MAX_CLIENT_RETRIES`` 的整数。
+
+    为什么必须在构造期校验，而不是交给 SDK：SDK 对 ``max_retries`` 不做任何
+    检查，取值直接决定重试循环的次数，于是每一类非法取值都表现为远处的怪错误。
+
+    * **负数**：``range(max_retries + 1)`` 一次都不执行，请求根本没发出去，
+      最终抛的是 SDK 内部的 ``AssertionError: could not resolve response
+      (should never happen)``——实测 ``max_retries=-1`` 时 HTTP 请求数为 **0**，
+      用户看到的是「断言失败」，与「重试次数配错了」毫无关联。
+    * **超大值**：等价于无上限重试。
+    * **非整数**（``"abc"``／``1.5``／``True``）：SDK 把它们原样存进
+      ``self.max_retries``，直到真正重试时才在 ``max_retries - retries_taken``
+      上抛 ``TypeError``，报错点离配置处很远。
+
+    字符串按十进制字面量接受（``"3"``），因为 ``.env``／TOML 来源本来就以字符串
+    到达；``bool`` 必须显式拒绝——它是 ``int`` 的子类，``True`` 会静默变成 ``1``。
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{provider} options.max_retries 必须是整数，不能是布尔值。")
+    if isinstance(value, str):
+        parsed = parse_decimal_int(value)
+        if parsed is None:
+            raise ValueError(f"{provider} options.max_retries 必须是整数。")
+        numeric = parsed
+    elif isinstance(value, int):
+        numeric = value
+    elif isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError(f"{provider} options.max_retries 必须是整数。")
+        numeric = int(value)
+    else:
+        raise ValueError(f"{provider} options.max_retries 必须是整数。")
+    if not 0 <= numeric <= _MAX_CLIENT_RETRIES:
+        raise ValueError(
+            f"{provider} options.max_retries 必须在 0 到 {_MAX_CLIENT_RETRIES} 之间，"
+            f"但得到 {safe_repr(value)}。"
+        )
+    return numeric
+
+
 def is_retryable_error(error: BaseException) -> bool:
     """只对连接、限流和服务端错误重试，避免参数/认证错误重复发送请求。"""
     if isinstance(error, (TimeoutError, ConnectionError)):
@@ -1285,9 +1491,14 @@ def is_retryable_error(error: BaseException) -> bool:
             continue
         if isinstance(status, int):
             return status == 429 or status >= 500
-        if isinstance(status, str) and status.isdigit():
-            numeric_status = int(status)
-            return numeric_status == 429 or numeric_status >= 500
+        # 解析走 ``parse_decimal_int``：``int()`` 会抛错的情形有两类——非十进制
+        # 数字字符（``isdigit()`` 为真但 ``int()`` 抛错的 ``²`` ``①`` ``፩`` …）
+        # 与位数超过 ``sys.get_int_max_str_digits()``。任一类漏掉都会让「这个错误
+        # 要不要重试」的判断本身崩掉，把可重试的 5xx 变成一条解析异常。
+        if isinstance(status, str):
+            numeric_status = parse_decimal_int(status)
+            if numeric_status is not None:
+                return numeric_status == 429 or numeric_status >= 500
     name = error.__class__.__name__.lower()
     return any(
         token in name
@@ -1387,6 +1598,13 @@ def raise_for_stream_error_event(event: Any, provider: str) -> None:
     """将协议层 error 事件转换为带状态码的异常。"""
     event_type = field(event, "type", "")
     embedded_error = field(event, "error")
+    # ``event_type`` 来自网关 JSON，形态不受控：``type`` 写成 list/dict 时
+    # ``not in {...}`` 抛 ``TypeError: unhashable type``，而本函数的调用方
+    # 按 ``ValueError``/``RuntimeError`` 分类错误。先判类型，与
+    # ``_normalize_responses_native_item`` 的 ``isinstance(item_type, str)``
+    # 同一写法。
+    if not isinstance(event_type, str):
+        event_type = ""
     if event_type not in {"error", "response.error"} and embedded_error is None:
         return
     error = embedded_error or event
@@ -1427,9 +1645,13 @@ def raise_for_stream_error_event(event: Any, provider: str) -> None:
         if isinstance(value, int):
             status = value
             break
-        if isinstance(value, str) and value.isdigit():
-            status = int(value)
-            break
+        # 同 ``is_retryable_error``：``int()`` 解析不了的值必须跳过，而不是让
+        # 流错误的提取本身崩掉。
+        if isinstance(value, str):
+            parsed_status = parse_decimal_int(value)
+            if parsed_status is not None:
+                status = parsed_status
+                break
     raise StreamEventError(f"{provider} 流返回错误: {message}", status)
 
 

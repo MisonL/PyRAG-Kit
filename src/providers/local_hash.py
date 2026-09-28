@@ -6,6 +6,7 @@ import re
 import jieba  # type: ignore[import-untyped]
 
 from src.providers.__base__.model_provider import TextEmbeddingModel
+from src.utils.config import _MAX_EMBEDDING_DIMENSION, parse_decimal_int
 
 DEFAULT_DIMENSION = 256
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]")
@@ -14,8 +15,27 @@ jieba.setLogLevel(jieba.logging.ERROR)
 
 
 def _parse_dimension(model_name: str) -> int:
+    """从 ``model_name`` 的数字后缀取维度，超过上界时直接拒绝。
+
+    校验必须在这里而不是调用方：``_embed_text`` 会**先按该维度分配出完整向量**
+    再返回，等调用方拿到结果再判已经晚了——实测 ``local-hash-100000000`` 单次
+    调用耗时 136 秒、峰值内存 3.9 GB。维度是用户可写的 ``model_name`` 决定的，
+    与 ``chat_top_k`` 那类规模参数同理，都需要上界。
+    """
     suffix = model_name.rsplit("-", maxsplit=1)[-1]
-    return int(suffix) if suffix.isdigit() and int(suffix) > 0 else DEFAULT_DIMENSION
+    # 解析走 ``parse_decimal_int``：它同时挡住「``isdigit()`` 为真但 ``int()``
+    # 抛错」（``²`` ``①`` ``፩`` …）与「位数超过 ``sys.get_int_max_str_digits()``」
+    # （``"9" * 4301`` 是合法整数却照样抛错）两类。任何一种漏掉都会变成一条
+    # 不带 ``model_name`` 的裸解析错误（实测消息只有 "invalid literal for int()
+    # with base 10: '²'"），用户无从知道是配置里的哪个字段写坏了。
+    parsed = parse_decimal_int(suffix)
+    dimension = parsed if parsed is not None and parsed > 0 else DEFAULT_DIMENSION
+    if dimension > _MAX_EMBEDDING_DIMENSION:
+        raise ValueError(
+            f"local-hash 的维度超过上界：model_name={model_name!r} 解析出 {dimension}，"
+            f"上界 {_MAX_EMBEDDING_DIMENSION}。请检查配置里的 model_name。"
+        )
+    return dimension
 
 
 def _tokenize(text: str) -> list[str]:

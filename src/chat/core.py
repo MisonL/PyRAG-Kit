@@ -29,7 +29,14 @@ from ..services.chat_service import ChatService
 from ..services.embedding_service import EmbeddingService
 from ..services.retrieval_service import RetrievalService
 from ..ui.config_menu import launch_config_editor
-from ..ui.display_utils import display_chat_config, get_relative_path
+from ..ui.display_utils import (
+    display_chat_config,
+    document_content,
+    document_score,
+    document_source,
+    get_relative_path,
+    markup_text,
+)
 from ..utils.config import get_settings
 from ..utils.log_manager import get_chat_logger
 from ..utils.security import safe_exception_text
@@ -60,8 +67,27 @@ class Chatbot:
             return
         if not hasattr(self, "session_config"):
             self.session_config = build_session_config(get_settings())
-        for key, item in value.items():
-            self.session_config[key] = item
+        # 先在副本上逐个写入，全部通过后再整体替换。
+        #
+        # 直接循环写 ``self.session_config`` 不是原子的：任一字段被拒时，
+        # 前面的字段已经落进去了——实测 ``{"top_k": 42, "retrieval_method":
+        # "不存在"}`` 会留下「top_k 已改成 42、检索模式还是旧的」这种改了一半
+        # 的状态，而调用方只看到一个异常，以为整批都没生效。
+        #
+        # 用 ``deepcopy`` 而不是 ``SessionConfig(**to_dict())``：``session_config``
+        # 的类型是运行时可替换的（嵌入方可以传入自己的映射实现），``__setitem__``
+        # 是唯一被要求的接口，重建具体类型会把这类实现挡在外面。
+        candidate = deepcopy(self.session_config)
+        # 有 ``set_many`` 就用它：逐个 ``__setitem__`` 会拿**旧**的兄弟字段值
+        # 做组合校验，于是「top_k × multiplier」这类上界约束会因为中间态瞬时
+        # 越界而拒绝一个合法终态，且结论随 dict 键顺序变化。
+        set_many = getattr(candidate, "set_many", None)
+        if callable(set_many):
+            set_many(value)
+        else:
+            for key, item in value.items():
+                candidate[key] = item
+        self.session_config = candidate
 
     def _initialize_vector_store(self):
         self.vector_store = VectorStoreFactory.get_default_vector_store()
@@ -74,7 +100,9 @@ class Chatbot:
         # 「无相关文档」，把构建缺失误诊成检索质量差。
         chunk_count = len(getattr(self.vector_store, "documents", []) or [])
         if chunk_count:
-            self.console.print(f"[green]知识快照加载成功，共 {chunk_count} 个分块。[/green]")
+            self.console.print(
+                markup_text("[green]知识快照加载成功，共 {} 个分块。[/green]", chunk_count)
+            )
         else:
             self.console.print(
                 "[bold yellow]未找到可用的知识快照，检索将始终返回空结果。[/bold yellow]"
@@ -104,7 +132,9 @@ class Chatbot:
         except Exception as exc:  # noqa: BLE001 - reload boundary reports provider failures
             if new_model is not None and new_model is not self.llm_model:
                 self._dispose_model(new_model)
-            self.console.print(f"[bold red]重载 LLM 出错: {safe_exception_text(exc)}[/bold red]")
+            self.console.print(
+                markup_text("[bold red]重载 LLM 出错: {}[/bold red]", safe_exception_text(exc))
+            )
             return False
 
     def _dispose_model(self, model: LargeLanguageModel) -> None:
@@ -231,7 +261,9 @@ class Chatbot:
                 await self._adispose_model(new_model)
             if previous_config is not None:
                 self.session_config = previous_config
-            self.console.print(f"[bold red]重载 LLM 出错: {safe_exception_text(exc)}[/bold red]")
+            self.console.print(
+                markup_text("[bold red]重载 LLM 出错: {}[/bold red]", safe_exception_text(exc))
+            )
             self.console.print("[bold yellow]LLM 切换失败，已保留当前模型配置。[/bold yellow]")
 
     async def _identify_intent_async(self, user_query: str) -> str:
@@ -255,7 +287,7 @@ class Chatbot:
         try:
             intent = await self._identify_intent_async(user_input)
             retrieved_docs = await self._retrieve_knowledge_async(intent)
-            self.console.print(f"  [bold]意图:[/bold] [yellow]{intent}[/yellow]")
+            self.console.print(markup_text("  [bold]意图:[/bold] [yellow]{}[/yellow]", intent))
             self._display_retrieved_docs(retrieved_docs)
 
             chat_service = getattr(self, "chat_service", None)
@@ -296,7 +328,9 @@ class Chatbot:
                 "聊天请求处理失败: %s",
                 error_text,
             )
-            self.console.print(f"[red]LLM 异步生成出错: {safe_exception_text(exc)}[/red]")
+            self.console.print(
+                markup_text("[red]LLM 异步生成出错: {}[/red]", safe_exception_text(exc))
+            )
             # 已经输出部分内容时不要追加道歉文本，避免用户收到混合响应；
             # 具体异常已通过日志和控制台显式记录。
             if not full_response:
@@ -312,9 +346,12 @@ class Chatbot:
         table.add_column("预览", style="white")
         table.add_column("得分", style="bold")
         for doc in docs:
-            preview = doc.get("page_content", "")[:60].replace("\n", " ") + "..."
-            source = get_relative_path(doc.get("metadata", {}).get("source", "N/A"))
-            table.add_row(source, preview, f"{doc.get('score', 0):.4f}")
+            # 字段形态由 document_* 助手收敛（检索结果可以来自第三方 store，
+            # 不经 FaissStore 的载入期归一化）；预览与来源还可能含字面量
+            # ``[/]`` 之类的标记形态，因此用 Text 包装后再交给 add_row。
+            preview = document_content(doc, "")[:60].replace("\n", " ") + "..."
+            source = get_relative_path(document_source(doc))
+            table.add_row(Text(source), Text(preview), f"{document_score(doc):.4f}")
         self.console.print(table)
 
 
@@ -327,7 +364,10 @@ async def start_chat_session_async():
         if bot.llm_model:
             display_chat_config(console, bot.chat_config)
             console.print(
-                f"客服已就绪 ([bold green]{bot.chat_config['active_llm_configuration']}[/bold green])"
+                markup_text(
+                    "客服已就绪 ([bold green]{}[/bold green])",
+                    bot.chat_config["active_llm_configuration"],
+                )
             )
 
             while True:
@@ -348,18 +388,45 @@ async def start_chat_session_async():
                             launch_config_editor,
                             editable_config,
                         )
-                        # 真实 Chatbot 使用异步重载以正确释放 SDK 连接池；保留
-                        # 同步兼容入口，便于嵌入方或旧版替身实现配置编辑。
-                        apply_async = getattr(bot, "apply_config_update_async", None)
-                        if callable(apply_async):
-                            result = apply_async(updated_config, llm_needs_reload)
-                            if inspect.isawaitable(result):
-                                await result
-                        else:
-                            apply_sync = getattr(bot, "apply_config_update", None)
-                            if not callable(apply_sync):
-                                raise AttributeError("Chatbot 缺少配置更新方法。")
-                            apply_sync(updated_config, llm_needs_reload)
+                        # 配置应用失败**不能**终止整个会话。``SessionConfig`` 的
+                        # 校验器会拒绝非法取值（``ValueError``），而编辑器的动态
+                        # 上界与它是两套独立实现，任一侧演化就会命中这条路径——
+                        # 实测编辑器返回「非法字段 + 非法值」时，异常穿透内层只接
+                        # ``(KeyboardInterrupt, EOFError)`` 的 ``try``，用户被丢回
+                        # 主菜单并丢失会话。同文件的 ``chat_async`` 对异常是恢复的
+                        # （打印后继续下一轮），这里与之对齐：报错、保留原配置、
+                        # 回到提示符。
+                        try:
+                            # 真实 Chatbot 使用异步重载以正确释放 SDK 连接池；保留
+                            # 同步兼容入口，便于嵌入方或旧版替身实现配置编辑。
+                            apply_async = getattr(bot, "apply_config_update_async", None)
+                            if callable(apply_async):
+                                result = apply_async(updated_config, llm_needs_reload)
+                                if inspect.isawaitable(result):
+                                    await result
+                            else:
+                                apply_sync = getattr(bot, "apply_config_update", None)
+                                if not callable(apply_sync):
+                                    raise AttributeError("Chatbot 缺少配置更新方法。")
+                                apply_sync(updated_config, llm_needs_reload)
+                        except (ValueError, KeyError) as exc:
+                            # 经 ``getattr`` 取 logger：``bot`` 的类型是运行时
+                            # 可替换的（嵌入方可以传入自己的实现），同文件其它
+                            # 位置也用 ``getattr`` 探测 ``apply_config_update``／
+                            # ``aclose``。诊断日志取不到时不能反过来把恢复路径
+                            # 变成新的失败点。
+                            logger = getattr(bot, "logger", None)
+                            if logger is not None:
+                                logger.warning(
+                                    "配置应用失败，保留原配置: %s", safe_exception_text(exc)
+                                )
+                            console.print(
+                                markup_text(
+                                    "[bold yellow]配置未生效: {}[/bold yellow] 已保留当前配置。",
+                                    safe_exception_text(exc),
+                                )
+                            )
+                            continue
                         display_chat_config(console, bot.chat_config)
                         continue
 

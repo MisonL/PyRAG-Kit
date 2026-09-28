@@ -15,11 +15,31 @@ from src.utils.config import (  # 导入 get_settings 函数
     ModelDetail,
     ModelProtocol,
     get_settings,
+    safe_repr,
 )
 from src.utils.log_manager import get_module_logger  # 导入日志管理器
-from src.utils.security import redact_sensitive_text, validate_secret_free_options
+from src.utils.security import safe_exception_text, validate_secret_free_options
 
 logger = get_module_logger(__name__)  # 获取当前模块的日志器
+
+
+def _normalize_protocol_text(value: Any, *, label: str) -> str:
+    """把协议名收敛成小写、连字符转下划线的形态。
+
+    ``protocol_status`` 与 ``capability_report`` 是公开的诊断入口（配置界面与
+    排障工具会调），参数来自调用方而非 ``Settings``——``ModelDetail.protocol``
+    有 validator，但这两个入口收的是**裸取值**，没有任何校验。此前直接写
+    ``str(value).strip().lower()``，于是 ``10**4301`` 撞上 CPython 的整数位数
+    上限，抛的是 ``ValueError: Exceeds the limit (4300 digits) for integer
+    string conversion``——既没有「哪个参数错了」，也没有「可选值是什么」，
+    用户拿到的是与协议诊断毫无关系的整数转换错误。
+
+    非字符串一律显式拒绝：协议名只能是字符串，``None``／列表／整数都说明调用方
+    传错了参数，而不是「某个协议没被支持」。
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"{label} 必须是字符串，但得到 {safe_repr(value)}。")
+    return value.strip().lower().replace("-", "_")
 
 
 class ModelProviderFactory:
@@ -194,7 +214,7 @@ class ModelProviderFactory:
             logger.error(
                 "导入提供商模块失败: %s - %s",
                 provider_info["module"],
-                redact_sensitive_text(str(e)),
+                safe_exception_text(e),
             )
             raise ImportError(f"无法加载提供商模块: {provider_info['module']}") from e
         except AttributeError as e:
@@ -202,7 +222,7 @@ class ModelProviderFactory:
                 "在模块中找不到提供商类: %s in %s - %s",
                 provider_info["class"],
                 provider_info["module"],
-                redact_sensitive_text(str(e)),
+                safe_exception_text(e),
             )
             raise AttributeError(f"无法找到提供商类: {provider_info['class']}") from e
 
@@ -342,7 +362,7 @@ class ModelProviderFactory:
         }
         normalized: set[str] = set()
         for value in configured:
-            protocol = str(value).strip().lower().replace("-", "_")
+            protocol = _normalize_protocol_text(value, label="server_verified_protocols")
             protocol = aliases.get(protocol, protocol)
             try:
                 normalized_protocol = ModelProtocol(protocol).value
@@ -464,7 +484,7 @@ class ModelProviderFactory:
         else:
             normalized_role = str(role).strip().lower()
         resolved, info = cls._provider_info_for_role(provider_name, normalized_role)
-        normalized = str(protocol).strip().lower().replace("-", "_")
+        normalized = _normalize_protocol_text(protocol, label="protocol")
         normalized = {
             "chat": ModelProtocol.CHAT_COMPLETIONS.value,
             "completion": ModelProtocol.CHAT_COMPLETIONS.value,
@@ -499,6 +519,19 @@ class ModelProviderFactory:
     ) -> ModelDetail:
         if configurations is None:
             configurations = getattr(get_settings(), settings_field)
+        # 形态必须在成员判断**之前**收敛：``key not in dict`` 对不可哈希的取值抛
+        # 裸 ``TypeError: unhashable type: 'list'``（不是 ``ValueError``，穿透
+        # ``Chatbot.reload_llm`` 的 ``except Exception`` 分类与上游的
+        # ``except ValueError``），而消息里的 f-string 对位数超限的整数抛
+        # ``ValueError: Exceeds the limit``——类型对，内容与字段无关。
+        # ``key`` 来源是 ``SessionConfig.active_llm_configuration`` 等可直写属性。
+        # 同一判据在 ``src/runtime/contracts.py`` 的 ``_require_known_field`` 里
+        # 已认领过（同样的 ``key not in ...`` + f-string 组合），这里对齐。
+        if not isinstance(provider_key, str):
+            raise ValueError(
+                f"{settings_field} 的 key 必须是字符串，但得到 {safe_repr(provider_key)}。"
+                f" 请检查 {role_label} 的当前配置项。"
+            )
         if provider_key not in configurations:
             logger.error(f"在{role_label}配置中未找到key: {provider_key}")
             raise ValueError(f"在{role_label}配置中未找到key: {provider_key}")
@@ -533,7 +566,7 @@ class ModelProviderFactory:
                 "获取LLM提供商实例失败: %s (%s) - %s",
                 provider_name,
                 model_name,
-                redact_sensitive_text(str(e)),
+                safe_exception_text(e),
             )
             raise
 
@@ -565,7 +598,7 @@ class ModelProviderFactory:
                 "获取Embedding提供商实例失败: %s (%s) - %s",
                 provider_name,
                 model_name,
-                redact_sensitive_text(str(e)),
+                safe_exception_text(e),
             )
             raise
 
@@ -597,6 +630,6 @@ class ModelProviderFactory:
                 "获取Rerank提供商实例失败: %s (%s) - %s",
                 provider_name,
                 model_name,
-                redact_sensitive_text(str(e)),
+                safe_exception_text(e),
             )
             raise

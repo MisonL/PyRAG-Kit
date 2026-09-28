@@ -163,10 +163,12 @@ def _write_snapshot(root, snapshot_id, provider, model):
         chunk_count=1,
     )
     (snapshot_dir / "manifest.toml").write_text(manifest.to_toml(), encoding="utf-8")
-    # 快照目录校验除了「文件齐全」还要求 chunks.pkl 与 embeddings.npy 的行数自洽
-    # （见 SnapshotRepository._validate_snapshot_row_counts），因此这里写最小但
-    # 可解析的内容：1 个分块 + 1 行向量。兼容性检测本身发生在 load_snapshot 之前，
-    # 这些内容不参与断言。
+    # 快照目录校验除了「文件齐全」还要求 chunks.pkl／parents.pkl 可解析、且
+    # chunks.pkl 与 embeddings.npy 的行数自洽（见
+    # SnapshotRepository._validate_snapshot_row_counts），因此这里写最小但**真实**
+    # 的内容：1 个分块 + 1 行向量 + 空父块映射。兼容性检测本身发生在 load_snapshot
+    # 之前，这些内容不参与断言；但占位字节构造出的快照本来就无法被加载，等于绕过
+    # 被测行为（``semantic.index`` 此前就是这么写的，已一并改为真实索引）。
     import pickle
 
     import numpy as np
@@ -174,8 +176,15 @@ def _write_snapshot(root, snapshot_id, provider, model):
     with (snapshot_dir / "chunks.pkl").open("wb") as file:
         pickle.dump([{"page_content": "占位分块", "metadata": {"source": "placeholder.md"}}], file)
     np.save(snapshot_dir / "embeddings.npy", np.zeros((1, 4), dtype=np.float32))
-    (snapshot_dir / "parents.pkl").write_bytes(b"")
-    (snapshot_dir / "semantic.index").write_bytes(b"")
+    with (snapshot_dir / "parents.pkl").open("wb") as file:
+        pickle.dump({}, file)
+    # 可解析的 FAISS 索引：占位字节会让真实加载路径（faiss.read_index）失败，
+    # 构造出的快照本来就不可能被加载。
+    import faiss
+
+    index = faiss.IndexFlatL2(4)
+    index.add(np.zeros((1, 4), dtype=np.float32))
+    faiss.write_index(index, str(snapshot_dir / "semantic.index"))
     (snapshot_dir / "stats.json").write_text(
         json.dumps({"chunk_count": 1}, ensure_ascii=False), encoding="utf-8"
     )

@@ -3236,3 +3236,275 @@ def test_responses_json_schema_accepts_flat_shape():
         "schema": {"type": "object"},
         "strict": True,
     }
+
+
+# ── 回归：``max_tokens`` 的有限性必须先于 ``int()`` 判 ──
+#
+# ``_default_max_tokens`` 原先是「判类型 -> ``int(configured)`` -> 判正数与整数性」。
+# ``int(float("inf"))`` 抛的是 ``OverflowError: cannot convert float infinity to
+# integer``，``int(float("nan"))`` 抛 ``ValueError: cannot convert float NaN to
+# integer``——两者都**不是**该方法承诺的「必须是正整数」消息，而 ``OverflowError``
+# 连 ``except ValueError`` 都接不住。实测 ``options.max_tokens = inf`` 正是这种
+# 收场，而同为非法取值的 ``1.5``／``0``／``-1``／``True`` 都能得到带指引的消息。
+
+
+@pytest.mark.parametrize(
+    "value",
+    [float("inf"), float("-inf"), float("nan"), 1e400],
+)
+def test_anthropic_max_tokens_rejects_non_finite_values(value):
+    """``inf``／``nan`` 必须报成「必须是正整数」，而不是 ``OverflowError``。"""
+    provider = object.__new__(AnthropicProvider)
+    provider._model_name = "claude-sonnet-4-5"
+    provider._options = {"max_tokens": value}
+
+    with pytest.raises(ValueError, match="max_tokens"):
+        provider._default_max_tokens()
+
+
+@pytest.mark.parametrize("value", [1.5, 0, -1, True, "100"])
+def test_anthropic_max_tokens_rejects_other_invalid_values(value):
+    """收紧不能误伤既有判据：其余非法取值照旧拒绝且消息一致。"""
+    provider = object.__new__(AnthropicProvider)
+    provider._model_name = "claude-sonnet-4-5"
+    provider._options = {"max_tokens": value}
+
+    with pytest.raises(ValueError, match="max_tokens"):
+        provider._default_max_tokens()
+
+
+def test_anthropic_max_tokens_accepts_valid_values():
+    """收紧不能误伤：合法取值照常返回。"""
+    provider = object.__new__(AnthropicProvider)
+    provider._model_name = "claude-sonnet-4-5"
+
+    provider._options = {"max_tokens": 100}
+    assert provider._default_max_tokens() == 100
+
+    provider._options = {"max_tokens": 8192.0}
+    assert provider._default_max_tokens() == 8192
+
+    provider._options = {}
+    assert provider._default_max_tokens() > 0
+
+
+# ── 回归：流式拒答文本的取值来自服务端，不得让它抛裸的整数转换错误 ──
+#
+# ``_stream_event`` 的两处拒答分支写的是
+# ``refusal if isinstance(refusal, str) else str(refusal or "")``——非字符串走
+# 裸 ``str()``。而 ``refusal`` 来自服务端返回的 JSON（``content_block`` 或
+# ``delta`` 里的字段），形态不受本地控制：JSON 里一个超大整数字面量
+# （``10**4301``）会让 ``str()`` 撞上 CPython 的整数位数上限，抛
+# ``ValueError: Exceeds the limit``。
+#
+# 这个异常发生在**流式解析**过程中，即 ``_iterate_stream_events`` 的生成器里：
+# 用户已经看到部分输出，随后拿到一条与「服务端拒答」毫无关系的整数转换错误，
+# 而同一函数对正常拒答文本给出的是 ``StreamEvent(type="refusal_delta")``。
+# 同一份输入里 ``42`` 被正常转成 ``"42"``、``None`` 变成 ``""``，只有位数超限
+# 的那一个炸——收场方式取决于取值的**大小**而不是形态。
+@pytest.mark.parametrize(
+    "hostile_refusal",
+    [
+        pytest.param(10**4301, id="huge-int-4301"),
+        pytest.param(10**4000, id="huge-int-4000"),
+    ],
+)
+def test_anthropic_stream_refusal_delta_survives_huge_integer(hostile_refusal):
+    block = SimpleNamespace(type="refusal", refusal=hostile_refusal)
+    event = SimpleNamespace(type="content_block_start", content_block=block)
+
+    converted = AnthropicProvider._stream_event(event, "response-id")
+
+    assert converted is not None
+    assert converted.type == "refusal_delta"
+    # 必须仍然是字符串，且不能是空的——空的会让调用方以为「没有拒答」。
+    assert isinstance(converted.refusal, str)
+    assert converted.refusal
+
+
+def test_anthropic_stream_refusal_delta_survives_huge_integer_in_delta():
+    """``content_block_delta`` 路径的同一判据（两处都要守住）。"""
+    delta = SimpleNamespace(type="refusal_delta", refusal=10**4301)
+    event = SimpleNamespace(type="content_block_delta", delta=delta)
+
+    converted = AnthropicProvider._stream_event(event, "response-id")
+
+    assert converted is not None
+    assert converted.type == "refusal_delta"
+    assert isinstance(converted.refusal, str)
+    assert converted.refusal
+
+
+def test_anthropic_stream_refusal_delta_keeps_plain_text_intact():
+    """反向守卫：正常拒答文本必须原样保留，不能被量级描述改写。"""
+    block = SimpleNamespace(type="refusal", refusal="我无法回答这个问题。")
+    event = SimpleNamespace(type="content_block_start", content_block=block)
+
+    converted = AnthropicProvider._stream_event(event, "response-id")
+
+    assert converted.refusal == "我无法回答这个问题。"
+
+
+# ── 回归：拒答详情（stop_details）的取值同样来自服务端，两处都要守卫 ──
+#
+# 上一轮修的是 ``_stream_event`` 里 ``refusal``／``delta.refusal`` 两条分支；
+# 同一文件还有**两处**用同一写法处理 ``stop_details``：``explanation`` 与
+# ``category`` 都来自服务端 JSON（``stop_details`` 是 Anthropic 的拒答详情对象），
+# 而它们写的是 ``str(explanation or category or "<默认文案>")``——非字符串走裸
+# ``str()``，JSON 里一个超大整数字面量就抛 ``ValueError: Exceeds the limit``。
+#
+# 这两处的后果与上一轮同源但方向相反：``stop_reason == "refusal"`` 是**安全拦截**
+# 的信号，此处抛异常会让一次本该被显式上报的拒答变成一条与安全策略无关的整数
+# 转换错误——用户看到的是「程序出错了」，而不是「请求被安全策略拒绝」。
+#
+# 非流式与流式（``message_delta``）两条路径各有一份，都要守住。
+def _anthropic_refusal_response(explanation, category=None):
+    stop_details = SimpleNamespace(type="refusal", explanation=explanation, category=category)
+    return SimpleNamespace(
+        stop_reason="refusal", stop_details=stop_details, id="response-id", content=[], usage=None
+    )
+
+
+@pytest.mark.parametrize(
+    "hostile_value",
+    [
+        pytest.param(10**4301, id="huge-int-4301"),
+        pytest.param(10**4000, id="huge-int-4000"),
+    ],
+)
+def test_anthropic_extract_result_survives_huge_integer_refusal_detail(hostile_value):
+    result = AnthropicProvider._extract_result(_anthropic_refusal_response(hostile_value))
+
+    assert isinstance(result.refusal, str)
+    # 空串会让调用方以为「没有拒答」，静默吞掉一次安全拦截。
+    assert result.refusal
+
+
+@pytest.mark.parametrize(
+    "hostile_value",
+    [
+        pytest.param(10**4301, id="huge-int-4301"),
+        pytest.param(10**4000, id="huge-int-4000"),
+    ],
+)
+def test_anthropic_stream_refusal_stop_details_survives_huge_integer(hostile_value):
+    stop_details = SimpleNamespace(type="refusal", explanation=hostile_value, category=None)
+    delta = SimpleNamespace(stop_reason="refusal", stop_details=stop_details)
+    event = SimpleNamespace(type="message_delta", delta=delta)
+
+    converted = AnthropicProvider._stream_event(event, "response-id")
+
+    assert converted is not None
+    assert converted.type == "refusal_delta"
+    assert isinstance(converted.refusal, str)
+    assert converted.refusal
+
+
+def test_anthropic_refusal_detail_keeps_plain_text_and_default():
+    """反向守卫：正常文本原样保留，两者皆缺时仍给默认文案。"""
+    assert (
+        AnthropicProvider._extract_result(_anthropic_refusal_response("策略说明")).refusal
+        == "策略说明"
+    )
+    # 只有 category 时用它
+    assert (
+        AnthropicProvider._extract_result(_anthropic_refusal_response(None, "cyber")).refusal
+        == "cyber"
+    )
+    # 两者皆缺时给可读的默认文案，而不是空串
+    assert (
+        AnthropicProvider._extract_result(_anthropic_refusal_response(None, None)).refusal
+        == "Anthropic 请求被安全策略拒绝"
+    )
+
+
+# ── 回归：finish_reason 归一化不得抛裸的整数转换错误 ──
+#
+# ``finish_reason`` 来自服务端响应（``stop_reason``／``finishReason`` 字段），
+# 形态不受本地控制。两处归一化都用裸 ``str()``：
+# ``GoogleProvider._normalize_finish_reason`` 的 ``str(raw)`` 与
+# ``AnthropicProvider._stream_event`` 的 ``str(reason)``。JSON 里一个超大整数
+# 字面量（``10**4301``）就让它们撞上 CPython 的整数位数上限，抛
+# ``ValueError: Exceeds the limit``——而这两个位置都在**流式/非流式响应解析**
+# 里，用户已经拿到部分输出后才看到一条与「停止原因」毫无关系的整数转换错误。
+#
+# 归一化的职责是「把枚举或原始值统一成协议字符串」，不是「原样渲染任意取值」：
+# 位数超限时给可读描述（``safe_repr``）即可，仍能区分不同取值。
+@pytest.mark.parametrize(
+    "hostile_reason",
+    [
+        pytest.param(10**4301, id="huge-int-4301"),
+        pytest.param(10**4000, id="huge-int-4000"),
+    ],
+)
+def test_google_normalize_finish_reason_survives_huge_integer(hostile_reason):
+    from src.providers.google import GoogleProvider
+
+    normalized = GoogleProvider._normalize_finish_reason(hostile_reason)
+
+    assert isinstance(normalized, str)
+    assert normalized
+
+
+@pytest.mark.parametrize(
+    "hostile_reason",
+    [
+        pytest.param(10**4301, id="huge-int-4301"),
+        pytest.param(10**4000, id="huge-int-4000"),
+    ],
+)
+def test_google_extract_result_survives_huge_finish_reason(hostile_reason):
+    part = SimpleNamespace(text="正文", function_call=None, thought=None, refusal=None)
+    response = SimpleNamespace(
+        candidates=[
+            SimpleNamespace(
+                content=SimpleNamespace(parts=[part]),
+                finish_reason=hostile_reason,
+                refusal=None,
+            )
+        ],
+        usage_metadata=SimpleNamespace(prompt_token_count=1, candidates_token_count=1),
+        response_id="response-id",
+    )
+
+    result = GoogleProvider._extract_result(response)
+
+    assert isinstance(result.finish_reason, str)
+
+
+@pytest.mark.parametrize(
+    "hostile_reason",
+    [
+        pytest.param(10**4301, id="huge-int-4301"),
+        pytest.param(10**4000, id="huge-int-4000"),
+    ],
+)
+def test_anthropic_stream_finish_reason_survives_huge_integer(hostile_reason):
+    delta = SimpleNamespace(stop_reason=hostile_reason, stop_details=None)
+    event = SimpleNamespace(type="message_delta", delta=delta, usage=None)
+
+    converted = AnthropicProvider._stream_event(event, "response-id")
+
+    assert converted is not None
+    assert converted.type == "finish"
+    assert isinstance(converted.finish_reason, str)
+    assert converted.finish_reason
+
+
+def test_finish_reason_normalization_keeps_enum_and_plain_values_intact():
+    """反向守卫：枚举对象与普通字符串仍按原语义归一化。"""
+    from src.providers.google import GoogleProvider
+
+    # 普通字符串照旧大写化、去掉点号前缀
+    assert GoogleProvider._normalize_finish_reason("stop") == "STOP"
+    assert GoogleProvider._normalize_finish_reason("FinishReason.MAX_TOKENS") == "MAX_TOKENS"
+    assert GoogleProvider._normalize_finish_reason(None) is None
+    assert GoogleProvider._normalize_finish_reason("") is None
+
+    # 枚举形态（有 name 属性）优先取 name
+    enum_like = SimpleNamespace(name="stop", value=1)
+    assert GoogleProvider._normalize_finish_reason(enum_like) == "STOP"
+
+    # 只有 value 时取 value
+    value_only = SimpleNamespace(value="max_tokens")
+    assert GoogleProvider._normalize_finish_reason(value_only) == "MAX_TOKENS"

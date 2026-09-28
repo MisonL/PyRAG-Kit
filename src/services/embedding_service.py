@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
@@ -8,6 +9,40 @@ import numpy as np
 from src.providers.__base__.model_provider import close_resource_sync
 from src.providers.factory import ModelProviderFactory
 from src.runtime.contracts import RunConfig
+from src.utils.config import _MAX_EMBEDDING_DIMENSION, is_double_convertible, safe_repr
+
+
+def _reject_unconvertible_numbers(values: Any, label: str) -> None:
+    """拒绝会让 ``float()`` 抛 ``OverflowError`` 的整数。
+
+    只递归检查 ``int``：``float`` 的 ``inf``／``nan`` 由调用方的
+    ``np.isfinite`` 判据负责（消息更贴切），这里专管「形态是合法数字、值却
+    超出 C double」这一类。``bool`` 是 ``int`` 子类，一并跳过——它是合法取值。
+    """
+    if isinstance(values, bool):
+        return
+    if isinstance(values, int):
+        if not is_double_convertible(values):
+            raise ValueError(
+                f"{label}包含超出双精度范围的整数（{safe_repr(values)}）；"
+                "请检查 embedding provider 的返回内容。"
+            )
+        return
+    if isinstance(values, (list, tuple)):
+        for item in values:
+            _reject_unconvertible_numbers(item, label)
+        return
+    # ``ndarray`` 与「``ndarray`` 的 list」都是 ``_probe_dimension`` 显式支持的
+    # 输入形态，因此它们会走到这里。不递归的话，``dtype=object`` 的数组带着
+    # ``10**400`` 直接进 ``np.array(..., dtype=np.float32)``，由 numpy 抛裸
+    # ``OverflowError``——同一批数据，``list`` 形态得到下面那条干净的
+    # ``ValueError``，``ndarray`` 形态得到 ``ArithmeticError`` 子类，收场方式
+    # 不一致，且穿透调用方的 ``except ValueError`` 分类与日志脱敏。
+    # 只有 ``object`` dtype 能装下 Python 大整数；数值 dtype 的取值一定在
+    # double 范围内，无需遍历（``tolist()`` 对高维数组代价不低）。
+    if isinstance(values, np.ndarray) and values.dtype == object:
+        for item in values.ravel().tolist():
+            _reject_unconvertible_numbers(item, label)
 
 
 class EmbeddingService:
@@ -20,8 +55,31 @@ class EmbeddingService:
         return self.run_config.default_embedding_provider
 
     @property
-    def embedding_model_detail(self):
-        return self.run_config.embedding_configurations[self.embedding_provider_key]
+    def embedding_model_detail(self) -> Any:
+        """按 key 取 embedding 模型详情，缺失时给出与工厂一致的 ``ValueError``。
+
+        原实现是直接下标 ``configurations[key]``，而 ``default_embedding_provider``
+        没有任何 validator（``Settings`` 里只是普通 ``str``）。打错一个 provider
+        名时这里抛裸 ``KeyError``，而同一份配置走
+        ``ModelProviderFactory.get_embedding_provider`` 得到的是带可选值列表的
+        ``ValueError``——两条路径的报错契约本该一致，否则调用方按
+        ``ValueError`` 写的错误分类与脱敏接不住 ``KeyError``。
+
+        调用点包括 ``embed_query``（Google 渠道分支）与
+        ``knowledge_build_service`` 的清单写入，都在检索/建库的主路径上。
+        """
+        configurations = self.run_config.embedding_configurations
+        key = self.embedding_provider_key
+        if not isinstance(configurations, Mapping) or key not in configurations:
+            available = (
+                ", ".join(sorted(configurations)) if isinstance(configurations, Mapping) else "无"
+            )
+            raise ValueError(
+                f"在Embedding配置中未找到key: {safe_repr(key)}。可选值: {available}。"
+                " 请检查 config.toml 里的 default_embedding_provider 与"
+                " embedding_configurations 是否对应。"
+            )
+        return configurations[key]
 
     def _get_model(self):
         if self._embedding_model is None:
@@ -82,7 +140,49 @@ class EmbeddingService:
                 await result
 
     @staticmethod
+    def _probe_dimension(embeddings: Any) -> int | None:
+        """在不分配矩阵的前提下取出维度，取不到时返回 ``None``。
+
+        上界校验必须在 ``np.array(...)`` **之前**：走到那一步时内存已经按该维度
+        分配过了。对 ``list`` 形态（本项目所有 embedding provider 的返回）看首行
+        长度即可，实测对 10⁷ 元素的列表耗时 9 微秒；``ndarray`` 直接读 shape；
+        其余形态交给后面的正常路径处理。
+        """
+        if isinstance(embeddings, np.ndarray):
+            return int(embeddings.shape[1]) if embeddings.ndim == 2 else None
+        if isinstance(embeddings, (list, tuple)):
+            if not embeddings:
+                return None
+            first = embeddings[0]
+            if isinstance(first, np.ndarray):
+                return int(first.shape[0]) if first.ndim == 1 else None
+            if isinstance(first, (list, tuple)):
+                return len(first)
+        return None
+
+    @staticmethod
     def _as_float32_matrix(embeddings: Any, expected_rows: int | None = None) -> np.ndarray:
+        # 维度上界必须先于分配检查：``local-hash`` 的维度直接来自用户可写的
+        # ``model_name`` 数字后缀，实测配成 ``local-hash-100000000`` 时一次
+        # ``embed_texts(["测试"])`` 就分配 (1, 10⁸) 的 float32 矩阵——耗时 180 秒、
+        # 峰值内存 3.9 GB；按真实知识库 115 个分块算，``np.vstack`` 需要约 4.3 GB，
+        # 进程会被 OOM 杀掉而不是得到一条可读的错误。与已经加过界的
+        # ``chat_top_k × retrieval_candidate_multiplier`` 同一类问题。
+        probed = EmbeddingService._probe_dimension(embeddings)
+        if probed is not None and probed > _MAX_EMBEDDING_DIMENSION:
+            raise ValueError(
+                "Embedding 维度超过上界："
+                f"得到 {probed}，上界 {_MAX_EMBEDDING_DIMENSION}。"
+                " 请检查 embedding_configurations 里的 model_name"
+                "（local-hash 的维度取自它的数字后缀）或 provider 的返回内容。"
+            )
+        # 超大整数必须在 ``np.array`` **之前**拦下：numpy 走 ``float()`` 转换，
+        # ``10**400`` 抛裸 ``OverflowError``（它不是 ``ValueError``，穿透调用方
+        # 全部 ``except ValueError`` 分类与日志脱敏），而同一批输入里的 ``inf``
+        # 却能得到下面那条干净的 ``ValueError``——收场方式不一致。
+        # 与 ``RetrievalService._validate_rerank_output`` 的守卫对称：那里同样
+        # 收敛 provider 返回的超大整数。
+        _reject_unconvertible_numbers(embeddings, "EmbeddingService 收到的向量")
         matrix = np.array(embeddings, dtype=np.float32)
         if matrix.ndim != 2:
             raise ValueError("EmbeddingService 期望二维向量矩阵。")
@@ -91,7 +191,13 @@ class EmbeddingService:
         if expected_rows is not None and matrix.shape[0] != expected_rows:
             raise ValueError(
                 "EmbeddingService 收到的向量数量与输入文本数量不一致。"
-                f" 输入 {expected_rows} 条，返回 {matrix.shape[0]} 条。"
+                # ``expected_rows`` 是调用方给的期望条数，形态不受控；``matrix``
+                # 的 shape 来自刚建好的 ndarray，必是小的 Python int。前者要经
+                # ``safe_repr``：裸插值在位数超限时抛
+                # ``ValueError: Exceeds the limit``，把「条数不一致」这条诊断
+                # 换成整数转换错误。实测 ``expected_rows=10**4301`` 时复现
+                # （``10**4000`` 不会，位数在上限内）。
+                f" 输入 {safe_repr(expected_rows)} 条，返回 {matrix.shape[0]} 条。"
             )
         # 有限性是硬要求，不是洁癖：FAISS 会把 NaN 向量照单收下（ntotal 正常增加），
         # 直到查询时才以 3.4e38 的哨兵距离暴露出来，而那时「哪个文档坏了」已经无法

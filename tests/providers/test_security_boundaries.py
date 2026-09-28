@@ -6,6 +6,7 @@ from src.utils.security import (
     find_sensitive_option_paths,
     is_sensitive_option_key,
     redact_sensitive_text,
+    safe_exception_text,
     validate_secret_free_options,
 )
 
@@ -166,6 +167,24 @@ def test_security_parseable_and_unparseable_urls_are_equally_strict():
 # ── 回归：面向用户的异常输出必须脱敏 ──
 
 
+def test_redact_sensitive_text_survives_huge_integers():
+    """位数超限的整数必须降级为量级描述，而不是抛 ``ValueError``。"""
+    for value in (10**4301, -(10**4301)):
+        result = redact_sensitive_text(value)
+
+        assert isinstance(result, str)
+        assert "Exceeds the limit" not in result
+
+
+def test_redact_sensitive_text_still_redacts_non_string_containers():
+    """收紧不能误伤：容器形态的脱敏照常生效。"""
+    secret = "sk-live-abcdef123456"
+
+    assert secret not in redact_sensitive_text({"api_key": secret})
+    assert secret not in redact_sensitive_text({"a": [{"b": secret}]})
+    assert secret not in redact_sensitive_text(f"Bearer {secret}")
+
+
 def test_safe_exception_text_redacts_credentials():
     """SDK 异常常回显请求头或 URL，终端与日志是凭证最容易泄漏的出口。"""
     from src.utils.security import safe_exception_text
@@ -182,6 +201,69 @@ def test_safe_exception_text_handles_empty_and_long_messages():
 
     assert safe_exception_text(ValueError()) == "ValueError"
     assert len(safe_exception_text(RuntimeError("x" * 500))) <= 260
+
+
+# ``safe_exception_text`` 是**最后一道展示边界**：22 处 ``except`` 都经它输出，
+# 它自己再抛，用户看到的就是解释器默认 handler 打出的裸 traceback——连脱敏都
+# 没有，比「消息不好看」严重得多。
+#
+# 触发条件是异常自身的 args 含位数超限的整数：``str(10**4301)`` 撞上 CPython
+# 的 ``sys.get_int_max_str_digits()``（默认 4300）抛 ``ValueError``。可达性经
+# 核实：JSON 与 TOML 两条路径送不进来（解析器自己就抛），但 ``pickle`` 是二进制
+# 格式、不受十进制位数限制，实测 ``pickle.loads(pickle.dumps(10**4301))`` 正常
+# 往返，而本项目加载 pickle 知识快照。
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ValueError(10**4301),
+        KeyError(10**4301),
+        TypeError(-(10**4301)),
+        RuntimeError(10**4301, "第二"),
+        RuntimeError("前缀", 10**4301),
+        OSError(10**4301),
+    ],
+    ids=["value", "key", "type-negative", "two-args", "mixed-args", "oserror"],
+)
+def test_safe_exception_text_survives_unprintable_exception_args(exc):
+    """异常 args 含位数超限的整数时，展示边界不得自己抛异常。"""
+    from src.utils.security import safe_exception_text
+
+    rendered = safe_exception_text(exc)
+
+    assert type(exc).__name__ in rendered
+    assert "Exceeds the limit" not in rendered
+
+
+def test_safe_exception_text_renders_each_arg_separately():
+    """逐元素渲染：不能把整个 args 元组交给 ``repr`` 后只退回 ``<tuple>``。
+
+    那样虽然不抛，却把「是哪个值出的问题」也丢掉了——本函数存在的意义就是让
+    用户看懂发生了什么。
+    """
+    from src.utils.security import safe_exception_text
+
+    rendered = safe_exception_text(RuntimeError("前缀", 10**4301))
+
+    assert "前缀" in rendered, rendered
+    assert "整数" in rendered, rendered
+
+
+def test_safe_exception_text_survives_pickle_roundtripped_huge_int():
+    """走真实的 pickle 往返构造异常——这是该值在生产里的唯一入口。
+
+    ``pickle`` 是二进制格式，不受 ``sys.get_int_max_str_digits()`` 限制，因此
+    快照里的畸形值可以携带 4301 位以上的整数进入异常对象。
+    """
+    import pickle
+
+    from src.utils.security import safe_exception_text
+
+    huge = pickle.loads(pickle.dumps(10**4301))
+
+    rendered = safe_exception_text(RuntimeError(huge))
+
+    assert "RuntimeError" in rendered
+    assert "Exceeds the limit" not in rendered
 
 
 def test_user_facing_error_paths_do_not_print_raw_exceptions():
@@ -629,3 +711,134 @@ def test_security_bearer_rule_redacts_alphabetic_token_adjacent_to_cjk():
 
     assert token not in rendered
     assert "[REDACTED]" in rendered
+
+
+# ── 回归：无键名的固定前缀凭证也要脱敏 ──
+#
+# SDK 的异常消息常回显请求头或 URL（``safe_exception_text`` 的 docstring 写明
+# 了这一点），此时凭证是**裸串**，没有键名可锚定。既有的
+# ``_TEXT_CREDENTIAL_KEYS`` 覆盖的是键名，``volc_access_key=...`` 这类会被
+# 脱敏，但 ``invalid access key 'AKLT...'`` 这种回显形态不会——实测
+# ``RedactingFormatter`` 对它原样输出。这与已存在的 ``AIza``（Google）规则
+# 是同一类：前缀可自证，因此不依赖上下文。
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "invalid access key 'AKLTZmE3YjA0YzQt'",
+        "Auth failed for access key LTAI5tAbCdEfGhIjKlMnOpQr",
+        "请求被拒绝: AKLTZmE3YjA0YzQtABCDEF",
+    ],
+)
+def test_security_redacts_bare_prefixed_credentials(value):
+    """没有键名、只有固定前缀的凭证必须被脱敏。"""
+    redacted = redact_sensitive_text(value)
+
+    assert "[REDACTED]" in redacted
+    assert "AKLTZmE3YjA0YzQt" not in redacted
+    assert "LTAI5tAbCdEfGhIjKlMnOpQr" not in redacted
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "AKLT 是火山引擎凭证的前缀",
+        "LTAI 开头的串",
+        "这是一段普通的中文说明文本",
+        "http://[::1]:8080/v1",
+    ],
+)
+def test_security_keeps_ordinary_text_with_short_prefixes(value):
+    """收紧不能误伤：前缀本身、或长度不足的串不得被改写。"""
+    assert redact_sensitive_text(value) == value
+
+
+# ── 回归：PEM 私钥正文必须脱敏 ──
+#
+# 这是本项目**自己点名要防**的一类凭证——``SENSITIVE_OPTION_KEYS`` 里同时列了
+# ``privatekey``／``sshkey``／``sshprivatekey``，Google Vertex AI 的 ADC 服务账号
+# JSON 里就带 ``private_key``。但键名规则只挡得住「键名 + 值」的形态：私钥
+# **正文**作为一段独立文本出现时没有任何锚点，会原样落进终端与日志。
+#
+# 实测两条真实泄漏路径：
+#   * ``validate_secret_free_options`` 把私钥当键名拒绝时，回显的消息里带着完整正文；
+#   * 裸 PEM 文本走 ``redact_sensitive_text`` 原样返回。
+#
+# 覆盖 BEGIN/END 成对与裸 ``BEGIN`` 两种：``safe_exception_text`` 会把消息截到
+# 240 字符，END 标记可能已被切掉，只匹配成对形态会漏。
+
+_PEM_BODY = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQ"
+
+
+@pytest.mark.parametrize(
+    "text,label",
+    [
+        (
+            f"-----BEGIN RSA PRIVATE KEY-----\n{_PEM_BODY}\n-----END RSA PRIVATE KEY-----",
+            "RSA 私钥块",
+        ),
+        (
+            f"-----BEGIN PRIVATE KEY-----\n{_PEM_BODY}\n-----END PRIVATE KEY-----",
+            "通用 PRIVATE KEY",
+        ),
+        (
+            (
+                "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n"
+                "-----END OPENSSH PRIVATE KEY-----"
+            ),
+            "OpenSSH 私钥",
+        ),
+        ("-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIB\n-----END EC PRIVATE KEY-----", "EC 私钥"),
+        (f"-----BEGIN RSA PRIVATE KEY-----\n{_PEM_BODY}", "被截断（无 END 标记）"),
+        (
+            (
+                f"ValueError: load failed:\n-----BEGIN PRIVATE KEY-----\n{_PEM_BODY}\n"
+                "-----END PRIVATE KEY-----"
+            ),
+            "在异常消息里",
+        ),
+    ],
+)
+def test_security_redacts_pem_private_key_blocks(text, label):
+    """私钥正文不得出现在脱敏结果里。"""
+    redacted = redact_sensitive_text(text)
+
+    assert _PEM_BODY not in redacted, label
+    assert "b3BlbnNzaC1rZXktdjEAAAAA" not in redacted, label
+    assert "MHcCAQEEIB" not in redacted, label
+    assert "[REDACTED PRIVATE KEY]" in redacted, label
+
+
+def test_security_redacts_pem_key_echoed_as_an_option_key():
+    """私钥作为 options 键名被拒绝时，回显的消息里不得带正文。
+
+    ``validate_secret_free_options`` 会把违规的键名放进错误消息，而消息随后经
+    ``safe_exception_text`` 展示给用户。键名本身可以显示（用户需要知道改哪一
+    处），但若键名是一段 PEM，正文必须被吃掉。
+    """
+    pem = f"-----BEGIN RSA PRIVATE KEY-----\n{_PEM_BODY}\n-----END RSA PRIVATE KEY-----"
+
+    with pytest.raises(ValueError) as excinfo:
+        validate_secret_free_options({pem: 1}, "Test")
+
+    message = safe_exception_text(excinfo.value)
+    assert _PEM_BODY not in message
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "这是一个普通的 Markdown 文档，讲的是加密与密钥管理。",
+        "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----",
+        "PRIVATE KEY 这个词单独出现不该被吃掉",
+        "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----",
+    ],
+)
+def test_security_keeps_non_private_pem_and_ordinary_text(text):
+    """收紧不能误伤：证书、公钥与普通文本不得被改写。
+
+    只匹配 ``PRIVATE KEY``，因此 ``CERTIFICATE`` 与 ``PUBLIC KEY`` 照常保留——
+    它们不是凭证，脱敏掉会让用户拿不到有用的上下文。
+    """
+    assert redact_sensitive_text(text) == text

@@ -6,8 +6,9 @@ from typing import Any
 from src.providers.__base__.model_provider import LargeLanguageModel
 from src.runtime.contracts import SessionConfig
 from src.services.retrieval_service import RetrievalService
+from src.ui.display_utils import document_content, document_source
 from src.utils.log_manager import get_chat_logger
-from src.utils.security import redact_sensitive_text
+from src.utils.security import safe_exception_text
 
 
 class ChatService:
@@ -31,7 +32,7 @@ class ChatService:
             async for chunk in self.llm_model.ainvoke(**invoke_kwargs):
                 response += chunk
         except Exception as exc:
-            self.logger.error("异步意图识别失败: %s", redact_sensitive_text(str(exc)))
+            self.logger.error("异步意图识别失败: %s", safe_exception_text(exc))
             raise RuntimeError("意图识别失败，无法继续检索。") from exc
         intent = response.strip()
         if not intent:
@@ -60,11 +61,21 @@ class ChatService:
 
     @staticmethod
     def _build_prompt(user_input: str, intent: str, documents: list[dict[str, Any]]) -> str:
-        context = "\n".join(
-            f"来源: {(doc.get('metadata') or {}).get('source') or '未知来源'}\n"
-            f"内容: {doc.get('page_content', '')}"
-            for doc in documents
-        )
+        # 字段形态统一由 display_utils 的助手收敛。检索结果可以来自任何
+        # ``VectorStoreBase`` 实现——``FaissStore`` 会在载入期校验并归一化，
+        # 第三方 store 不会。两处后果：``metadata`` 非映射时抛
+        # ``AttributeError``；更隐蔽的是 ``page_content=None`` 不抛错，而是把
+        # 字面量 ``内容: None`` 当作一条真实知识喂给模型。
+        #
+        # 内容缺失时整条跳过而不是留一行空「内容:」：向模型提交一条没有正文的
+        # 「知识」只会增加噪声，还可能让它顺着回答。
+        entries = []
+        for document in documents:
+            content = document_content(document, "")
+            if not content:
+                continue
+            entries.append(f"来源: {document_source(document, '未知来源')}\n内容: {content}")
+        context = "\n".join(entries)
         if context:
             return (
                 "你是一个智能客服。根据知识回答。\n"

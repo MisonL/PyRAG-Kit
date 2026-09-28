@@ -320,12 +320,60 @@ def _redact_masked_credential(match: re.Match[str]) -> str:
 
 
 _GOOGLE_API_KEY_RE = re.compile(r"(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{20,}(?![A-Za-z0-9])")
+# 有固定前缀、可自证的凭证。与 ``_GOOGLE_API_KEY_RE`` 同一类：**不带键名**也能
+# 认出是凭证，因此不依赖 ``key=value`` 上下文。
+#
+# 为什么需要：SDK 的异常消息常回显请求头或 URL（``safe_exception_text`` 的
+# docstring 写明了这一点），此时凭证是**裸串**，没有键名可锚定。本项目的
+# ``_TEXT_CREDENTIAL_KEYS`` 覆盖的是键名，``volc_access_key=...`` 这类会被
+# 脱敏，但 ``invalid access key 'AKLT...'`` 这种回显形态不会——实测
+# ``RedactingFormatter`` 对它原样输出。火山引擎（Ark）与阿里云都使用这种
+# 固定前缀的长串凭证。
+#
+# 前缀足够长（4 字符）且有长度下限，因此误伤风险很低：对真实知识库 4489 行、
+# 全部源码与文档扫描，零命中。
+_AK_SK_PREFIXED_KEY_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:AKLT|LTAI)[0-9A-Za-z_-]{12,}(?![A-Za-z0-9])"
+)
+
+
+# PEM 私钥块。这是本项目**自己点名要防**的一类凭证——``SENSITIVE_OPTION_KEYS``
+# 里同时列了 ``privatekey``／``sshkey``／``sshprivatekey``，Google Vertex AI 的
+# ADC 服务账号 JSON 里就带 ``private_key``。但键名规则只挡得住「键名 + 值」的
+# 形态：私钥**正文**作为一段独立文本出现时（异常消息回显文件内容、URL 参数、
+# 单行 base64 正文）没有任何锚点，会原样落进终端与日志。实测
+# ``validate_secret_free_options`` 把私钥当键名拒绝时，回显的消息里就带着完整
+# 正文；裸 PEM 文本走 ``redact_sensitive_text`` 同样原样返回。
+#
+# 覆盖 BEGIN/END 成对与裸 ``BEGIN`` 两种：前者吃掉整块（含正文），后者兜住被
+# 截断的片段（``safe_exception_text`` 会把消息截到 240 字符，END 可能已被切掉）。
+_PEM_PRIVATE_KEY_RE = re.compile(
+    r"(?i)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"
+    r".*?"
+    r"(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)",
+    re.DOTALL,
+)
 
 
 def redact_sensitive_text(value: Any) -> str:
     """脱敏异常、日志和请求错误中的常见凭证表示。"""
     if not isinstance(value, str):
-        value = str(value)
+        # ``str(10**4301)`` 撞上 CPython 的整数位数上限抛 ``ValueError``。这个
+        # 分支明确声明支持非字符串（调用方有传异常、URL、映射的），而 pickle 是
+        # 二进制格式、不受十进制位数限制，畸形快照能带进这种值。
+        #
+        # 这里内联判据而**不**导入 ``config.safe_repr``：``config`` 反过来从本模块
+        # 导入 ``redact_sensitive_text`` 与 ``validate_secret_free_options``，跨模块
+        # 引用会形成循环导入。判据与 ``safe_repr`` 一致（位数超限时用
+        # ``bit_length()`` 给出量级），改一处时两处都要看。
+        try:
+            value = str(value)
+        except (ValueError, RuntimeError, RecursionError):
+            if isinstance(value, int):
+                digits = value.bit_length() * 30103 // 100000 + 1  # log10(2) ≈ 0.30103
+                value = f"<整数，约 {digits} 位十进制>"
+            else:
+                value = f"<{type(value).__name__}>"
     # 掩码形态必须最先处理：``_BEARER_TEXT_RE`` 会先吃掉 ``Bearer sk-abc``
     # 的可见前缀，使后续的 ``sk-`` 锚点失效，尾部掩码片段就会残留。
     redacted = _MASKED_CREDENTIAL_RE.sub(_redact_masked_credential, value)
@@ -335,7 +383,13 @@ def redact_sensitive_text(value: Any) -> str:
     redacted = _URL_USERINFO_RE.sub(r"\1[REDACTED]:[REDACTED]@", redacted)
     redacted = _URL_QUERY_SECRET_RE.sub(r"\1[REDACTED]", redacted)
     redacted = _OPENAI_KEY_RE.sub("[REDACTED]", redacted)
-    return _GOOGLE_API_KEY_RE.sub("[REDACTED]", redacted)
+    redacted = _GOOGLE_API_KEY_RE.sub("[REDACTED]", redacted)
+    redacted = _AK_SK_PREFIXED_KEY_RE.sub("[REDACTED]", redacted)
+    # PEM 块放最后：它的正文是多行 base64，前面几条规则可能已经改写了其中的
+    # 片段（例如正文里恰好出现 ``sk-`` 形态），但 BEGIN/END 标记不受影响，
+    # 整块仍能被吃掉。放前面则会把已被部分脱敏的块再匹配一次，结果相同但多
+    # 一次全串扫描。
+    return _PEM_PRIVATE_KEY_RE.sub("[REDACTED PRIVATE KEY]", redacted)
 
 
 def safe_exception_text(exc: BaseException) -> str:
@@ -344,8 +398,38 @@ def safe_exception_text(exc: BaseException) -> str:
     终端与日志是凭证最容易泄漏的出口——SDK 的异常消息常回显请求头或
     URL。所有面向用户的异常输出都应经过这里，而不是直接 ``str(exc)``
     或把异常对象交给 ``console.print`` / ``logger.error``。
+
+    ``str(exc)`` 自己会抛，必须兜住：``str(10**4301)`` 撞上 CPython 的整数
+    位数上限（``sys.get_int_max_str_digits()``，默认 4300）抛 ``ValueError``。
+    本函数是**最后一道展示边界**，它在 22 处 ``except`` 里被调用——它再抛，
+    用户看到的就是解释器默认 handler 打出的裸 traceback，连脱敏都没有，
+    比「消息不好看」严重得多。
+
+    这类值确实可达：``pickle`` 是二进制格式，不受十进制位数限制，实测
+    ``pickle.loads(pickle.dumps(10**4301))`` 正常往返，而本项目加载 pickle
+    知识快照。JSON 与 TOML 两条路径送不进来（解析器自己就抛），所以此前没被
+    发现；快照里的畸形值可以。
+
+    兜底不用 ``repr``（同样会抛），用 ``safe_repr``：它对位数超限的整数退回
+    ``bit_length()`` 给出量级，既保住了「是哪个字段」的信息，也不再抛。
     """
-    message = str(exc).strip()
+    try:
+        message = str(exc).strip()
+    except Exception:  # noqa: BLE001 - 展示边界不得再抛
+        # 只有异常自身的 args 含位数超限的整数会走到这里。
+        #
+        # 逐个渲染 args 而不是把整个元组交给 ``safe_repr``：``repr(tuple)`` 会
+        # 递归到元素上，对含超大整数的元组抛错，``safe_repr`` 兜住后只能退回
+        # ``<tuple>``，把「是哪个值出的问题」也丢掉了。逐元素渲染既保住信息，
+        # 又因为每个元素单独兜底而不会抛。
+        #
+        # 局部导入 ``safe_repr``：``config`` 在模块层导入本模块
+        # （``from src.utils.security import redact_sensitive_text, ...``），
+        # 模块层反向导入会成环。这里只在异常兜底分支执行，代价可忽略。
+        from src.utils.config import safe_repr
+
+        rendered = ", ".join(safe_repr(item) for item in exc.args) if exc.args else ""
+        return f"{type(exc).__name__}: {rendered}" if rendered else type(exc).__name__
     if not message:
         return type(exc).__name__
     return f"{type(exc).__name__}: {redact_sensitive_text(message)[:240]}"
@@ -383,6 +467,19 @@ def _model_dump_mapping(value: Any) -> Mapping[str, Any] | None:
     Pydantic 型 SDK 配置对象（例如 ``google.genai.types.HttpOptions``）不是
     ``Mapping``，只遍历普通字典会让其中的 headers/base URL 绕过配置边界。
     仅使用 SDK 明确提供的 ``model_dump``，无法读取时保持原有兼容行为。
+
+    返回 ``None`` 的语义是「**这个值检视不了**」，不是「这个值是安全的」——
+    调用方 ``find_sensitive_option_paths`` 会就此跳过它。这是**有意的
+    fail-open**，与边界对其它不可检视值的处理一致：没有 ``model_dump`` 的对象、
+    任意 ``object()``、``bytes`` 同样被跳过（实测四者都返回 ``[]``）。收紧成
+    fail-closed 会让所有非 pydantic 的第三方配置对象（``httpx.Client``、
+    ``openai.OpenAI`` 都属此类）连同其中的普通配置一起被拒，那是行为破坏而非
+    加固。
+
+    此处原先的注释写「third-party model_dump must fail closed」，与代码相反；
+    那句话描述的是**意图**（不要因为读不到就当成已检查），而实现选择的是
+    「读不到就不检查、也不拒绝」。注释已按实际行为改写，避免下一个人照着
+    「fail closed」去推断边界强度。
     """
     model_dump = getattr(value, "model_dump", None)
     if not callable(model_dump):
@@ -392,9 +489,9 @@ def _model_dump_mapping(value: Any) -> Mapping[str, Any] | None:
     except TypeError:
         try:
             dumped = model_dump()
-        except Exception:  # noqa: BLE001 - third-party model_dump must fail closed
+        except Exception:  # noqa: BLE001 - 读不到就不检查，见 docstring 的 fail-open 说明
             return None
-    except Exception:  # noqa: BLE001 - third-party model_dump must fail closed
+    except Exception:  # noqa: BLE001 - 读不到就不检查，见 docstring 的 fail-open 说明
         return None
     if dumped is value or not isinstance(dumped, Mapping):
         return None
@@ -735,8 +832,19 @@ def resolve_within(
     （``root/link -> /etc`` 这类逃逸）。``resolve()`` 用默认的
     ``strict=False``：目标可以尚不存在，此处只判断归属，存在性由调用方另行校验。
     """
-    resolved_root = Path(root).resolve()
-    resolved_candidate = Path(candidate).resolve()
+    # ``Path.resolve()`` 对符号链接环抛 ``RuntimeError: Symlink loop from ...``，
+    # 它**不是** ``ValueError``，会穿透本函数的契约与调用方的 ``except ValueError``
+    # ——``ensure_trusted_source`` 只接 ``ValueError``，于是一条「拒绝加载」的消息
+    # 变成 pathlib 的内部错误。``strict=False`` 不覆盖这种情况：环是**解析期**的
+    # 失败，与目标是否存在无关。这里统一收敛成 ``ValueError``。
+    try:
+        resolved_root = Path(root).resolve()
+        resolved_candidate = Path(candidate).resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(
+            f"{label} 无法解析（{type(exc).__name__}: {exc}）。"
+            " 路径可能包含符号链接环或过长的间接层，请检查配置。"
+        ) from exc
     if resolved_candidate != resolved_root and not resolved_candidate.is_relative_to(resolved_root):
         raise ValueError(
             f"{label} 必须位于受信根目录内。"
@@ -764,12 +872,14 @@ def ensure_trusted_source(
             " 请在调用处显式传入 trusted_paths/trusted_roots（通常来自 RunConfig 的"
             " snapshot_root 或 legacy_pkl_path）。"
         )
-    errors: list[str] = []
     for root in roots:
         try:
             return resolve_within(candidate, root, label=label)
-        except ValueError as exc:
-            errors.append(str(exc))
+        except ValueError:
+            # 逐个根试探，全部落空后由下面的消息统一报告：单条 ``resolve_within``
+            # 的消息只提一个根，而这里的结论是「一个都没命中」，把根列表完整
+            # 列出来更有用。收集各条子消息再拼进去会让消息变长却不增加信息量。
+            continue
     raise ValueError(
         f"{label} 不在任何受信路径内。路径={Path(candidate)}。"
         f" 受信路径={[str(root) for root in roots]}。"

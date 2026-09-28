@@ -12,9 +12,11 @@ from src.providers.__base__.model_provider import (
     LargeLanguageModel,
     TextEmbeddingModel,
     _normalize_responses_native_item,
+    _responses_content_part,
     normalize_chat_messages,
     normalize_messages,
     normalize_responses_input,
+    raise_for_stream_error_event,
 )
 from src.providers.anthropic import AnthropicProvider
 from src.providers.factory import ModelProviderFactory
@@ -7534,3 +7536,635 @@ def test_ark_responses_accepts_ark_only_fields():
     )
 
     assert converted[0]["image_pixel_limit"] == {"m": 1}
+
+
+# ---------------------------------------------------------------------------
+# 客户端级 max_retries
+# ---------------------------------------------------------------------------
+#
+# ``timeout`` 与 ``max_retries`` 是 openai SDK 的**客户端构造参数**，本项目把它们
+# 从 ``options`` 直接透传给 ``openai.OpenAI(...)``（见 ``_get_client``）。SDK 自己
+# 不做任何校验，于是 ``options`` 里的取值可以造成两类失败：
+#
+# 1. ``max_retries`` 为**负数**：SDK 的重试循环是 ``range(max_retries + 1)``，
+#    负数让循环体一次都不执行，请求根本没发出去，最后抛的是 SDK 内部的
+#    ``AssertionError: could not resolve response (should never happen)``——
+#    实测 ``max_retries=-1`` 时请求数为 **0**。
+# 2. ``max_retries`` 为**超大值**（``10**400`` 这类，``config.toml`` 的 TOML
+#    整数无上界）：等价于无上限重试，网络故障下会一直重试下去。
+#
+# 非整数（``"abc"``／``1.5``／``True``）则是第三种：SDK 把它们存进
+# ``self.max_retries``，直到真正重试时才在 ``max_retries - retries_taken`` 上
+# 抛 ``TypeError``，报错点离配置处很远。
+#
+# Ark 渠道的 ``_normalize_client_options`` 早就校验了 ``max_retries``（要求
+# ``>= 0`` 的整数），OpenAI 兼容渠道漏了同一道。这里补齐，并给上界——重试次数
+# 是配置项，不是可以取到天文数字的量。
+_CLIENT_OPTION_PROVIDER = "qwen"
+_CLIENT_OPTION_SETTINGS = SimpleNamespace(
+    qwen_api_key="key",
+    qwen_base_url="https://qwen.invalid/v1",
+)
+
+
+def _build_client_option_provider(**options):
+    return OpenAICompatibleProvider(
+        "demo", _CLIENT_OPTION_PROVIDER, settings=_CLIENT_OPTION_SETTINGS, options=options
+    )
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        pytest.param(-1, id="negative"),
+        pytest.param(-(10**400), id="negative-beyond-double-range"),
+        pytest.param(10**400, id="400digits-over-upper-bound"),
+        pytest.param(10**4301, id="4301digits-over-int-max-str-digits"),
+        pytest.param(True, id="bool"),
+        pytest.param(1.5, id="float"),
+        pytest.param("abc", id="non-numeric-string"),
+        pytest.param("", id="empty-string"),
+    ],
+)
+def test_openai_compatible_client_max_retries_must_be_bounded_non_negative_int(bad_value):
+    """``options.max_retries`` 必须在构造期收敛成有上界的非负整数。"""
+    with pytest.raises(ValueError, match="max_retries"):
+        _build_client_option_provider(max_retries=bad_value)
+
+
+@pytest.mark.parametrize(
+    ("good_value", "expected"),
+    [
+        (0, 0),
+        (1, 1),
+        (10, 10),
+        (100, 100),
+        # 数字字符串必须继续接受：``.env`` 与 TOML 来源本来就以字符串形态到达，
+        # 且 Ark 渠道的同一套判据也接受 ``"5"``。
+        ("5", 5),
+        (5.0, 5),
+    ],
+)
+def test_openai_compatible_client_max_retries_accepts_valid_values(good_value, expected):
+    provider = _build_client_option_provider(max_retries=good_value)
+    assert provider._client_options()["max_retries"] == expected
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        pytest.param(-1, id="negative"),
+        pytest.param(0, id="zero"),
+        pytest.param(10**400, id="400digits-beyond-double-range"),
+        pytest.param(10**4301, id="4301digits-over-int-max-str-digits"),
+        pytest.param(True, id="bool"),
+        pytest.param("abc", id="non-numeric-string"),
+    ],
+)
+def test_openai_compatible_client_timeout_must_be_finite_positive(bad_value):
+    """``options.timeout`` 是客户端构造参数，同样要在构造期拒绝非法取值。
+
+    原实现把 ``timeout`` 原样透传给 ``openai.OpenAI``，而 SDK 不校验：实测
+    ``timeout="abc"``、``timeout=-1``、``timeout=0`` 全部被接受并存进
+    ``client.timeout``，直到 httpx 层才以形态各异的错误暴露。
+    """
+    with pytest.raises(ValueError, match="timeout"):
+        _build_client_option_provider(timeout=bad_value)
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        pytest.param(101, id="just-over-upper-bound"),
+        pytest.param(10**400, id="400digits-over-upper-bound"),
+        pytest.param(10**4301, id="4301digits-over-int-max-str-digits"),
+        pytest.param(-1, id="negative"),
+        pytest.param(True, id="bool"),
+        pytest.param(1.5, id="float"),
+        pytest.param("abc", id="non-numeric-string"),
+    ],
+)
+def test_ark_client_max_retries_must_be_bounded_non_negative_int(bad_value):
+    """Ark 的 ``max_retries`` 与 OpenAI 兼容渠道走同一套判据。
+
+    此前的内联实现只要求「``>= 0`` 的整数」，**没有上界**：实测
+    ``max_retries = 10**400`` 被原样接受并传给 Ark SDK，而 SDK 的重试循环按该值
+    决定次数，等价于无限重试。
+    """
+    with pytest.raises(ValueError, match="max_retries"):
+        VolcengineProvider._normalize_client_options({"max_retries": bad_value})
+
+
+@pytest.mark.parametrize(
+    ("good_value", "expected"),
+    [(0, 0), (1, 1), (100, 100), ("5", 5), (5.0, 5)],
+)
+def test_ark_client_max_retries_accepts_valid_values(good_value, expected):
+    normalized = VolcengineProvider._normalize_client_options({"max_retries": good_value})
+    assert normalized["max_retries"] == expected
+
+
+# ---------------------------------------------------------------------------
+# Anthropic 的客户端级 timeout / max_retries
+# ---------------------------------------------------------------------------
+#
+# 与 OpenAI 兼容渠道同一类问题：``timeout``／``max_retries`` 被原样透传给
+# ``anthropic.Anthropic(...)``，SDK 不做任何校验。Anthropic SDK 的重试循环同样是
+# ``for retries_taken in range(max_retries + 1)``，因此 ``max_retries=-1`` 时循环体
+# 一次都不执行——实测 HTTP 请求数为 **0**，最终抛
+# ``RuntimeError: could not resolve response (should never happen)``。
+_ANTHROPIC_CLIENT_OPTION_SETTINGS = SimpleNamespace(anthropic_api_key="sk-ant-test")
+
+
+def _patch_anthropic_settings(monkeypatch) -> None:
+    """把 ``get_settings`` 打到 ``AnthropicProvider`` 真正读取的那个模块字典上。
+
+    不能用字符串形式 ``monkeypatch.setattr("src.providers.anthropic.get_settings", ...)``：
+    ``tests/providers/test_factory.py`` 会从 ``sys.modules`` 里删除
+    ``src.providers.anthropic`` 再重新导入，于是字符串形式解析到的是**新**模块对象，
+    而 ``AnthropicProvider.__init__`` 仍从**旧**模块字典取 ``get_settings``——patch
+    落空，构造器读到真实配置（无 key）后抛 ``ANTHROPIC_API_KEY is required``。
+    单独跑本文件时不会触发，只有全量运行才暴露。
+    """
+    module_globals = AnthropicProvider.__init__.__globals__
+    monkeypatch.setitem(module_globals, "get_settings", lambda: _ANTHROPIC_CLIENT_OPTION_SETTINGS)
+
+
+def _build_anthropic_provider(**options):
+    return AnthropicProvider("claude-sonnet-4-6", options=options or None)
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        pytest.param(101, id="just-over-upper-bound"),
+        pytest.param(10**400, id="400digits-over-upper-bound"),
+        pytest.param(10**4301, id="4301digits-over-int-max-str-digits"),
+        pytest.param(-1, id="negative"),
+        pytest.param(True, id="bool"),
+        pytest.param(1.5, id="float"),
+        pytest.param("abc", id="non-numeric-string"),
+    ],
+)
+def test_anthropic_client_max_retries_must_be_bounded_non_negative_int(monkeypatch, bad_value):
+    _patch_anthropic_settings(monkeypatch)
+    with pytest.raises(ValueError, match="max_retries"):
+        _build_anthropic_provider(max_retries=bad_value)
+
+
+@pytest.mark.parametrize(
+    ("good_value", "expected"),
+    [(0, 0), (1, 1), (100, 100), ("5", 5)],
+)
+def test_anthropic_client_max_retries_accepts_valid_values(monkeypatch, good_value, expected):
+    _patch_anthropic_settings(monkeypatch)
+    provider = _build_anthropic_provider(max_retries=good_value)
+    assert provider._normalized_client_options["max_retries"] == expected
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        pytest.param(-1, id="negative"),
+        pytest.param(0, id="zero"),
+        pytest.param(10**400, id="400digits-beyond-double-range"),
+        pytest.param(10**4301, id="4301digits-over-int-max-str-digits"),
+        pytest.param(True, id="bool"),
+        pytest.param("abc", id="non-numeric-string"),
+    ],
+)
+def test_anthropic_client_timeout_must_be_finite_positive(monkeypatch, bad_value):
+    _patch_anthropic_settings(monkeypatch)
+    with pytest.raises(ValueError, match="timeout"):
+        _build_anthropic_provider(timeout=bad_value)
+
+
+def test_anthropic_client_accepts_httpx_timeout_object(monkeypatch):
+    """``httpx.Timeout`` 形态必须保留——SDK 接受它，且无法用 TOML 表达。"""
+    import httpx2
+
+    _patch_anthropic_settings(monkeypatch)
+    provider = _build_anthropic_provider(timeout=httpx2.Timeout(5.0))
+    assert hasattr(provider._normalized_client_options["timeout"], "connect")
+
+
+# ── 回归：客户端 timeout 的**上界**与派生值 ──
+#
+# 四个渠道原本只判「有限正数」，没有上界。失效点不在超时值本身，而在派生值：
+# Google 是唯一把秒换算成毫秒再交给 SDK 的渠道（``_build_http_options`` 的
+# ``int(timeout * 1000)``），超过 ``DBL_MAX/1000`` 的秒数让该派生抛
+# ``OverflowError``——它是 ``ArithmeticError`` 的子类，**不是** ``ValueError``，
+# 穿透项目全部以 ``ValueError`` 为契约的 handler，以裸 traceback 终止会话。
+# 实测 ``config.toml`` 写 ``timeout = 1e306`` 即可复现：配置加载成功、provider
+# 构造成功，首次提问才炸。
+
+_BEYOND_MILLISECOND_RANGE = [
+    pytest.param(1e306, id="306exponent"),
+    pytest.param(1e308, id="308exponent"),
+    pytest.param(86_401.0, id="just-over-one-day"),
+]
+
+
+@pytest.mark.parametrize("bad_value", _BEYOND_MILLISECOND_RANGE)
+def test_google_request_timeout_has_upper_bound(bad_value):
+    """``options.timeout`` 必须在上界内，否则毫秒派生值会抛 OverflowError。"""
+    provider = object.__new__(GoogleProvider)
+    provider._model_name = "gemini-test"
+    provider._options = {}
+    with pytest.raises(ValueError, match="不能超过"):
+        provider._build_generation_config("system", None, 0.2, timeout=bad_value)
+
+
+@pytest.mark.parametrize("bad_value", _BEYOND_MILLISECOND_RANGE)
+def test_openai_compatible_client_timeout_has_upper_bound(bad_value):
+    with pytest.raises(ValueError, match="不能超过"):
+        _build_client_option_provider(timeout=bad_value)
+
+
+@pytest.mark.parametrize("bad_value", _BEYOND_MILLISECOND_RANGE)
+def test_anthropic_client_timeout_has_upper_bound(monkeypatch, bad_value):
+    _patch_anthropic_settings(monkeypatch)
+    with pytest.raises(ValueError, match="不能超过"):
+        _build_anthropic_provider(timeout=bad_value)
+
+
+def test_ark_client_timeout_has_upper_bound():
+    with pytest.raises(ValueError, match="不能超过"):
+        VolcengineProvider._normalize_client_options({"timeout": 1e306})
+
+
+def test_google_http_options_timeout_rejects_beyond_millisecond_range():
+    """``options.http_options.timeout`` 是毫秒，同样需要上界。
+
+    此前判据只要求「正整数毫秒」，实测 ``1e308`` 能通过，到真实
+    ``genai.Client(...)`` 构造时才抛 pydantic 的
+    ``Unable to parse input string as an integer``——错误消息与 Google 配置
+    毫无关联。
+    """
+    with pytest.raises(ValueError, match="正整数毫秒"):
+        GoogleProvider._validate_http_options({"timeout": 1e308})
+
+
+@pytest.mark.parametrize("good_value", [1, 30.0, "60"])
+def test_client_timeout_accepts_values_within_bound(good_value):
+    """上界之内的正常取值必须继续接受（Ark 渠道的字符串形态也在其中）。"""
+    assert VolcengineProvider._normalize_client_options({"timeout": good_value})["timeout"] > 0
+
+
+# ── 回归：Ark ``count_tokens`` 与其余七个 token 计数入口同契约 ──
+#
+# 八个 provider 的 token 计数入口都已改用 ``require_token_count``，只有 Ark 的
+# 同步/异步 ``count_tokens`` 漏了，写的是 ``int(field(item, "total_tokens", 0))``：
+# ``"abc"`` 抛裸 ``ValueError``、``None`` 抛裸 ``TypeError``、位数超限的数字串抛
+# 与 token 计数无关的位数错误，且消息里连字段名都没有；``0`` 默认值还把
+# 「响应不完整」静默算成「0 个 token」。
+
+
+def _ark_provider_with_tokenization_response(items):
+    """构造只带假 tokenization 资源的 Ark provider。"""
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "ark-model"
+    provider._options = {}
+    provider._get_client = lambda: SimpleNamespace(
+        tokenization=SimpleNamespace(
+            create=lambda **kwargs: SimpleNamespace(data=items),
+        )
+    )
+    return provider
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        pytest.param("abc", id="non-numeric-string"),
+        pytest.param(None, id="missing-field"),
+        pytest.param(1.5, id="fractional"),
+        pytest.param(-5, id="negative"),
+        pytest.param("9" * 4301, id="4301digits-over-int-max-str-digits"),
+    ],
+)
+def test_ark_count_tokens_reports_field_name_for_bad_values(bad_value):
+    provider = _ark_provider_with_tokenization_response([SimpleNamespace(total_tokens=bad_value)])
+    with pytest.raises(RuntimeError, match="total_tokens"):
+        provider.count_tokens("hello")
+
+
+def test_ark_count_tokens_sums_valid_values():
+    provider = _ark_provider_with_tokenization_response(
+        [SimpleNamespace(total_tokens=3), SimpleNamespace(total_tokens=4)]
+    )
+    assert provider.count_tokens("hello") == 7
+
+
+# ── 回归：不可哈希取值不得让集合成员守卫抛 TypeError ──
+#
+# ``field(x, "type") in {"a", "b"}`` 对 ``list``/``dict`` 抛
+# ``TypeError: unhashable type``，而调用方按 ``ValueError``/``RuntimeError``
+# 分类错误。这些值来自网关 JSON：openai SDK 对 SSE chunk 的未知顶层字段用
+# ``extra="allow"`` 原样保留，实测一个 ``{"type": ["error"]}`` 就能构造出来，
+# 于是「网关返回了形态异常的事件」变成裸 ``TypeError``。
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [pytest.param(["error"], id="list"), pytest.param({"a": 1}, id="dict")],
+)
+def test_responses_stream_event_type_must_not_raise_type_error(bad_value):
+    """非字符串 ``type`` 按「未知事件」处理，不得抛 TypeError。"""
+    assert raise_for_stream_error_event({"type": bad_value}, "openai") is None
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [pytest.param(["auto"], id="list"), pytest.param({"a": 1}, id="dict")],
+)
+@pytest.mark.parametrize("part_type", ["input_image", "input_file"])
+def test_responses_content_part_detail_must_not_raise_type_error(part_type, bad_value):
+    """``detail`` 非字符串时必须报 ``ValueError``，而不是 ``TypeError``。"""
+    part = {"type": part_type, "detail": bad_value}
+    if part_type == "input_image":
+        part["image_url"] = "https://x/y.png"
+    else:
+        part["file_data"] = "data:x"
+    with pytest.raises(ValueError, match="detail"):
+        _responses_content_part(part, "input[0]", provider="openai")
+
+
+def test_responses_stream_delta_survives_unhashable_event_type():
+    """网关 SSE chunk 的 ``type`` 是 list 时不得抛 TypeError。
+
+    openai SDK 对未知顶层字段用 ``extra="allow"`` 原样保留，因此
+    ``{"type": ["error"]}`` 会以 list 形态到达 ``_stream_delta``。
+    """
+    chunk = SimpleNamespace(type=["error"], delta="")
+    assert OpenAICompatibleProvider._stream_delta(chunk) == ""
+
+
+# ── 回归：错误消息插值不得因超大整数改抛位数错误 ──
+#
+# ``f"{10**4300}"`` 抛 ``ValueError: Exceeds the limit (4300 digits)``。
+# 这些字段（``status``／``code``／``message``）来自网关 JSON，而 openai SDK 能
+# 解析出 4300 位的整数——于是「网关返回了业务错误」变成「整数转字符串超限」。
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        pytest.param("status", id="status"),
+        pytest.param("code", id="code"),
+        pytest.param("error_code", id="error_code"),
+        pytest.param("message", id="message"),
+    ],
+)
+def test_chat_response_error_message_survives_huge_integer_field(field_name):
+    response = SimpleNamespace(choices=None, **{field_name: 10**4300})
+    with pytest.raises(RuntimeError, match="Chat Completions"):
+        OpenAICompatibleProvider._raise_for_chat_response_error(response)
+
+
+def test_chat_response_error_status_still_compares_numerically():
+    """``status`` 仍须参与 ``>= 400`` 的数值比较，不能被收敛成空串。"""
+    response = SimpleNamespace(choices=None, status=503)
+    with pytest.raises(RuntimeError, match="status=503"):
+        OpenAICompatibleProvider._raise_for_chat_response_error(response)
+
+
+# ── 回归：Embedding ``options.dimensions`` 必须校验 ──
+#
+# 这个值从 ``config.toml`` 直达请求体，此前**完全没有校验**：``-1``／``0``／
+# ``"abc"``／``1.5``／``True`` 全部原样发给远端；``10**4301`` 在 ``json.dumps``
+# 编码请求体时才抛位数错误。项目里 ``_MAX_EMBEDDING_DIMENSION`` 早就是这个量
+# 的上界（``local_hash`` 与 ``embedding_service`` 都在用）。
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        pytest.param(-1, id="negative"),
+        pytest.param(0, id="zero"),
+        pytest.param(10**400, id="400digits-over-upper-bound"),
+        pytest.param(10**4301, id="4301digits-over-int-max-str-digits"),
+        pytest.param("abc", id="non-numeric-string"),
+        pytest.param(1.5, id="float"),
+        pytest.param(True, id="bool"),
+    ],
+)
+def test_embedding_dimensions_option_is_validated(bad_value):
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._options = {"dimensions": bad_value}
+    provider._provider = "openai"
+    with pytest.raises(ValueError, match="dimensions"):
+        provider._embedding_options()
+
+
+def test_embedding_dimensions_option_accepts_valid_value():
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._options = {"dimensions": 1536}
+    provider._provider = "openai"
+    assert provider._embedding_options()["dimensions"] == 1536
+
+
+# ── 回归：Google 整数型生成参数必须校验 ──
+#
+# 此前只做键名白名单，取值原样透传给 ``types.GenerateContentConfig``：实测
+# ``options.max_output_tokens = 10**400`` 时构造与调用都成功，请求体里就带着
+# 那个 401 位整数发给服务端（MockTransport 抓包确认）；``candidate_count``
+# 的 ``-1``／``0`` 同样静默通过。
+
+
+@pytest.mark.parametrize("field_name", ["max_output_tokens", "candidate_count"])
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        pytest.param(-1, id="negative"),
+        pytest.param(0, id="zero"),
+        pytest.param(10**400, id="400digits-over-upper-bound"),
+        pytest.param(10**4301, id="4301digits-over-int-max-str-digits"),
+        pytest.param(1.5, id="float"),
+        pytest.param(True, id="bool"),
+    ],
+)
+def test_google_generation_options_are_validated(field_name, bad_value):
+    provider = object.__new__(GoogleProvider)
+    provider._options = {field_name: bad_value}
+    with pytest.raises(ValueError, match=field_name):
+        provider._generation_options()
+
+
+def test_google_generation_options_accept_valid_values():
+    provider = object.__new__(GoogleProvider)
+    provider._options = {"max_output_tokens": 4096, "candidate_count": 1}
+    values = provider._generation_options()
+    assert values == {"max_output_tokens": 4096, "candidate_count": 1}
+
+
+# ── 回归：Ark Classification 的动态资源路径必须与 Facade 同约束 ──
+#
+# AGENTS.md 要求 Ark Classification 资源「需通过显式 Facade/入口调用，不能把
+# 缺少资源挂载静默当成成功」。Facade 侧做对了（``_get_classification_resource``
+# 在 SDK 未挂载时抛带指引的 ``NotImplementedError``），但动态路径
+# ``resources.classification.create(...)`` 既不过 Facade、也不做参数白名单，
+# 实测 ``恶意字段=1`` 一路放行，最终拿到 SDK 内部的
+# ``AttributeError: 'Ark' object has no attribute 'classification'``。
+
+
+def _ark_provider_with_classification_resource():
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "ark-model"
+    provider._options = {}
+    provider._classification_resource = SimpleNamespace(create=lambda **kwargs: kwargs)
+    provider._get_client = lambda: SimpleNamespace()
+    return provider
+
+
+def test_ark_classification_dynamic_path_shares_facade_kwargs_whitelist():
+    provider = _ark_provider_with_classification_resource()
+    with pytest.raises(ValueError, match="Classification"):
+        provider._require_provider_resource(
+            "volcengine.classification.create",
+            {"unknown": 1},
+        )
+
+
+def test_ark_classification_dynamic_path_accepts_facade_supported_kwargs():
+    provider = _ark_provider_with_classification_resource()
+    # 不抛错即通过；具体资源可用性由 SDK 决定，本测试只固定「不受门禁误伤」。
+    provider._require_provider_resource(
+        "volcengine.classification.create",
+        {"user": "u1"},
+    )
+
+
+# ── 回归：诊断入口对形态异常的参数必须给可读消息，而不是裸的整数转换错误 ──
+#
+# ``protocol_status`` 与 ``capability_report`` 是公开的诊断 API（配置界面与
+# 排障工具会调），参数来自调用方而非 ``Settings``——``ModelDetail.protocol``
+# 有 validator，但这两个入口收的是**裸字符串**，没有任何校验。
+#
+# 两处都把取值直接喂给 ``str(...).strip().lower()`` 做协议名归一化：
+# ``10**4301`` 撞上 CPython 的整数位数上限，抛的是
+# ``ValueError: Exceeds the limit (4300 digits) for integer string conversion``
+# ——既没有「哪个参数错了」，也没有「可选值是什么」，用户拿到的是与协议诊断
+# 毫无关系的整数转换错误。同一文件的其它入口（``_normalize_verified_protocols``
+# 的非字符串分支）早已给出带指引的消息，这里补齐一致性。
+#
+# ``server_verified_protocols`` 里的取值同理：它是 ``options`` 里的任意值，
+# 而 ``validate_secret_free_options`` 只查敏感键名、不做类型校验。
+# 用显式 id：pytest 默认把参数值 ``str()`` 成用例 id，而 ``10**4301`` 在
+# 收集期就会抛 ``ValueError``，整个文件无法导入。
+@pytest.mark.parametrize(
+    "hostile_protocol",
+    [
+        pytest.param(10**4301, id="huge-int-4301"),
+        pytest.param(10**4000, id="huge-int-4000"),
+        pytest.param(None, id="none"),
+        pytest.param(["responses"], id="list"),
+    ],
+)
+def test_protocol_status_rejects_malformed_protocol_with_a_readable_message(hostile_protocol):
+    with pytest.raises(ValueError) as excinfo:
+        ModelProviderFactory.protocol_status("openai", hostile_protocol)
+
+    message = str(excinfo.value)
+    # 只断言「抛 ValueError」不够：未修复的实现抛的也是 ValueError（整数转换
+    # 错误），必须断言消息指向**参数名**。用参数名而不是「协议」二字，是因为
+    # 诊断入口的调用方要靠它定位自己传错了哪个实参。
+    assert "protocol" in message
+    assert "必须是字符串" in message
+
+
+@pytest.mark.parametrize(
+    "hostile_value",
+    [
+        pytest.param(10**4301, id="huge-int-4301"),
+        pytest.param(10**4000, id="huge-int-4000"),
+    ],
+)
+def test_protocol_status_rejects_malformed_verified_entry_with_a_readable_message(hostile_value):
+    with pytest.raises(ValueError) as excinfo:
+        ModelProviderFactory.protocol_status(
+            "openai",
+            "responses",
+            options={"server_verified_protocols": [hostile_value]},
+        )
+
+    message = str(excinfo.value)
+    assert "server_verified_protocols" in message
+    assert "必须是字符串" in message
+    # 关键区分：未修复的实现抛的是 CPython 的整数转换错误，用户拿不到任何
+    # 「哪个参数错了」的线索。断言消息里**不出现**那段原始文本。
+    assert "Exceeds the limit" not in message
+
+
+def test_protocol_status_still_accepts_valid_protocols_after_the_guard():
+    """反向守卫：收紧不得误伤正常取值与别名。"""
+    assert ModelProviderFactory.protocol_status("openai", "responses") == {
+        "adapter_supported": True,
+        "server_verified": False,
+    }
+    assert ModelProviderFactory.protocol_status("openai", "  RESPONSES  ") == (
+        ModelProviderFactory.protocol_status("openai", "responses")
+    )
+
+
+# ── 回归：协议名归一化的另外三处同样不能抛裸的整数转换错误 ──
+#
+# 与 ``factory`` 那两处同一根因：把取值直接喂给 ``str(...).strip().lower()``，
+# ``10**4301`` 撞上 CPython 的整数位数上限，抛的是与「协议名不支持」毫无关系的
+# ``ValueError: Exceeds the limit``。三处都可达（前两处经公开构造器，第三处经
+# ``_normalize_responses_native_item`` 的入口分流）。
+@pytest.mark.parametrize(
+    "hostile_protocol",
+    [
+        pytest.param(10**4301, id="huge-int-4301"),
+        pytest.param(None, id="none"),
+        pytest.param(["responses"], id="list"),
+    ],
+)
+def test_openai_compatible_normalize_protocol_rejects_non_string(hostile_protocol):
+    from src.providers.openai_compatible import OpenAICompatibleProvider
+
+    with pytest.raises(ValueError) as excinfo:
+        OpenAICompatibleProvider._normalize_protocol(hostile_protocol)
+
+    message = str(excinfo.value)
+    assert "必须是字符串" in message
+    assert "Exceeds the limit" not in message
+    # 诊断入口要给出可选值，否则用户只知道「传错了」。
+    assert "chat_completions" in message
+
+
+@pytest.mark.parametrize(
+    "hostile_protocol",
+    [
+        pytest.param(10**4301, id="huge-int-4301"),
+        pytest.param(None, id="none"),
+        pytest.param(["responses"], id="list"),
+    ],
+)
+def test_volcengine_rejects_non_string_protocol(hostile_protocol):
+    from src.providers.volcengine import VolcengineProvider
+
+    with pytest.raises(ValueError) as excinfo:
+        VolcengineProvider(model_name="demo", protocol=hostile_protocol)
+
+    message = str(excinfo.value)
+    assert "必须是字符串" in message
+    assert "Exceeds the limit" not in message
+
+
+def test_responses_provider_variant_falls_back_instead_of_raising():
+    """纯分流判断不该抛错：非字符串一律走 openai 变体。
+
+    它抛在 ``_normalize_responses_native_item`` 的入口，会把本该给出的
+    「字段类型不对」消息换成一条与协议无关的整数转换错误。
+    """
+    from src.providers.__base__.model_provider import _responses_provider_variant
+
+    for hostile in (10**4301, None, ["ark"], 42):
+        assert _responses_provider_variant(hostile) == "openai"
+    # 反向守卫：正常取值仍要正确分流。
+    assert _responses_provider_variant("ark") == "ark"
+    assert _responses_provider_variant("volcengine") == "ark"
+    assert _responses_provider_variant("  ARK  ") == "ark"
+    assert _responses_provider_variant("openai") == "openai"

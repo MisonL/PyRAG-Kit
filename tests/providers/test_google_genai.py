@@ -498,3 +498,38 @@ def test_google_embedding_rejects_request_credentials_before_client_init(mock_se
             )
 
     asyncio.run(consume())
+
+
+# ── 回归：partial_args 的 json_path 索引位数超限时不得崩 ──
+#
+# ``_partial_arg_tokens`` 用 ``re.match(r"^\[(\d+)\]", rest)`` 取索引，再
+# ``int(indexed.group(1))``。``\d+`` 对任意长度的数字串都匹配，而
+# ``int("9" * 4301)`` 撞上 CPython 的 ``sys.get_int_max_str_digits()``
+# （默认 4300）抛 ``ValueError: Exceeds the limit``——异常类型是本函数契约里的
+# ``ValueError``，但**内容**是整数转换问题，与「json_path 不合法」无关，同函数
+# 另外两条拒绝分支都带着原始 ``json_path`` 与指引。
+#
+# json_path 来自模型的流式 function call 分片（``partial_args``），形态不受控；
+# 同一份响应里普通路径（``$.a``／``$[1]``）都能得到可读错误，只有这一支例外。
+
+
+@pytest.mark.parametrize(
+    "json_path",
+    ["$[" + "9" * 4301 + "]", "$[" + "9" * 5000 + "]"],
+    ids=["4301digits", "5000digits"],
+)
+def test_google_partial_args_rejects_oversized_index_readably(json_path):
+    """超长索引必须给出带 json_path 的 ``ValueError``，不是整数转换超限。"""
+    with pytest.raises(ValueError) as excinfo:
+        GoogleProvider._partial_arg_tokens(json_path)
+
+    message = str(excinfo.value)
+    assert "Exceeds the limit" not in message, message
+    assert "json_path" in message
+
+
+def test_google_partial_args_still_accepts_normal_paths():
+    """收紧不能误伤：普通 JSONPath 子集照常解析。"""
+    assert GoogleProvider._partial_arg_tokens("$.a[0].b") == ["a", 0, "b"]
+    assert GoogleProvider._partial_arg_tokens("$['k'][2]") == ["k", 2]
+    assert GoogleProvider._partial_arg_tokens("$") == []

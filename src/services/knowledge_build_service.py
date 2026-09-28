@@ -113,7 +113,18 @@ class KnowledgeBuildService:
 
     def _process_file(self, pipeline: Pipeline, file_path: Path) -> list[Document]:
         logger.info("正在处理文件: %s", file_path)
-        content = file_path.read_text(encoding="utf-8")
+        # 读取失败要把**文件名**带进错误里。知识库目录通常有几十个文件，而
+        # ``UnicodeDecodeError`` 的消息只有字节偏移（``'utf-8' codec can't
+        # decode byte 0xff in position 0``），不说是哪个文件——用户拿到的是
+        # 「程序运行期间发生错误」加一串偏移量，无从下手。实测 39 个文件的
+        # 知识库里混入一个非 UTF-8 文件即是这种收场。
+        try:
+            content = file_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                f"知识库文件不是 UTF-8 编码，无法读取: {file_path}。"
+                f" 请把该文件转为 UTF-8 后重试（{type(exc).__name__}: {exc}）。"
+            ) from exc
         document = Document(content=content, metadata={"source": str(file_path)})
         chunks = pipeline.process(document)
         return chunks

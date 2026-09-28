@@ -1,16 +1,23 @@
 import asyncio
 import importlib
+import math
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import openai
 import pytest
 
 import src.providers.factory as factory_module
 from src.providers.__base__.model_provider import (
     CompletionRequest,
     LargeLanguageModel,
+    StreamEventError,
+    _responses_content_part,
+    is_retryable_error,
     iterate_async,
+    normalize_embedding_vector,
     raise_for_stream_error_event,
+    require_token_count,
     retry_async_stream,
     retry_sync_stream,
 )
@@ -177,6 +184,53 @@ def test_openai_compatible_provider_normalizes_hyphenated_settings(monkeypatch):
 
     assert provider._api_key == "no-key-required"
     assert provider._base_url == "http://localhost:1234/v1"
+
+
+# ── 回归：空的 base_url 必须与「未配置」同义，而不是把请求打到相对路径 ──
+#
+# ``openai_compatible.__init__`` 用 ``getattr(settings, "<provider>_base_url")``
+# 取值，随后只判 ``if provider != "openai" and not self._base_url``——**openai
+# 被显式排除在外**（它允许回落到 SDK 自带的默认地址）。而字段的默认值非空、
+# ``.env`` 里又有 ``OPENAI_API_BASE``，于是「显式置空」这条路径没人管：
+# 实测 ``OPENAI_API_BASE=""`` 时 ``self._base_url`` 是空串（不是 ``None``），
+# 判断 ``is None`` 的回落分支不触发，``openai.OpenAI(base_url="")`` 得到
+# ``URL('')``，请求 URL 变成相对路径 ``chat/completions``——没有主机名，
+# 失败信息与「地址配错」毫无关系。
+#
+# 判据要覆盖三个取值：``""``（显式置空）、``"   "``（空白，SDK 会把它编码成
+# ``%20%20%20/``）、以及 ``None``（真正未配置，应当回落 SDK 默认）。只判
+# ``is None`` 会漏掉前两者，只判 falsy 又会把 ``None`` 一并拒掉。
+@pytest.mark.parametrize("blank_value", ["", "   "])
+def test_openai_compatible_provider_rejects_blank_base_url(monkeypatch, blank_value):
+    fake_settings = SimpleNamespace(
+        openai_api_key="token",
+        openai_api_base=blank_value,
+    )
+    monkeypatch.setattr("src.providers.openai_compatible.get_settings", lambda: fake_settings)
+
+    with pytest.raises(ValueError) as excinfo:
+        OpenAICompatibleProvider("demo", "openai")
+
+    message = str(excinfo.value)
+    assert "openai_api_base" in message
+    # 只查键名的话，一个把任意异常都包成同一句话的实现也能通过；消息必须
+    # 指出「空值」这一真实原因。
+    assert "空" in message
+
+
+def test_openai_compatible_provider_still_defaults_when_base_url_is_unset(monkeypatch):
+    """反向守卫：``None`` 是「未配置」，必须继续回落 SDK 默认地址。
+
+    把判据写成「一律拒绝空值」会连这条一起拒掉，而 ``openai`` 渠道依赖它。
+    """
+    fake_settings = SimpleNamespace(openai_api_key="token", openai_api_base=None)
+    monkeypatch.setattr("src.providers.openai_compatible.get_settings", lambda: fake_settings)
+
+    provider = OpenAICompatibleProvider("demo", "openai")
+
+    # 与「不传 base_url」的 SDK 客户端逐字节一致：``openai.base_url`` 这个模块级
+    # 常量是 ``None``（不是默认地址），拿它作基准的话未修复的实现也能通过。
+    assert provider._get_client().base_url == openai.OpenAI(api_key="token").base_url
 
 
 def test_openai_compatible_provider_forwards_tools(monkeypatch):
@@ -475,3 +529,243 @@ def test_retry_async_stream_closes_iterator_on_consumer_abort():
     asyncio.run(consume_one())
 
     assert closed == [True]
+
+
+# ── 回归：错误分类不得被「看起来像数字」的 Unicode 码位打断 ──
+#
+# ``is_retryable_error`` 与 ``raise_for_stream_error_event`` 都用 ``str.isdigit()``
+# 判断 SDK/网关给的 status 是不是数字串。``isdigit()`` 对 128 个 Unicode 码位
+# 为真（``²`` ``①`` ``፩`` ``₅`` …）而 ``int()`` 对它们一律抛 ``ValueError``——
+# 于是一个形态奇怪的 status 值会让**错误分类本身**崩掉：本该重试的 5xx 变成
+# 一条解析异常，本该报出的流错误也变成一条解析异常。
+#
+# 全码位穷举：``isdigit()`` 为真的 788 个码位里 128 个 ``int()`` 抛错；
+# ``isdecimal()`` 为真的 660 个码位 ``int()`` 全部可解析。
+
+
+@pytest.mark.parametrize("status", ["²", "①", "፹", "₅", "4²0"])
+def test_is_retryable_error_survives_unparseable_digit_status(status):
+    """status 是「看起来像数字但 ``int()`` 解析不了」时必须给出布尔判断。"""
+    error = SimpleNamespace(status_code=status)
+
+    assert is_retryable_error(error) is False
+
+
+@pytest.mark.parametrize(
+    "status,expected",
+    [("503", True), ("429", True), ("404", False), ("200", False)],
+)
+def test_is_retryable_error_still_classifies_numeric_status(status, expected):
+    """收紧不能误伤：正常数字串的分类结果不得改变。"""
+    error = SimpleNamespace(status_code=status)
+
+    assert is_retryable_error(error) is expected
+
+
+@pytest.mark.parametrize("status", ["²", "①", "₅"])
+def test_stream_error_event_survives_unparseable_digit_status(status):
+    """流错误事件的 status 解析不了时必须照常报出流错误，而不是解析异常。"""
+    event = {"type": "error", "error": {"message": "overloaded", "status_code": status}}
+
+    with pytest.raises(StreamEventError, match="overloaded") as excinfo:
+        raise_for_stream_error_event(event, "Test")
+
+    assert excinfo.value.status_code is None
+
+
+def test_stream_error_event_still_extracts_numeric_status():
+    """收紧不能误伤：正常数字串仍要提取成 status_code。"""
+    event = {"type": "error", "error": {"message": "overloaded", "status_code": "503"}}
+
+    with pytest.raises(StreamEventError) as excinfo:
+        raise_for_stream_error_event(event, "Test")
+
+    assert excinfo.value.status_code == 503
+
+
+@pytest.mark.parametrize("status", ["²", "①", "4²0"])
+def test_chat_status_is_error_survives_unparseable_digit_status(status):
+    """网关响应体里的 status 解析不了时，错误分类必须照常给出布尔判断。
+
+    ``_chat_status_is_error`` 是 ``_raise_for_chat_response_error`` 的一环，
+    用于识别「HTTP 200 但响应体里写着失败」的兼容网关。它崩掉意味着这类网关
+    的业务错误被误报成空文本。
+    """
+    assert OpenAICompatibleProvider._chat_status_is_error(status) is False
+
+
+def test_chat_status_is_error_still_classifies_numeric_status():
+    """收紧不能误伤：正常数字串的分类结果不得改变。"""
+    assert OpenAICompatibleProvider._chat_status_is_error("500") is True
+    assert OpenAICompatibleProvider._chat_status_is_error("200") is False
+    assert OpenAICompatibleProvider._chat_status_is_error("error") is True
+
+
+def _huge_digits():
+    import sys
+
+    return "9" * (sys.get_int_max_str_digits() + 1)
+
+
+def test_is_retryable_error_survives_digit_strings_beyond_the_conversion_limit():
+    """超长数字 status 必须给出布尔判断，而不是让重试判定抛 ``ValueError``。"""
+    error = SimpleNamespace(status_code=_huge_digits())
+
+    assert is_retryable_error(error) is False
+
+
+def test_stream_error_event_survives_digit_strings_beyond_the_conversion_limit():
+    """超长数字 status 必须照常报出流错误，而不是解析异常。"""
+    event = {"type": "error", "error": {"message": "overloaded", "status_code": _huge_digits()}}
+
+    with pytest.raises(StreamEventError, match="overloaded") as excinfo:
+        raise_for_stream_error_event(event, "Test")
+
+    assert excinfo.value.status_code is None
+
+
+def test_chat_status_is_error_survives_digit_strings_beyond_the_conversion_limit():
+    """超长数字 status 必须给出布尔判断，而不是让错误分类抛 ``ValueError``。"""
+    assert OpenAICompatibleProvider._chat_status_is_error(_huge_digits()) is False
+
+
+# ── 回归：token 计数响应只判了 None，形态异常会抛与「token 计数」无关的异常 ──
+#
+# 八个方法（Anthropic 同步/异步 × 普通/Beta、Google 同步/异步、OpenAI Responses
+# 同步/异步）此前都是「判 None 后直接 ``int(value)``」。那只挡住了缺字段：
+# SDK 或兼容网关返回 ``"abc"``／``1.5``／``[1]``／位数超限的数字串时，``int()``
+# 抛裸 ``ValueError``／``TypeError``／位数超限错误，调用方拿不到是哪个字段出的
+# 问题。非负整数才是这份数据的真实契约——token 计数不可能为负，也不可能带小数。
+
+
+@pytest.mark.parametrize(
+    "value,label",
+    [
+        (None, "缺字段"),
+        ("abc", "非数值字符串"),
+        ("1.5", "浮点字符串"),
+        ("9" * 5000, "位数超限的数字串"),
+        (1.5, "浮点数"),
+        (float("inf"), "无穷大"),
+        (float("nan"), "NaN"),
+        ([1], "列表"),
+        ({"a": 1}, "映射"),
+        (True, "布尔值"),
+        (-5, "负数"),
+    ],
+)
+def test_require_token_count_reports_malformed_values(value, label):
+    """形态异常必须报成带 provider 与字段名的 ``RuntimeError``。"""
+    with pytest.raises(RuntimeError) as excinfo:
+        require_token_count(value, "Test", "total_tokens")
+
+    message = str(excinfo.value)
+    assert "Test" in message, label
+    assert "total_tokens" in message, label
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [(0, 0), (12, 12), (12.0, 12), ("12", 12), ("0", 0)],
+)
+def test_require_token_count_accepts_valid_counts(value, expected):
+    """收紧不能误伤：正常计数照常通过（含整数值的浮点与数字字符串）。"""
+    assert require_token_count(value, "Test", "total_tokens") == expected
+
+
+def test_require_token_count_never_raises_a_non_runtime_error():
+    """契约是「要么返回 int，要么抛 RuntimeError」，不能漏出 ``OverflowError``。
+
+    ``int(float("inf"))`` 抛的是 ``OverflowError``——它既不是 ``ValueError`` 也
+    不是 ``TypeError``，任何按后者写的处理都接不住。
+
+    ``10**400`` 与 ``"9" * 5000`` 走的是**正数**方向，负数方向另有
+    ``test_require_token_count_negative_branch_survives_unprintable_integer``
+    覆盖：那条路径上的消息格式化自己也会抛，是本文件里唯一一处「抛异常时再抛
+    异常」的站点。
+    """
+    for value in [float("inf"), float("-inf"), float("nan"), 10**400, "9" * 5000]:
+        try:
+            require_token_count(value, "Test", "total_tokens")
+        except RuntimeError:
+            pass
+        except BaseException as exc:
+            raise AssertionError(f"{value!r} 抛出了 {type(exc).__name__}: {exc}") from exc
+
+
+# ``repr(10**4301)`` 自己抛 ``ValueError: Exceeds the limit (4300 digits)``
+# （CPython 的 ``sys.get_int_max_str_digits()``，默认 4300）。错误消息里凡是
+# 直接插值 ``{numeric}`` 的地方，都会在**正要报告一个错误时**改抛另一个错误，
+# 把契约里承诺的 ``RuntimeError`` 换成与字段无关的 ``ValueError``。
+#
+# 这条路径只有**负数**能走到：正数在 ``numeric < 0`` 之前就返回了，因此
+# 上面那条「永不抛非 RuntimeError」的用例（探针全是正数）碰不到它。实测把
+# ``safe_repr(numeric)`` 换回 ``{numeric}`` 后本用例变红。
+def test_require_token_count_negative_branch_survives_unprintable_integer():
+    """负数分支的消息格式化不得自己抛异常。"""
+    huge_negative = -(10**4301)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        require_token_count(huge_negative, "Test", "total_tokens")
+
+    message = str(excinfo.value)
+    assert "Test" in message
+    assert "total_tokens" in message
+    assert "Exceeds the limit" not in message, message
+
+
+# ---------------------------------------------------------------------------
+# 超出双精度范围的整数
+# ---------------------------------------------------------------------------
+#
+# ``math.isfinite(x)`` 与 ``float(x)`` 对任意大的 Python int 都会先尝试转成
+# C double，超出 ``DBL_MAX``（约 1.8e308）时抛 ``OverflowError: int too large
+# to convert to float``。``OverflowError`` 是 ``ArithmeticError`` 的子类，
+# **不是** ``ValueError``，会穿透这些方法承诺的异常契约与调用方的
+# ``except ValueError``。
+#
+# 输入可达：``config.toml`` 的整数是无上界的 TOML 整数，``tomllib`` 原样解析
+# 成 Python int；provider 的 ``options`` 又是文档指定的扩展入口。provider
+# 返回值一侧同理——网络 JSON 里出现一个超大整数字面量就能走到。
+#
+# 参数 id 必须显式给出：``10**4301`` 超过 ``sys.get_int_max_str_digits()``，
+# pytest 自动生成 id 时调 ``str(val)`` 会自己抛 ``ValueError``，测试在收集
+# 阶段就崩掉。
+_BEYOND_DOUBLE_INTS = [
+    pytest.param(10**400, id="400digits"),
+    pytest.param(-(10**400), id="negative-400digits"),
+    pytest.param(10**4301, id="4301digits-over-int-max-str-digits"),
+]
+
+
+@pytest.mark.parametrize("value", _BEYOND_DOUBLE_INTS)
+def test_normalize_embedding_vector_rejects_ints_beyond_double_range(value):
+    """SDK 返回的向量里出现超大整数时，必须报成 ``ValueError`` 而不是 ``OverflowError``。"""
+    with pytest.raises(ValueError, match="超出双精度范围"):
+        normalize_embedding_vector([1.0, value])
+
+
+def test_normalize_embedding_vector_still_passes_through_non_finite_floats():
+    """只收敛 ``OverflowError``：``inf``/``nan`` 的既有契约不变。
+
+    base64 分支（``struct.unpack``）本来就可能产出 ``inf``/``nan``，有限性由下游
+    ``EmbeddingService`` 的 ``np.isfinite`` 检查统一负责。在这里另加一道拒绝会让
+    两个分支的契约不一致。
+    """
+    assert normalize_embedding_vector([float("inf"), 1.0]) == [float("inf"), 1.0]
+    assert math.isnan(normalize_embedding_vector([float("nan")])[0])
+
+
+@pytest.mark.parametrize("value", _BEYOND_DOUBLE_INTS)
+def test_responses_video_fps_beyond_double_range_is_explicit(value):
+    """Ark Responses 的 ``fps`` 超出双精度范围时必须是 ``ValueError``。"""
+    with pytest.raises(ValueError, match=r"fps 必须是有限数字"):
+        _responses_content_part(
+            {
+                "type": "input_video",
+                "video_url": {"url": "https://example.invalid/v.mp4"},
+                "fps": value,
+            },
+            "params",
+            provider="ark",
+        )

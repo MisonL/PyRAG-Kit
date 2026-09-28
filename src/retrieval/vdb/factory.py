@@ -6,7 +6,8 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from ...runtime.contracts import KnowledgeSnapshotManifest, build_run_config
-from ...utils.config import get_settings
+from ...ui.display_utils import document_source
+from ...utils.config import get_settings, safe_repr
 from ...utils.log_manager import get_module_logger
 from ..snapshot_repository import SnapshotRepository
 from .base import VectorStoreBase
@@ -23,6 +24,13 @@ class VectorStoreFactory:
         *,
         trusted_paths: Iterable[str | Path] | None = None,
     ) -> VectorStoreBase:
+        # 先判类型再调 ``.lower()``：非字符串取值抛 ``AttributeError``，而本方法
+        # 的契约是 ``ValueError``。``Settings.default_vector_store`` 已能拦住
+        # 配置来源的非字符串，但本方法是公开入口（测试与库调用方直接调用），
+        # 与 ``RecursiveTextSplitter.structure_mode``、``SessionConfig`` 的融合
+        # 策略同一判据。
+        if not isinstance(store_type, str):
+            raise ValueError(f"不支持的向量存储类型: {safe_repr(store_type)}")
         if store_type.lower() == "faiss":
             return FaissStore(file_path=file_path, trusted_paths=trusted_paths)
         raise ValueError(f"不支持的向量存储类型: {store_type}")
@@ -84,11 +92,13 @@ class VectorStoreFactory:
                 ].model_name,
                 chunk_mode="legacy-import",
                 source_digest="legacy-import",
+                # ``metadata`` 的形态由助手收敛：``FaissStore`` 会在载入期归一化，
+                # 但本分支正是为**第三方 store** 准备的（``get_default_vector_store``
+                # 可以返回任何 ``VectorStoreBase`` 实现），它的 ``documents`` 里
+                # ``metadata=None``／列表、甚至条目本身不是映射都会让这里的
+                # ``.get(...).get(...)`` 抛 ``AttributeError``。
                 document_count=len(
-                    {
-                        doc.get("metadata", {}).get("source")
-                        for doc in getattr(store, "documents", [])
-                    }
+                    {document_source(doc, "") for doc in getattr(store, "documents", [])}
                 ),
                 chunk_count=len(getattr(store, "documents", [])),
             )

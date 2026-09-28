@@ -296,3 +296,50 @@ def test_unsupported_provider_type():
     """测试 _get_provider_class 方法处理不支持的提供商名称"""
     with pytest.raises(ValueError, match="不支持的模型提供商: unsupported_provider"):
         ModelProviderFactory._get_provider_class("unsupported_provider")
+
+
+# ── 回归：provider key 的形态校验 ──
+#
+# ``_get_model_detail`` 直接写 ``if provider_key not in configurations``，随后
+# ``configurations[provider_key]`` 与错误消息里的 f-string 插值。三条失败路径都
+# 与「配置里没有这个 key」无关：
+#   ``key not in dict`` 对不可哈希的取值抛 ``TypeError: unhashable type: 'list'``
+#     （它不是 ``ValueError``，穿透 ``Chatbot.reload_llm`` 的
+#     ``except Exception`` 分类与上游的 ``except ValueError``）；
+#   ``f"...{provider_key}"`` 对位数超限的整数抛
+#     ``ValueError: Exceeds the limit (4300 digits)``——类型对，内容与字段无关。
+#
+# 同一个判据在 ``src/runtime/contracts.py`` 的 ``_require_known_field`` 里已经
+# 认领过（同样的 ``key not in ...`` + f-string 组合），provider 工厂漏了。
+# key 来源是 ``SessionConfig.active_llm_configuration`` 等可直写属性。
+
+
+@pytest.mark.parametrize("bad_key", [[1], {1: 2}, {1, 2}], ids=["list", "dict", "set"])
+def test_get_llm_provider_rejects_unhashable_key_readably(bad_key):
+    """不可哈希的 key 必须给 ``ValueError``，不是裸 ``TypeError: unhashable type``。"""
+    with pytest.raises(ValueError, match="llm_configurations"):
+        ModelProviderFactory.get_llm_provider(bad_key, {})
+
+
+@pytest.mark.parametrize("bad_key", [10**4301, -(10**4301)], ids=["huge", "negative-huge"])
+def test_get_llm_provider_rejects_oversized_key_readably(bad_key):
+    """位数超限的 key 必须给出字段名，而不是整数转换超限。"""
+    with pytest.raises(ValueError) as excinfo:
+        ModelProviderFactory.get_llm_provider(bad_key, {})
+
+    message = str(excinfo.value)
+    assert "Exceeds the limit" not in message, message
+    assert "llm_configurations" in message
+
+
+@pytest.mark.parametrize("bad_key", [[1], 10**4301], ids=["list", "huge-int"])
+def test_get_embedding_provider_rejects_malformed_key_readably(bad_key):
+    """Embedding 与 Rerank 走同一 helper，判据必须一致。"""
+    with pytest.raises(ValueError, match="embedding_configurations"):
+        ModelProviderFactory.get_embedding_provider(bad_key, {})
+
+
+def test_get_llm_provider_still_reports_missing_key():
+    """收紧不能误伤：合法的字符串 key 照常给出原有消息。"""
+    with pytest.raises(ValueError, match="在LLM配置中未找到key: nope"):
+        ModelProviderFactory.get_llm_provider("nope", {})

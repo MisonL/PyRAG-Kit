@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from typing import Any
 
 import questionary
@@ -5,15 +6,51 @@ from rich.console import Console
 from rich.panel import Panel
 
 from ..utils.config import (
+    _MAX_RETRIEVAL_CANDIDATES,
     _MAX_RETRIEVAL_MULTIPLIER,
     _MAX_RETRIEVAL_TOP_K,
     RetrievalMethod,
+    parse_decimal_int,
+    safe_repr,
 )
 from ..utils.log_manager import get_module_logger  # 导入日志管理器
-from .display_utils import display_chat_config
+from .display_utils import display_chat_config, markup_text
 
 logger = get_module_logger(__name__)  # 获取当前模块的日志器
 console = Console()
+
+
+def _top_k_ceiling(multiplier: int) -> int:
+    """返回当前倍率下 ``top_k`` 可用的上界。
+
+    真正送进 ``faiss_index.search()`` 的是 ``top_k × multiplier``（FAISS 既不
+    报错也不截断），因此单字段上界不够——UI 放行一个组合越界的值，会在应用
+    配置时抛 ``ValueError`` 并终止会话。
+    """
+    return min(_MAX_RETRIEVAL_TOP_K, _MAX_RETRIEVAL_CANDIDATES // max(1, multiplier))
+
+
+def _multiplier_ceiling(top_k: int) -> int:
+    """返回当前 ``top_k`` 下候选倍率可用的上界。"""
+    return min(_MAX_RETRIEVAL_MULTIPLIER, _MAX_RETRIEVAL_CANDIDATES // max(1, top_k))
+
+
+def _bounded_int_validator(ceiling: int) -> Callable[[str], bool]:
+    """构造 questionary 的整数输入校验器，接受 ``1`` 到 ``ceiling``。
+
+    解析一律走 ``parse_decimal_int``，**校验器本身不抛任何异常**。这一点是硬要求：
+    questionary 的 ``build_validator`` 只把 ``ValidationError`` 转成「输入无效」
+    提示，其余异常会一路冒到 prompt_toolkit 的事件循环之外——用户按下回车后看到
+    ``Unhandled exception in event loop`` 加一段 traceback，输入框卡死。实测两种
+    输入都会造成这种收场：``²``（``isdigit()`` 为真但 ``int()`` 抛错）与
+    ``"9" * 4301``（合法的十进制整数，但位数超过 ``sys.get_int_max_str_digits()``）。
+    """
+
+    def validate(text: str) -> bool:
+        parsed = parse_decimal_int(text)
+        return parsed is not None and 1 <= parsed <= ceiling
+
+    return validate
 
 
 def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
@@ -23,8 +60,13 @@ def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
         current_method = chat_config["retrieval_method"].value
         current_top_k = chat_config["top_k"]
         current_rerank = "启用" if chat_config["rerank_enabled"] else "禁用"
+        # 权重同样要经 ``safe_repr``：``SessionConfig`` 是公开类、普通属性没有
+        # ``__setattr__`` 守卫，嵌入方或携带超大整数的 pickle 快照可以直写
+        # ``cfg.vector_weight = 10**4301``，随后这里与下面三处的裸插值都会抛
+        # ``ValueError: Exceeds the limit``——菜单与提示串根本渲染不出来。
         current_weights = (
-            f"向量: {chat_config['vector_weight']} / 关键词: {chat_config['keyword_weight']}"
+            f"向量: {safe_repr(chat_config['vector_weight'])}"
+            f" / 关键词: {safe_repr(chat_config['keyword_weight'])}"
         )
         current_fusion_strategy = chat_config["hybrid_fusion_strategy"].upper()
         current_candidate_multiplier = chat_config["retrieval_candidate_multiplier"]
@@ -33,14 +75,16 @@ def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
             "选择要调整的检索参数:",
             choices=[
                 questionary.Choice(f"1. 检索模式 (当前: {current_method})", value="method"),
-                questionary.Choice(f"2. 检索数量 Top K (当前: {current_top_k})", value="top_k"),
+                questionary.Choice(
+                    f"2. 检索数量 Top K (当前: {safe_repr(current_top_k)})", value="top_k"
+                ),
                 questionary.Choice(f"3. Rerank重排 (当前: {current_rerank})", value="rerank"),
                 questionary.Choice(f"4. 混合搜索权重 (当前: {current_weights})", value="weights"),
                 questionary.Choice(
                     f"5. 混合融合策略 (当前: {current_fusion_strategy})", value="fusion"
                 ),
                 questionary.Choice(
-                    f"6. 候选过量招募倍率 (当前: {current_candidate_multiplier})",
+                    f"6. 候选过量招募倍率 (当前: {safe_repr(current_candidate_multiplier)})",
                     value="candidate_multiplier",
                 ),
                 questionary.Separator(),
@@ -67,20 +111,26 @@ def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
             ).ask()
             if new_method:
                 chat_config["retrieval_method"] = RetrievalMethod(new_method)
-                console.print(f"[green]检索模式已更新为: {new_method}[/green]")
+                console.print(markup_text("[green]检索模式已更新为: {}[/green]", new_method))
                 logger.info(f"检索模式已更新为: {new_method}")
 
         elif choice == "top_k":
-            # 上界与 SessionConfig/Settings 的守卫一致：此处不挡，非法值会一路
-            # 走到 faiss_index.search()，FAISS 既不报错也不截断。
+            # 上界必须与 SessionConfig/Settings 的守卫一致，且要连**组合**一起判：
+            # 真正送进 faiss_index.search() 的是 top_k × multiplier（FAISS 既不
+            # 报错也不截断）。这里只按单字段上界放行的话，用户设成 2000 会在
+            # 应用配置时抛 ValueError——而那个异常落在 chat 主循环之外，会以裸
+            # traceback 终止整个会话。所以校验里把当前倍率算进去。
+            top_k_ceiling = _top_k_ceiling(chat_config["retrieval_candidate_multiplier"])
             new_top_k = questionary.text(
-                f"输入新的Top K值 (1-{_MAX_RETRIEVAL_TOP_K}, 当前: {current_top_k}):",
-                validate=lambda text: text.isdigit() and 1 <= int(text) <= _MAX_RETRIEVAL_TOP_K,
-                default=str(current_top_k),
+                f"输入新的Top K值 (1-{safe_repr(top_k_ceiling)}, 当前: {safe_repr(current_top_k)}):",
+                validate=_bounded_int_validator(top_k_ceiling),
+                # ``str`` 而不是裸取值：位数超限的整数连 ``str()`` 都抛，而
+                # ``default=`` 的取值同样要经过渲染。
+                default=safe_repr(current_top_k),
             ).ask()
             if new_top_k:
-                chat_config["top_k"] = int(new_top_k)
-                console.print(f"[green]Top K 已更新为: {new_top_k}[/green]")
+                chat_config["top_k"] = parse_decimal_int(new_top_k)
+                console.print(markup_text("[green]Top K 已更新为: {}[/green]", new_top_k))
                 logger.info(f"Top K 已更新为: {new_top_k}")
 
         elif choice == "rerank":
@@ -89,7 +139,11 @@ def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
             ).ask()
             if new_rerank is not None:
                 chat_config["rerank_enabled"] = new_rerank
-                console.print(f"[green]Rerank已更新为: {'启用' if new_rerank else '禁用'}[/green]")
+                console.print(
+                    markup_text(
+                        "[green]Rerank已更新为: {}[/green]", "启用" if new_rerank else "禁用"
+                    )
+                )
                 logger.info(f"Rerank已更新为: {'启用' if new_rerank else '禁用'}")
 
         elif choice == "weights":
@@ -105,9 +159,9 @@ def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
                     return False
 
             new_vector_weight_str = questionary.text(
-                f"输入新的向量权重 (0.0-1.0, 当前: {chat_config['vector_weight']}):",
+                f"输入新的向量权重 (0.0-1.0, 当前: {safe_repr(chat_config['vector_weight'])}):",
                 validate=is_float_between_0_and_1,
-                default=str(chat_config["vector_weight"]),
+                default=safe_repr(chat_config["vector_weight"]),
             ).ask()
 
             if new_vector_weight_str:
@@ -116,10 +170,16 @@ def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
                 chat_config["vector_weight"] = new_vector_weight
                 chat_config["keyword_weight"] = round(new_keyword_weight, 2)
                 console.print(
-                    f"[green]混合搜索权重已更新为 -> 向量: {chat_config['vector_weight']}, 关键词: {chat_config['keyword_weight']}[/green]"
+                    markup_text(
+                        "[green]混合搜索权重已更新为 -> 向量: {}, 关键词: {}[/green]",
+                        chat_config["vector_weight"],
+                        chat_config["keyword_weight"],
+                    )
                 )
                 logger.info(
-                    f"混合搜索权重已更新为 -> 向量: {chat_config['vector_weight']}, 关键词: {chat_config['keyword_weight']}"
+                    "混合搜索权重已更新为 -> 向量: %s, 关键词: %s",
+                    safe_repr(chat_config["vector_weight"]),
+                    safe_repr(chat_config["keyword_weight"]),
                 )
 
         elif choice == "fusion":
@@ -137,20 +197,25 @@ def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
             ).ask()
             if new_strategy:
                 chat_config["hybrid_fusion_strategy"] = new_strategy
-                console.print(f"[green]混合融合策略已更新为: {new_strategy.upper()}[/green]")
+                console.print(
+                    markup_text("[green]混合融合策略已更新为: {}[/green]", new_strategy.upper())
+                )
                 logger.info(f"混合融合策略已更新为: {new_strategy.upper()}")
 
         elif choice == "candidate_multiplier":
+            # 同 top_k：上界要连当前 top_k 一起算，否则「两个字段各自合法、
+            # 乘积越界」会在应用配置时抛错并终止会话。
+            multiplier_ceiling = _multiplier_ceiling(chat_config["top_k"])
             new_multiplier = questionary.text(
-                f"输入候选过量招募倍率 (1-{_MAX_RETRIEVAL_MULTIPLIER}, 当前: {current_candidate_multiplier}):",
-                validate=lambda text: (
-                    text.isdigit() and 1 <= int(text) <= _MAX_RETRIEVAL_MULTIPLIER
-                ),
+                f"输入候选过量招募倍率 (1-{safe_repr(multiplier_ceiling)}, 当前: {safe_repr(current_candidate_multiplier)}):",
+                validate=_bounded_int_validator(multiplier_ceiling),
                 default=str(current_candidate_multiplier),
             ).ask()
             if new_multiplier:
-                chat_config["retrieval_candidate_multiplier"] = int(new_multiplier)
-                console.print(f"[green]候选过量招募倍率已更新为: {new_multiplier}[/green]")
+                chat_config["retrieval_candidate_multiplier"] = parse_decimal_int(new_multiplier)
+                console.print(
+                    markup_text("[green]候选过量招募倍率已更新为: {}[/green]", new_multiplier)
+                )
                 logger.info(f"候选过量招募倍率已更新为: {new_multiplier}")
     # 检索参数的更改不需要重载任何模型
 
@@ -187,7 +252,7 @@ def edit_model_params(chat_config: dict[str, Any]) -> bool:
             ).ask()
             if new_llm and new_llm != current_llm:
                 chat_config["active_llm_configuration"] = new_llm
-                console.print(f"[green]LLM配置已切换为: {new_llm}[/green]")
+                console.print(markup_text("[green]LLM配置已切换为: {}[/green]", new_llm))
                 logger.info(f"LLM配置已切换为: {new_llm}")
                 llm_changed = True
 
@@ -198,7 +263,7 @@ def edit_model_params(chat_config: dict[str, Any]) -> bool:
             ).ask()
             if new_rerank:
                 chat_config["active_rerank_configuration"] = new_rerank
-                console.print(f"[green]Rerank已切换为: {new_rerank}[/green]")
+                console.print(markup_text("[green]Rerank已切换为: {}[/green]", new_rerank))
                 logger.info(f"Rerank已切换为: {new_rerank}")
                 # Rerank模型是按需加载的，所以不需要标记状态
 

@@ -61,8 +61,34 @@ jobs:
             release_artifacts/*.tar.gz
           if-no-files-found: error
 
+  test:
+    # 发布流程此前从不跑测试：打标签的提交若没走过 PR 门禁，产物会在测试全红
+    # 的情况下被发出去。刻意用单独的 job 而不是塞进 build：build 是五平台矩阵，
+    # 其中四个平台（Windows 与 macOS/linux arm64）本仓库从未在 CI 上跑过测试，
+    # 拿它们当发布门禁等于用一个没人验证过的信号去拦发布。这里固定在
+    # ubuntu-24.04——与 quality.yml 同一环境，覆盖已验证的路径。
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Setup Python
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.11"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7.6.0
+
+      - name: Sync dependencies
+        run: uv sync --group dev
+
+      - name: Run tests
+        run: uv run pytest -q
+
   publish:
-    needs: build
+    needs: [build, test]
     runs-on: ubuntu-24.04
 
     steps:
@@ -126,12 +152,102 @@ jobs:
       - name: Extract release notes
         run: python scripts/extract_release_notes.py --version "${{ steps.release_meta.outputs.version }}" --output RELEASE_NOTES.md
 
+      - name: Verify archive contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 发布包必须自证两件事，否则坏包会直接流到用户手里：
+          #   1) 不含凭证文件（.env / config.toml）——它们由用户从示例复制，
+          #      打进包里等于把某台机器的配置发给所有人；
+          #   2) 含离线分词兜底（tiktoken_cache）——缺失时首次构建知识库
+          #      会在无网环境下失败，而构建期的 --validate 有网、看不出来。
+          # download-artifact 把每个 artifact 解到 release_artifacts/<name>/，
+          # 所以归档在下一层，必须用 find 递归（与 publish 步骤的 maxdepth 2 一致）。
+          # 用 glob 会一个都匹配不到，循环体不执行、fail 保持 0，整步静默通过。
+          archives=()
+          while IFS= read -r archive; do
+            archives+=("${archive}")
+          done < <(find release_artifacts -maxdepth 2 -type f \
+            \( -name "PyRAG-Kit-*.tar.gz" -o -name "PyRAG-Kit-*.zip" \) | sort)
+          if [ "${#archives[@]}" -eq 0 ]; then
+            echo "未找到任何归档，无法校验（下载步骤是否失败？）。" >&2
+            exit 1
+          fi
+
+          fail=0
+          for archive in "${archives[@]}"; do
+            echo "== ${archive}"
+            if [[ "${archive}" == *.zip ]]; then
+              listing="$(python -c "import sys,zipfile;print('\n'.join(zipfile.ZipFile(sys.argv[1]).namelist()))" "${archive}")"
+            else
+              listing="$(tar -tzf "${archive}")"
+            fi
+
+            # 判据必须写成 `grep -E ... >/dev/null`，**不能**用 `grep -q`。
+            # `grep -q` 命中即退出，上游 `printf` 收到 SIGPIPE 后以 141 退出；
+            # `set -o pipefail` 让整条管道返回 141，而 `if` 只把 0 当成功——
+            # 于是「命中」被判成「未命中」。触发条件是归档列表超过管道缓冲区
+            # （Linux 上 64 KiB）：实测真实 v1.4.0 产物的列表已是 75–79 KB，
+            # 也就是这条检查自发布起就一直是失效的。
+            #
+            # 两个方向都会给出与事实相反的结论：凭证检查静默跳过（含 `.env`
+            # 的包被放行发布），tiktoken_cache 检查误报缺失（正常包被拦下）。
+            # `>/dev/null` 让 grep 读完整个输入，不产生 SIGPIPE。
+            if grep -E '/(\.env|config\.toml)$' >/dev/null <<<"${listing}"; then
+              echo "  ✗ 归档内含凭证文件" >&2
+              grep -E '/(\.env|config\.toml)$' >&2 <<<"${listing}"
+              fail=1
+            fi
+            if ! grep -F '/tiktoken_cache/' >/dev/null <<<"${listing}"; then
+              echo "  ✗ 归档内缺少 tiktoken_cache（离线分词兜底）" >&2
+              fail=1
+            fi
+          done
+
+          if [ "${fail}" -ne 0 ]; then
+            exit 1
+          fi
+          echo "归档校验通过（${#archives[@]} 个）。"
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 只对归档取校验和，便于用户核对下载内容与发布产物一致。
+          # 输出用 basename：download-artifact 会多一层 <artifact-name>/ 目录，
+          # 带上它会让用户拿单个下载文件对不上号。sha256sum 是 coreutils 标配，
+          # shasum 只在装了 perl 的机器上有，所以优先前者。
+          if command -v sha256sum >/dev/null 2>&1; then
+            hash_cmd=(sha256sum)
+          else
+            hash_cmd=(shasum -a 256)
+          fi
+
+          # 落在 release_artifacts/ 内：publish 步骤按该前缀查找待上传文件，
+          # 写到工作区根目录的话这个文件不会随 release 一起发布。
+          sums=release_artifacts/SHA256SUMS.txt
+          : > "${sums}"
+          while IFS= read -r archive; do
+            "${hash_cmd[@]}" "${archive}" | sed "s|\([^ ]*\)  .*/|\1  |" >> "${sums}"
+          done < <(find release_artifacts -maxdepth 2 -type f \
+            \( -name "PyRAG-Kit-*.zip" -o -name "PyRAG-Kit-*.tar.gz" \) | sort)
+
+          if [ ! -s "${sums}" ]; then
+            echo "未找到任何归档，无法生成校验和。" >&2
+            exit 1
+          fi
+          cat "${sums}"
+
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
-          mapfile -t files < <(find release_artifacts -maxdepth 2 -type f \( -name "PyRAG-Kit-*.zip" -o -name "PyRAG-Kit-*.tar.gz" \) | sort)
+          files=()
+          while IFS= read -r file; do
+            files+=("${file}")
+          done < <(find release_artifacts -maxdepth 2 -type f \
+            \( -name "PyRAG-Kit-*.zip" -o -name "PyRAG-Kit-*.tar.gz" -o -name "SHA256SUMS.txt" \) | sort)
           if [ "${#files[@]}" -eq 0 ]; then
             echo "未找到发布产物。" >&2
             exit 1

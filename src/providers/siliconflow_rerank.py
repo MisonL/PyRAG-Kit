@@ -8,13 +8,20 @@ from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponen
 from src.providers.__base__.model_provider import (
     RerankModel,
     is_retryable_error,
+    normalize_client_timeout,
     validate_secret_free_options,
 )
-from src.utils.config import get_settings
+from src.utils.config import get_settings, is_double_convertible, safe_repr
 from src.utils.log_manager import get_module_logger
-from src.utils.security import redact_sensitive_text, validate_secret_free_payload
+from src.utils.security import safe_exception_text, validate_secret_free_payload
 
 logger = get_module_logger(__name__)
+
+
+# rerank 请求 ``top_n`` 的上界。上游 API 会自行截断，因此它不需要与文档数
+# 挂钩；这个界的作用是挡住 TOML／调用方传进来的天文数字——它们会被静默接受，
+# 直到 ``json.dumps`` 编码请求体时才抛与 rerank 无关的位数错误。
+_MAX_RERANK_TOP_N = 10_000
 
 
 class SiliconflowRerankProvider(RerankModel):
@@ -91,15 +98,11 @@ class SiliconflowRerankProvider(RerankModel):
         return payload
 
     def _request_timeout(self) -> float:
-        timeout = self._options.get("timeout", 30.0)
-        if (
-            isinstance(timeout, bool)
-            or not isinstance(timeout, (int, float))
-            or not math.isfinite(float(timeout))
-            or timeout <= 0
-        ):
-            raise ValueError("SiliconFlow Rerank options.timeout 必须是正数。")
-        return float(timeout)
+        # 走共享 helper：它带**上界**。此前只有下界，实测 ``options.timeout``
+        # 写成 ``10**400`` 时构造成功，到 httpx 比较超时才以形态各异的错误暴露。
+        return normalize_client_timeout(
+            self._options.get("timeout", 30.0), "SiliconFlow", "options.timeout"
+        )
 
     @staticmethod
     def _validate_inputs(query: str, documents: list[str], top_n: int) -> None:
@@ -109,8 +112,23 @@ class SiliconflowRerankProvider(RerankModel):
             raise ValueError("SiliconFlow Rerank documents 必须是非空列表。")
         if any(not isinstance(document, str) for document in documents):
             raise ValueError("SiliconFlow Rerank documents 必须全部是字符串。")
-        if not isinstance(top_n, int) or isinstance(top_n, bool) or top_n < 1:
-            raise ValueError("SiliconFlow Rerank top_n 必须是大于等于 1 的整数。")
+        # 上界此前缺失：``10**400`` 与 ``10**4301`` 都被静默接受，后者在
+        # ``json.dumps`` 编码请求体时才抛「整数转字符串超限」——错误消息与
+        # rerank 参数毫无关联，而同一份文件里 ``options.timeout`` 与响应
+        # ``relevance_score`` 都已判过双精度范围，只有这里漏了。
+        #
+        # 上界取 ``_MAX_RERANK_TOP_N`` 而不是 ``len(documents)``：上游 API 自己
+        # 会截断，``top_n`` 超过文档数是合法输入（由
+        # ``test_rerank_accepts_top_n_larger_than_document_count`` 固定）。
+        if (
+            not isinstance(top_n, int)
+            or isinstance(top_n, bool)
+            or not 1 <= top_n <= _MAX_RERANK_TOP_N
+        ):
+            raise ValueError(
+                f"SiliconFlow Rerank top_n 必须是 1 到 {_MAX_RERANK_TOP_N} 之间的整数，"
+                f"但得到 {safe_repr(top_n)}。"
+            )
 
     def _parse_response(
         self, results: list[dict], documents: list[str]
@@ -147,6 +165,23 @@ class SiliconflowRerankProvider(RerankModel):
                 if not isinstance(doc_content, str) or not positions.get(doc_content):
                     raise RuntimeError("SiliconFlow Rerank 响应无法映射到输入文档。")
                 index = positions[doc_content].pop(0)
+            # 取分数用 ``.get`` 而不是 ``[]``：``res["relevance_score"]`` 在字段
+            # 缺失时抛 ``KeyError``，而它**不在**下面那个 ``try`` 的覆盖范围内
+            # （那一段只包 ``float(...)``），于是本方法承诺的 ``RuntimeError``
+            # 变成裸 ``KeyError: 'relevance_score'``。响应来自网络 JSON，一个
+            # 不含该字段的结果项就能触发；调用方的错误分类与日志脱敏都按
+            # ``RuntimeError`` 写，接不住 ``KeyError``。
+            #
+            # ``float(10**400)`` 抛 ``OverflowError``——它同样不是 ``ValueError``，
+            # 因此下面这个 ``except`` 也接不住。响应来自网络 JSON，一个超大整数
+            # 字面量就能触发。这里先判可转换性再交给 ``float``。
+            raw_score = res.get("relevance_score") if isinstance(res, Mapping) else None
+            if (
+                isinstance(raw_score, int)
+                and not isinstance(raw_score, bool)
+                and not is_double_convertible(raw_score)
+            ):
+                raise RuntimeError("SiliconFlow Rerank 响应 relevance_score 超出双精度范围。")
             try:
                 score = float(res["relevance_score"])
             except (KeyError, TypeError, ValueError) as exc:
@@ -191,7 +226,7 @@ class SiliconflowRerankProvider(RerankModel):
             logger.info(f"SiliconFlow Rerank ({self._model_name}) 完成，耗时: {duration:.2f}s")
             return indices, scores
         except Exception as e:
-            error_text = redact_sensitive_text(str(e))
+            error_text = safe_exception_text(e)
             logger.exception(
                 "SiliconFlow Rerank (%s) 出错: %s",
                 self._model_name,
@@ -235,7 +270,7 @@ class SiliconflowRerankProvider(RerankModel):
             logger.info(f"SiliconFlow Rerank ({self._model_name}) 异步完成，耗时: {duration:.2f}s")
             return indices, scores
         except Exception as e:
-            error_text = redact_sensitive_text(str(e))
+            error_text = safe_exception_text(e)
             logger.exception(
                 "SiliconFlow Rerank (%s) 异步出错: %s",
                 self._model_name,

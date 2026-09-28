@@ -6,6 +6,7 @@ from pathlib import Path
 from rich import box
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -16,7 +17,12 @@ from src.retrieval.vdb.factory import VectorStoreFactory
 from src.runtime.contracts import build_run_config
 from src.services.embedding_service import EmbeddingService
 from src.services.knowledge_build_service import KnowledgeBuildService
-from src.ui.display_utils import CONSOLE_WIDTH, get_relative_path
+from src.ui.display_utils import (
+    CONSOLE_WIDTH,
+    _require_model_detail,
+    get_relative_path,
+    markup_text,
+)
 from src.utils.config import get_settings
 from src.utils.log_manager import get_module_logger
 
@@ -45,43 +51,74 @@ def display_config_and_confirm(splitter_structure_mode: str):
     table.add_row("[bold green]知识库配置[/bold green]", "")
     table.add_row(
         "知识库目录",
-        f"[bold cyan]{get_relative_path(str(run_config.knowledge_base_path))}[/bold cyan]",
+        markup_text(
+            "[bold cyan]{}[/bold cyan]",
+            get_relative_path(str(run_config.knowledge_base_path)),
+        ),
     )
     table.add_row(
-        "快照根目录", f"[bold cyan]{get_relative_path(str(run_config.snapshot_root))}[/bold cyan]"
+        "快照根目录",
+        markup_text("[bold cyan]{}[/bold cyan]", get_relative_path(str(run_config.snapshot_root))),
     )
     table.add_row(
         "旧版 pkl 路径",
-        f"[bold cyan]{get_relative_path(str(run_config.legacy_pkl_path))}[/bold cyan]",
-    )
-    table.add_row("索引模式", f"[bold magenta]{splitter_structure_mode}[/bold magenta]")
-    table.add_row("文本切分块大小", f"[bold magenta]{run_config.kb_chunk_size}[/bold magenta]")
-    table.add_row("切分重叠量", f"[bold magenta]{run_config.kb_chunk_overlap}[/bold magenta]")
-    table.add_row("子分段块大小", f"[bold magenta]{run_config.kb_child_chunk_size}[/bold magenta]")
-    table.add_row(
-        "子分段重叠量", f"[bold magenta]{run_config.kb_child_chunk_overlap}[/bold magenta]"
+        markup_text(
+            "[bold cyan]{}[/bold cyan]",
+            get_relative_path(str(run_config.legacy_pkl_path)),
+        ),
     )
     table.add_row(
-        "嵌入批大小", f"[bold magenta]{run_config.kb_embedding_batch_size}[/bold magenta]"
+        "索引模式", markup_text("[bold magenta]{}[/bold magenta]", splitter_structure_mode)
+    )
+    table.add_row(
+        "文本切分块大小",
+        markup_text("[bold magenta]{}[/bold magenta]", run_config.kb_chunk_size),
+    )
+    table.add_row(
+        "切分重叠量", markup_text("[bold magenta]{}[/bold magenta]", run_config.kb_chunk_overlap)
+    )
+    table.add_row(
+        "子分段块大小",
+        markup_text("[bold magenta]{}[/bold magenta]", run_config.kb_child_chunk_size),
+    )
+    table.add_row(
+        "子分段重叠量",
+        markup_text("[bold magenta]{}[/bold magenta]", run_config.kb_child_chunk_overlap),
+    )
+    table.add_row(
+        "嵌入批大小",
+        markup_text("[bold magenta]{}[/bold magenta]", run_config.kb_embedding_batch_size),
     )
 
     embedding_key = run_config.default_embedding_provider
-    embedding_detail = run_config.embedding_configurations[embedding_key]
+    # 走共用助手而不是直接下标：``default_embedding_provider`` 没有 validator，
+    # 打错字时裸下标抛 ``KeyError``，而 ``main()`` 只接 ``KeyboardInterrupt``
+    # ——用户看到 traceback，报错里连可选值都没有。chat 路径已改用同一契约。
+    embedding_detail = _require_model_detail(
+        run_config.embedding_configurations, embedding_key, "Embedding"
+    )
     provider = embedding_detail.provider
     table.add_section()
     table.add_row("[bold green]模型与 API 配置[/bold green]", "")
     table.add_row(
-        "激活嵌入提供商", f"[bold green]{embedding_key}[/bold green] ([dim]{provider}[/dim])"
+        "激活嵌入提供商",
+        markup_text("[bold green]{}[/bold green] ([dim]{}[/dim])", embedding_key, provider),
     )
     table.add_row(
-        "模型名称", f"[bold bright_white]{embedding_detail.model_name}[/bold bright_white]"
+        "模型名称",
+        markup_text("[bold bright_white]{}[/bold bright_white]", embedding_detail.model_name),
     )
     if provider == "local-hash":
-        table.add_row("API Key", "[dim]本地模型，无需设置[/dim]")
+        table.add_row("API Key", markup_text("[dim]本地模型，无需设置[/dim]"))
     else:
+        # 行标签由 ``provider`` 拼出，而该值来自 ``config.toml``，本函数在
+        # **任何校验之前**运行（``main_async`` 先调它、再建服务），因此标签里的
+        # ``[/]`` 会让表格渲染抛 ``MarkupError``，把「确认配置」这一步变成崩溃。
         key_field_name = f"{provider.lower()}_api_key"
         api_key_value = getattr(settings, key_field_name, None)
-        table.add_row(f"API Key ({key_field_name.upper()})", mask_api_key(api_key_value))
+        table.add_row(
+            Text(f"API Key ({key_field_name.upper()})"), markup_text(mask_api_key(api_key_value))
+        )
 
     console.print(table)
     console.print("[yellow]配置信息来源于 config.toml、.env 或环境变量。[/yellow]")
@@ -109,9 +146,12 @@ async def main_async(splitter_structure_mode: str):
     result = await build_service.build(splitter_structure_mode)
 
     console.print(
-        f"\n[bold green]知识库构建完成。活动快照: [cyan]{result['snapshot_id']}[/cyan][/bold green]"
+        markup_text(
+            "\n[bold green]知识库构建完成。活动快照: [cyan]{}[/cyan][/bold green]",
+            result["snapshot_id"],
+        )
     )
-    console.print(f"[green]快照目录: [cyan]{result['snapshot_dir']}[/cyan][/green]")
+    console.print(markup_text("[green]快照目录: [cyan]{}[/cyan][/green]", result["snapshot_dir"]))
     logger.info("知识库快照构建完成: %s", result)
 
 
