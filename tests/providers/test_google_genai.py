@@ -533,3 +533,84 @@ def test_google_partial_args_still_accepts_normal_paths():
     assert GoogleProvider._partial_arg_tokens("$.a[0].b") == ["a", 0, "b"]
     assert GoogleProvider._partial_arg_tokens("$['k'][2]") == ["k", 2]
     assert GoogleProvider._partial_arg_tokens("$") == []
+
+
+# ── 回归：Google 覆写的 embed_query 必须与基类保持同一兜底 ──
+#
+# ``TextEmbeddingModel`` 的默认 ``embed_query`` 先判 ``if not vectors`` 再取
+# ``[0]``，空结果得到的是带指引的 ``ValueError("Embedding provider 返回空结果。")``。
+# ``GoogleProvider`` 为了设 ``task_type`` 覆写了这两个方法，却把那条兜底丢了，
+# 直接下标取 ``[0]``——provider 返回空列表时抛裸
+# ``IndexError: list index out of range``。
+#
+# 空返回不是假想输入：``values`` 数量校验是按 ``len(texts)`` 做的，传空 ``texts``
+# 时 ``len(values) == len(texts) == 0`` 成立，方法正常返回 ``[]``。网关在截断
+# 响应、或返回空 ``embeddings`` 字段时也会走到同一形态。
+#
+# ``IndexError`` 不是 ``ValueError``／``RuntimeError``，会穿透调用方按这两类做的
+# 错误分类与日志脱敏，且消息与「provider 返回了什么」毫无关系。
+
+
+class _EmptyEmbeddingGoogle(GoogleProvider):
+    """绕过网络：让底层 ``embed_documents`` 返回空结果。"""
+
+    def __init__(self):
+        self._model_name = "m"
+
+    def embed_documents(self, texts, **kwargs):
+        self.seen_kwargs = kwargs
+        return []
+
+    async def aembed_documents(self, texts, **kwargs):
+        self.seen_kwargs = kwargs
+        return []
+
+
+def test_google_embed_query_reports_empty_result_as_value_error():
+    """空结果必须是 ``ValueError``，不是裸 ``IndexError``。"""
+    provider = _EmptyEmbeddingGoogle()
+
+    with pytest.raises(ValueError, match="空结果"):
+        provider.embed_query("查询文本")
+
+
+def test_google_aembed_query_reports_empty_result_as_value_error():
+    """异步路径同判据。"""
+    provider = _EmptyEmbeddingGoogle()
+
+    with pytest.raises(ValueError, match="空结果"):
+        asyncio.run(provider.aembed_query("查询文本"))
+
+
+def test_google_embed_query_still_sets_retrieval_query_task_type():
+    """收紧不能误伤：覆写存在的理由（``task_type``）必须保留。"""
+    provider = _EmptyEmbeddingGoogle()
+
+    with pytest.raises(ValueError):
+        provider.embed_query("查询文本")
+
+    assert provider.seen_kwargs["task_type"] == "RETRIEVAL_QUERY"
+
+
+def test_google_aembed_query_still_sets_retrieval_query_task_type():
+    provider = _EmptyEmbeddingGoogle()
+
+    with pytest.raises(ValueError):
+        asyncio.run(provider.aembed_query("查询文本"))
+
+    assert provider.seen_kwargs["task_type"] == "RETRIEVAL_QUERY"
+
+
+def test_google_embed_query_returns_the_first_vector():
+    """正常路径不受影响。"""
+
+    class _One(_EmptyEmbeddingGoogle):
+        def embed_documents(self, texts, **kwargs):
+            self.seen_kwargs = kwargs
+            return [[0.5, 1.5]]
+
+        async def aembed_documents(self, texts, **kwargs):
+            self.seen_kwargs = kwargs
+            return [[0.5, 1.5]]
+
+    assert _One().embed_query("查询文本") == [0.5, 1.5]

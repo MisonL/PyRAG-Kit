@@ -4393,12 +4393,28 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             raise
 
     def embed_query(self, text: str, **kwargs: Any) -> list[float]:
+        # 覆写只为设 ``task_type``，但基类 ``TextEmbeddingModel.embed_query``
+        # 还有一层**空结果兜底**（``if not vectors: raise ValueError(...)``），
+        # 覆写时被一并丢掉了，这里补回来——判据与消息与基类逐字对齐。
+        #
+        # 空返回不是假想输入：``embed_documents`` 的条数校验是按 ``len(texts)``
+        # 做的，传空 ``texts`` 时 ``len(values) == len(texts) == 0`` 成立，方法
+        # 正常返回 ``[]``；网关截断响应或返回空 ``embeddings`` 字段也走到同一
+        # 形态。此时原先抛裸 ``IndexError: list index out of range``——它不是
+        # ``ValueError``／``RuntimeError``，会穿透调用方按这两类做的错误分类与
+        # 日志脱敏，而消息与「provider 返回了什么」毫无关系。
         kwargs.setdefault("task_type", "RETRIEVAL_QUERY")
-        return self.embed_documents([text], **kwargs)[0]
+        vectors = self.embed_documents([text], **kwargs)
+        if not vectors:
+            raise ValueError("Embedding provider 返回空结果。")
+        return vectors[0]
 
     async def aembed_query(self, text: str, **kwargs: Any) -> list[float]:
         kwargs.setdefault("task_type", "RETRIEVAL_QUERY")
-        return (await self.aembed_documents([text], **kwargs))[0]
+        vectors = await self.aembed_documents([text], **kwargs)
+        if not vectors:
+            raise ValueError("Embedding provider 返回空结果。")
+        return vectors[0]
 
     def close(self) -> None:
         """释放同步 Client 及其关联的异步资源。
