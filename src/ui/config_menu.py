@@ -1,4 +1,4 @@
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import questionary
@@ -220,6 +220,29 @@ def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
     # 检索参数的更改不需要重载任何模型
 
 
+def _configuration_keys(configurations: Any, role_label: str) -> list[Any]:
+    """取配置映射的键列表；取值不是映射时给出带指引的 ``ValueError``。
+
+    ``SessionConfig`` 的 ``_VALIDATORS`` 明确不登记 ``*_configurations``
+    （「按原样写入，由使用方负责其内部结构」），嵌入方可以把
+    ``chat_config["llm_configurations"]`` 直写成 ``5``。原先直接写
+    ``list(chat_config["llm_configurations"].keys())``，在那里抛裸
+    ``AttributeError: 'int' object has no attribute 'keys'``——异常类型与
+    「配置项形态错了」无关，且不是 ``ValueError``，会以裸 traceback 终止会话。
+    判据与 ``display_utils._require_model_detail`` 一致。
+
+    **只取键、不校验值**：菜单要把「值形态坏了」的配置项也列出来，否则用户
+    没有入口去切换掉它（`display_chat_config` 在上游读值时会直接拒绝，菜单
+    是唯一还能改配置的地方）。值的形态由使用方在真正读取时判。
+    """
+    if not isinstance(configurations, Mapping):
+        raise ValueError(
+            f"{role_label}配置必须是映射，但得到 {type(configurations).__name__}。"
+            " 请检查 config.toml 里的 *_configurations 配置项。"
+        )
+    return list(configurations.keys())
+
+
 def edit_model_params(chat_config: dict[str, Any]) -> bool:
     """编辑模型相关参数。"""
     logger.info("进入模型参数编辑菜单。")
@@ -246,26 +269,27 @@ def edit_model_params(chat_config: dict[str, Any]) -> bool:
             break
 
         if choice == "llm":
-            llm_options = list(chat_config["llm_configurations"].keys())
+            llm_options = _configuration_keys(chat_config["llm_configurations"], "LLM")
             new_llm = questionary.select(
                 "选择新的LLM配置:", choices=llm_options, default=current_llm
             ).ask()
             if new_llm and new_llm != current_llm:
                 chat_config["active_llm_configuration"] = new_llm
                 console.print(markup_text("[green]LLM配置已切换为: {}[/green]", new_llm))
-                logger.info(f"LLM配置已切换为: {new_llm}")
+                logger.info("LLM配置已切换为: %s", new_llm)
                 llm_changed = True
+            continue
 
-        elif choice == "rerank":
-            rerank_options = list(chat_config["rerank_configurations"].keys())
+        if choice == "rerank":
+            rerank_options = _configuration_keys(chat_config["rerank_configurations"], "Rerank")
             new_rerank = questionary.select(
                 "选择新的Rerank配置:", choices=rerank_options, default=current_rerank
             ).ask()
             if new_rerank:
                 chat_config["active_rerank_configuration"] = new_rerank
                 console.print(markup_text("[green]Rerank已切换为: {}[/green]", new_rerank))
-                logger.info(f"Rerank已切换为: {new_rerank}")
-                # Rerank模型是按需加载的，所以不需要标记状态
+                logger.info("Rerank已切换为: %s", new_rerank)
+            continue
 
     return llm_changed
 

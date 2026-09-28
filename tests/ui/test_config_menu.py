@@ -250,3 +250,116 @@ def test_ceilings_stay_usable_across_every_legal_config_value():
 
     assert min(_top_k_ceiling(m) for m in range(1, _MAX_RETRIEVAL_MULTIPLIER + 1)) >= 1
     assert min(_multiplier_ceiling(k) for k in range(1, _MAX_RETRIEVAL_TOP_K + 1)) >= 1
+
+
+# ── 回归：模型菜单必须能对不可用的配置**取值**保持可用 ──
+#
+# `edit_model_params` 原先直接写 `list(chat_config["llm_configurations"].keys())`。
+# `SessionConfig._VALIDATORS` 明确不登记 `*_configurations`（「按原样写入，由
+# 使用方负责其内部结构」），嵌入方可以把它直写成 `5`，于是抛裸
+# `AttributeError: 'int' object has no attribute 'keys'`——不是 `ValueError`，
+# 会以裸 traceback 终止会话。
+#
+# 关键取舍：菜单**只判容器、不判取值**。`display_chat_config` 在上游读值时会
+# 直接拒绝形态坏掉的配置项，菜单是用户唯一还能把激活项切走的入口；如果这里
+# 也按取值判，配置一旦写坏就彻底没有修复路径了。
+
+
+class _Choice:
+    def __init__(self, value):
+        self._value = value
+
+    def ask(self):
+        return self._value
+
+
+def _fake_select(answers):
+    """返回一个按顺序吐答案的 ``questionary.select`` 替身。
+
+    真实调用点把**菜单项**作为位置参数传入，替身必须收下（否则
+    ``questionary.Choice`` 的求值路径根本没被覆盖到）。
+    """
+    queue = list(answers)
+
+    def select(_prompt, *_args, **_kwargs):
+        return _Choice(queue.pop(0) if queue else None)
+
+    return select
+
+
+def test_edit_model_params_reports_non_mapping_llm_configurations(monkeypatch):
+    from src.ui import config_menu
+
+    monkeypatch.setattr(config_menu.questionary, "select", _fake_select(["llm"]))
+    chat_config = {
+        "llm_configurations": 5,
+        "active_llm_configuration": "broken",
+        "active_rerank_configuration": "",
+    }
+
+    with pytest.raises(ValueError, match="LLM配置"):
+        config_menu.edit_model_params(chat_config)
+
+
+def test_edit_model_params_reports_non_mapping_rerank_configurations(monkeypatch):
+    from src.ui import config_menu
+
+    monkeypatch.setattr(config_menu.questionary, "select", _fake_select(["rerank"]))
+    chat_config = {
+        "rerank_configurations": "x",
+        "active_llm_configuration": "",
+        "active_rerank_configuration": "broken",
+    }
+
+    with pytest.raises(ValueError, match="Rerank配置"):
+        config_menu.edit_model_params(chat_config)
+
+
+def test_edit_model_params_still_lists_configuration_keys(monkeypatch):
+    """收紧不能误伤：正常映射照常列出键并完成切换。"""
+    from src.ui import config_menu
+
+    prompts: list[str] = []
+    # 第一轮进 "llm" 分支、选到新的键；第二轮退出。主菜单必须真的退出，
+    # 否则 `while True` 会一直转（替身返回同一个答案就会死循环）。
+    answers = iter(["llm", "b", "back"])
+
+    def select(prompt, choices=None, **_kwargs):
+        prompts.append(prompt)
+        if prompt == "选择新的LLM配置:":
+            # 调用点把配置键列表原样当候选传入
+            assert [c.value if hasattr(c, "value") else c for c in choices] == ["a", "b"]
+        return _Choice(next(answers))
+
+    monkeypatch.setattr(config_menu.questionary, "select", select)
+    chat_config = {
+        "llm_configurations": {"a": object(), "b": object()},
+        "active_llm_configuration": "a",
+        "active_rerank_configuration": "",
+    }
+
+    assert config_menu.edit_model_params(chat_config) is True
+    assert chat_config["active_llm_configuration"] == "b"
+    assert "选择新的LLM配置:" in prompts
+
+
+def test_edit_model_params_lists_unusable_details_without_reading_them(monkeypatch):
+    """取舍锁死：取值不可用时菜单仍要列出键，不能连修复入口一起断掉。"""
+    from src.ui import config_menu
+
+    def select(prompt, choices=None, **_kwargs):
+        if prompt == "选择新的LLM配置:":
+            # 坏条目必须仍然出现在候选里——这是它能被切走的唯一入口
+            assert [c.value if hasattr(c, "value") else c for c in choices] == ["broken"]
+            return _Choice("broken")
+        return _Choice("back")
+
+    monkeypatch.setattr(config_menu.questionary, "select", select)
+    chat_config = {
+        "llm_configurations": {"broken": None},
+        "active_llm_configuration": "broken",
+        "active_rerank_configuration": "",
+    }
+
+    assert config_menu.edit_model_params(chat_config) is False
+    assert chat_config["active_llm_configuration"] == "broken"
