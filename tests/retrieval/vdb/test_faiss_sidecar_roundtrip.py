@@ -1041,3 +1041,111 @@ def test_parent_id_survives_huge_integer_metadata(tmp_path):
     reloaded.load_snapshot(str(snapshot_dir), snapshot_root=tmp_path)
 
     assert reloaded.resolve_parent_content(huge_parent_id) == "父块正文"
+
+
+# ── 回归：载入侧必须与写入侧一样拒绝非有限向量 ──
+#
+# 写入侧 ``EmbeddingService._as_float32_matrix`` 明确拒绝 NaN／inf，理由写在
+# 那里：FAISS 把 NaN 向量照单收下（``ntotal`` 正常增加），既不报错也不跳过，
+# 直到查询时那个下标干脆不出现在结果里——用户看到的是「搜到了」而不是「这份
+# 快照坏了」。而两个载入入口的 ``_validate_embeddings_shape`` 此前只判
+# ``ndim``，于是同一份内容写入侧拒绝、载入侧放行。
+#
+# 判据必须落在 ``astype(np.float32)`` **之后**：``1e300`` 在 float64 里是有限
+# 的，cast 成 float32 才溢出成 ``inf``。只对原数组调 ``isfinite`` 会在这里再次
+# 与写入侧分叉，因此四个方向都要有用例。
+
+
+@pytest.mark.parametrize(
+    ("embeddings", "label"),
+    [
+        (np.full((2, 4), np.nan), "NaN"),
+        (np.full((2, 4), np.inf), "正无穷"),
+        (np.full((2, 4), -np.inf), "负无穷"),
+        (np.array([[1e300, 0.0, 0.0, 0.0], [1.0, 2.0, 3.0, 4.0]]), "float64 有限但 cast 后溢出"),
+    ],
+    ids=["nan", "inf", "neg-inf", "post-cast-overflow"],
+)
+def test_load_rejects_non_finite_embeddings(tmp_path, embeddings, label):
+    """legacy 载入的非有限向量必须是 ``ValueError``，且 store 保持原状。"""
+    store = FaissStore(file_path=None)
+    store.upsert_embeddings(
+        [{"page_content": "alpha", "metadata": {}}], np.zeros((1, 4), dtype=np.float32)
+    )
+    before = (
+        [doc["page_content"] for doc in store.documents],
+        store.embeddings.shape,
+        store.faiss_index.ntotal,
+    )
+
+    path = _legacy_file(
+        tmp_path,
+        {
+            "documents": [{"page_content": "a", "metadata": {}}],
+            "embeddings": embeddings,
+        },
+    )
+    with pytest.raises(ValueError, match="非有限值"):
+        store.load(str(path), trusted_paths=[tmp_path])
+
+    after = (
+        [doc["page_content"] for doc in store.documents],
+        store.embeddings.shape,
+        store.faiss_index.ntotal,
+    )
+    assert before == after, label
+
+
+@pytest.mark.parametrize(
+    ("array", "label"),
+    [
+        (np.full((1, 4), np.nan), "nan"),
+        (np.full((1, 4), np.inf), "inf"),
+        (np.array([[1e300, 0.0, 0.0, 0.0]]), "post-cast-overflow"),
+    ],
+    ids=["nan", "inf", "post-cast-overflow"],
+)
+def test_load_snapshot_rejects_non_finite_embeddings(tmp_path, array, label):
+    """快照载入的非有限向量同样必须是 ``ValueError``。"""
+    import pickle
+
+    snapshot_dir = tmp_path / f"kb-finite-{label}"
+    snapshot_dir.mkdir()
+    with (snapshot_dir / "chunks.pkl").open("wb") as file:
+        pickle.dump([{"page_content": "alpha", "metadata": {}}], file)
+    with (snapshot_dir / "parents.pkl").open("wb") as file:
+        pickle.dump({}, file)
+    np.save(snapshot_dir / "embeddings.npy", array)
+    _activate_snapshot(tmp_path, snapshot_dir.name)
+
+    store = FaissStore(file_path=None)
+    with pytest.raises(ValueError, match="非有限值"):
+        store.load_snapshot(str(snapshot_dir), snapshot_root=tmp_path)
+
+
+def test_load_accepts_finite_embeddings_without_leaking_a_warning(tmp_path):
+    """收紧不能误伤：正常向量照常载入，且不泄漏无谓的 RuntimeWarning。
+
+    cast 那份副本对正常取值不会溢出，因此这里不该有任何 ``RuntimeWarning``——
+    守卫用 ``catch_warnings`` 包住 cast 是为了压掉**预期内**的溢出警告，不是
+    把整类警告静默掉。
+    """
+    import pickle
+    import warnings
+
+    snapshot_dir = tmp_path / "kb-finite-ok"
+    snapshot_dir.mkdir()
+    with (snapshot_dir / "chunks.pkl").open("wb") as file:
+        pickle.dump([{"page_content": "alpha", "metadata": {}}], file)
+    with (snapshot_dir / "parents.pkl").open("wb") as file:
+        pickle.dump({}, file)
+    np.save(snapshot_dir / "embeddings.npy", np.zeros((1, 4), dtype=np.float64))
+    _activate_snapshot(tmp_path, snapshot_dir.name)
+
+    store = FaissStore(file_path=None)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        store.load_snapshot(str(snapshot_dir), snapshot_root=tmp_path)
+
+    assert store.embeddings.shape == (1, 4)
+    assert not [w for w in caught if issubclass(w.category, RuntimeWarning)]

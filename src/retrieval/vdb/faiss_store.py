@@ -8,6 +8,7 @@ import os
 # Pickle is retained only for trusted local legacy snapshots.
 import pickle  # nosec B403
 import time
+import warnings
 from collections.abc import Iterable, Mapping
 from copy import deepcopy
 from pathlib import Path
@@ -244,6 +245,30 @@ class FaissStore(VectorStoreBase):
                 f"（得到 {type(embeddings).__name__}，ndim={ndim!r}）。"
                 " 请重建知识快照或修正数据来源。"
             )
+        # 有限性同样要判，且必须判在 ``astype(np.float32)`` **之后**：写入侧
+        # ``EmbeddingService._as_float32_matrix`` 早就拦了非有限向量，理由写在
+        # 那里——FAISS 把 NaN 向量照单收下（``ntotal`` 正常增加），既不报错也不
+        # 跳过，直到查询时那个下标干脆不出现在结果里，用户看到的是「搜到了」而
+        # 不是「这份快照坏了」。载入侧此前只判 ``ndim``，于是同一份内容写入侧
+        # 拒绝、载入侧放行。
+        #
+        # 判 cast 之后的矩阵而不是原数组：``1e300`` 在 float64 里是**有限**的，
+        # cast 成 float32 才溢出成 ``inf``（写入侧正是靠这个顺序把这一类也拦住）。
+        # 只对原数组调 ``isfinite`` 会让载入侧在这一点上再次与写入侧分叉。
+        # ``astype`` 只是校验用的副本，不改写 ``embeddings`` 本身，因此失败时
+        # store 仍保持原状。
+        #
+        # 溢出警告在这里是预期行为（正是它说明 cast 确实产生了 inf），不能让它
+        # 冒充成新的警告泄漏出去。
+        if isinstance(embeddings, np.ndarray):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                cast = embeddings.astype(np.float32)
+            if not np.isfinite(cast).all():
+                raise ValueError(
+                    f"{source}的 embeddings 包含非有限值（NaN 或无穷大）。"
+                    " 请重建知识快照或修正数据来源。"
+                )
 
     @staticmethod
     def _validate_document_shape(document: Any, position: int, *, source: str) -> None:
