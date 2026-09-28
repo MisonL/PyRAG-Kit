@@ -395,6 +395,22 @@ class FaissStore(VectorStoreBase):
         return normalized_documents, normalized_parent_documents
 
     def register_parent_documents(self, parent_documents: dict[str, dict[str, Any]]):
+        # 顶层形态的判据与载入侧 ``_normalize_documents`` 的同名守卫一致（同一条
+        # 注释：「``load``／``load_snapshot`` 是 ``VectorStoreBase`` 的契约方法，
+        # 直接调它们的嵌入方不经过那道校验」——本方法同样是契约方法，取舍同样
+        # 适用）。此前只有载入侧有这条守卫：非映射传进来时，这里在 ``.items()``
+        # 上抛裸 ``AttributeError: 'int' object has no attribute 'items'``，而
+        # 载入侧对同一形态给的是带指引的 ``ValueError``。同一件事两种收场。
+        #
+        # 本仓自带流程到不了这里（``knowledge_build_service`` 传的是
+        # ``dict``，且前面已用 ``isinstance(..., dict)`` 过滤），因此在生产上
+        # 不可达——修的是契约一致性：嵌入方直接调这个公开方法时，拿到的错误
+        # 应当和其它入口一样指向「配置项形态错了」。
+        if not isinstance(parent_documents, Mapping):
+            raise ValueError(
+                "父块索引的顶层不是映射"
+                f"（{type(parent_documents).__name__}），无法作为父块索引使用。"
+            )
         for parent_id, parent_document in parent_documents.items():
             normalized = self._normalize_parent_document(parent_document)
             if normalized["content"]:

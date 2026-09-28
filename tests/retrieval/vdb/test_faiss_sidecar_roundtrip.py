@@ -1149,3 +1149,56 @@ def test_load_accepts_finite_embeddings_without_leaking_a_warning(tmp_path):
 
     assert store.embeddings.shape == (1, 4)
     assert not [w for w in caught if issubclass(w.category, RuntimeWarning)]
+
+
+# ── 回归：父块索引的顶层形态两个入口收场一致 ──
+#
+# 载入侧 ``_normalize_documents`` 早就拒绝非映射的父块索引，给的是带指引的
+# ``ValueError``；而写入侧 ``register_parent_documents`` 直接在 ``.items()`` 上
+# 抛裸 ``AttributeError: 'int' object has no attribute 'items'``。两者都是
+# ``VectorStoreBase`` 的公开契约方法，`_normalize_documents` 的注释也已写明
+# 「直接调它们的嵌入方不经过快照校验」——同一取舍本应两侧都执行。
+#
+# 本仓自带流程到不了写入侧这条分支（``knowledge_build_service`` 传的是 dict，
+# 且前面已用 isinstance 过滤），因此这是一致性修复而非崩溃修复。
+
+
+@pytest.mark.parametrize(
+    "bad_index", [5, None, [1, 2], "x", 10**4301], ids=["int", "None", "list", "str", "huge-int"]
+)
+def test_register_parent_documents_rejects_non_mapping(bad_index):
+    """写入侧非映射必须是 ``ValueError``，不是裸 ``AttributeError``。"""
+    store = FaissStore(file_path=None)
+
+    with pytest.raises(ValueError, match="父块索引"):
+        store.register_parent_documents(bad_index)
+
+    assert store.parent_documents == {}
+
+
+def test_register_and_load_agree_on_non_mapping_parent_index():
+    """同一形态在写入侧与载入侧必须同为 ``ValueError``（收场一致）。"""
+    store = FaissStore(file_path=None)
+    with pytest.raises(ValueError) as write_error:
+        store.register_parent_documents(5)
+
+    with pytest.raises(ValueError) as load_error:
+        FaissStore._normalize_documents([], 5)
+
+    assert "父块索引的顶层不是映射" in str(write_error.value)
+    assert "父块索引的顶层不是映射" in str(load_error.value)
+
+
+def test_register_parent_documents_still_accepts_a_mapping():
+    """收紧不能误伤：正常映射照常注册，空 content 仍按原语义丢弃。"""
+    store = FaissStore(file_path=None)
+
+    store.register_parent_documents(
+        {
+            "p-ok": {"content": "父块正文", "metadata": {"k": 1}},
+            "p-empty": {"content": "", "metadata": {"k": 2}},
+        }
+    )
+
+    assert set(store.parent_documents) == {"p-ok"}
+    assert store.resolve_parent_content("p-ok") == "父块正文"
