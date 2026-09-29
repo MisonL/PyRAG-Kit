@@ -1246,33 +1246,36 @@ def normalize_tool_arguments(value: Any) -> str:
         raise ValueError("工具调用 arguments 必须可序列化为 JSON。") from exc
 
 
-# 流式工具调用的 ``type`` 在两条协议上取值不同，且都可合法地表示「函数调用」：
-# Chat Completions 与各家的 OpenAI 兼容流式片段用 ``function``（见
-# ``merge_tool_call_fragment`` 的默认值与各 provider 的片段构造），Responses 用
-# ``function_call``。校验与转换都必须把两者等价看待，否则 ``function`` 会绕过
-# 下面的 JSON 判据，半截参数被当作完整工具调用交付给调用方。
-_FUNCTION_TOOL_CALL_TYPES = frozenset({"function", "function_call"})
-
-
 def validate_complete_tool_call(tool_call: Mapping[str, Any], provider: str) -> dict[str, Any]:
-    """校验流式工具调用在发送 completed 事件前已经完整。"""
+    """校验流式工具调用在发送 completed 事件前已经完整。
+
+    判据是**黑名单**：只有 ``custom_tool_call`` 接受任意文本（Responses 的
+    custom tool 契约里 ``input`` 就是 ``str``，无 JSON 约束），其余任何 ``type``
+    都按函数调用要求完整 JSON。
+
+    这一点必须说清楚，因为两条判据很容易被写成相反的方向——「必须有非空
+    arguments」用 ``type != "custom_tool_call"``（黑名单），「必须校验 JSON」却
+    写成 ``type in {"function", "function_call"}``（白名单）。这样任何不在白名单
+    里的取值（网关改写过的 ``type``、大写形式、空串）同时满足「必须有参数」与
+    「不必校验参数」，半截 JSON 就被当作完整调用交付。而 ``type`` 是不可信输入：
+    SDK 流式解析走 ``construct_type``（``_process_response_data`` 在非严格校验下
+    不校验已声明字段），``tool_calls[].type`` 写成 ``["function"]`` 也能到达这里。
+
+    因此这里只做一次类型收敛（非字符串无法与 ``custom_tool_call`` 相等，按函数
+    调用处理），不再做集合成员测试——成员测试对 ``list``/``dict`` 会抛
+    ``TypeError: unhashable type``，那是崩溃而不是校验。
+    """
     name = tool_call.get("name")
     if not isinstance(name, str) or not name.strip():
         raise RuntimeError(f"{provider} 工具调用缺少 name，流提前结束。")
-    # ``type`` 与 ``enum_field`` 同源：它来自网关 JSON（``openai`` SDK 对 SSE
-    # chunk 的未知字段用 ``extra="allow"`` 原样保留，``{"type": ["function"]}``
-    # 是能构造出来的）。直接对集合做成员测试会让 ``list``/``dict`` 抛
-    # ``TypeError: unhashable type``——不是调用方按 ``RuntimeError`` 做的分类，
-    # 消息里也没有工具调用名。非字符串收敛成 ``""``：落在「不是已知类型」的
-    # 分支上，与 ``merge_tool_call_fragment`` 的口径一致。
-    raw_type = tool_call.get("type", "function_call")
-    tool_type = raw_type if isinstance(raw_type, str) else ""
+    raw_type = tool_call.get("type")
+    is_custom_tool = isinstance(raw_type, str) and raw_type == "custom_tool_call"
     arguments = tool_call.get("arguments")
     # Responses custom tools intentionally accept arbitrary text, including an
-    # empty input. Function calls still require a complete JSON arguments value.
-    if tool_type != "custom_tool_call" and (arguments is None or arguments == ""):
+    # empty input. Every other call requires a complete JSON arguments value.
+    if not is_custom_tool and (arguments is None or arguments == ""):
         raise RuntimeError(f"{provider} 工具调用 {name} 缺少完整 arguments，流提前结束。")
-    if tool_type in _FUNCTION_TOOL_CALL_TYPES and isinstance(arguments, str):
+    if not is_custom_tool and isinstance(arguments, str):
         try:
             json.loads(arguments)
         except json.JSONDecodeError as exc:

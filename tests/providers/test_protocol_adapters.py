@@ -1723,6 +1723,71 @@ def test_validate_complete_tool_call_rejects_unverifiable_arguments():
             )
 
 
+def test_validate_complete_tool_call_requires_json_for_unknown_type():
+    """除 ``custom_tool_call`` 外，任何 ``type`` 都必须带完整 JSON。
+
+    同一函数里两条判据方向相反：第一条是**黑名单**（``type !=
+    "custom_tool_call"`` 就必须有非空 arguments），第二条却是**白名单**
+    （``type in {"function", "function_call"}`` 才校验 JSON）。于是任何不在白名单
+    里的取值——网关改写过的 ``type``、大写形式、空串——同时满足「必须有参数」与
+    「不必校验参数」，半截 JSON 被当作完整调用交付。
+
+    白名单方向本身还带来第二个问题：集合成员测试对 ``list``/``dict`` 抛
+    ``TypeError: unhashable type``（``tool_calls[].type`` 在 SDK 流式解析里走
+    ``construct_type``，不做 ``Literal`` 校验，所以非字符串是可达的）。
+    """
+    for tool_type in ("weird", "FUNCTION", "", ["function"], {"name": "function"}, None):
+        with pytest.raises(RuntimeError, match="lookup"):
+            validate_complete_tool_call(
+                {"name": "lookup", "type": tool_type, "arguments": '{"id":'},
+                "OpenAI Chat Completions",
+            )
+
+
+def test_openai_chat_stream_rejects_unknown_type_with_incomplete_arguments():
+    """端到端：未知 ``type`` 的半截 JSON 不能交付给调用方。
+
+    用真实 SDK 的 ``construct_type`` 构造 chunk——这正是 SDK 流式路径的解析
+    方式（``_process_response_data`` 在非严格校验下走 ``construct_type``，跳过
+    已声明字段的 ``Literal`` 校验），因此这里的 ``type`` 取值是可真实到达的。
+    """
+    from openai._models import construct_type
+    from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
+
+    # 真实流式形态：``finish_reason`` 与最后一个 delta 在同一个 chunk 上。
+    delta = construct_type(
+        type_=ChatCompletionChunk,
+        value={
+            "id": "chat-1",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "chat-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call-1",
+                                "type": "tool_call",
+                                "function": {"name": "lookup", "arguments": '{"id":'},
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+        },
+    )
+
+    accumulator: dict[object, dict[str, object]] = {}
+    completed: set[object] = set()
+    with pytest.raises(RuntimeError, match="不是完整 JSON"):
+        for event in OpenAICompatibleProvider._chat_stream_events(delta):
+            OpenAICompatibleProvider._chat_completion_events(event, accumulator, completed)
+
+
 def test_validate_complete_tool_call_keeps_custom_tool_arbitrary_text():
     """``custom_tool_call`` 的任意文本语义不受上述收敛影响。"""
     result = validate_complete_tool_call(
