@@ -3,8 +3,10 @@
 # 遵循修改后的 Apache License 2.0 许可证。详情请参阅项目根目录下的 DIFY_LICENSE 文件。
 
 import re
+from collections.abc import Sequence
 
 from src.models.document import Document
+from src.utils.config import safe_repr
 
 from .base import BaseCleaner
 
@@ -30,8 +32,21 @@ class BasicCleaner(BaseCleaner):
         Returns:
             List[Document]: 清洗后的文档对象列表。
         """
+        # 形态校验先做：``documents=5`` 抛裸
+        # ``TypeError: 'int' object is not iterable``，``"abc"``／``[5]``／
+        # ``[None]`` 抛裸 ``AttributeError: 'str' object has no attribute
+        # 'content'``（下面的 ``doc.content``）——两者都不在调用方按
+        # ``ValueError`` 建立的分类内。判据与同一层的
+        # ``RecursiveTextSplitter._require_documents`` 一致（两者在
+        # ``Pipeline.process`` 里前后相邻调用，同一份 ``Document`` 列表）。
+        if isinstance(documents, (str, bytes, bytearray)) or not isinstance(documents, Sequence):
+            raise ValueError(f"清洗器 documents 必须是文档列表，但得到 {safe_repr(documents)}。")
         cleaned_documents = []
-        for doc in documents:
+        for index, doc in enumerate(documents):
+            if not isinstance(doc, Document):
+                raise ValueError(
+                    f"清洗器 documents[{index}] 必须是 Document，但得到 {safe_repr(doc)}。"
+                )
             # 直接访问 Document 对象的属性
             content = doc.content
 

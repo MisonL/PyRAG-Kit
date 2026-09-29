@@ -292,7 +292,19 @@
   - **六个 embedding 实现都不判 `texts` 的形态**：`TextEmbeddingModel` 的全部公开入口此前没有一处校验，而 `texts` 是它们唯一的必填入参。`texts=5` 在四处抛裸 `TypeError: object of type 'int' has no len()`、在 `local_hash` 抛 `TypeError: 'int' object is not iterable`；`texts="abc"` 更隐蔽——字符串是合法的 `Sequence`，被**静默**当成三条单字符文本向量化（`local_hash` 实测返回 3 条），调用方以为传了一条文本、实际入库三条垃圾向量。现新增 `require_text_list`（`src/providers/__base__/model_provider.py`），接入 `local_hash`／`google`／`openai_compatible`／`volcengine` 的同步与异步共 8 个入口。空列表**合法**——语义是「没有文档要向量化」，与 rerank 的「必须非空」有意不同。
 
 
+- **补齐 ETL 三个阶段的入参形态校验（第六轮对抗审查）**。``Pipeline.process`` → ``Cleaner.clean`` → ``Splitter.split`` 是建库主路径上相邻的三步（``KnowledgeBuildService._process_file`` 对知识库里的每个文件各调一次），三处此前都不判入参形态，实测：
+
+  - ``Pipeline.process(5)`` → 裸 ``AttributeError: 'int' object has no attribute 'metadata'``（方法第一行就读 ``document.metadata``）。``"abc"``／``[5]``／``None`` 同理。``process`` 是 ``_process_file`` 的直接下游，异常落在 ``KnowledgeBuildService.build`` 按 ``ValueError`` 建立的分类之外。
+  - ``BasicCleaner.clean(5)`` → 裸 ``TypeError: 'int' object is not iterable``；``clean("abc")``／``clean([5])``／``clean([None])`` → 裸 ``AttributeError: 'str' object has no attribute 'content'``。
+  - ``RecursiveTextSplitter.split(5)`` → 裸 ``TypeError: object of type 'int' has no len()``（日志行里的 ``len(documents)``）；``split("abc")``／``split([5])`` → 裸 ``AttributeError: 'str' object has no attribute 'metadata'``。``split_hierarchical`` 是公开方法且同样暴露：``split_hierarchical(5)`` → ``TypeError: 'int' object is not iterable``。
+
+  三处的 ``"abc"`` 尤其要紧：字符串是合法的 ``Sequence``，只判「可迭代」拦不住，它会被当成一串字符逐字处理。现三处共用同一判据（容器必须是 ``Sequence`` 且显式排除 ``str``／``bytes``／``bytearray``，条目必须是 ``Document`` 实例并带下标），分片器把判据抽成 ``_require_documents`` 供 ``split`` 与 ``split_hierarchical`` 共用——只守卫 ``split`` 会留下「直接调 ``split_hierarchical``」的口子。条目判据用 ``Document`` 实例而非鸭子类型：三个阶段后续都直接读它的 ``content``／``metadata``，而 ``Document`` 是 pydantic 模型（构造期已校验 ``content: str``），要求实例化才能进入能让错误定位到构造处而不是处理处。
+
+
 ### 测试
+
+- 新增第六轮的回归用例（22 个用例；回退源码后其中 18 个变红，4 个「不误伤」反向守卫保持绿）：``Pipeline.process`` 对四类非法入参的拒绝、``BasicCleaner.clean`` 对四类非法容器与三类非法条目的拒绝、``RecursiveTextSplitter.split`` 的同两组、``split_hierarchical`` 与 ``split`` 共用同一判据（这条专门盯「只守卫一个入口」），以及三个阶段合法路径照旧工作（含空列表与清洗结果）。
+
 
 - 新增第五轮的回归用例（9 个测试函数，覆盖 24 条 provider×方向路径；回退源码后其中 8 个变红，1 个「不误伤」反向守卫保持绿）：四个 provider 的工具转换器对不可迭代取值的拒绝与对 `None`／空列表／合法工具的接受、`extract_system_prompt` 对四类非法容器与两类非法条目的拒绝、两个 rerank provider 同步与异步入口对非序列 `documents` 的拒绝、四个 embedding provider 同步与异步入口对四类非法 `texts` 的拒绝（含 `"abc"` 这条静默拆分的）、以及 `require_text_list` 报错消息带下标。
 

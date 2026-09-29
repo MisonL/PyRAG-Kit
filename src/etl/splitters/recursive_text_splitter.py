@@ -4,7 +4,7 @@
 
 import re
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import tiktoken
@@ -370,6 +370,7 @@ class RecursiveTextSplitter(BaseSplitter):
 
     def split_hierarchical(self, documents: list[Document]) -> list[Document]:
         """层级分片：先切父块，再切子块。"""
+        self._require_documents(documents)
         all_chunks: list[Document] = []
         child_splitter = self._build_child_splitter()
         self.parent_documents = {}
@@ -441,10 +442,40 @@ class RecursiveTextSplitter(BaseSplitter):
         else:
             logger.debug("文档 '%s' 清洗后为空，跳过。", source)
 
+    @staticmethod
+    def _require_documents(documents: Any) -> None:
+        """校验分片入参是 ``Document`` 列表。
+
+        本类此前对七类非法输入全部抛裸异常：``documents=5`` 抛
+        ``TypeError: object of type 'int' has no len()``（``split`` 里的日志行）
+        或 ``TypeError: 'int' object is not iterable``（``split_hierarchical``
+        的循环），``"abc"``／``[5]``／``[None]`` 抛
+        ``AttributeError: 'str' object has no attribute 'metadata'``（两个分支
+        里的 ``doc.metadata``）。两者都不在调用方按 ``ValueError`` 建立的分类内。
+
+        两个公开入口（``split`` 与 ``split_hierarchical``）共用这一处判据：
+        只守卫 ``split`` 会留下「直接调 ``split_hierarchical``」的口子，而它是
+        公开方法。
+
+        条目判据用 ``Document`` 实例而不是鸭子类型：两个分支都直接读
+        ``doc.content`` 与 ``doc.metadata``，而 ``Document`` 是 pydantic 模型
+        （构造期已校验 ``content: str``），要求实例化才能进入这里，能让错误
+        定位到构造处而不是分片处。
+        """
+        if isinstance(documents, (str, bytes, bytearray)) or not isinstance(documents, Sequence):
+            raise ValueError(f"分片器 documents 必须是文档列表，但得到 {safe_repr(documents)}。")
+        for index, document in enumerate(documents):
+            if not isinstance(document, Document):
+                raise ValueError(
+                    f"分片器 documents[{index}] 必须是 Document，但得到 {safe_repr(document)}。"
+                )
+
     def split(self, documents: list[Document], **kwargs) -> list[Document]:
         """
         将文档列表中的文本内容分割成更小的块。
         """
+        # 形态校验必须先于日志里的 ``len(documents)``。
+        self._require_documents(documents)
         logger.info(f"开始分割 {len(documents)} 个文档。")
 
         # 实时同步最新配置

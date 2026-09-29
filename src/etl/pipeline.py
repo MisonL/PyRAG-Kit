@@ -12,6 +12,7 @@ from src.etl.extractors.markdown_extractor import MarkdownExtractor
 from src.etl.splitters.base import BaseSplitter
 from src.etl.splitters.recursive_text_splitter import RecursiveTextSplitter
 from src.models.document import Document
+from src.utils.config import safe_repr
 from src.utils.log_manager import get_module_logger
 
 logger = get_module_logger(__name__)
@@ -59,6 +60,16 @@ class Pipeline:
         """
         处理单个文档，并监控每一步的耗时 (CSE Sensor)。
         """
+        # 形态校验先做：``process`` 的第一行就读 ``document.metadata``，此前
+        # ``5``／``"abc"``／``[5]``／``None`` 全部抛裸
+        # ``AttributeError: ... object has no attribute 'metadata'``——不在
+        # ``KnowledgeBuildService.build`` 按 ``ValueError`` 建立的分类内，而
+        # 那是建库主路径（``_process_file`` 对知识库里的每个文件调一次）。
+        # 判据与 ``RecursiveTextSplitter._require_documents`` 一致：要求
+        # ``Document`` 实例而不是鸭子类型，本方法后续每一步都读它的
+        # ``content``／``metadata``。
+        if not isinstance(document, Document):
+            raise ValueError(f"Pipeline 处理的文档必须是 Document，但得到 {safe_repr(document)}。")
         source = document.metadata.get("source", "未知来源")
         logger.info(f"开始处理文档: {source}")
 

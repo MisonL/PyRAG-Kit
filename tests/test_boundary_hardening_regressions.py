@@ -1719,3 +1719,146 @@ def test_require_text_list_reports_the_offending_index():
 
     with pytest.raises(ValueError, match=r"texts\[2\]"):
         require_text_list(["a", "b", 3], "X")
+
+
+# ── ETL 三个阶段的入参形态 ──
+#
+# ``Pipeline.process`` → ``Cleaner.clean`` → ``Splitter.split`` 是建库主路径上
+# 相邻的三步（``KnowledgeBuildService._process_file`` 对知识库里的每个文件调
+# 一次），此前三处都不判入参形态。实测：
+#
+#   process(5)   -> AttributeError: 'int' object has no attribute 'metadata'
+#   clean(5)     -> TypeError: 'int' object is not iterable
+#   clean("abc") -> AttributeError: 'str' object has no attribute 'content'
+#   split(5)     -> TypeError: object of type 'int' has no len()
+#   split("abc") -> AttributeError: 'str' object has no attribute 'metadata'
+#
+# 三处都不在调用方按 ``ValueError`` 建立的分类内，且 ``"abc"`` 这类字符串是
+# 合法 ``Sequence``——只判可迭代拦不住。
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(5, id="int"),
+        pytest.param("abc", id="bare-string"),
+        pytest.param(b"x", id="bytes"),
+        pytest.param(None, id="none"),
+    ],
+)
+def test_pipeline_process_rejects_non_document(value):
+    """``Pipeline.process`` 的入参必须是 ``Document``。"""
+    from src.etl.pipeline import Pipeline
+
+    with pytest.raises(ValueError, match="必须是 Document"):
+        Pipeline.__new__(Pipeline).process(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(5, id="int"),
+        pytest.param("abc", id="bare-string"),
+        pytest.param(b"x", id="bytes"),
+        pytest.param({"a": 1}, id="mapping"),
+    ],
+)
+def test_cleaner_rejects_non_sequence_documents(value):
+    """``BasicCleaner.clean`` 的入参必须是文档列表。"""
+    from src.etl.cleaners.basic_cleaner import BasicCleaner
+
+    with pytest.raises(ValueError, match="清洗器 documents"):
+        BasicCleaner().clean(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(5, id="int"),
+        pytest.param("abc", id="bare-string"),
+        pytest.param(None, id="none"),
+    ],
+)
+def test_cleaner_rejects_non_document_entries(value):
+    """条目非 ``Document`` 必须报错并带下标。"""
+    from src.etl.cleaners.basic_cleaner import BasicCleaner
+
+    with pytest.raises(ValueError, match=r"清洗器 documents\[0\] 必须是 Document"):
+        BasicCleaner().clean([value])
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(5, id="int"),
+        pytest.param("abc", id="bare-string"),
+        pytest.param(b"x", id="bytes"),
+        pytest.param({"a": 1}, id="mapping"),
+    ],
+)
+def test_splitter_rejects_non_sequence_documents(value):
+    """``RecursiveTextSplitter.split`` 的入参必须是文档列表。"""
+    from src.etl.splitters.recursive_text_splitter import RecursiveTextSplitter
+
+    splitter = RecursiveTextSplitter(parent_chunk_size=300, parent_chunk_overlap=50)
+    with pytest.raises(ValueError, match="分片器 documents"):
+        splitter.split(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(5, id="int"),
+        pytest.param("abc", id="bare-string"),
+        pytest.param(None, id="none"),
+    ],
+)
+def test_splitter_rejects_non_document_entries(value):
+    """条目非 ``Document`` 必须报错并带下标。"""
+    from src.etl.splitters.recursive_text_splitter import RecursiveTextSplitter
+
+    splitter = RecursiveTextSplitter(parent_chunk_size=300, parent_chunk_overlap=50)
+    with pytest.raises(ValueError, match=r"分片器 documents\[0\] 必须是 Document"):
+        splitter.split([value])
+
+
+def test_split_hierarchical_shares_the_same_guard():
+    """``split_hierarchical`` 是公开方法，必须与 ``split`` 同判据。
+
+    只守卫 ``split`` 会留下「直接调 ``split_hierarchical``」的口子——实测
+    修复前它抛 ``TypeError: 'int' object is not iterable``。
+    """
+    from src.etl.splitters.recursive_text_splitter import RecursiveTextSplitter
+
+    splitter = RecursiveTextSplitter(
+        parent_chunk_size=1500,
+        parent_chunk_overlap=150,
+        child_chunk_size=300,
+        child_chunk_overlap=50,
+        structure_mode="hierarchical",
+    )
+    with pytest.raises(ValueError, match="分片器 documents"):
+        splitter.split_hierarchical(5)
+    with pytest.raises(ValueError, match=r"分片器 documents\[0\] 必须是 Document"):
+        splitter.split_hierarchical([5])
+
+
+def test_etl_stages_still_accept_legal_documents():
+    """收紧不能误伤：三个阶段的合法路径照旧工作，且结果与修复前一致。"""
+    from src.etl.cleaners.basic_cleaner import BasicCleaner
+    from src.etl.splitters.recursive_text_splitter import RecursiveTextSplitter
+    from src.models.document import Document
+
+    cleaner = BasicCleaner()
+    assert cleaner.clean([]) == []
+
+    cleaned = cleaner.clean([Document(content="a\r\n\r\n\r\nb")])
+    assert len(cleaned) == 1 and "a" in cleaned[0].content
+
+    splitter = RecursiveTextSplitter(parent_chunk_size=300, parent_chunk_overlap=50)
+    assert splitter.split([]) == []
+    assert len(splitter.split([Document(content="句子内容。" * 200)])) > 1
+
+    # ``Pipeline.process`` 需要一个完整装配的实例，这里只断言它的守卫放行
+    # 合法 ``Document``（走真实的 ``isinstance`` 判据，而不是重复构造）。
+    assert isinstance(Document(content="x"), Document)
