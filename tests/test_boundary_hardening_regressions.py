@@ -32,6 +32,15 @@ from src.utils.log_manager import cleanup_old_logs
 _HUGE_INT = 10**4301
 
 
+def _patch_provider_settings(monkeypatch, module_name: str, **values):
+    """替换 provider 模块里的 ``get_settings``，避免依赖真实凭证。
+
+    provider 构造器在缺 key 时直接拒绝，而 ``get_settings`` 带 ``lru_cache``——
+    设置环境变量不会生效（缓存里已有实例）。仓库既有用例同样打这个模块级名字。
+    """
+    monkeypatch.setattr(f"{module_name}.get_settings", lambda: SimpleNamespace(**values))
+
+
 def _log_settings(log_path: str, *, retention_days: int):
     """构造 ``cleanup_old_logs`` 需要的 settings 替身。
 
@@ -773,3 +782,343 @@ def test_cleanup_old_logs_still_removes_expired_files(tmp_path):
 def test_get_settings_still_returns_settings():
     """收紧不能误伤：正常配置加载路径不受影响。"""
     assert get_settings() is not None
+
+
+# ---------------------------------------------------------------------------
+# 四、volcengine / anthropic 渠道的边界缺陷（第二轮审查）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "tool_type",
+    [
+        "web_search_20250305",
+        "code_execution_20250522",
+        "text_editor_20250728",
+        "memory_20250818",
+        "web_fetch_20250910",
+        "browser_toolset_20260801",
+        "tool_search_tool_bm25",
+        "computer_toolset_20260801",
+        # 已从当前 SDK 联合类型移除、但仍在服务端生效的旧字面量
+        "computer_20250124",
+        "bash_20250124",
+        "text_editor_20250124",
+        "server_custom",
+        "custom",
+    ],
+)
+def test_anthropic_server_tools_pass_through_verbatim(tool_type):
+    """服务端工具必须原样透传，不得被降级成空 schema 的普通函数工具。
+
+    白名单原先只认 ``server_`` 前缀与三个 2025-01-24 时代的字面量，而 SDK 里
+    真实存在二十种服务端工具类型——它们被降级后 ``max_uses`` 等专属字段被丢弃，
+    服务端收到自定义函数工具而非服务端检索工具，用户看到 web_search 静默失效。
+    """
+    from src.providers.anthropic import AnthropicProvider
+
+    tool = {"type": tool_type, "name": "n", "max_uses": 5}
+    assert AnthropicProvider._convert_tools([tool])[0] == tool
+
+
+def test_anthropic_server_tool_types_track_the_sdk():
+    """推导集合必须跟随 SDK，而不是写死的白名单。
+
+    SDK 升级新增工具时集合自动跟随——写死白名单的失效模式正是「SDK 加了新工具、
+    本地静默降级」。
+    """
+    import typing
+
+    import anthropic
+
+    from src.providers.anthropic import _SERVER_TOOL_TYPES
+
+    derived: set[str] = set()
+    for member in typing.get_args(anthropic.types.ToolUnionParam):
+        if member is anthropic.types.ToolParam:
+            continue
+        for literal in typing.get_args(typing.get_type_hints(member).get("type")):
+            if isinstance(literal, str):
+                derived.add(literal)
+    assert derived, "SDK 联合类型里应当能推导出服务端工具类型"
+    assert derived <= _SERVER_TOOL_TYPES
+
+
+def test_anthropic_function_tools_still_become_schemas():
+    """收紧不能误伤：普通函数工具仍走 schema 转换分支。"""
+    from src.providers.anthropic import AnthropicProvider
+
+    converted = AnthropicProvider._convert_tools(
+        [{"function": {"name": "lookup", "parameters": {"type": "object"}}}]
+    )
+    assert converted[0]["name"] == "lookup"
+    assert "input_schema" in converted[0]
+
+
+@pytest.mark.parametrize("value", ["json_object", 42, ["a"]])
+def test_anthropic_response_format_rejects_non_mapping(value):
+    """``response_format`` 的两个来源必须同判据。
+
+    ``options.response_format`` 那一侧早有守卫，但**请求参数**来源直接进
+    ``_response_format_config``，非 Mapping 时 ``.get()`` 抛裸 ``AttributeError``。
+    """
+    from src.providers.anthropic import AnthropicProvider
+
+    with pytest.raises(ValueError, match="response_format 必须是对象"):
+        AnthropicProvider._response_format_config(value)
+
+
+@pytest.mark.parametrize("value", ["json_object", 42, ["a"]])
+def test_ark_response_format_rejects_non_mapping(value):
+    """Ark Responses 同一语义的同一判据（与 google.py 对齐）。"""
+    from src.providers.volcengine import VolcengineProvider
+
+    with pytest.raises(ValueError, match="response_format 必须是对象"):
+        VolcengineProvider._convert_responses_format(value)
+
+
+def test_response_format_still_converts_legal_values():
+    """收紧不能误伤：合法的 ``json_object``／``json_schema`` 照旧转换。"""
+    from src.providers.anthropic import AnthropicProvider
+    from src.providers.volcengine import VolcengineProvider
+
+    assert AnthropicProvider._response_format_config({"type": "json_object"}) == {
+        "type": "json_schema",
+        "schema": {"type": "object"},
+    }
+    assert VolcengineProvider._convert_responses_format({"type": "json_object"}) == {
+        "format": {"type": "json_object"}
+    }
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(10**400, id="beyond-double"),
+        pytest.param("abc", id="string"),
+        pytest.param([1], id="list"),
+        pytest.param(1.5, id="float"),
+        pytest.param(-5, id="negative"),
+        pytest.param(True, id="bool"),
+        pytest.param(0, id="zero"),
+    ],
+)
+def test_anthropic_request_max_tokens_is_validated(value, monkeypatch):
+    """请求级 ``max_tokens`` 与 ``options.max_tokens`` 必须同一判据。
+
+    修复前请求级取值原样进 params，由 SDK 深处的
+    ``_calculate_nonstreaming_timeout`` 执行 ``maximum_time * max_tokens / 128_000``
+    时才炸：``10**400`` 抛 ``OverflowError``（``ArithmeticError`` 子类，既不落
+    ``except ValueError`` 也不落 ``except RuntimeError``），``"abc"`` 抛
+    ``TypeError``，而 ``1.5``／``-5``／``True`` 静默通过、原样发给服务端。
+    """
+    _patch_provider_settings(monkeypatch, "src.providers.anthropic", anthropic_api_key="test-key")
+    from src.providers.anthropic import AnthropicProvider
+
+    provider = AnthropicProvider("claude-sonnet-4-5")
+    with pytest.raises(ValueError, match="必须是正整数"):
+        provider._build_message_params(prompt="hi", max_tokens=value, stream=False)
+
+
+def test_anthropic_request_max_tokens_accepts_positive_integers(monkeypatch):
+    """收紧不能误伤：合法取值照旧通过；未提供时用模型默认。"""
+    _patch_provider_settings(monkeypatch, "src.providers.anthropic", anthropic_api_key="test-key")
+    from src.providers.anthropic import AnthropicProvider
+
+    provider = AnthropicProvider("claude-sonnet-4-5")
+    assert (
+        provider._build_message_params(prompt="hi", max_tokens=4096, stream=False)["max_tokens"]
+        == 4096
+    )
+    assert provider._build_message_params(prompt="hi", stream=False)["max_tokens"] > 0
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        pytest.param({"type": "refusal", "refusal": "被拒绝"}, id="refusal-key"),
+        pytest.param({"type": "refusal", "reason": "被拒绝"}, id="reason-key"),
+        pytest.param({"type": "refusal", "text": "被拒绝"}, id="text-key"),
+        pytest.param(
+            {"type": "refusal", "refusal": "A", "text": "B", "reason": "C"}, id="priority"
+        ),
+    ],
+)
+def test_anthropic_refusal_block_matches_between_streaming_and_complete(block):
+    """非流式与流式对同一 refusal 块必须给出同一结果。
+
+    非流式原先只读 ``reason``／``text``，漏了 SDK ``RefusalBlock`` 的正式字段名
+    ``refusal``——于是 ``[{"type": "refusal", "refusal": "被拒绝"}]`` 在非流式得到
+    ``refusal=None``、``text=''``、``finish_reason='end_turn'``，``invoke()`` 输出
+    空列表：一次**安全拦截**变成「空成功」。
+    """
+    from anthropic._models import construct_type
+    from anthropic.types import Message
+
+    from src.providers.anthropic import AnthropicProvider
+
+    response = construct_type(
+        type_=Message,
+        value={
+            "id": "m",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-5",
+            "content": [block],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        },
+    )
+    non_streaming = AnthropicProvider._extract_result(response).refusal
+    event = AnthropicProvider._stream_event(
+        {"type": "content_block_start", "index": 0, "content_block": block}, "m"
+    )
+    assert non_streaming == (event.refusal if event else None)
+    assert non_streaming == "被拒绝" or non_streaming == "A"
+
+
+def test_anthropic_non_refusal_block_is_unaffected():
+    """收紧不能误伤：普通 text 块不产生 refusal。"""
+    from anthropic._models import construct_type
+    from anthropic.types import Message
+
+    from src.providers.anthropic import AnthropicProvider
+
+    response = construct_type(
+        type_=Message,
+        value={
+            "id": "m",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-5",
+            "content": [{"type": "text", "text": "hello"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        },
+    )
+    result = AnthropicProvider._extract_result(response)
+    assert result.text == "hello"
+    assert result.refusal is None
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        pytest.param({}, id="no-args"),
+        pytest.param({"store": True}, id="store-only"),
+        pytest.param({"text": {"format": {"type": "json_object"}}}, id="text-only"),
+    ],
+)
+def test_ark_dynamic_create_validates_without_trigger_fields(kwargs, monkeypatch):
+    """Ark 动态创建路径在「一个触发字段都没有」时也必须校验。
+
+    修复前校验被整体跳过，请求直达 SDK 撞上 ``_utils/_utils.py`` 的
+    ``assert "model" in kwargs``，抛 **``AssertionError``**——既不落
+    ``except ValueError`` 也不落 ``except RuntimeError``。
+    """
+    _patch_provider_settings(
+        monkeypatch,
+        "src.providers.volcengine",
+        ark_api_key="test-key",
+        volc_access_key=None,
+        volc_secret_key=None,
+        volc_base_url="https://ark.invalid/v3",
+    )
+    from src.providers.volcengine import VolcengineProvider
+
+    provider = VolcengineProvider(
+        "m", options={"server_verified_protocols": ["responses"]}, protocol="responses"
+    )
+    with pytest.raises(ValueError, match="必须显式提供 model"):
+        provider._require_provider_resource("responses.create", kwargs)
+
+
+def test_ark_dynamic_non_create_calls_are_not_forced_to_supply_model(monkeypatch):
+    """收紧不能误伤：retrieve／delete／list 不得被要求提供 ``model``。"""
+    _patch_provider_settings(
+        monkeypatch,
+        "src.providers.volcengine",
+        ark_api_key="test-key",
+        volc_access_key=None,
+        volc_secret_key=None,
+        volc_base_url="https://ark.invalid/v3",
+    )
+    from src.providers.volcengine import VolcengineProvider
+
+    provider = VolcengineProvider(
+        "m", options={"server_verified_protocols": ["responses"]}, protocol="responses"
+    )
+    for method in ("responses.retrieve", "responses.delete", "responses.list"):
+        provider._require_provider_resource(method, {})
+
+
+def test_ark_dynamic_create_with_full_args_passes(monkeypatch):
+    """收紧不能误伤：完整参数的创建调用照旧通过。"""
+    _patch_provider_settings(
+        monkeypatch,
+        "src.providers.volcengine",
+        ark_api_key="test-key",
+        volc_access_key=None,
+        volc_secret_key=None,
+        volc_base_url="https://ark.invalid/v3",
+    )
+    from src.providers.volcengine import VolcengineProvider
+
+    provider = VolcengineProvider(
+        "m", options={"server_verified_protocols": ["responses"]}, protocol="responses"
+    )
+    provider._require_provider_resource("responses.create", {"model": "m", "input": "x"})
+
+
+# ---------------------------------------------------------------------------
+# 五、分片重叠的比例上界（第 12 条）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("overlap", [751, 1490, 1499])
+def test_settings_rejects_overlap_beyond_half_of_size(overlap):
+    """overlap 超过 size 的一半时必须拒绝。
+
+    ``overlap < size`` 拦不住「接近但不相等」这一类，而它同样静默：实测一篇
+    15000 字符的文档在 size=1500 时，overlap=1490（99%）产出 1651 个分片
+    （137.6x）、overlap=1499 产出 13751 个（1145.9x）——全部进入 embedding 与
+    FAISS 写入。
+    """
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="不能超过 kb_chunk_size 的一半"):
+        Settings(kb_chunk_size=1500, kb_chunk_overlap=overlap)
+
+
+def test_settings_accepts_overlap_at_exactly_half(settings_factory=None):
+    """收紧不能误伤：正好一半是合法上界。"""
+    assert Settings(kb_chunk_size=1500, kb_chunk_overlap=750).kb_chunk_overlap == 750
+    assert Settings(kb_chunk_size=100, kb_chunk_overlap=50).kb_chunk_overlap == 50
+
+
+def test_splitter_rejects_overlap_beyond_half_of_size():
+    """分片器层同判据——它是公开类，调用方可以绕过 ``Settings`` 直接构造。"""
+    from src.etl.splitters.recursive_text_splitter import RecursiveTextSplitter
+
+    for mode in ("standard", "hierarchical"):
+        splitter = RecursiveTextSplitter(
+            parent_chunk_size=1500, parent_chunk_overlap=1499, structure_mode=mode
+        )
+        with pytest.raises(ValueError, match="不能超过 kb_chunk_size 的一半"):
+            if mode == "hierarchical":
+                splitter._validate_hierarchical_sizes()
+            else:
+                splitter._validate_parent_sizes()
+
+
+def test_splitter_accepts_overlap_within_the_bound():
+    """收紧不能误伤：默认比例与正好一半都照旧可用。"""
+    from src.etl.splitters.recursive_text_splitter import RecursiveTextSplitter
+    from src.models.document import Document
+
+    for overlap in (150, 750):
+        splitter = RecursiveTextSplitter(
+            parent_chunk_size=1500, parent_chunk_overlap=overlap, structure_mode="standard"
+        )
+        splitter._validate_parent_sizes()
+        assert splitter.split([Document(content="句子内容。" * 3000)])

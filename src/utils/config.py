@@ -697,13 +697,38 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_overlap_smaller_than_size(self) -> "Settings":
-        """overlap 必须严格小于 size，否则分片无法推进。
+        """overlap 必须严格小于 size，且不得超过 size 的一半。
 
         ``chunk_size == chunk_overlap`` 会让切分器无法前进（得到空分片或
         死循环），且这一约束无法用单字段 validator 表达。
+
+        比例上界（``overlap <= size / 2``）拦的是另一类失败：LangChain 的
+        ``RecursiveCharacterTextSplitter`` 只在 ``overlap > size`` 时报错，
+        **接近** size 时静默接受，而每个分片只前进 ``size - overlap`` 个字符，
+        冗余随比例急剧放大。实测一篇 15000 字符的文档：
+
+        ==========  ==========  ==========
+        overlap     分片数      放大倍数
+        ==========  ==========  ==========
+        10%          14           1.1x
+        50%          23           1.9x
+        80%          56           4.7x
+        99%          1651       137.6x
+        99.9%        13751     1145.9x
+        ==========  ==========  ==========
+
+        这些分片全部进入 embedding 与 FAISS 写入，是一次「配置看着正常、代价
+        上千倍」的静默放大。50% 是主流 RAG 实践的通行上界（它同时保证每个
+        分片至少有一半是新内容），且实测在该点上放大仅 1.9x。
         """
         if self.kb_chunk_overlap >= self.kb_chunk_size:
             raise ValueError("kb_chunk_overlap 必须小于 kb_chunk_size。")
+        if self.kb_chunk_overlap * 2 > self.kb_chunk_size:
+            raise ValueError(
+                "kb_chunk_overlap 不能超过 kb_chunk_size 的一半"
+                f"（得到 overlap={self.kb_chunk_overlap}、size={self.kb_chunk_size}）。"
+                " 重叠比例过高会让分片器几乎无法推进，产出成百上千倍的冗余分片。"
+            )
         # 子分片的两条关系（``child_overlap < child_size``、
         # ``child_size < chunk_size``）**不在这里判**：它们只在层级模式下有
         # 意义，而模式是分片时的运行时参数（``build(splitter_structure_mode)``／

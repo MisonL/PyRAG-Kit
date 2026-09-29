@@ -703,8 +703,24 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             # ``async_create`` 这类 SDK 演进后新增的写法）。凡是参数里出现
             # 受校验字段就执行同一套校验——这正是「动态路径与 Facade 受同一
             # 约束」的判据。
-            if kwargs and self._ARK_RESPONSES_VALIDATED_KWARGS.intersection(kwargs):
-                self._validate_native_response_kwargs(kwargs)
+            #
+            # 但「一个触发字段都没出现」不等于「不是创建调用」：此前那种情况下
+            # 整套校验被跳过，请求直达 SDK，撞上 ``_utils/_utils.py`` 的
+            # ``assert "model" in kwargs``，抛出 **``AssertionError``**——它既不
+            # 落 ``except ValueError`` 也不落 ``except RuntimeError``。实测
+            # ``resources.responses.create()``／``create(store=True)``／
+            # ``create(text={...})`` 三条都得到 ``AssertionError: you need to
+            # support model``，而同样参数走 Facade 得到的是带指引的
+            # ``ValueError: Ark Responses 原生调用必须显式提供 model。``。
+            #
+            # ``create`` 是 ``responses`` 段下的动态方法（路径形如
+            # ``responses.create``／``responses.async_create``），其 ``model``
+            # 与 ``input`` 都是必填——无参调用本就该被本地拒绝。因此对创建方法
+            # 无条件执行校验，其余（retrieve／delete／list／子资源）仍按触发字段
+            # 判断，以免 ``retrieve("r1")`` 被误要求提供 model。
+            is_create = any(segment in {"create", "async_create"} for segment in segments)
+            if is_create or (kwargs and self._ARK_RESPONSES_VALIDATED_KWARGS.intersection(kwargs)):
+                self._validate_native_response_kwargs(kwargs or {})
 
     def _require_responses_resource(self, operation: str) -> None:
         """阻止未验证的 Ark Responses 请求到达远端。"""
@@ -782,7 +798,20 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
     _merge_extra_body = staticmethod(OpenAICompatibleProvider._merge_extra_body)
 
     @staticmethod
-    def _convert_responses_format(response_format: dict[str, Any]) -> dict[str, Any]:
+    def _convert_responses_format(response_format: Any) -> dict[str, Any]:
+        """把统一的 ``response_format`` 转成 Ark Responses 的 ``format``。
+
+        容器形态判在这里：本函数的两个来源（``options.response_format`` 与请求参数）
+        都会走到它，而非 Mapping 时 ``.get()`` 抛裸 ``AttributeError``——不是
+        ``ValueError``，穿透调用方的错误分类。判据与 ``google.py`` 的
+        ``_response_format_values`` 一致。
+        """
+        if response_format is None:
+            return {}
+        if not isinstance(response_format, Mapping):
+            raise ValueError(
+                f"Ark Responses 的 response_format 必须是对象，但得到 {safe_repr(response_format)}。"
+            )
         if response_format.get("type") == "json_schema":
             schema = response_format.get("json_schema", response_format)
             if not isinstance(schema, dict):
@@ -800,7 +829,7 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         if response_format.get("type") == "json_object":
             return {"format": {"type": "json_object"}}
         if "format" in response_format:
-            return response_format
+            return dict(response_format)
         raise ValueError("Ark Responses 的 response_format 仅支持 json_schema 或 json_object。")
 
     @staticmethod

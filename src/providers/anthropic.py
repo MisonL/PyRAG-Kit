@@ -5,7 +5,7 @@ import json
 import re
 import time
 from collections.abc import AsyncGenerator, Generator, Mapping
-from typing import Any
+from typing import Any, get_args, get_type_hints
 
 import anthropic
 
@@ -48,6 +48,70 @@ from src.utils.security import (
 )
 
 logger = get_module_logger(__name__)
+
+
+def _safe_type_hint(model: Any, field_name: str) -> Any:
+    """读取模型字段的类型注解，读不到时返回 ``None``。"""
+    try:
+        return get_type_hints(model).get(field_name)
+    except Exception:  # noqa: BLE001 - 注解解析失败只影响该成员的推导
+        logger.debug("无法解析 %s 的类型注解，跳过。", getattr(model, "__name__", model))
+        return None
+
+
+def _server_tool_types() -> frozenset[str]:
+    """从 SDK 的 ``ToolUnionParam`` 联合类型推导「非普通函数工具」的 ``type`` 取值。
+
+    为什么要推导而不是写死白名单：``_convert_tools`` 原先只认 ``server_`` 前缀与
+    三个 2025-01-24 时代的字面量（``computer_``／``bash_``／``text_editor_``）。
+    而 SDK 里真实存在的服务端工具类型有二十种（``web_search_20250305``、
+    ``code_execution_20250522``、``memory_20250818``、``web_fetch_20250910``、
+    ``browser_toolset_20260801`` …），它们既不匹配那个前缀、也不在那三个字面量里，
+    于是被降级成空 schema 的普通函数工具——``max_uses`` 等专属字段被丢弃，服务端
+    收到的是自定义函数工具而不是服务端检索工具，用户看到 web_search 静默失效。
+    实测发出的请求体从 ``{'type': 'web_search_20250305', 'name': 'web_search',
+    'max_uses': 5}`` 变成 ``{'name': 'web_search', 'description': '',
+    'input_schema': {...}}``。
+
+    推导口径：联合类型里除 ``ToolParam``（普通函数工具，其 ``type`` 是
+    ``Literal['custom']``）之外，每个成员都是某个服务端工具的专用参数模型，
+    取其 ``type`` 的字面量取值。SDK 升级新增工具时集合自动跟随，不需要改这里的
+    代码——写死白名单的失效模式正是「SDK 加了新工具、本地静默降级」。
+
+    推导失败（SDK 结构变化）时退回 ``server_`` 前缀判据：宁可少认几个工具，也不能
+    让普通函数工具被当成服务端工具原样透传。
+    """
+    members = get_args(getattr(anthropic.types, "ToolUnionParam", None) or ())
+    function_tool = getattr(anthropic.types, "ToolParam", None)
+    types: set[str] = set()
+    for member in members:
+        if member is function_tool:
+            continue
+        # 单个成员解析失败不影响其余成员：``get_type_hints`` 对无法解析的注解会抛
+        # 任意异常，而一个成员的模型结构变化不该让整张表退化成空集。
+        hint = _safe_type_hint(member, "type")
+        for literal in get_args(hint) if hint is not None else ():
+            if isinstance(literal, str):
+                types.add(literal)
+    return frozenset(types)
+
+
+# 历史上被硬编码认可、但已从当前 SDK 联合类型中移除的服务端工具字面量。
+#
+# 推导集合跟随 SDK，而 SDK 会**移除**旧版本的工具模型（实测 ``computer_20250124``
+# 已被 ``computer_toolset_20260801`` 取代、不再出现在 ``ToolUnionParam`` 里）。
+# 只取推导集合会让这些仍在服务端生效的旧取值从「原样透传」退回「降级成空 schema
+# 的函数工具」——比修复前更糟。与推导集合取并集。
+_LEGACY_SERVER_TOOL_TYPES = frozenset(
+    {
+        "computer_20250124",
+        "bash_20250124",
+        "text_editor_20250124",
+    }
+)
+
+# 服务端工具（非普通函数 schema）的 ``type`` 取值集合，启动时从 SDK 推导一次。
+_SERVER_TOOL_TYPES = _server_tool_types() | _LEGACY_SERVER_TOOL_TYPES
 
 
 class AnthropicProvider(LargeLanguageModel):
@@ -240,11 +304,40 @@ class AnthropicProvider(LargeLanguageModel):
             )
         raise ValueError("当前 Claude 模型不支持 top_k；请移除该字段。")
 
+    @staticmethod
+    def _require_positive_max_tokens(value: Any, field_name: str) -> int:
+        """把 ``max_tokens`` 收敛成正整数，非法取值给出带来源的 ``ValueError``。
+
+        两个入口共用：``options.max_tokens``（经 ``_default_max_tokens``）与
+        请求级 ``max_tokens``。后者此前**完全无校验**，取值原样进 params，由 SDK
+        深处的 ``_calculate_nonstreaming_timeout`` 执行
+        ``maximum_time * max_tokens / 128_000`` 时才炸：实测 ``10**400`` 抛
+        ``OverflowError: integer division result too large for a float``（它是
+        ``ArithmeticError`` 子类，既不落 ``except ValueError`` 也不落
+        ``except RuntimeError``）、``"abc"`` 与 ``[1]`` 抛 ``TypeError``，而
+        ``1.5``／``-5``／``True`` 静默通过、原样发给服务端。
+
+        判据用 ``is_double_convertible`` 而不是 ``math.isfinite``：后者对超出
+        双精度范围的整数自己就抛 ``OverflowError``（实测 ``math.isfinite(10**400)``
+        抛错），拿它当守卫等于没有守卫。
+        """
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"Anthropic {field_name} 必须是正整数。")
+        if not is_double_convertible(value):
+            raise ValueError(f"Anthropic {field_name} 必须是正整数。")
+        number = int(value)
+        if number <= 0 or number != value:
+            raise ValueError(f"Anthropic {field_name} 必须是正整数。")
+        return number
+
     def _default_max_tokens(self) -> int:
         configured = getattr(self, "_options", {}).get("max_tokens")
         if configured is not None:
             if isinstance(configured, bool) or not isinstance(configured, (int, float)):
                 raise ValueError("Anthropic options.max_tokens 必须是正整数。")
+            # 余下判据（有限性、整数性、正数）在 ``_require_positive_max_tokens``
+            # 里，请求级 ``max_tokens`` 走同一个 helper——同一个量在两个入口的
+            # 判据必须一致。
             # 有限性必须先判，再 ``int()``：``inf`` 让 ``int()`` 抛
             # ``OverflowError: cannot convert float infinity to integer``，
             # ``nan`` 抛 ``ValueError: cannot convert float NaN to integer``——
@@ -255,12 +348,7 @@ class AnthropicProvider(LargeLanguageModel):
             # 判据用 ``is_double_convertible`` 而不是 ``math.isfinite``：后者对
             # 超出双精度范围的整数自己就抛 ``OverflowError``（实测
             # ``math.isfinite(10**400)`` 抛错），拿它当守卫等于没有守卫。
-            if not is_double_convertible(configured):
-                raise ValueError("Anthropic options.max_tokens 必须是正整数。")
-            configured_int = int(configured)
-            if configured_int <= 0 or configured_int != configured:
-                raise ValueError("Anthropic options.max_tokens 必须是正整数。")
-            return configured_int
+            return self._require_positive_max_tokens(configured, "options.max_tokens")
         model = str(getattr(self, "_model_name", "")).lower()
         if "claude-3-opus" in model or "claude-3-haiku" in model:
             return 4096
@@ -308,16 +396,15 @@ class AnthropicProvider(LargeLanguageModel):
             if not isinstance(tool, Mapping):
                 raise ValueError(f"Anthropic 工具定义[{index}] 必须是对象。")
             tool_type = tool.get("type")
-            # Anthropic 的 server_* 工具不是 function schema，原样传递其
-            # 专属字段，避免统一 OpenAI schema 破坏服务端工具配置。
+            # Anthropic 的服务端工具不是 function schema，原样传递其专属字段，
+            # 避免统一 OpenAI schema 破坏服务端工具配置。判据取自 SDK 联合类型
+            # （见 ``_SERVER_TOOL_TYPES``），而不是写死的白名单——后者在 SDK
+            # 新增工具时会静默降级。``custom`` 也是 ``ToolParam`` 自己声明的
+            # 合法取值（``Literal['custom']``），同样原样透传。
             if isinstance(tool_type, str) and (
-                tool_type.startswith("server_")
-                or tool_type
-                in {
-                    "computer_20250124",
-                    "bash_20250124",
-                    "text_editor_20250124",
-                }
+                tool_type in _SERVER_TOOL_TYPES
+                or tool_type == "custom"
+                or tool_type.startswith("server_")
             ):
                 converted.append(dict(tool))
                 continue
@@ -537,15 +624,29 @@ class AnthropicProvider(LargeLanguageModel):
         return converted
 
     @staticmethod
-    def _response_format_config(response_format: dict[str, Any] | None) -> dict[str, Any] | None:
+    def _response_format_config(response_format: Any) -> dict[str, Any] | None:
+        """把统一的 ``response_format`` 转成 Anthropic 的 ``output_config.format``。
+
+        容器形态必须在这里判：``options.response_format`` 那一侧已有守卫（见
+        ``_build_message_params``），但**请求参数**来源（``request.response_format``）
+        直接进本函数，非 Mapping 时 ``.get()`` 抛裸 ``AttributeError``。同一语义的
+        两个来源，守卫只盖住了一处；``google.py`` 的 ``_response_format_values``
+        对同一判据给的是显式 ``ValueError``。
+        """
         if not response_format:
             return None
+        if not isinstance(response_format, Mapping):
+            raise ValueError(
+                f"Anthropic response_format 必须是对象，但得到 {safe_repr(response_format)}。"
+            )
         if response_format.get("type") == "json_schema":
             schema = response_format.get("json_schema", response_format)
             return {"type": "json_schema", "schema": schema.get("schema", schema)}
         if response_format.get("type") == "json_object":
             return {"type": "json_schema", "schema": {"type": "object"}}
-        return response_format
+        # ``dict(...)`` 而不是原样返回：入参经上面的守卫收窄成 ``Mapping``，而本函数
+        # 的契约是返回可自由改写的 ``dict``（调用方会把它嵌进 params）。
+        return dict(response_format)
 
     def _build_message_params(
         self,
@@ -613,7 +714,11 @@ class AnthropicProvider(LargeLanguageModel):
         normalized = normalize_messages(prompt, system_prompt, messages)
         params: dict[str, Any] = {
             "model": self._model_name,
-            "max_tokens": max_tokens if max_tokens is not None else self._default_max_tokens(),
+            "max_tokens": (
+                self._require_positive_max_tokens(max_tokens, "请求级 max_tokens")
+                if max_tokens is not None
+                else self._default_max_tokens()
+            ),
             "messages": self._convert_messages(normalized),
         }
         effective_system = extract_system_prompt(messages) or system_prompt
@@ -834,9 +939,18 @@ class AnthropicProvider(LargeLanguageModel):
             if field(block, "type") == "tool_use"
         ]
         usage_dict = normalize_usage(field(response, "usage"))
+        # 取值优先级必须与流式路径（``_stream_event`` 的 content_block_start 与
+        # content_block_delta 两个分支）**逐字一致**：三处都是
+        # ``refusal or text or reason``。此前这里漏了 ``refusal`` 键，于是同一份
+        # 响应在两条路径上给出不同结果——实测 content 为
+        # ``[{"type": "refusal", "refusal": "被拒绝"}]`` 时非流式得到
+        # ``refusal=None``、``text=''``、``finish_reason='end_turn'``，``invoke()``
+        # 输出空列表：一次**安全拦截**变成「空成功」，而流式路径正确抛出
+        # ``RuntimeError: Anthropic 请求被拒绝``。``refusal`` 是 SDK 的
+        # ``RefusalBlock`` 的正式字段名（``text``／``reason`` 只是兼容形态）。
         refusal = next(
             (
-                field(block, "reason", "") or field(block, "text", "")
+                field(block, "refusal") or field(block, "text") or field(block, "reason")
                 for block in blocks
                 if field(block, "type") == "refusal"
             ),

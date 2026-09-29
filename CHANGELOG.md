@@ -6,6 +6,16 @@
 
 ### 修复
 
+- **补齐分片重叠的比例上界（`kb_chunk_overlap <= kb_chunk_size / 2`）**。原先只判 `overlap < size`，而 LangChain 的 `RecursiveCharacterTextSplitter` 只在 `overlap > size` 时报错、**接近** size 时静默接受——每个分片只前进 `size - overlap` 个字符，冗余随比例急剧放大。实测一篇 15000 字符的文档在 `size=1500` 时：overlap=150（10%）产出 14 个分片（1.1x），overlap=1490（99%）产出 1651 个（137.6x），overlap=1499 产出 13751 个（**1145.9x**）——全部进入 embedding 与 FAISS 写入，是一次「配置看着正常、代价上千倍」的静默放大。50% 是主流 RAG 实践的通行上界（它同时保证每个分片至少有一半是新内容），且实测在该点上放大仅 1.9x。判据同时加在 `Settings.validate_overlap_smaller_than_size`（拦配置来源）与 `RecursiveTextSplitter._validate_parent_sizes`／`_validate_hierarchical_sizes`（拦直接构造，它是公开类）——两个入口必须一致。
+
+- **修复 anthropic 与 volcengine 渠道的 5 处边界缺陷**（第二轮对抗审查，同样逐条实测复现）：
+
+  - **Anthropic 的服务端工具被静默降级成空 schema 的普通函数工具**：`_convert_tools` 的白名单只认 `server_` 前缀与三个 2025-01-24 时代的字面量，而 SDK 里真实存在二十种服务端工具类型（`web_search_20250305`、`code_execution_20250522`、`memory_20250818`、`web_fetch_20250910`、`browser_toolset_20260801` …）。实测发出的请求体从 `{'type': 'web_search_20250305', 'name': 'web_search', 'max_uses': 5}` 变成 `{'name': 'web_search', 'description': '', 'input_schema': {...}}`——`max_uses` 等专属字段被丢弃，服务端收到自定义函数工具而非服务端检索工具，用户看到 web_search 静默失效。现从 SDK 的 `ToolUnionParam` 联合类型**推导**集合（除普通 `ToolParam` 外每个成员的 `type` 字面量），SDK 新增工具时自动跟随；再与旧字面量取并集——SDK 会**移除**旧版本的工具模型（实测 `computer_20250124` 已被 `computer_toolset_20260801` 取代），只取推导集合会让这些仍在服务端生效的取值从「原样透传」退回「降级」，比修复前更糟。
+  - **`response_format` 非 Mapping 抛裸 `AttributeError`**（两处，同一语义两个来源）：`anthropic._response_format_config` 与 `volcengine._convert_responses_format` 都直接 `.get("type")`。`options.response_format` 那一侧早有守卫，但**请求参数**来源直接进这两个函数，实测 `"json_object"`／`42`／`['a']` 都得到 `AttributeError`——不是 `ValueError`，穿透调用方的错误分类。`google.py` 的 `_response_format_values` 对同一判据给的是显式 `ValueError`，现三处对齐。
+  - **Anthropic 请求级 `max_tokens` 完全无校验**：`_default_max_tokens` 对 `options.max_tokens` 有完整判据（含专门的有限性注释），而请求参数那条路原样塞进 params，由 SDK 深处的 `_calculate_nonstreaming_timeout` 执行 `maximum_time * max_tokens / 128_000` 时才炸——实测 `10**400` 抛 `OverflowError: integer division result too large for a float`（`ArithmeticError` 子类，既不落 `except ValueError` 也不落 `except RuntimeError`），`"abc"`／`[1]` 抛 `TypeError`，而 `1.5`／`-5`／`True` 静默通过、原样发给服务端。现抽出 `_require_positive_max_tokens` 供两个入口共用。
+  - **Anthropic 非流式路径读不到 `refusal` 键，拒答被静默丢弃**：流式 `_stream_event` 读 `refusal or text or reason`，非流式 `_extract_result` 只读 `reason or text`。实测 `content=[{"type": "refusal", "refusal": "被拒绝"}]`、`stop_reason="end_turn"` 时非流式返回 `text=''`、`refusal=None`、`finish_reason='end_turn'`，`invoke(stream=False)` 输出 `[]`——一次**安全拦截**变成「空成功」，而流式路径正确抛 `RuntimeError: Anthropic 请求被拒绝`。`refusal` 是 SDK `RefusalBlock` 的正式字段名，现三处取值优先级逐字一致。
+  - **Ark 动态资源路径在未命中触发字段时完全跳过参数校验**：`_require_provider_resource` 只在参数里出现 `_ARK_RESPONSES_VALIDATED_KWARGS` 之一时才调 `_validate_native_response_kwargs`，于是 `resources.responses.create()`／`create(store=True)`／`create(text={...})` 直达 SDK，撞上 `_utils/_utils.py` 的 `assert "model" in kwargs`，抛 **`AssertionError`**——既不落 `except ValueError` 也不落 `except RuntimeError`；同样参数走 Facade 得到的是带指引的 `ValueError`。现对创建方法（`create`／`async_create`）无条件执行校验，其余（retrieve／delete／list／子资源）仍按触发字段判断，避免把 `retrieve("r1")` 误要求提供 `model`。
+
 - **收敛 24 处边界缺陷（异常分类泄漏、读写不对称、静默语义破坏）**。全部来自一次六维对抗审查，每条都在修复前实测复现、修复后加了回归测试（`tests/test_boundary_hardening_regressions.py`，82 个用例；回退源码后其中 58 个变红）。
 
   **异常分类泄漏**（守卫抛出的异常不在调用方的 `except ValueError`／`RuntimeError` 之内）：

@@ -211,15 +211,20 @@ class RecursiveTextSplitter(BaseSplitter):
         return size, overlap
 
     def _validate_parent_sizes(self) -> None:
-        """校验父分片器的 ``overlap < size``，两种结构模式都要过。
+        """校验父分片器的 ``overlap < size`` 与 ``overlap <= size / 2``。
 
-        为什么必须在这里判：``Settings.validate_overlap_smaller_than_size`` 只要求
-        ``overlap < size``，因此 ``kb_chunk_size=1500, kb_chunk_overlap=1499``
-        完全合法；而 LangChain 的 ``RecursiveCharacterTextSplitter`` 只在
-        ``overlap > size`` 时报错，**相等时静默接受**（实测 size=100/ov=100 通过，
-        ov=101 抛 ValueError）。于是每个分片只前进 1 个字符：实测一篇 15000 字符的
-        文档产出 13751 个分片、合计 1718 万字符（放大 1146 倍），随后全部进入
-        embedding 与 FAISS 写入。
+        为什么必须在这里判：``RecursiveTextSplitter`` 是公开类，调用方可以直接
+        构造它而不经过 ``Settings``，而 LangChain 的
+        ``RecursiveCharacterTextSplitter`` 只在 ``overlap > size`` 时报错，
+        **相等时静默接受**（实测 size=100/ov=100 通过、ov=101 抛 ValueError）——
+        每个分片只前进 1 个字符。
+
+        比例上界（``overlap <= size / 2``）拦的是「接近但不相等」这一类，
+        它同样静默：实测一篇 15000 字符的文档在 size=1500 时，overlap=150（10%）
+        产出 14 个分片（1.1x），而 overlap=1490（99%）产出 1651 个（137.6x）、
+        overlap=1499 产出 13751 个（1145.9x）——全部进入 embedding 与 FAISS
+        写入。判据与 ``Settings.validate_overlap_smaller_than_size`` 同源，两个
+        入口必须一致（``Settings`` 拦配置来源、这里拦直接构造）。
 
         ``_validate_hierarchical_sizes`` 对**子**分片早有同一判据（注释写明「相等
         会让子分片器无法推进」），父分片这条同一语义的判据此前缺失；而父分片器在
@@ -232,6 +237,12 @@ class RecursiveTextSplitter(BaseSplitter):
                 "kb_chunk_overlap 必须小于 kb_chunk_size，"
                 f"但得到 overlap={safe_repr(overlap)}、size={safe_repr(size)}。"
                 " 相等会让父分片器几乎无法推进，产出成百上千倍的冗余分片。"
+            )
+        if overlap * 2 > size:
+            raise ValueError(
+                "kb_chunk_overlap 不能超过 kb_chunk_size 的一半，"
+                f"但得到 overlap={safe_repr(overlap)}、size={safe_repr(size)}。"
+                " 重叠比例过高会让父分片器几乎无法推进，产出成百上千倍的冗余分片。"
             )
 
     def _validate_hierarchical_sizes(self) -> None:
