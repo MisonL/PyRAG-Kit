@@ -1147,14 +1147,15 @@ def _capture_anthropic_headers(provider, *, beta: bool) -> dict[str, object]:
         captured.update(kwargs)
         return SimpleNamespace(input_tokens=3)
 
-    messages = SimpleNamespace(count_tokens=_capture)
+    # ``create`` 与 ``count_tokens`` 共用同一个捕获函数：测试关心的是**发给 SDK
+    # 的参数**，入口不同不改变判据。
     client = SimpleNamespace(
-        messages=messages,
-        beta=SimpleNamespace(messages=SimpleNamespace(count_tokens=_capture)),
+        messages=SimpleNamespace(count_tokens=_capture, create=_capture),
+        beta=SimpleNamespace(messages=SimpleNamespace(count_tokens=_capture, create=_capture)),
     )
     aclient = SimpleNamespace(
-        messages=SimpleNamespace(count_tokens=_acapture),
-        beta=SimpleNamespace(messages=SimpleNamespace(count_tokens=_acapture)),
+        messages=SimpleNamespace(count_tokens=_acapture, create=_acapture),
+        beta=SimpleNamespace(messages=SimpleNamespace(count_tokens=_acapture, create=_acapture)),
     )
     provider._get_client = lambda: client
     provider._get_aclient = lambda: aclient
@@ -1324,3 +1325,113 @@ def test_knowledge_build_surfaces_unusable_embedding_detail_as_value_error():
 
     with pytest.raises(ValueError, match="必须是提供"):
         _ = service.embedding_service.embedding_model_detail.model_name
+
+
+# ── user / betas 的取值校验 ──
+#
+# ``CompletionRequest`` 是普通 dataclass、``__post_init__`` 不校验这两个字段
+# （声明类型分别是 ``str | None`` 与 ``Sequence[str] | None``）。它们都进 HTTP
+# 请求：``user`` 转成 ``user_profile_id`` 头，``betas`` 拼成 ``anthropic-beta``
+# 头。走真实 SDK（``httpx2.MockTransport`` 拦网）实测的修复前收场：
+#
+#   invoke(user=5)         -> AttributeError: 'int' object has no attribute 'encode'
+#   beta_create(betas=5)   -> TypeError: 'int' object is not iterable
+#   beta_create(betas=b"x")-> 发出 anthropic-beta: 120
+#   beta_create(betas=[1, 2]) -> 发出 anthropic-beta: 1,2
+#   beta_create(betas={"a": 1}) -> 发出 anthropic-beta: a（静默取键）
+#
+# 前者不是本渠道 ``except ValueError``／``except RuntimeError`` 分类内的类型；
+# 后三者不报错，但服务端收到一个不存在的 beta 名——要么报一个与调用方写法
+# 毫无关系的错，要么静默忽略掉本想启用的特性。
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(5, id="int"),
+        pytest.param(["a"], id="list"),
+        pytest.param(b"x", id="bytes"),
+        pytest.param({"a": 1}, id="dict"),
+    ],
+)
+def test_anthropic_rejects_non_string_user(monkeypatch, value):
+    """``user`` 非字符串必须抛 ``ValueError``，不是裸 ``AttributeError``。"""
+    provider = _anthropic_provider(monkeypatch)
+    _capture_anthropic_headers(provider, beta=False)
+
+    with pytest.raises(ValueError, match="user 必须是字符串"):
+        provider.count_tokens(prompt="hi", user=value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(5, id="int"),
+        pytest.param(b"x", id="bytes"),
+        pytest.param("s", id="bare-string"),
+        pytest.param({"a": 1}, id="mapping"),
+    ],
+)
+def test_anthropic_rejects_non_list_betas(monkeypatch, value):
+    """``betas`` 不是字符串列表时必须拒绝。
+
+    ``bytes``／``str``／``Mapping`` 都是**可迭代**的，``list()`` 不会报错而是
+    静默给出错误结果：``list(b"x")`` 得 ``[120]``、``list("ab")`` 把单个 beta
+    名拆成两个、``list({"a": 1})`` 取键得 ``["a"]``。
+    """
+    provider = _anthropic_provider(monkeypatch)
+    _capture_anthropic_headers(provider, beta=True)
+
+    with pytest.raises(ValueError, match="betas"):
+        provider.beta_create(prompt="hi", betas=value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param([1, 2], id="ints"),
+        pytest.param(["a", 1], id="mixed"),
+        pytest.param([None], id="none-element"),
+    ],
+)
+def test_anthropic_rejects_non_string_beta_elements(monkeypatch, value):
+    """``betas`` 的元素非字符串必须拒绝——它们会被拼进 HTTP 头。"""
+    provider = _anthropic_provider(monkeypatch)
+    _capture_anthropic_headers(provider, beta=True)
+
+    with pytest.raises(ValueError, match="元素必须是字符串"):
+        provider.beta_create(prompt="hi", betas=value)
+
+
+def test_anthropic_betas_validated_without_user(monkeypatch):
+    """``betas`` 必须在 ``user`` 为 ``None`` 时也校验。
+
+    ``_user_profile_fields`` 只在 ``user is not None`` 时被调用，而 ``betas``
+    走 ``beta_values`` 直接进 params——把校验只放在那个函数里会漏掉这条路径，
+    实测 ``beta_create(prompt="hi", betas=5)`` 仍抛裸 ``TypeError``。
+    """
+    provider = _anthropic_provider(monkeypatch)
+    _capture_anthropic_headers(provider, beta=True)
+
+    with pytest.raises(ValueError, match="betas"):
+        provider.beta_create(prompt="hi", betas=5)
+
+
+def test_anthropic_user_and_betas_still_accept_legal_values(monkeypatch):
+    """收紧不能误伤：合法 ``user`` 与 ``betas`` 照旧合并进 ``anthropic-beta``。"""
+    provider = _anthropic_provider(monkeypatch)
+    captured = _capture_anthropic_headers(provider, beta=True)
+
+    provider.beta_create(prompt="hi", user="u1", betas=["a", "b"])
+    assert captured["betas"] == ["a", "b", "user-profiles-2026-08-18"]
+    assert captured["user_profile_id"] == "u1"
+
+
+def test_anthropic_betas_alone_reach_params_unchanged(monkeypatch):
+    """``user`` 为 ``None`` 时 ``betas`` 原样进 params（不注入 profile 头）。"""
+    provider = _anthropic_provider(monkeypatch)
+    captured = _capture_anthropic_headers(provider, beta=True)
+
+    provider.beta_create(prompt="hi", betas=["a"])
+    assert captured["betas"] == ["a"]
+    assert "user_profile_id" not in captured

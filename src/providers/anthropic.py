@@ -397,6 +397,63 @@ class AnthropicProvider(LargeLanguageModel):
                 )
         return {name: value for name, value in headers.items() if value is not None}
 
+    @staticmethod
+    def _require_profile_id(user: Any) -> str | None:
+        """校验 ``user``（转成 ``user_profile_id``）是字符串。
+
+        声明类型是 ``str | None``，但 ``CompletionRequest`` 是普通 dataclass、
+        ``__post_init__`` 不校验它——实测 ``beta_create(prompt="hi", user=5)``
+        构造成功。SDK 把这个值当 HTTP 头的取值，非字符串抛
+        ``AttributeError: 'int' object has no attribute 'encode'``（``bytes``
+        抛 ``'bytes' object has no attribute 'encode'``，因为 httpx 对 ``bytes``
+        头值走的是另一条分支）。``AttributeError`` 不落本渠道的
+        ``except ValueError``／``except RuntimeError`` 分类。
+
+        走真实 SDK（``httpx2.MockTransport`` 拦网）实测：``invoke``／
+        ``beta_create``／``async_beta_create`` 三个入口对 ``5``／``["a"]``／
+        ``b"x"`` 都抛该 ``AttributeError``。
+        """
+        if user is None or isinstance(user, str):
+            return user
+        raise ValueError(f"Anthropic user 必须是字符串，但得到 {safe_repr(user)}。")
+
+    @staticmethod
+    def _require_beta_tokens(betas: Any) -> list[str] | None:
+        """把 ``betas`` 收敛成字符串列表；非法形态给带字段名的 ``ValueError``。
+
+        ``CompletionRequest.betas`` 声明为 ``Sequence[str] | None``，但同样不经
+        校验。三种形态的收场都不在渠道契约内（走真实 SDK 实测）：
+
+        * ``5`` 抛裸 ``TypeError: 'int' object is not iterable``（``list(5)``）；
+        * ``b"x"`` 被 ``list()`` 拆成 ``[120]``——整数进了 HTTP 头；
+        * ``{"a": 1}`` 静默取**键**得 ``["a"]``；
+        * ``["a", 1]`` 的元素原样进请求体。
+
+        后三类更隐蔽：SDK 把它们直接拼进 ``anthropic-beta`` 头（实测
+        ``betas=[1, 2]`` 发出 ``anthropic-beta: 1,2``、``betas=b"x"`` 发出
+        ``120``），服务端收到一个不存在的 beta 名——要么报一个与调用方写法
+        毫无关系的错，要么静默忽略掉本想启用的特性。字符串是唯一的合法元素
+        形态，与 ``_require_string_header_values`` 同一判据。
+        """
+        if betas is None:
+            return None
+        # 字符串与 bytes 要**先**拒：两者都是可迭代的，``list("ab")`` 会得到
+        # ``["a", "b"]``（把单个 beta 名拆成两个），``list(b"x")`` 得到
+        # ``[120]``（整数进 HTTP 头）。``Mapping`` 同样可迭代，但迭代的是**键**
+        # ——``{"a": 1}`` 静默变成 ``["a"]``，值被丢弃而调用方无从察觉。
+        if isinstance(betas, (str, bytes, Mapping)):
+            raise ValueError(f"Anthropic betas 必须是字符串列表，但得到 {safe_repr(betas)}。")
+        try:
+            values = list(betas)
+        except TypeError as exc:
+            raise ValueError(
+                f"Anthropic betas 必须是字符串列表，但得到 {safe_repr(betas)}。"
+            ) from exc
+        for value in values:
+            if not isinstance(value, str):
+                raise ValueError(f"Anthropic betas 的元素必须是字符串，但得到 {safe_repr(value)}。")
+        return values
+
     @classmethod
     def _user_profile_fields(
         cls,
@@ -413,14 +470,12 @@ class AnthropicProvider(LargeLanguageModel):
         # ``except ValueError`` 也不落 ``except RuntimeError``。而 ``user=None``
         # 恰恰是最常见的调用形态，这条路径比下面的合并分支更容易走到。
         headers = cls._require_string_header_values(extra_headers)
+        user = cls._require_profile_id(user)
         if user is None:
             return headers, betas
         header = "user-profiles-2026-08-18"
         if beta:
-            if isinstance(betas, str):
-                values = [betas]
-            else:
-                values = list(betas or [])
+            values = cls._require_beta_tokens(betas) or []
             if header not in values:
                 values.append(header)
             # 返回**校验过**的副本（``headers`` 可能是 ``None``，此时语义就是
@@ -752,7 +807,12 @@ class AnthropicProvider(LargeLanguageModel):
             "context_management": context_management,
             "mcp_servers": mcp_servers,
             "speed": speed,
-            "betas": betas,
+            # ``betas`` 必须在这里校验，不能只在 ``_user_profile_fields`` 里判：
+            # 那个函数仅在 ``user is not None`` 时被调用，而 ``betas`` 走
+            # ``beta_values`` 直接进 params（见下方 ``if beta:`` 的 update）。
+            # 实测 ``beta_create(prompt="hi", betas=5)`` 在加这条之前抛裸
+            # ``TypeError``、``betas=[1, 2]`` 把 ``1,2`` 拼进 anthropic-beta 头。
+            "betas": self._require_beta_tokens(betas),
             "diagnostics": diagnostics,
             "fallback_credit_token": fallback_credit_token,
             "fallbacks": fallbacks,

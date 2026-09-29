@@ -276,7 +276,20 @@
   - **beta 计数入口丢弃了校验后的头**：`beta_count_tokens`／`async_beta_count_tokens` 把 `_user_profile_fields` 的返回值丢进 `_`，转头写回原始的 `request.extra_headers`——被剔除的 `None` 值于是原样发给 httpx。同文件 `beta=False` 的计数入口用的正是 `profile_headers`，两处现对齐。
   - **`EmbeddingService.embedding_model_detail` 只判键在不在、不判值可用**：`{"local-hash": None}` 的键确实存在，`None` 被原样返回，两个调用点（`embed_query` 的 Google 分支、`knowledge_build_service` 写清单）紧接着读 `.provider`／`.model_name`，在那里抛裸 `AttributeError`。同一份配置走 `ModelProviderFactory.get_embedding_provider` 得到的是带字段名的 `ValueError`——两条路径的报错契约本该一致，否则调用方按 `ValueError` 写的错误分类与日志脱敏接不住 `AttributeError`。现复用 `require_detail_attributes`（判据是属性存在性而非 `isinstance(..., ModelDetail)`，理由见其 docstring——使用方只要求取值提供这几个属性，仓库测试就用 `SimpleNamespace` 构造等价配置）。可达路径里最晚暴露的是**零分块**的 markdown：它跳过 embedding 调用、直接走到写清单那一步读 `model_name`。
 
+- **补齐 Anthropic `user`／`betas` 的取值校验（第四轮对抗审查）**。`CompletionRequest` 是普通 dataclass，`__post_init__` 只校验 `extra_headers`／`extra_query`／`extra_body`，声明为 `str | None` 与 `Sequence[str] | None` 的这两个字段不受任何约束。它们都进 HTTP 请求（`user` 转成 `user_profile_id` 头、`betas` 拼成 `anthropic-beta` 头），走真实 SDK（`httpx2.MockTransport` 拦网）实测修复前的收场：
+
+  - `invoke(user=5)`／`beta_create(user=5)` → `AttributeError: 'int' object has no attribute 'encode'`（`['a']` 与 `b"x"` 同理，后者是 httpx 对 `bytes` 头值走另一条分支）。`AttributeError` 不落本渠道的 `except ValueError`／`except RuntimeError` 分类。七个入口（`invoke`／`count_tokens`／`beta_create`／`beta_stream`／`beta_count_tokens` 及三个异步对应项）实测全部如此。
+  - `beta_create(betas=5)` → 裸 `TypeError: 'int' object is not iterable`。
+  - `beta_create(betas=[1, 2])` 发出 `anthropic-beta: 1,2`；`betas=b"x"` 发出 `120`（`list(b"x")` 得 `[120]`）；`betas={"a": 1}` 静默取**键**发出 `a`；`betas="s"` 被 `list()` 拆成 `['s']`。服务端收到不存在的 beta 名——要么报一个与调用方写法毫无关系的错，要么静默忽略掉本想启用的特性。
+  - 现新增 `_require_profile_id` 与 `_require_beta_tokens`：前者只接受 `str | None`；后者把 `str`／`bytes`／`Mapping` 三类「可迭代但不是字符串列表」的形态显式拒绝（`list()` 对它们不报错，只会静默给出错误结果），并逐个校验元素类型。
+  - **`betas` 的校验必须放在 `_build_message_params` 的 `beta_values` 构造处**，不能只放在 `_user_profile_fields` 里：那个函数仅在 `user is not None` 时被调用，而 `betas` 走 `beta_values` 直接进 params——只加在前者时 `beta_create(prompt="hi", betas=5)` 仍抛裸 `TypeError`（这正是首版实现漏掉的路径，回归用例 `test_anthropic_betas_validated_without_user` 专门盯它）。
+
+
 ### 测试
+
+- 新增 Anthropic `user`／`betas` 取值的回归用例（14 个；回退源码后其中 12 个变红）：`user` 的四类非字符串形态、`betas` 的四类非列表形态（`int`／`bytes`／裸字符串／`Mapping`）、`betas` 元素的三类非字符串形态，以及三条「不误伤」的反向守卫（合法 `user` 与 `betas` 仍合并进 `anthropic-beta`、`betas` 单独出现时原样进 params 不注入 profile 头）。另有 `test_anthropic_betas_validated_without_user` 专门盯住「校验只加在 `_user_profile_fields` 里」这条漏网路径——`betas` 在 `user=None` 时不经过那个函数。测试的捕获 helper 同时装上 `create` 与 `count_tokens`，因为 `betas` 只被前者转发（`beta_count_tokens` 的白名单放行它但函数体不读）。
+
+
 
 - 新增第三轮修复的回归用例（`tests/test_boundary_hardening_regressions.py` 第六节，16 个用例；回退源码后其中 13 个变红）：`extra_headers` 的四类非字符串取值（`int`／`bytes`／`list`／`dict`）与 `None` 值剔除、`user` 已设置而 `extra_headers` 未提供、beta 计数入口同步与异步两条路径都用校验后的头、合法头（含既有 `anthropic-beta` 值）照旧保留并合并；以及 `embedding_model_detail` 对五类不可用取值（`None`／字符串／整数／缺 `model_name`／缺 `provider`）的拒绝与两条不误伤的接受路径，另有一条覆盖**零分块**建库路径（它跳过 embedding 调用、最晚暴露）。三条未变红的是「收紧不误伤」的反向守卫。beta 计数入口的用例整体替换 `_get_client`／`_get_aclient`（客户端是懒加载的，构造期 `_client` 为 `None`），沿用仓库既有协议适配测试的注入方式。
 
