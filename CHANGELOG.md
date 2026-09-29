@@ -301,7 +301,11 @@
   三处的 ``"abc"`` 尤其要紧：字符串是合法的 ``Sequence``，只判「可迭代」拦不住，它会被当成一串字符逐字处理。现三处共用同一判据（容器必须是 ``Sequence`` 且显式排除 ``str``／``bytes``／``bytearray``，条目必须是 ``Document`` 实例并带下标），分片器把判据抽成 ``_require_documents`` 供 ``split`` 与 ``split_hierarchical`` 共用——只守卫 ``split`` 会留下「直接调 ``split_hierarchical``」的口子。条目判据用 ``Document`` 实例而非鸭子类型：三个阶段后续都直接读它的 ``content``／``metadata``，而 ``Document`` 是 pydantic 模型（构造期已校验 ``content: str``），要求实例化才能进入能让错误定位到构造处而不是处理处。
 
 
+- **补齐配置写入入口的容器形态校验**：`SessionConfig.set_many` 与 `Chatbot.chat_config` setter 的标注是映射，但运行时不受约束，非映射取值一路走到 `.items()`／`set_many` 的迭代才炸。实测 `cfg.set_many(5)` 与 `bot.chat_config = 5` 都得到裸 `TypeError: 'int' object is not iterable`，而 `cfg.set_many("abc")` 更糟——字符串是合法的可迭代对象，它被拆成一串单字符字段名，抛出 `KeyError: "SessionConfig 没有字段 'a'。"`（`bot.chat_config = "abc"` 同理）。同一个「配置写错」的收场不该取决于写错的是标量还是映射：非法**字段名**早已给带指引的 `ValueError`，现在非法**容器**也是。两处都在任何写入之前判形态（`str`／`bytes`／`bytearray` 显式排除），`chat_config` setter 的既有原子性契约（`deepcopy` 副本上写入）保持不变。
+
 ### 测试
+
+- 新增第七轮的回归用例（14 个用例；回退源码后其中 10 个变红，4 个「不误伤」反向守卫保持绿）：`SessionConfig.set_many` 对五类非映射容器（`int`／`None`／`str`／`bytes`／`list`）的拒绝、`Chatbot.chat_config` setter 对同样五类的拒绝、两条合法路径照旧工作（映射与 `SessionConfig` 实例），以及被拒时状态不被改了一半。
 
 - 新增第六轮的回归用例（22 个用例；回退源码后其中 18 个变红，4 个「不误伤」反向守卫保持绿）：``Pipeline.process`` 对四类非法入参的拒绝、``BasicCleaner.clean`` 对四类非法容器与三类非法条目的拒绝、``RecursiveTextSplitter.split`` 的同两组、``split_hierarchical`` 与 ``split`` 共用同一判据（这条专门盯「只守卫一个入口」），以及三个阶段合法路径照旧工作（含空列表与清洗结果）。
 

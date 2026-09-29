@@ -1862,3 +1862,107 @@ def test_etl_stages_still_accept_legal_documents():
     # ``Pipeline.process`` 需要一个完整装配的实例，这里只断言它的守卫放行
     # 合法 ``Document``（走真实的 ``isinstance`` 判据，而不是重复构造）。
     assert isinstance(Document(content="x"), Document)
+
+
+# ── 配置写入入口的容器形态 ──
+#
+# ``SessionConfig.set_many`` 与 ``Chatbot.chat_config`` setter 是同一条写入路径
+# 的两端（后者优先转调前者），此前都不判入参容器形态。实测 ``5`` 与 ``None``
+# 在 ``for key in values`` 处抛裸 ``TypeError: 'int' object is not iterable``，
+# 而紧随其后的 ``_require_known_field`` 对可迭代但字段名非法的形态给的是带
+# 指引的 ``ValueError``——同一个「配置写错」的收场不该取决于它是标量还是映射。
+#
+# ``"abc"`` 更隐蔽：字符串是合法的 ``Sequence``，被拆成 ``a``／``b``／``c``
+# 三个字段名，报出与调用方写法毫无关系的 ``KeyError``。
+
+
+def _session_config_for_writes():
+    from src.runtime.contracts import build_session_config
+    from src.utils.config import get_settings
+
+    return build_session_config(get_settings())
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(5, id="int"),
+        pytest.param(None, id="none"),
+        pytest.param("abc", id="bare-string"),
+        pytest.param(b"x", id="bytes"),
+        pytest.param([1], id="list"),
+    ],
+)
+def test_set_many_rejects_non_mapping(value):
+    """``set_many`` 的入参必须是映射。"""
+    with pytest.raises(ValueError, match="批量写入必须是字段映射"):
+        _session_config_for_writes().set_many(value)
+
+
+def test_set_many_still_accepts_mappings():
+    """收紧不能误伤：空映射与合法映射照旧工作。"""
+    config = _session_config_for_writes()
+    config.set_many({})
+    config.set_many({"top_k": 3})
+    assert config.top_k == 3
+
+
+def test_set_many_still_reports_unknown_fields():
+    """字段名非法时的消息形态不变（带字段名与可选值）。"""
+    config = _session_config_for_writes()
+    with pytest.raises(ValueError, match="retrieval_method"):
+        config.set_many({"retrieval_method": "不存在"})
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(5, id="int"),
+        pytest.param(None, id="none"),
+        pytest.param("abc", id="bare-string"),
+        pytest.param(b"x", id="bytes"),
+        pytest.param([1], id="list"),
+    ],
+)
+def test_chat_config_setter_rejects_non_mapping(value):
+    """``Chatbot.chat_config`` setter 的入参必须是 ``SessionConfig`` 或映射。"""
+    from src.chat.core import Chatbot
+
+    bot = Chatbot.__new__(Chatbot)
+    bot.session_config = _session_config_for_writes()
+    with pytest.raises(ValueError, match="必须是 SessionConfig 或字段映射"):
+        bot.chat_config = value
+
+
+def test_chat_config_setter_still_accepts_both_forms():
+    """收紧不能误伤：``SessionConfig`` 实例与映射两条路径照旧工作。"""
+    from src.chat.core import Chatbot
+    from src.runtime.contracts import SessionConfig
+
+    bot = Chatbot.__new__(Chatbot)
+    bot.session_config = _session_config_for_writes()
+
+    replacement = _session_config_for_writes()
+    assert isinstance(replacement, SessionConfig)
+    bot.chat_config = replacement
+    assert bot.chat_config is replacement
+
+    bot.chat_config = {"top_k": 7}
+    assert bot.session_config.top_k == 7
+
+
+def test_chat_config_setter_rejection_is_atomic():
+    """被拒时不得留下改了一半的状态。
+
+    这条守着既有的原子性契约（``deepcopy`` 副本上写入），容器守卫加在它之前
+    不能破坏它。
+    """
+    from src.chat.core import Chatbot
+
+    bot = Chatbot.__new__(Chatbot)
+    bot.session_config = _session_config_for_writes()
+    before = bot.session_config.top_k
+
+    with pytest.raises(ValueError):
+        bot.chat_config = {"top_k": 42, "retrieval_method": "不存在"}
+    assert bot.session_config.top_k == before

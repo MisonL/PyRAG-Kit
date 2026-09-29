@@ -1,7 +1,7 @@
 import asyncio
 import inspect
 import os
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from copy import deepcopy
 from typing import Any
 
@@ -37,7 +37,7 @@ from ..ui.display_utils import (
     get_relative_path,
     markup_text,
 )
-from ..utils.config import get_settings
+from ..utils.config import get_settings, safe_repr
 from ..utils.log_manager import get_chat_logger
 from ..utils.security import safe_exception_text
 
@@ -65,6 +65,14 @@ class Chatbot:
         if isinstance(value, SessionConfig):
             self.session_config = value
             return
+        # 形态先判：标注是 ``SessionConfig | dict``，但运行时不受约束。非 Mapping
+        # 取值在此抛裸 ``TypeError: 'int' object is not iterable``（下面两条路径
+        # 的 ``.items()``／``set_many`` 迭代），而非法**字段名**给的是带指引的
+        # ``ValueError``。同一个「配置写错」的收场不该取决于它是标量还是映射。
+        if not isinstance(value, Mapping):
+            raise ValueError(
+                f"chat_config 必须是 SessionConfig 或字段映射，但得到 {safe_repr(value)}。"
+            )
         if not hasattr(self, "session_config"):
             self.session_config = build_session_config(get_settings())
         # 先在副本上逐个写入，全部通过后再整体替换。

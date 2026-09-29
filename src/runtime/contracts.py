@@ -183,6 +183,17 @@ class SessionConfig(MutableMapping[str, Any]):
         # ``TypeError: unhashable type``，而消息里的 ``{key!r}`` 对位数超限的整数
         # 抛 ``ValueError: Exceeds the limit``。两条都与「字段名写错了」无关，
         # 而同文件的 ``_validate_fusion_strategy`` 早已认领同一类线索。
+        # 容器形态先判：``for key in values`` 对不可迭代的取值抛裸
+        # ``TypeError: 'int' object is not iterable``——而紧随其后的
+        # ``_require_known_field`` 对**可迭代但字段名非法**的形态给的是带字段名
+        # 的 ``ValueError``。同一判据的两半必须都在，否则「参数写错」的收场
+        # 取决于它是标量还是序列。``str``／``bytes`` 要显式排除：它们是合法的
+        # ``Sequence``，迭代得到的是字符（``"ab"`` 会被拆成 ``a``／``b`` 两个
+        # 字段名，报出与调用方写法无关的 ``KeyError``）。
+        # 取值来源是公开的 ``Chatbot.chat_config`` setter（标注
+        # ``SessionConfig | dict``，但运行时不受约束）。
+        if isinstance(values, (str, bytes, bytearray)) or not isinstance(values, Mapping):
+            raise ValueError(f"批量写入必须是字段映射，但得到 {safe_repr(values)}。")
         for key in values:
             self._require_known_field(key)
 
