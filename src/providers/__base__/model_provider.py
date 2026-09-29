@@ -1259,7 +1259,14 @@ def validate_complete_tool_call(tool_call: Mapping[str, Any], provider: str) -> 
     name = tool_call.get("name")
     if not isinstance(name, str) or not name.strip():
         raise RuntimeError(f"{provider} 工具调用缺少 name，流提前结束。")
-    tool_type = tool_call.get("type", "function_call")
+    # ``type`` 与 ``enum_field`` 同源：它来自网关 JSON（``openai`` SDK 对 SSE
+    # chunk 的未知字段用 ``extra="allow"`` 原样保留，``{"type": ["function"]}``
+    # 是能构造出来的）。直接对集合做成员测试会让 ``list``/``dict`` 抛
+    # ``TypeError: unhashable type``——不是调用方按 ``RuntimeError`` 做的分类，
+    # 消息里也没有工具调用名。非字符串收敛成 ``""``：落在「不是已知类型」的
+    # 分支上，与 ``merge_tool_call_fragment`` 的口径一致。
+    raw_type = tool_call.get("type", "function_call")
+    tool_type = raw_type if isinstance(raw_type, str) else ""
     arguments = tool_call.get("arguments")
     # Responses custom tools intentionally accept arbitrary text, including an
     # empty input. Function calls still require a complete JSON arguments value.
@@ -1270,6 +1277,22 @@ def validate_complete_tool_call(tool_call: Mapping[str, Any], provider: str) -> 
             json.loads(arguments)
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"{provider} 工具调用 {name} 的 arguments 不是完整 JSON。") from exc
+        except RecursionError as exc:
+            # 嵌套深度超过解释器栈：JSON 可能结构完整，但本进程无法校验它。
+            # ``RecursionError`` 是 ``RuntimeError`` 的子类，类型上虽落在调用方
+            # 的分类内，消息却只有解释器文案，没有工具调用名。
+            raise RuntimeError(
+                f"{provider} 工具调用 {name} 的 arguments 嵌套过深，无法校验完整性。"
+            ) from exc
+        except ValueError as exc:
+            # 除 ``JSONDecodeError``（``ValueError`` 子类，上面已捕获）外，
+            # ``json.loads`` 还会因整数位数超过 ``sys.get_int_max_str_digits()``
+            # 抛 ``ValueError``。它不是 ``RuntimeError``，会穿透调用方按
+            # ``RuntimeError`` 做的错误分类，消息更是与「哪个工具调用」无关。
+            # 与全项目同一判据：整数转换问题不冒名成协议错误。
+            raise RuntimeError(
+                f"{provider} 工具调用 {name} 的 arguments 含超长整数，无法校验完整性。"
+            ) from exc
     return dict(tool_call)
 
 

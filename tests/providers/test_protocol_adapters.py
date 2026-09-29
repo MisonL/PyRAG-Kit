@@ -13,6 +13,7 @@ import src.providers.volcengine as volcengine_module
 from src.providers.__base__.model_provider import (
     CompletionRequest,
     normalize_responses_input,
+    validate_complete_tool_call,
 )
 from src.providers.anthropic import AnthropicProvider
 from src.providers.deepseek import DeepSeekProvider
@@ -1638,6 +1639,98 @@ def test_openai_chat_stream_events_propagate_refusal_delta():
     assert len(events) == 1
     assert events[0].type == "refusal_delta"
     assert events[0].refusal == "不能处理"
+
+
+def test_openai_chat_stream_survives_non_string_tool_call_type():
+    """网关把片段里的 ``type`` 写成数组时，chat 路径不能抛裸 ``TypeError``。
+
+    ``openai`` SDK 对 SSE chunk 的未知顶层字段用 ``extra="allow"`` 原样保留，
+    ``{"type": ["function"]}`` 因此能构造出来。上一轮把判据从 ``==`` 改成集合
+    成员测试后，这条路径从「静默通过」变成 ``TypeError: unhashable type``。
+    """
+
+    def chunk(arguments, tool_calls=None, finish_reason=None):
+        if tool_calls is None:
+            tool_calls = [
+                SimpleNamespace(
+                    id="call-1",
+                    index=0,
+                    type=["function"],
+                    function=SimpleNamespace(name="lookup", arguments=arguments),
+                )
+            ]
+        return SimpleNamespace(
+            id="chat-1",
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(content=None, tool_calls=tool_calls),
+                    finish_reason=finish_reason,
+                )
+            ],
+            usage=None,
+            model="chat-model",
+        )
+
+    accumulator: dict[object, dict[str, object]] = {}
+    completed: set[object] = set()
+    delivered = []
+    for event in [
+        *OpenAICompatibleProvider._chat_stream_events(chunk('{"id":1}')),
+        *OpenAICompatibleProvider._chat_stream_events(chunk(None, [], "tool_calls")),
+    ]:
+        for emitted in OpenAICompatibleProvider._chat_completion_events(
+            event, accumulator, completed
+        ):
+            if emitted.type == "tool_call_completed":
+                delivered.append(emitted.tool_call)
+
+    assert [call["arguments"] for call in delivered] == ['{"id":1}']
+
+
+def test_validate_complete_tool_call_accepts_non_string_type():
+    """``type`` 不是字符串时不能抛裸 ``TypeError``。
+
+    ``type`` 来自网关 JSON，``openai`` SDK 对 SSE chunk 的未知字段用
+    ``extra="allow"`` 原样保留，因此 ``{"type": ["function"]}`` 是能构造出来的。
+    判据若直接做集合成员测试，``list``/``dict`` 会抛
+    ``TypeError: unhashable type``——既不是调用方按 ``RuntimeError`` 做的分类，
+    消息里也没有工具调用名。``merge_tool_call_fragment`` 与 ``enum_field`` 对同一
+    形态都已有守卫，此处口径一致。
+    """
+    for tool_type in (["function"], {"name": "function"}, 1, None):
+        result = validate_complete_tool_call(
+            {"name": "lookup", "type": tool_type, "arguments": '{"id":1}'},
+            "OpenAI Chat Completions",
+        )
+
+        assert result["name"] == "lookup"
+
+
+def test_validate_complete_tool_call_rejects_unverifiable_arguments():
+    """``json.loads`` 的另两类失败也必须收敛成带指引的 ``RuntimeError``。
+
+    除 ``JSONDecodeError``（``ValueError`` 的子类）外，``json.loads`` 还会因整数
+    位数超过 ``sys.get_int_max_str_digits()`` 抛 ``ValueError``、因嵌套超过解释器
+    栈抛 ``RecursionError``。前者**不是** ``RuntimeError``，会穿透调用方按
+    ``RuntimeError`` 做的错误分类，消息更是与「哪个工具调用」无关；两者都让一段
+    结构完整、只是无法校验的 arguments 变成一条与工具调用无关的解析异常。
+    """
+    for arguments in ("9" * 4301, "[" * 2000 + "]" * 2000):
+        with pytest.raises(RuntimeError, match="lookup"):
+            validate_complete_tool_call(
+                {"name": "lookup", "type": "function", "arguments": arguments},
+                "OpenAI Chat Completions",
+            )
+
+
+def test_validate_complete_tool_call_keeps_custom_tool_arbitrary_text():
+    """``custom_tool_call`` 的任意文本语义不受上述收敛影响。"""
+    result = validate_complete_tool_call(
+        {"name": "run_command", "type": "custom_tool_call", "arguments": "echo hello"},
+        "OpenAI Responses",
+    )
+
+    assert result["arguments"] == "echo hello"
 
 
 def test_openai_chat_stream_rejects_incomplete_tool_call_arguments():
