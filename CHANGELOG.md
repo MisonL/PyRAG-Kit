@@ -17,6 +17,8 @@
 
 ## [Unreleased]
 
+### 修复
+
 - **重写流式工具调用完整性校验的判据方向**：`validate_complete_tool_call` 里相邻两条判据方向相反——「必须有非空 arguments」用黑名单（`type != "custom_tool_call"`），「必须校验 JSON」却用白名单（`type == "function_call"`）。任何不在白名单里的取值于是同时满足「必须有参数」与「不必校验参数」，半截 JSON 被当作完整调用交付。四个问题同源于此：
   - **`function` 绕过校验**：流式片段的 `type` 在两条协议上取值不同——Chat Completions 与各家 OpenAI 兼容片段用 `function`（`merge_tool_call_fragment` 的补默认值与四个 provider 的片段构造都写这个值），Responses 用 `function_call`。判据只认后者，实测四条真实流式路径（OpenAI Chat Completions、Google Gemini、Anthropic Messages、Ark Chat Completions）传 `'{"order_id":'` 时都把这段文本当完整调用交付。
   - **未知取值绕过校验**：白名单方向使任何其它取值（网关改写过的 `type`、大写形式、空串）同样豁免。实测 `type="tool_call"` 与 `type="FUNCTION"` 都交付半截 JSON。这一条**原本就有**，不是前一轮引入的。
@@ -24,7 +26,6 @@
   - **Anthropic 的两条流式路径完全没有交付前校验**：`stream_events`／`astream_events` 直接 `yield` 累积结果，其余三个 provider 的同类路径都调了 `validate_complete_tool_call`。因此它在判据修好之前连「缺 arguments」都不拦。
   - 现统一为**黑名单**：只做一次类型收敛（非字符串无法与 `custom_tool_call` 相等，按函数调用处理），只有 `custom_tool_call` 豁免——它的任意文本是 Responses 的 SDK 契约（`input: str`，无 JSON 约束），保持不变。
   - 顺带收敛同一处 `json.loads` 的另两类失败：`except json.JSONDecodeError` 只接住「JSON 语法不完整」，而 `json.loads` 还会因整数位数超过 `sys.get_int_max_str_digits()`（默认 4300）抛 `ValueError`、因嵌套深度超过解释器栈抛 `RecursionError`。前者**不是** `RuntimeError`，会穿透调用方按 `RuntimeError` 做的错误分类，消息只有 `Exceeds the limit (4300 digits)`；后者虽是 `RuntimeError` 子类、类型上落在分类内，消息却只有解释器文案、没有工具调用名。两者都让一段**结构完整**的 arguments 变成与工具调用无关的解析异常，现分别收敛成带 provider 与工具名的 `RuntimeError`。
-### 修复
 
 - **修复 provider key 与配置映射的形态校验**（三处，同一缺陷类）：
   - `ModelProviderFactory._get_model_detail`：`if provider_key not in configurations` 对不可哈希取值抛裸 `TypeError: unhashable type: 'list'`（不是 `ValueError`，穿透 `Chatbot.reload_llm` 的 `except Exception` 与上游 `except ValueError` 分类），消息里的 f-string 对位数超限整数抛 `ValueError: Exceeds the limit`。同一判据在 `runtime/contracts.py` 的 `_require_known_field` 里已认领过，工厂漏了。
