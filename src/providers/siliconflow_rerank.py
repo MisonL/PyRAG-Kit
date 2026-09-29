@@ -200,6 +200,9 @@ class SiliconflowRerankProvider(RerankModel):
     )
     def rerank(self, query: str, documents: list[str], top_n: int) -> tuple[list[int], list[float]]:
         """同步 Rerank (CSE Sensor)。"""
+        # ``len()`` 必须在校验**之后**：非序列取值在此抛裸 ``TypeError``，
+        # 而 ``_prepare_payload`` 对同一取值给的是带指引的 ``ValueError``。
+        self._validate_inputs(query, documents, top_n)
         logger.info(f"调用 SiliconFlow Rerank ({self._model_name})，文档数: {len(documents)}")
         import httpx
 
@@ -244,6 +247,8 @@ class SiliconflowRerankProvider(RerankModel):
         self, query: str, documents: list[str], top_n: int
     ) -> tuple[list[int], list[float]]:
         """异步 Rerank (CSE Sensor)。"""
+        # 与同步入口同判据：``len()`` 必须在 ``_validate_inputs`` 之后。
+        self._validate_inputs(query, documents, top_n)
         logger.info(f"异步调用 SiliconFlow Rerank ({self._model_name})，文档数: {len(documents)}")
         import httpx
 

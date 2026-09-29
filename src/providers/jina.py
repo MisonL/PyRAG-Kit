@@ -205,6 +205,13 @@ class JinaProvider(RerankModel):
     )
     def rerank(self, query: str, documents: list[str], top_n: int) -> tuple[list[int], list[float]]:
         """同步 Rerank (CSE Sensor)。"""
+        # ``len()`` 必须放在校验**之后**：``documents`` 是公开入口的参数，非序列
+        # 取值在这里抛裸 ``TypeError: object of type 'int' has no len()``——而
+        # 紧随其后的 ``_prepare_payload`` 对同一取值给的是带指引的
+        # ``ValueError: documents 必须是非空列表``。同一判据的两半顺序反了，
+        # 「参数写错」的收场就取决于日志级别是否够低（DEBUG 关闭时 f-string
+        # 仍会求值，所以它与日志级别无关，只是位置错了）。
+        self._validate_inputs(query, documents, top_n)
         logger.info(f"调用 Jina Rerank ({self._model_name})，文档数: {len(documents)}")
         import httpx
 
@@ -248,6 +255,8 @@ class JinaProvider(RerankModel):
         self, query: str, documents: list[str], top_n: int
     ) -> tuple[list[int], list[float]]:
         """异步 Rerank (CSE Sensor)。"""
+        # 与同步入口同判据：``len()`` 必须在 ``_validate_inputs`` 之后。
+        self._validate_inputs(query, documents, top_n)
         logger.info(f"异步调用 Jina Rerank ({self._model_name})，文档数: {len(documents)}")
         import httpx
 

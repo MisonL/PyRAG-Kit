@@ -500,6 +500,12 @@ class AnthropicProvider(LargeLanguageModel):
         if not tools:
             return None
 
+        # 容器形态先判：``enumerate(tools)`` 对不可迭代的取值抛裸
+        # ``TypeError: 'int' object is not iterable``，而同函数对可迭代但元素
+        # 非法的形态给的是带序号的 ``ValueError``——同一判据的两半必须都在。
+        # 实测 ``_build_message_params(prompt="hi", tools=5)`` 抛该 ``TypeError``。
+        if not isinstance(tools, (list, tuple)):
+            raise ValueError(f"Anthropic 工具定义必须是列表，但得到 {safe_repr(tools)}。")
         converted: list[dict[str, Any]] = []
         for index, tool in enumerate(tools):
             if not isinstance(tool, Mapping):

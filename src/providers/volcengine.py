@@ -27,6 +27,7 @@ from src.providers.__base__.model_provider import (
     normalize_usage,
     raise_for_stream_error_event,
     reject_unsupported_kwargs,
+    require_text_list,
     require_token_count,
     retry_async_call,
     retry_async_stream,
@@ -837,6 +838,11 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         """将统一的 Chat 工具 schema 转换为 Ark Responses 工具 schema。"""
         if not tools:
             return None
+        # 容器形态先判：``enumerate(tools)`` 对不可迭代的取值抛裸
+        # ``TypeError``，而同函数对可迭代但元素非法的形态给的是带序号的
+        # ``ValueError``。同一判据的两半必须都在。
+        if not isinstance(tools, (list, tuple)):
+            raise ValueError(f"Ark Responses 工具定义必须是列表，但得到 {safe_repr(tools)}。")
         converted: list[dict[str, Any]] = []
         for index, tool in enumerate(tools):
             if not isinstance(tool, Mapping):
@@ -2175,6 +2181,7 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         overlap = sorted({"input", "model"}.intersection(kwargs))
         if overlap:
             raise ValueError(f"Ark Embedding 不允许覆盖请求字段: {', '.join(overlap)}")
+        texts = require_text_list(texts, "Ark")
         request: dict[str, Any] = {"input": texts, "model": self._model_name}
         configured_options = self._embedding_options()
         configured_extra_body = self._validated_extra_body(
@@ -2221,6 +2228,7 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         overlap = sorted({"input", "model"}.intersection(kwargs))
         if overlap:
             raise ValueError(f"Ark Embedding 不允许覆盖请求字段: {', '.join(overlap)}")
+        texts = require_text_list(texts, "Ark")
         request: dict[str, Any] = {"input": texts, "model": self._model_name}
         configured_options = self._embedding_options()
         configured_extra_body = self._validated_extra_body(

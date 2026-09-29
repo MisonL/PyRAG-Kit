@@ -5,7 +5,7 @@ import re
 
 import jieba  # type: ignore[import-untyped]
 
-from src.providers.__base__.model_provider import TextEmbeddingModel
+from src.providers.__base__.model_provider import TextEmbeddingModel, require_text_list
 from src.utils.config import _MAX_EMBEDDING_DIMENSION, parse_decimal_int
 
 DEFAULT_DIMENSION = 256
@@ -77,6 +77,7 @@ class LocalHashEmbeddingProvider(TextEmbeddingModel):
 
     def embed_documents(self, texts: list[str], **kwargs) -> list[list[float]]:
         self._validate_kwargs(kwargs)
+        texts = require_text_list(texts, "LocalHash")
         return [self._embed_text(text) for text in texts]
 
     async def aembed_documents(self, texts: list[str], **kwargs) -> list[list[float]]:

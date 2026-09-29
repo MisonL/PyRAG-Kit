@@ -1234,14 +1234,31 @@ def normalize_usage(usage: Any) -> dict[str, Any]:
 
 
 def extract_system_prompt(messages: Sequence[Mapping[str, Any]] | None) -> str | None:
-    """提取消息列表中的 system 内容，供无 system role 的 SDK 使用。"""
-    if not messages:
+    """提取消息列表中的 system 内容，供无 system role 的 SDK 使用。
+
+    容器与条目形态都要先收敛：本函数在多数 provider 里**先于**
+    ``normalize_messages`` 被调用（后者有完整的 ``ValueError`` 判据），因此
+    非法取值在这里就炸，收场由本函数决定。实测 ``messages=5`` 抛裸
+    ``TypeError: 'int' object is not iterable``（列表推导的迭代）、
+    ``messages="s"`` 抛裸 ``AttributeError: 'str' object has no attribute 'get'``
+    （``"s".get`` 不存在，且字符串是合法的 ``Sequence``，只判可迭代拦不住）。
+    两者都不落调用方按 ``ValueError`` 建立的分类。
+
+    判据与 ``normalize_messages`` 逐字对齐（含 ``bytes``／``bytearray`` 的
+    显式排除——它们也是 ``Sequence``，迭代得到的是整数，``.get`` 不存在）。
+    条目非 Mapping 时同样给 ``ValueError`` 而不是跳过：静默跳过会让一条写错的
+    消息**悄悄消失**，system 提示随之丢失，比报错更难查。
+    """
+    if messages is None:
         return None
-    values = [
-        content_to_text(message.get("content", ""))
-        for message in messages
-        if message.get("role") == "system"
-    ]
+    if isinstance(messages, (str, bytes, bytearray)) or not isinstance(messages, Sequence):
+        raise ValueError("messages 必须是消息对象序列。")
+    values = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, Mapping):
+            raise ValueError(f"messages[{index}] 必须是消息对象，但得到 {safe_repr(message)}。")
+        if message.get("role") == "system":
+            values.append(content_to_text(message.get("content", "")))
     value = "\n\n".join(item for item in values if item)
     return value or None
 
@@ -2204,6 +2221,37 @@ class LargeLanguageModel(ABC):
     async def aclose(self) -> None:
         """释放 Provider 持有的异步 SDK 客户端。"""
         return
+
+
+def require_text_list(texts: Any, provider: str) -> list[str]:
+    """校验向量化入参是**字符串列表**，返回原对象。
+
+    ``texts`` 是 ``TextEmbeddingModel`` 全部公开入口的入参，此前六个实现
+    （``local_hash``／``openai_compatible``／``google``／``volcengine`` 各两个
+    方向）没有一处判它的形态。三种收场都不在调用方的错误分类内：
+
+    * ``texts=5`` —— 六个实现里有四处抛裸
+      ``TypeError: object of type 'int' has no len()``（日志里的
+      ``len(texts)`` 或 ``asyncio.to_thread`` 之前的迭代），``local_hash`` 抛
+      ``TypeError: 'int' object is not iterable``；
+    * ``texts="abc"`` —— 字符串是合法的 ``Sequence``，被**静默**当成三条单字符
+      文本向量化（``local_hash`` 实测返回 3 条），而不是报错；
+    * ``texts=[b"x"]`` —— 元素非字符串时由各家 SDK 分别报错，形态各异。
+
+    判据与 ``normalize_messages`` 对齐：显式排除 ``str``／``bytes``／
+    ``bytearray``（它们是 ``Sequence``，迭代得到的是字符或整数）。空列表**合法**
+    ——``embed_documents([])`` 的语义是「没有文档要向量化」，各家返回空列表。
+    """
+    if isinstance(texts, (str, bytes, bytearray)) or not isinstance(texts, Sequence):
+        raise ValueError(
+            f"{provider} Embedding texts 必须是字符串列表，但得到 {safe_repr(texts)}。"
+        )
+    for index, text in enumerate(texts):
+        if not isinstance(text, str):
+            raise ValueError(
+                f"{provider} Embedding texts[{index}] 必须是字符串，但得到 {safe_repr(text)}。"
+            )
+    return list(texts)
 
 
 class TextEmbeddingModel(ABC):

@@ -32,6 +32,7 @@ from src.providers.__base__.model_provider import (
     normalize_usage,
     raise_for_stream_error_event,
     reject_unsupported_kwargs,
+    require_text_list,
     require_token_count,
     retry_async_call,
     retry_async_stream,
@@ -1180,6 +1181,12 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         if not tools:
             return None
 
+        # 容器形态先判：``enumerate(tools)`` 对不可迭代的取值抛裸
+        # ``TypeError``，而同函数对可迭代但元素非法的形态给的是带序号的
+        # ``ValueError``。同一判据的两半必须都在——实测 ``complete(tools=5)``
+        # 在 responses 协议下抛该 ``TypeError``。
+        if not isinstance(tools, (list, tuple)):
+            raise ValueError(f"Responses 工具定义必须是列表，但得到 {safe_repr(tools)}。")
         converted: list[dict[str, Any]] = []
         for index, tool in enumerate(tools):
             if not isinstance(tool, Mapping):
@@ -2937,6 +2944,10 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     )
     def embed_documents(self, texts: list[str], **kwargs: Any) -> list[list[float]]:
         """同步向量化文档。"""
+        # 形态校验必须先于日志里的 ``len(texts)``：非序列取值在那里抛裸
+        # ``TypeError: object of type 'int' has no len()``，而 ``texts="abc"``
+        # 会被静默当成三条单字符文本。
+        texts = require_text_list(texts, self._provider)
         logger.info(f"调用 {self._provider} 嵌入 ({self._model_name})，数量: {len(texts)}")
         start_time = time.perf_counter()
         overlap = sorted({"input", "model"}.intersection(kwargs))
@@ -2995,6 +3006,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     )
     async def aembed_documents(self, texts: list[str], **kwargs: Any) -> list[list[float]]:
         """异步向量化文档。"""
+        texts = require_text_list(texts, self._provider)
         logger.info(f"异步调用 {self._provider} 嵌入 ({self._model_name})，数量: {len(texts)}")
         start_time = time.perf_counter()
         overlap = sorted({"input", "model"}.intersection(kwargs))

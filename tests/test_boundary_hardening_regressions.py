@@ -1435,3 +1435,287 @@ def test_anthropic_betas_alone_reach_params_unchanged(monkeypatch):
     provider.beta_create(prompt="hi", betas=["a"])
     assert captured["betas"] == ["a"]
     assert "user_profile_id" not in captured
+
+
+# ── 工具定义与消息列表的容器形态 ──
+#
+# 四个 provider 的 ``_convert_tools`` 都写 ``for index, tool in enumerate(tools)``，
+# 而同函数对**可迭代但元素非法**的形态（``"s"``／``{"a": 1}``／``b"x"``）早已给
+# 带序号的 ``ValueError``——只有「不可迭代」这一半漏了，``enumerate`` 抛裸
+# ``TypeError: 'int' object is not iterable``。同一判据的两半必须都在，否则
+# 「工具定义写错」的收场取决于它是标量还是序列。
+#
+# ``extract_system_prompt`` 是更典型的一处：它在多数 provider 里**先于**
+# ``normalize_messages``（后者有完整判据）被调用，因此非法取值在这里就炸。
+# 实测 ``messages=5`` 抛裸 ``TypeError``、``messages="s"`` 抛裸
+# ``AttributeError: 'str' object has no attribute 'get'``——字符串是合法的
+# ``Sequence``，只判可迭代拦不住。
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(5, id="int"),
+        pytest.param(1.5, id="float"),
+        pytest.param(object(), id="opaque-object"),
+    ],
+)
+def test_google_rejects_non_sequence_tools(value):
+    """``tools`` 不可迭代时必须抛 ``ValueError``，不是裸 ``TypeError``。"""
+    from src.providers.google import GoogleProvider
+
+    with pytest.raises(ValueError, match="工具定义必须是列表"):
+        GoogleProvider._convert_tools(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [pytest.param(5, id="int"), pytest.param(1.5, id="float")],
+)
+def test_anthropic_rejects_non_sequence_tools(value):
+    """Anthropic 同判据——``_build_message_params(prompt="hi", tools=5)`` 实测抛裸 ``TypeError``。"""
+    from src.providers.anthropic import AnthropicProvider
+
+    with pytest.raises(ValueError, match="工具定义必须是列表"):
+        AnthropicProvider._convert_tools(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [pytest.param(5, id="int"), pytest.param(1.5, id="float")],
+)
+def test_responses_converters_reject_non_sequence_tools(value):
+    """Ark 与 OpenAI 兼容的 Responses 转换器同判据。"""
+    from src.providers.openai_compatible import OpenAICompatibleProvider
+    from src.providers.volcengine import VolcengineProvider
+
+    with pytest.raises(ValueError, match="工具定义必须是列表"):
+        OpenAICompatibleProvider._convert_responses_tools(value)
+    with pytest.raises(ValueError, match="工具定义必须是列表"):
+        VolcengineProvider._convert_responses_tools(value)
+
+
+def test_tool_converters_still_accept_legal_sequences():
+    """收紧不能误伤：``None`` 与空列表照旧得到 ``None``，合法工具照旧转换。"""
+    from src.providers.anthropic import AnthropicProvider
+    from src.providers.google import GoogleProvider
+    from src.providers.openai_compatible import OpenAICompatibleProvider
+    from src.providers.volcengine import VolcengineProvider
+
+    for converter in (
+        GoogleProvider._convert_tools,
+        AnthropicProvider._convert_tools,
+        OpenAICompatibleProvider._convert_responses_tools,
+        VolcengineProvider._convert_responses_tools,
+    ):
+        assert converter(None) is None
+        assert converter([]) is None
+
+    converted = GoogleProvider._convert_tools(
+        [{"function": {"name": "lookup", "parameters": {"type": "object"}}}]
+    )
+    assert converted and converted[0] is not None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(5, id="int"),
+        pytest.param("s", id="bare-string"),
+        pytest.param(b"x", id="bytes"),
+        pytest.param({"a": 1}, id="mapping"),
+    ],
+)
+def test_extract_system_prompt_rejects_non_message_containers(value):
+    """``messages`` 非法形态必须抛 ``ValueError``。
+
+    字符串与 ``bytes`` 都是合法的 ``Sequence``，只判「可迭代」拦不住——
+    前者迭代出单字符、后者迭代出整数，随后 ``.get`` 抛裸 ``AttributeError``。
+    """
+    from src.providers.__base__.model_provider import extract_system_prompt
+
+    with pytest.raises(ValueError, match="messages 必须是消息对象序列"):
+        extract_system_prompt(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [pytest.param(5, id="int"), pytest.param("s", id="bare-string")],
+)
+def test_extract_system_prompt_rejects_non_mapping_entries(value):
+    """条目非 Mapping 必须报错而不是跳过。
+
+    静默跳过会让一条写错的消息**悄悄消失**，system 提示随之丢失——比报错
+    更难查。
+    """
+    from src.providers.__base__.model_provider import extract_system_prompt
+
+    with pytest.raises(ValueError, match=r"messages\[0\] 必须是消息对象"):
+        extract_system_prompt([value])
+
+
+def test_extract_system_prompt_still_extracts_system_content():
+    """收紧不能误伤：正常提取照旧，空列表与 ``None`` 返回 ``None``。"""
+    from src.providers.__base__.model_provider import extract_system_prompt
+
+    assert extract_system_prompt(None) is None
+    assert extract_system_prompt([]) is None
+    assert extract_system_prompt([{"role": "user", "content": "hi"}]) is None
+    assert (
+        extract_system_prompt(
+            [{"role": "system", "content": "A"}, {"role": "user", "content": "hi"}]
+        )
+        == "A"
+    )
+
+
+def test_google_invoke_surfaces_bad_messages_as_value_error(monkeypatch):
+    """走真实入口：``messages=5`` 必须得到 ``ValueError``。
+
+    必须**消费** ``invoke`` 的返回值——它是生成器，函数体在首次 ``next`` 之前
+    不执行，只调不迭代等于没验。
+    """
+    _patch_provider_settings(monkeypatch, "src.providers.google", google_api_key="test-key")
+    from src.providers.google import GoogleProvider
+
+    provider = GoogleProvider("gemini-2.0-flash")
+    with pytest.raises(ValueError, match="messages 必须是消息对象序列"):
+        list(provider.invoke(prompt="hi", stream=False, messages=5))
+
+
+# ── rerank 与 embedding 入口的入参形态 ──
+#
+# 两个 rerank provider 的 ``rerank``／``arerank`` 都把 ``len(documents)`` 写在
+# ``_validate_inputs`` **之前**的日志行里：非序列取值在那里抛裸
+# ``TypeError: object of type 'int' has no len()``，而紧随其后的校验对同一取值
+# 给的是带指引的 ``ValueError``。同一判据的两半顺序反了。
+#
+# embedding 侧更彻底：``TextEmbeddingModel`` 的六个实现没有一处判 ``texts``
+# 的形态。``texts=5`` 抛裸 ``TypeError``；``texts="abc"`` 是合法的
+# ``Sequence``，被**静默**当成三条单字符文本向量化（local_hash 实测返回 3 条）。
+
+
+def _rerank_providers():
+    from src.providers.jina import JinaProvider
+    from src.providers.siliconflow_rerank import SiliconflowRerankProvider
+
+    return [
+        ("Jina", JinaProvider("m"), JinaProvider._validate_inputs),
+        ("SiliconFlow", SiliconflowRerankProvider("m"), SiliconflowRerankProvider._validate_inputs),
+    ]
+
+
+@pytest.mark.parametrize("value", [pytest.param(5, id="int"), pytest.param(1.5, id="float")])
+def test_rerank_rejects_non_sequence_documents(value, monkeypatch):
+    """``documents`` 非序列必须抛 ``ValueError``，不是裸 ``TypeError``。
+
+    四个入口（两个 provider × 同步/异步）的日志行都在校验之前求值
+    ``len(documents)``。
+    """
+    monkeypatch.setattr(
+        "src.providers.jina.get_settings",
+        lambda: SimpleNamespace(jina_api_key="k"),
+    )
+    monkeypatch.setattr(
+        "src.providers.siliconflow_rerank.get_settings",
+        lambda: SimpleNamespace(siliconflow_api_key="k", siliconflow_base_url="https://x/v1"),
+    )
+    import asyncio
+
+    for name, provider, _validate in _rerank_providers():
+        with pytest.raises(ValueError, match="必须是非空列表"):
+            provider.rerank(query="q", documents=value, top_n=3)
+        with pytest.raises(ValueError, match="必须是非空列表"):
+            asyncio.run(provider.arerank(query="q", documents=value, top_n=3))
+
+
+def test_rerank_still_accepts_legal_documents(monkeypatch):
+    """收紧不能误伤：合法 ``documents`` 照旧通过校验。"""
+    monkeypatch.setattr(
+        "src.providers.jina.get_settings", lambda: SimpleNamespace(jina_api_key="k")
+    )
+    monkeypatch.setattr(
+        "src.providers.siliconflow_rerank.get_settings",
+        lambda: SimpleNamespace(siliconflow_api_key="k", siliconflow_base_url="https://x/v1"),
+    )
+    for name, _provider, validate in _rerank_providers():
+        validate("q", ["a", "b"], 2)
+
+
+def _embedding_providers():
+    from src.providers.google import GoogleProvider
+    from src.providers.local_hash import LocalHashEmbeddingProvider
+    from src.providers.openai_compatible import OpenAICompatibleProvider
+    from src.providers.volcengine import VolcengineProvider
+
+    openai_settings = SimpleNamespace(
+        openai_api_key="k", openai_api_base="https://api.openai.com/v1"
+    )
+    return [
+        ("LocalHash", LocalHashEmbeddingProvider("local-hash-32")),
+        ("Google", GoogleProvider("gemini-2.0-flash")),
+        (
+            "OpenAI",
+            OpenAICompatibleProvider("text-embedding-3-large", "openai", settings=openai_settings),
+        ),
+        ("Ark", VolcengineProvider("m")),
+    ]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(5, id="int"),
+        pytest.param("abc", id="bare-string"),
+        pytest.param([b"x"], id="bytes-element"),
+        pytest.param([1], id="int-element"),
+    ],
+)
+def test_embedding_rejects_non_string_list_texts(value, monkeypatch):
+    """``texts`` 非法形态必须抛 ``ValueError``。
+
+    ``"abc"`` 尤其要紧：它是合法的 ``Sequence``，此前被静默拆成三条单字符文本
+    向量化——调用方以为传了一条文本，实际入库三条垃圾向量。
+    """
+    _patch_provider_settings(monkeypatch, "src.providers.google", google_api_key="k")
+    _patch_provider_settings(
+        monkeypatch,
+        "src.providers.volcengine",
+        volc_access_key="a",
+        volc_secret_key="s",
+        volc_base_url="https://ark.cn-beijing.volces.com/api/v3",
+        ark_api_key="k",
+    )
+    import asyncio
+
+    for name, provider in _embedding_providers():
+        with pytest.raises(ValueError, match="texts"):
+            provider.embed_documents(value)
+        with pytest.raises(ValueError, match="texts"):
+            asyncio.run(provider.aembed_documents(value))
+
+
+def test_embedding_still_accepts_legal_texts(monkeypatch):
+    """收紧不能误伤：空列表、列表与元组照旧可用。
+
+    空列表**合法**——语义是「没有文档要向量化」，各家返回空列表，不能收紧成
+    「必须非空」（``require_text_list`` 与 rerank 的 ``_validate_inputs`` 在
+    这一点上有意不同）。
+    """
+    _patch_provider_settings(monkeypatch, "src.providers.google", google_api_key="k")
+    from src.providers.__base__.model_provider import require_text_list
+    from src.providers.local_hash import LocalHashEmbeddingProvider
+
+    provider = LocalHashEmbeddingProvider("local-hash-32")
+    assert provider.embed_documents([]) == []
+    assert len(provider.embed_documents(["a", "b"])) == 2
+    assert len(provider.embed_documents(("a", "b"))) == 2
+    assert require_text_list([], "X") == []
+
+
+def test_require_text_list_reports_the_offending_index():
+    """元素非法时消息里要有下标，否则用户不知道是哪一条。"""
+    from src.providers.__base__.model_provider import require_text_list
+
+    with pytest.raises(ValueError, match=r"texts\[2\]"):
+        require_text_list(["a", "b", 3], "X")

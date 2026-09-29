@@ -284,8 +284,18 @@
   - 现新增 `_require_profile_id` 与 `_require_beta_tokens`：前者只接受 `str | None`；后者把 `str`／`bytes`／`Mapping` 三类「可迭代但不是字符串列表」的形态显式拒绝（`list()` 对它们不报错，只会静默给出错误结果），并逐个校验元素类型。
   - **`betas` 的校验必须放在 `_build_message_params` 的 `beta_values` 构造处**，不能只放在 `_user_profile_fields` 里：那个函数仅在 `user is not None` 时被调用，而 `betas` 走 `beta_values` 直接进 params——只加在前者时 `beta_create(prompt="hi", betas=5)` 仍抛裸 `TypeError`（这正是首版实现漏掉的路径，回归用例 `test_anthropic_betas_validated_without_user` 专门盯它）。
 
+- **补齐工具定义、消息列表、rerank 与 embedding 入口的入参形态校验（第五轮对抗审查）**。四组缺陷同一类：判据只覆盖了「可迭代但元素非法」，漏了「不可迭代」那一半，或者把形态判据放在了读取形态的代码**之后**。
+
+  - **四个 provider 的 `_convert_tools` 对不可迭代的 `tools` 抛裸 `TypeError`**：`google`／`anthropic`／`volcengine`／`openai_compatible` 都写 `for index, tool in enumerate(tools)`，而同函数对 `"s"`／`{"a": 1}`／`b"x"` 这类可迭代但元素非法的形态早已给带序号的 `ValueError`——只有标量漏了。实测 `google.invoke(tools=5)` 与 `openai.complete(tools=5)`（responses 协议）抛 `TypeError: 'int' object is not iterable`。现四处统一补容器判据。
+  - **`extract_system_prompt` 的形态判据缺失**：它是 12 处调用的共享 helper，且在多数 provider 里**先于** `normalize_messages`（后者有完整判据）被调用，因此非法取值在这里就炸。实测 `messages=5` 抛裸 `TypeError: 'int' object is not iterable`，`messages="s"` 抛裸 `AttributeError: 'str' object has no attribute 'get'`——字符串是合法的 `Sequence`，只判可迭代拦不住。现判据与 `normalize_messages` 逐字对齐（含 `bytes`／`bytearray` 的显式排除），条目非 Mapping 时给带下标的 `ValueError` 而不是静默跳过——跳过会让一条写错的消息**悄悄消失**，system 提示随之丢失。
+  - **两个 rerank provider 把 `len(documents)` 写在参数校验之前**：`jina` 与 `siliconflow_rerank` 的同步/异步四个入口，日志行 `文档数: {len(documents)}` 都在 `_validate_inputs` 之前求值。实测 `documents=5` 抛裸 `TypeError: object of type 'int' has no len()`，而紧随其后的校验对同一取值给的是带指引的 `ValueError`。现把校验提到日志之前（`_prepare_payload` 里那次保留——它是请求构造路径的守卫）。
+  - **六个 embedding 实现都不判 `texts` 的形态**：`TextEmbeddingModel` 的全部公开入口此前没有一处校验，而 `texts` 是它们唯一的必填入参。`texts=5` 在四处抛裸 `TypeError: object of type 'int' has no len()`、在 `local_hash` 抛 `TypeError: 'int' object is not iterable`；`texts="abc"` 更隐蔽——字符串是合法的 `Sequence`，被**静默**当成三条单字符文本向量化（`local_hash` 实测返回 3 条），调用方以为传了一条文本、实际入库三条垃圾向量。现新增 `require_text_list`（`src/providers/__base__/model_provider.py`），接入 `local_hash`／`google`／`openai_compatible`／`volcengine` 的同步与异步共 8 个入口。空列表**合法**——语义是「没有文档要向量化」，与 rerank 的「必须非空」有意不同。
+
 
 ### 测试
+
+- 新增第五轮的回归用例（9 个测试函数，覆盖 24 条 provider×方向路径；回退源码后其中 8 个变红，1 个「不误伤」反向守卫保持绿）：四个 provider 的工具转换器对不可迭代取值的拒绝与对 `None`／空列表／合法工具的接受、`extract_system_prompt` 对四类非法容器与两类非法条目的拒绝、两个 rerank provider 同步与异步入口对非序列 `documents` 的拒绝、四个 embedding provider 同步与异步入口对四类非法 `texts` 的拒绝（含 `"abc"` 这条静默拆分的）、以及 `require_text_list` 报错消息带下标。
+
 
 - 新增 Anthropic `user`／`betas` 取值的回归用例（14 个；回退源码后其中 12 个变红）：`user` 的四类非字符串形态、`betas` 的四类非列表形态（`int`／`bytes`／裸字符串／`Mapping`）、`betas` 元素的三类非字符串形态，以及三条「不误伤」的反向守卫（合法 `user` 与 `betas` 仍合并进 `anthropic-beta`、`betas` 单独出现时原样进 params 不注入 profile 头）。另有 `test_anthropic_betas_validated_without_user` 专门盯住「校验只加在 `_user_profile_fields` 里」这条漏网路径——`betas` 在 `user=None` 时不经过那个函数。测试的捕获 helper 同时装上 `create` 与 `count_tokens`，因为 `betas` 只被前者转发（`beta_count_tokens` 的白名单放行它但函数体不读）。
 

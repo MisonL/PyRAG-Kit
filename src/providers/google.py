@@ -36,6 +36,7 @@ from src.providers.__base__.model_provider import (
     normalize_usage,
     raise_for_stream_error_event,
     reject_unsupported_kwargs,
+    require_text_list,
     require_token_count,
     retry_async_call,
     retry_async_stream,
@@ -1200,6 +1201,14 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
     def _convert_tools(tools: list[dict[str, Any]] | None) -> list[Any] | None:
         if not tools:
             return None
+        # 容器形态先判：``for ... in enumerate(tools)`` 对不可迭代的取值抛裸
+        # ``TypeError: 'int' object is not iterable``——而同函数对**可迭代但
+        # 元素非法**的形态（``"s"``／``{"a": 1}``／``b"x"``）给的都是带序号的
+        # ``ValueError``。同一判据的两半必须都在，否则「工具定义写错」的收场
+        # 取决于它是标量还是序列，且前者不落调用方按 ``ValueError`` 建立的
+        # 分类。``tools=5`` 走 ``invoke`` 实测即抛该 ``TypeError``。
+        if not isinstance(tools, (list, tuple)):
+            raise ValueError(f"Google 工具定义必须是列表，但得到 {safe_repr(tools)}。")
 
         converted_tools: list[Any] = []
         declarations = []
@@ -4361,6 +4370,8 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
     )
     def embed_documents(self, texts: list[str], **kwargs: Any) -> list[list[float]]:
         """同步向量化文档。"""
+        # 形态校验必须先于日志里的 ``len(texts)``（同 openai_compatible）。
+        texts = require_text_list(texts, "Google")
         logger.info(f"调用 Google Embedding ({self._model_name})，数量: {len(texts)}")
         start_time = time.perf_counter()
 
@@ -4424,6 +4435,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
     )
     async def aembed_documents(self, texts: list[str], **kwargs: Any) -> list[list[float]]:
         """异步向量化文档。"""
+        texts = require_text_list(texts, "Google")
         logger.info(f"异步调用 Google Embedding ({self._model_name})，数量: {len(texts)}")
         start_time = time.perf_counter()
 
