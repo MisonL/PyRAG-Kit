@@ -1122,3 +1122,205 @@ def test_splitter_accepts_overlap_within_the_bound():
         )
         splitter._validate_parent_sizes()
         assert splitter.split([Document(content="句子内容。" * 3000)])
+
+
+# ---------------------------------------------------------------------------
+# 六、请求头取值与 embedding 配置取值的校验（第三轮审查）
+# ---------------------------------------------------------------------------
+
+
+def _capture_anthropic_headers(provider, *, beta: bool) -> dict[str, object]:
+    """替换 provider 的 ``count_tokens`` 客户端，捕获它实际收到的参数。
+
+    客户端是懒加载的（构造期 ``_client`` 为 ``None``），因此要整体替换
+    ``_get_client``／``_get_aclient`` 而不是给 ``provider._client`` 打属性——
+    后者对 ``None`` 抛 ``AttributeError: 'NoneType' object has no attribute
+    'messages'``。仓库既有的协议适配测试用的是同一种注入方式。
+    """
+    captured: dict[str, object] = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(input_tokens=3)
+
+    async def _acapture(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(input_tokens=3)
+
+    messages = SimpleNamespace(count_tokens=_capture)
+    client = SimpleNamespace(
+        messages=messages,
+        beta=SimpleNamespace(messages=SimpleNamespace(count_tokens=_capture)),
+    )
+    aclient = SimpleNamespace(
+        messages=SimpleNamespace(count_tokens=_acapture),
+        beta=SimpleNamespace(messages=SimpleNamespace(count_tokens=_acapture)),
+    )
+    provider._get_client = lambda: client
+    provider._get_aclient = lambda: aclient
+    return captured
+
+
+def _anthropic_provider(monkeypatch):
+    """走真实构造器拿到 provider，避免手工拼内部属性时漏字段。"""
+    _patch_provider_settings(monkeypatch, "src.providers.anthropic", anthropic_api_key="test-key")
+    from src.providers.anthropic import AnthropicProvider
+
+    return AnthropicProvider("claude-sonnet-4-5")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(42, id="int"),
+        pytest.param(b"x", id="bytes"),
+        pytest.param(["a"], id="list"),
+        pytest.param({"a": 1}, id="dict"),
+    ],
+)
+def test_anthropic_rejects_non_string_header_values(monkeypatch, value):
+    """``extra_headers`` 的**取值**必须校验，不能只校验容器。
+
+    ``validate_secret_free_request_overrides`` 只确认 ``extra_headers`` 是 Mapping，
+    值原样保留。非字符串值的两种收场都不在渠道的错误契约内：交给 httpx 时抛
+    ``TypeError: Header value must be str or bytes``；而本模块对 ``anthropic-beta``
+    做 ``.split(",")`` 时抛 ``AttributeError: 'int' object has no attribute 'split'``
+    ——两者都不落 ``except ValueError``／``except RuntimeError``。
+    """
+    provider = _anthropic_provider(monkeypatch)
+    with pytest.raises(ValueError, match="extra_headers"):
+        provider.count_tokens(prompt="hi", user="u1", extra_headers={"anthropic-beta": value})
+
+
+def test_anthropic_drops_none_header_values(monkeypatch):
+    """``None`` 头值等价于「该头未设置」，必须剔除而不是透传。
+
+    httpx 对 ``None`` 头值抛 ``TypeError``，SDK 更早一步抛
+    ``AttributeError: 'NoneType' object has no attribute 'encode'``。
+    """
+    provider = _anthropic_provider(monkeypatch)
+    captured = _capture_anthropic_headers(provider, beta=False)
+
+    provider.count_tokens(
+        prompt="hi", user="u1", extra_headers={"x-trace": None, "anthropic-beta": None}
+    )
+    headers = captured["extra_headers"]
+    assert "x-trace" not in headers
+    assert "None" not in headers.get("anthropic-beta", "")
+
+
+def test_anthropic_user_without_extra_headers_still_works(monkeypatch):
+    """``user`` 已设置而 ``extra_headers`` 为 ``None`` 时必须能合并出 beta 头。
+
+    修复前这里对 ``None`` 做 ``headers["anthropic-beta"] = ...``，抛裸
+    ``TypeError: 'NoneType' object does not support item assignment``。而
+    ``extra_headers`` 不传恰恰是最常见的调用形态。
+    """
+    provider = _anthropic_provider(monkeypatch)
+    captured = _capture_anthropic_headers(provider, beta=False)
+
+    provider.count_tokens(prompt="hi", user="u1")
+    assert captured["extra_headers"]["anthropic-beta"] == "user-profiles-2026-08-18"
+
+
+@pytest.mark.parametrize("async_path", [False, True])
+def test_anthropic_beta_count_tokens_uses_validated_headers(monkeypatch, async_path):
+    """beta 计数入口必须用**校验后**的头，不能回退到原始的 ``request.extra_headers``。
+
+    同文件 ``beta=False`` 的计数入口用的是 ``profile_headers``，而 ``beta=True``
+    的两个入口把校验结果丢进 ``_``，转头写回原始字典——被剔除的 ``None`` 值于是
+    原样发给 httpx。
+    """
+    import asyncio
+
+    provider = _anthropic_provider(monkeypatch)
+    captured = _capture_anthropic_headers(provider, beta=True)
+
+    call = (
+        provider.async_beta_count_tokens(prompt="hi", user="u1", extra_headers={"x-trace": None})
+        if async_path
+        else provider.beta_count_tokens(prompt="hi", user="u1", extra_headers={"x-trace": None})
+    )
+    if async_path:
+        asyncio.run(call)
+
+    assert "x-trace" not in captured["extra_headers"]
+
+
+def test_anthropic_header_validation_does_not_touch_legal_headers(monkeypatch):
+    """收紧不能误伤：合法字符串头（含既有 anthropic-beta 值）照旧保留并合并。"""
+    provider = _anthropic_provider(monkeypatch)
+    captured = _capture_anthropic_headers(provider, beta=False)
+
+    provider.count_tokens(
+        prompt="hi", user="u1", extra_headers={"x-trace": "t", "anthropic-beta": "a,b"}
+    )
+    headers = captured["extra_headers"]
+    assert headers["x-trace"] == "t"
+    assert headers["anthropic-beta"] == "a,b,user-profiles-2026-08-18"
+
+
+# ── embedding 配置的取值校验 ──
+#
+# ``EmbeddingService.embedding_model_detail`` 原先只判**键**在不在，不判**值**
+# 可用。``{"local-hash": None}`` 的键确实存在，于是 ``None`` 被原样返回，两个
+# 调用点紧接着读 ``.provider``／``.model_name``，在那里抛裸 ``AttributeError``。
+# 同一份配置走 ``ModelProviderFactory.get_embedding_provider`` 得到的是
+# ``ValueError``——两条路径的报错契约本该一致。
+
+
+def _embedding_service(configurations):
+    from src.services.embedding_service import EmbeddingService
+
+    return EmbeddingService(
+        SimpleNamespace(
+            default_embedding_provider="local-hash",
+            embedding_configurations=configurations,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(None, id="none"),
+        pytest.param("local-hash-32", id="string"),
+        pytest.param(5, id="int"),
+        pytest.param(SimpleNamespace(provider="local-hash"), id="missing-model-name"),
+        pytest.param(SimpleNamespace(model_name="m"), id="missing-provider"),
+    ],
+)
+def test_embedding_model_detail_rejects_unusable_values(value):
+    """取值不提供 ``provider``／``model_name`` 时必须抛 ``ValueError``。
+
+    判据是**属性存在性**而非 ``isinstance(..., ModelDetail)``：使用方只要求取值
+    具备这些属性，仓库测试就用 ``SimpleNamespace`` 构造等价配置。
+    """
+    with pytest.raises(ValueError, match="必须是提供"):
+        _ = _embedding_service({"local-hash": value}).embedding_model_detail
+
+
+def test_embedding_model_detail_accepts_attribute_bearing_values():
+    """收紧不能误伤：``ModelDetail`` 与具备同名属性的替身都照旧可用。"""
+    from src.utils.config import ModelDetail
+
+    detail = ModelDetail(provider="local-hash", model_name="local-hash-32")
+    assert _embedding_service({"local-hash": detail}).embedding_model_detail is detail
+
+    stand_in = SimpleNamespace(provider="local-hash", model_name="m")
+    assert _embedding_service({"local-hash": stand_in}).embedding_model_detail is stand_in
+
+
+def test_knowledge_build_surfaces_unusable_embedding_detail_as_value_error():
+    """建库主路径上同判据——错误分类必须是 ``ValueError``，不是裸 ``AttributeError``。
+
+    零分块的 markdown 会跳过 embedding 调用，直接走到写清单那一步读
+    ``model_name``；这是最晚才暴露、也最难从消息反推原因的路径。
+    """
+    from src.services.knowledge_build_service import KnowledgeBuildService
+
+    service = KnowledgeBuildService.__new__(KnowledgeBuildService)
+    service.embedding_service = _embedding_service({"local-hash": None})
+
+    with pytest.raises(ValueError, match="必须是提供"):
+        _ = service.embedding_service.embedding_model_detail.model_name

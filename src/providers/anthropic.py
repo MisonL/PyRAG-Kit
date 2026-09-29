@@ -359,7 +359,47 @@ class AnthropicProvider(LargeLanguageModel):
         return 8192
 
     @staticmethod
+    def _require_string_header_values(
+        extra_headers: Mapping[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """校验 ``extra_headers`` 的**取值**都是字符串，返回浅拷贝。
+
+        为什么值也要判：``validate_secret_free_request_overrides`` 只校验
+        ``extra_headers`` 整体是 Mapping，不校验值——实测
+        ``CompletionRequest(extra_headers={"anthropic-beta": 42})`` 构造成功并原样
+        保留。非字符串值的两种收场都不在本渠道的错误契约内：
+
+        * 交给 httpx 时抛 ``TypeError: Header value must be str or bytes``；
+        * 本模块对 ``anthropic-beta`` 做 ``.split(",")`` 时抛
+          ``AttributeError: 'int' object has no attribute 'split'``。
+
+        HTTP 头的值本来就该是字符串，非字符串一律给出带头名的 ``ValueError``。
+        ``None`` **剔除**而不是放行，且必须是**在合并之前**剔除：合并分支对
+        ``anthropic-beta`` 做 ``.split(",")``，``None`` 在那里抛
+        ``AttributeError: 'NoneType' object has no attribute 'split'``（实测
+        ``_user_profile_fields("u1", {"anthropic-beta": None}, None, beta=False)``）；
+        交给 httpx 时则抛 ``TypeError: Header value must be str or bytes``。两者
+        都不在本渠道的错误契约内。剔除后它与「该头未设置」完全等价，符合调用方
+        写 ``extra_headers={"x": None}`` 时的意图。
+
+        只收 ``str`` 不收 ``bytes``：``bytes`` 虽是 httpx 接受的形态，但本模块对
+        ``anthropic-beta`` 做的是 ``.split(",")``（``str`` 分隔符），对 bytes 抛
+        ``TypeError: a bytes-like object is required``——放行它只是把问题挪个地方。
+        """
+        if extra_headers is None:
+            return None
+        headers = dict(extra_headers)
+        for name, value in headers.items():
+            if value is not None and not isinstance(value, str):
+                raise ValueError(
+                    f"Anthropic extra_headers[{safe_repr(name)}] 必须是字符串，"
+                    f"但得到 {safe_repr(value)}。"
+                )
+        return {name: value for name, value in headers.items() if value is not None}
+
+    @classmethod
     def _user_profile_fields(
+        cls,
         user: str | None,
         extra_headers: Mapping[str, str] | None = None,
         betas: Any = None,
@@ -367,8 +407,14 @@ class AnthropicProvider(LargeLanguageModel):
         beta: bool,
     ) -> tuple[dict[str, str] | None, Any]:
         """补齐 user profile 所需的 SDK beta 资源声明。"""
+        # 头值校验放在**两条分支之前**：``user=None`` 时这里直接返回原样的
+        # ``extra_headers``，非字符串值会一路交给 httpx，在那里抛
+        # ``TypeError: Header value must be str or bytes``——既不落
+        # ``except ValueError`` 也不落 ``except RuntimeError``。而 ``user=None``
+        # 恰恰是最常见的调用形态，这条路径比下面的合并分支更容易走到。
+        headers = cls._require_string_header_values(extra_headers)
         if user is None:
-            return dict(extra_headers) if extra_headers is not None else None, betas
+            return headers, betas
         header = "user-profiles-2026-08-18"
         if beta:
             if isinstance(betas, str):
@@ -377,14 +423,22 @@ class AnthropicProvider(LargeLanguageModel):
                 values = list(betas or [])
             if header not in values:
                 values.append(header)
-            return dict(extra_headers) if extra_headers is not None else None, values
-        headers = dict(extra_headers or {})
-        existing = headers.get("anthropic-beta", "")
+            # 返回**校验过**的副本（``headers`` 可能是 ``None``，此时语义就是
+            # 「没有额外头」），不能用原始的 ``extra_headers``——那会绕过上面刚做的
+            # 取值校验。
+            return headers, values
+        # ``headers`` 可能是 ``None``（调用方没传 extra_headers），而
+        # ``_require_string_header_values`` 对 ``None`` 输入原样返回 ``None``。
+        # 合并必须建立在副本上：直接写 ``headers`` 会在 ``None`` 上抛裸
+        # ``TypeError``，而写在原字典上会让调用方的 ``request.extra_headers``
+        # 被就地修改。
+        merged = dict(headers or {})
+        existing = merged.get("anthropic-beta") or ""
         values = [item.strip() for item in existing.split(",") if item.strip()]
         if header not in values:
             values.append(header)
-        headers["anthropic-beta"] = ",".join(values)
-        return headers, betas
+        merged["anthropic-beta"] = ",".join(values)
+        return merged, betas
 
     @staticmethod
     def _convert_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
@@ -1682,7 +1736,12 @@ class AnthropicProvider(LargeLanguageModel):
             params["speed"] = request.speed
         if request.user is not None:
             params["user_profile_id"] = request.user
-        _, profile_betas = self._user_profile_fields(
+        # 取**校验后**的 ``profile_headers``，不能用 ``request.extra_headers``——
+        # 后者仍带着 ``_user_profile_fields`` 已经剔除掉的非字符串/``None`` 值，
+        # 原样透传会让 httpx 抛 ``TypeError: Header value must be str or bytes``。
+        # 同文件的 ``beta=False`` 分支（``messages.count_tokens``）用的就是校验后的
+        # 返回值，这里原先漏了。
+        profile_headers, profile_betas = self._user_profile_fields(
             request.user, request.extra_headers, request.betas, beta=True
         )
         if profile_betas is not None:
@@ -1693,8 +1752,8 @@ class AnthropicProvider(LargeLanguageModel):
                 "Anthropic Beta Messages token count",
                 "extra_body",
             )
-        if request.extra_headers is not None:
-            params["extra_headers"] = request.extra_headers
+        if profile_headers is not None:
+            params["extra_headers"] = profile_headers
         if request.extra_query is not None:
             params["extra_query"] = request.extra_query
         if request.timeout is not None:
@@ -1897,7 +1956,12 @@ class AnthropicProvider(LargeLanguageModel):
             params["speed"] = request.speed
         if request.user is not None:
             params["user_profile_id"] = request.user
-        _, profile_betas = self._user_profile_fields(
+        # 取**校验后**的 ``profile_headers``，不能用 ``request.extra_headers``——
+        # 后者仍带着 ``_user_profile_fields`` 已经剔除掉的非字符串/``None`` 值，
+        # 原样透传会让 httpx 抛 ``TypeError: Header value must be str or bytes``。
+        # 同文件的 ``beta=False`` 分支（``messages.count_tokens``）用的就是校验后的
+        # 返回值，这里原先漏了。
+        profile_headers, profile_betas = self._user_profile_fields(
             request.user, request.extra_headers, request.betas, beta=True
         )
         if profile_betas is not None:
@@ -1908,8 +1972,8 @@ class AnthropicProvider(LargeLanguageModel):
                 "Anthropic Beta Messages token count",
                 "extra_body",
             )
-        if request.extra_headers is not None:
-            params["extra_headers"] = request.extra_headers
+        if profile_headers is not None:
+            params["extra_headers"] = profile_headers
         if request.extra_query is not None:
             params["extra_query"] = request.extra_query
         if request.timeout is not None:

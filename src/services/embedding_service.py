@@ -9,7 +9,12 @@ import numpy as np
 from src.providers.__base__.model_provider import close_resource_sync
 from src.providers.factory import ModelProviderFactory
 from src.runtime.contracts import RunConfig
-from src.utils.config import _MAX_EMBEDDING_DIMENSION, is_double_convertible, safe_repr
+from src.utils.config import (
+    _MAX_EMBEDDING_DIMENSION,
+    is_double_convertible,
+    require_detail_attributes,
+    safe_repr,
+)
 
 
 def _reject_unconvertible_numbers(values: Any, label: str) -> None:
@@ -79,7 +84,24 @@ class EmbeddingService:
                 " 请检查 config.toml 里的 default_embedding_provider 与"
                 " embedding_configurations 是否对应。"
             )
-        return configurations[key]
+        # 键在**不**代表值可用。``{"local-hash": None}`` 的键确实存在，于是不会
+        # 走上面「未找到key」的分支，而是把 ``None`` 原样返回——两个调用点紧接着
+        # 读 ``.provider``／``.model_name``，在那里抛裸 ``AttributeError``。
+        # 与 ``ModelProviderFactory._get_model_detail`` 的同类情形对齐：同一个
+        # ``{"k": None}`` 走工厂得到 ``ValueError``，走这里得到 ``AttributeError``，
+        # 而调用方按 ``ValueError`` 写的错误分类与日志脱敏接不住后者。
+        # 判据用属性存在性而非 ``isinstance(..., ModelDetail)``，理由见
+        # ``require_detail_attributes`` 的 docstring（测试用 ``SimpleNamespace``
+        # 构造等价配置）。
+        detail = configurations[key]
+        require_detail_attributes(
+            detail,
+            ("provider", "model_name"),
+            field="embedding_configurations",
+            key=key,
+            role_label="Embedding",
+        )
+        return detail
 
     def _get_model(self):
         if self._embedding_model is None:
