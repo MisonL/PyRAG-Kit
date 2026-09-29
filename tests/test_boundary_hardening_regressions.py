@@ -1966,3 +1966,223 @@ def test_chat_config_setter_rejection_is_atomic():
     with pytest.raises(ValueError):
         bot.chat_config = {"top_k": 42, "retrieval_method": "不存在"}
     assert bot.session_config.top_k == before
+
+
+# ── retrieval_method 的取值收敛（三个取用点） ──
+#
+# ``retrieval_method`` 声明为 ``RetrievalMethod``，但 ``SessionConfig`` 是公开类、
+# 普通属性没有 ``__setattr__`` 守卫，嵌入方（或携带异常取值的 pickle 快照）可以
+# 直写成任何形态。修复前实测三个取用点各自的收场：
+#
+#   * ``RetrievalService.retrieve``：``==`` 判分支，而它**没有**形态收敛——是该
+#     函数里唯一没有 ``_coerce_*`` 助手的字段（top_k／候选倍率／score_threshold／
+#     rerank_enabled／hybrid_fusion_strategy 都有）。``"hybrid"``／``None``／``5``
+#     静默落进 else 分支，**退化成纯关键词检索**（实测只调了 keyword_search）。
+#     用户看到的是「配好了混合检索但只召回关键词命中」，不是一条配置错误。
+#   * ``display_chat_config``：读 ``.value``，在 ``start_chat_session_async`` 里于
+#     任何提示符**之前**被调用，直写 ``5``／``None`` 抛裸
+#     ``AttributeError: 'int' object has no attribute 'value'``，会话在启动横幅
+#     这一步就终止。
+#   * ``config_menu.edit_retrieval_params``：读同一个 ``.value``，菜单渲染不出来。
+
+
+def _retrieval_service_with_recording():
+    """返回 (service, calls)：记录实际走到了哪条检索路径。"""
+    from src.retrieval.vdb.faiss_store import FaissStore
+    from src.runtime.contracts import build_run_config
+    from src.services.embedding_service import EmbeddingService
+    from src.services.retrieval_service import RetrievalService
+    from src.utils.config import get_settings
+
+    service = RetrievalService(FaissStore(), EmbeddingService(build_run_config(get_settings())))
+    calls: list[str] = []
+    original_semantic = service._semantic_retrieve
+    original_keyword = service._keyword_retrieve
+
+    async def recording_semantic(query, top_k):
+        calls.append("semantic")
+        return await original_semantic(query, top_k)
+
+    async def recording_keyword(query, top_k):
+        calls.append("keyword")
+        return await original_keyword(query, top_k)
+
+    service._semantic_retrieve = recording_semantic
+    service._keyword_retrieve = recording_keyword
+    return service, calls
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        pytest.param("hybrid", id="english-alias"),
+        pytest.param("语义", id="abbreviated"),
+        pytest.param(None, id="none"),
+        pytest.param(5, id="int"),
+        pytest.param(["向量检索"], id="list"),
+        # id 必须显式给：pytest 生成参数 id 时会对取值调 ``str()``，位数超限的
+        # 整数会让**收集阶段**自己崩掉（实测）。
+        pytest.param(_HUGE_INT, id="beyond-int-max-str-digits"),
+    ],
+)
+def test_retrieve_rejects_unusable_retrieval_method(bad_value):
+    """无法识别的检索模式必须报错，而不是静默走错分支。
+
+    ``"hybrid"`` 这条尤其要紧：它是 ``"混合检索"`` 的英文写法，用户很容易写，
+    而修复前它悄悄变成纯关键词检索。
+    """
+    import asyncio
+
+    from src.runtime.contracts import build_session_config
+    from src.utils.config import get_settings
+
+    service, calls = _retrieval_service_with_recording()
+    config = build_session_config(get_settings())
+    config.retrieval_method = bad_value
+
+    with pytest.raises(ValueError, match="retrieval_method 必须是"):
+        asyncio.run(service.retrieve("测试", config))
+
+    # 关键断言：被拒之前**没有**发起任何一路检索。只断言「抛了 ValueError」
+    # 会让「先检索再校验」的实现也通过。
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_calls"),
+    [
+        (RetrievalMethod.HYBRID_SEARCH, ["semantic", "keyword"]),
+        ("混合检索", ["semantic", "keyword"]),
+        (RetrievalMethod.SEMANTIC_SEARCH, ["semantic"]),
+        ("向量检索", ["semantic"]),
+        (RetrievalMethod.FULL_TEXT_SEARCH, ["keyword"]),
+        ("全文检索", ["keyword"]),
+    ],
+)
+def test_retrieve_keeps_working_for_valid_retrieval_methods(value, expected_calls):
+    """收紧不能误伤：枚举成员与它的字符串取值（config.toml 的既有契约）都照旧。"""
+    import asyncio
+
+    from src.runtime.contracts import build_session_config
+    from src.utils.config import get_settings
+
+    service, calls = _retrieval_service_with_recording()
+    config = build_session_config(get_settings())
+    config.retrieval_method = value
+
+    asyncio.run(service.retrieve("测试", config))
+
+    assert calls == expected_calls
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        pytest.param("hybrid", id="english-alias"),
+        pytest.param(5, id="int"),
+        pytest.param(None, id="none"),
+        pytest.param(_HUGE_INT, id="beyond-int-max-str-digits"),
+    ],
+)
+def test_display_chat_config_rejects_unusable_retrieval_method(bad_value):
+    """启动横幅不得因可直写的取值而抛裸 ``AttributeError``。
+
+    本函数在 ``start_chat_session_async`` 里于任何提示符**之前**被调用，修复前
+    用户看到的是 ``'int' object has no attribute 'value'``——会话直接终止。
+    """
+    from rich.console import Console
+
+    from src.runtime.contracts import build_session_config
+    from src.ui.display_utils import display_chat_config
+    from src.utils.config import get_settings
+
+    config = build_session_config(get_settings())
+    config.retrieval_method = bad_value
+
+    with pytest.raises(ValueError, match="retrieval_method 必须是"):
+        display_chat_config(Console(quiet=True), config)
+
+
+def test_display_chat_config_keeps_working_for_valid_retrieval_method():
+    """收紧不能误伤：合法的枚举成员与字符串取值照旧渲染。
+
+    配置**自造**而不是 ``build_session_config(get_settings())``：后者读开发机上的
+    ``config.toml``，而本机实测 ``active_llm_configuration='google'`` 并不在
+    ``llm_configurations`` 的键里——那条与本用例无关的既有不一致会让本测试以
+    ``ValueError`` 失败，把「retrieval_method 的收紧误伤了合法取值」这条断言
+    变成对开发者本地配置的断言。
+    """
+    from rich.console import Console
+
+    from src.ui.display_utils import display_chat_config
+    from src.utils.config import RetrievalMethod
+
+    for value in (RetrievalMethod.HYBRID_SEARCH, "混合检索"):
+        config = _session_config(
+            retrieval_method=value,
+            active_llm_configuration="demo",
+            llm_configurations={"demo": SimpleNamespace(provider="openai", model_name="demo")},
+        )
+        display_chat_config(Console(quiet=True), config)
+
+
+def test_session_config_validator_and_runtime_reader_agree():
+    """配置边界与运行期读取侧对同一取值必须给出同一种收场。
+
+    两边此前各写一份判据（``SessionConfig._validate_retrieval_method`` 与
+    ``retrieve`` 的裸 ``==``），现在共用 ``require_retrieval_method``。这条测试
+    盯住「只修一边」——只改读取侧会让「写得进、读不出」，只改写入侧则相反。
+    """
+    from src.runtime.contracts import build_session_config
+    from src.services.retrieval_service import require_retrieval_method
+    from src.utils.config import get_settings
+
+    config = build_session_config(get_settings())
+    for bad_value in ("hybrid", None, 5):
+        with pytest.raises(ValueError):
+            config["retrieval_method"] = bad_value
+        with pytest.raises(ValueError):
+            require_retrieval_method(bad_value)
+
+
+def test_require_retrieval_method_accepts_enum_and_string_forms():
+    """共享助手接受既有形态，并对无法识别的取值一律拒绝。"""
+    from src.services.retrieval_service import require_retrieval_method
+    from src.utils.config import RetrievalMethod
+
+    assert require_retrieval_method("混合检索") is RetrievalMethod.HYBRID_SEARCH
+    assert require_retrieval_method(RetrievalMethod.HYBRID_SEARCH) is RetrievalMethod.HYBRID_SEARCH
+    for bad_value in ("hybrid", "HYBRID_SEARCH", "", " 混合检索", 0, True, None, ["向量检索"]):
+        with pytest.raises(ValueError):
+            require_retrieval_method(bad_value)
+
+
+def test_require_retrieval_method_accepts_duck_typed_substitutes():
+    """判据是**属性存在性**，不是具体类型——仓库的既有约定。
+
+    ``require_detail_attributes`` 的 docstring 写明「使用方只要求取值提供这几个
+    属性，任何具备它们的对象都能正常工作（仓库里的测试就用 ``SimpleNamespace``
+    构造等价配置）」。``display_utils``／``chat/core`` 的既有测试都用
+    ``SimpleNamespace(value="混合检索")`` 作 ``retrieval_method`` 的替身，按
+    ``isinstance(value, RetrievalMethod)`` 收窄会把它们一并拒掉——实测如此，
+    4 个既有用例直接 error。
+
+    这条盯住「收紧不能把等价替身一起拒掉」：它是对**判据方向**的断言，而不是
+    对某个具体替身类型的断言。
+    """
+    from src.services.retrieval_service import require_retrieval_method
+    from src.utils.config import RetrievalMethod
+
+    assert (
+        require_retrieval_method(SimpleNamespace(value="混合检索")) is RetrievalMethod.HYBRID_SEARCH
+    )
+    # ``.value`` 本身是枚举成员也要接受（替身套替身）。
+    assert (
+        require_retrieval_method(SimpleNamespace(value=RetrievalMethod.SEMANTIC_SEARCH))
+        is RetrievalMethod.SEMANTIC_SEARCH
+    )
+    # 取值形态不对时仍要拒绝，且消息里带的是**原取值**（便于定位是哪个配置项）。
+    with pytest.raises(ValueError, match="retrieval_method 必须是"):
+        require_retrieval_method(SimpleNamespace(value="hybrid"))
+    with pytest.raises(ValueError, match="retrieval_method 必须是"):
+        require_retrieval_method(SimpleNamespace())

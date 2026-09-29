@@ -14,6 +14,7 @@ from ..utils.config import (  # 导入 get_settings 函数
     get_settings,
     is_double_convertible,
     require_detail_attributes,
+    require_retrieval_method,
     safe_repr,
 )
 from ..utils.log_manager import get_module_logger  # 导入日志管理器
@@ -325,7 +326,13 @@ def display_chat_config(console: Console, chat_config: dict[str, Any]):
     # ``MarkupError``——聊天会话在启动横幅这一步就崩。
     #
     # 值一律经 ``Text()`` 原样呈现，样式由 ``add_column(style=...)`` 提供。
-    chat_table.add_row("检索策略:", Text(str(chat_config["retrieval_method"].value)))
+    # 直读 ``.value`` 会在可直写的非枚举取值上抛裸 ``AttributeError``，而本函数在
+    # ``start_chat_session_async`` 里于任何提示符**之前**被调用——会话在启动横幅
+    # 这一步就终止。与同一张表的其它单元格同因（普通属性没有 ``__setattr__`` 守卫）。
+    chat_table.add_row(
+        "检索策略:",
+        Text(require_retrieval_method(chat_config["retrieval_method"]).value),
+    )
     chat_table.add_row(
         "混合搜索权重 (向量/关键词):",
         Text(

@@ -344,6 +344,62 @@ def require_detail_attributes(
             )
 
 
+def require_retrieval_method(value: Any, *, label: str = "retrieval_method") -> RetrievalMethod:
+    """把检索模式收敛成 ``RetrievalMethod`` 成员，非法取值给出带指引的 ``ValueError``。
+
+    ``retrieval_method`` 声明为 ``RetrievalMethod``，但 ``SessionConfig`` 是公开类、
+    普通属性没有 ``__setattr__`` 守卫，嵌入方（或携带异常取值的 pickle 快照）可以
+    把它直写成任何形态。此前有三个取用点各自假设它是枚举成员：
+
+    * ``retrieval_service.retrieve`` 用 ``==`` 判分支，且**没有任何形态收敛**——它是
+      该函数里唯一没有 ``_coerce_*`` 助手的字段（``top_k``／候选倍率／
+      ``score_threshold``／``rerank_enabled``／``hybrid_fusion_strategy`` 都有）。
+      实测 ``cfg.retrieval_method = "hybrid"``／``None``／``5`` 时静默落进 else
+      分支，变成**纯关键词检索**；只有恰好等于 ``"向量检索"`` 的取值才走语义检索。
+      用户看到的是「混合检索配好了但只召回关键词命中」，而不是一条配置错误。
+    * ``display_chat_config`` 读 ``.value``——它在 ``start_chat_session_async`` 里于
+      任何提示符**之前**被调用，直写 ``5``／``None`` 时抛裸
+      ``AttributeError: 'int' object has no attribute 'value'``，会话在启动横幅
+      这一步就终止。
+    * ``config_menu.edit_retrieval_params`` 读同一个 ``.value``，菜单渲染不出来。
+
+    接受三类形态，判据是**属性存在性**而不是具体类型（与 ``require_detail_attributes``
+    同一约定——使用方只要求取值提供 ``.value``，任何具备它的对象都能正常工作）：
+
+    * ``RetrievalMethod`` 成员；
+    * 它的**字符串取值**（``"混合检索"``）——本项目的既有契约，``config.toml`` 的
+      ``chat_retrieval_method`` 与 ``Settings`` 走的就是这条路径，而
+      ``RetrievalMethod`` 本身是 ``str`` 枚举，两种形态在 ``==`` 下等价；
+    * 任何提供 ``.value`` 的等价替身。仓库里的测试用 ``SimpleNamespace(value="混合检索")``
+      构造这种替身，按类型收窄会把它们一并拒掉。
+
+    不做大小写／别名归一：``"hybrid"`` 不是合法取值，静默接受它等于把「配置写错了」
+    变成「检索行为悄悄变了」。
+
+    ``Enum`` 查找对不可哈希取值抛 ``ValueError``（``['a']``、``{'a': 1}`` 实测），
+    但位数超限的整数抛的 ``ValueError`` 消息是 ``Exceeds the limit (4300 digits)``
+    ——与「检索模式不合法」无关，因此先做一次形态收敛，把消息统一成带可选值的形态。
+    """
+    if isinstance(value, RetrievalMethod):
+        return value
+    candidate: Any = value
+    if not isinstance(candidate, str):
+        # ``getattr`` 而非 ``.value``：非字符串取值（``5``／``None``／列表）没有该
+        # 属性，直接取会抛裸 ``AttributeError``。替身对象的 ``.value`` 也可能是
+        # property（可以抛），因此整体包在 ``try`` 里。
+        try:
+            candidate = getattr(value, "value", _DETAIL_ATTRIBUTE_MISSING)
+        except Exception:  # noqa: BLE001 - 取值不可用等同于「不是合法的检索模式」
+            candidate = _DETAIL_ATTRIBUTE_MISSING
+    if isinstance(candidate, str):
+        try:
+            return RetrievalMethod(candidate)
+        except ValueError:
+            pass
+    allowed = ", ".join(member.value for member in RetrievalMethod)
+    raise ValueError(f"{label} 必须是 {allowed} 之一，但得到 {safe_repr(value)}。")
+
+
 def to_finite_float(value: Any) -> float | None:
     """把数值收敛成有限 ``float``；不能安全转换时返回 ``None``，**绝不抛异常**。
 

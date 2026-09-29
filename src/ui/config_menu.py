@@ -11,6 +11,7 @@ from ..utils.config import (
     _MAX_RETRIEVAL_TOP_K,
     RetrievalMethod,
     parse_decimal_int,
+    require_retrieval_method,
     safe_repr,
 )
 from ..utils.log_manager import get_module_logger  # 导入日志管理器
@@ -57,7 +58,9 @@ def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
     """编辑检索相关参数。"""
     logger.info("进入检索参数编辑菜单。")
     while True:
-        current_method = chat_config["retrieval_method"].value
+        # 与 ``display_chat_config`` 同因：直读 ``.value`` 对可直写的非枚举取值抛裸
+        # ``AttributeError``，菜单渲染不出来。收敛后 ``default=`` 也拿到规范取值。
+        current_method = require_retrieval_method(chat_config["retrieval_method"]).value
         current_top_k = chat_config["top_k"]
         current_rerank = "启用" if chat_config["rerank_enabled"] else "禁用"
         # 权重同样要经 ``safe_repr``：``SessionConfig`` 是公开类、普通属性没有

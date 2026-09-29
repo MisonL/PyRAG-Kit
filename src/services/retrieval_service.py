@@ -23,6 +23,7 @@ from src.utils.config import (
     is_double_convertible,
     parse_decimal_int,
     require_detail_attributes,
+    require_retrieval_method,
     safe_repr,
     to_finite_float,
 )
@@ -581,7 +582,10 @@ class RetrievalService:
     async def retrieve(
         self, query: str, session_config: SessionConfig, console: Console | None = None
     ) -> list[dict[str, Any]]:
-        retrieval_method = session_config.retrieval_method
+        # 检索模式同样要收敛：它是本函数里唯一没有对应助手的字段，而
+        # ``==`` 判分支**不会**对未知取值报错——``"hybrid"``／``None``／``5``
+        # 全部静默落进 else 分支，变成纯关键词检索（实测）。详见该助手的说明。
+        retrieval_method = require_retrieval_method(session_config.retrieval_method)
         # 形态必须在这里收敛：``SessionConfig`` 的属性可被直写，而 ``max()`` 对
         # 非数值抛裸 ``TypeError``（详见 ``_coerce_scale_field``）。
         top_k = _coerce_scale_field(session_config.top_k, "top_k")

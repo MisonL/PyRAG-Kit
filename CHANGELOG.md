@@ -303,7 +303,17 @@
 
 - **补齐配置写入入口的容器形态校验**：`SessionConfig.set_many` 与 `Chatbot.chat_config` setter 的标注是映射，但运行时不受约束，非映射取值一路走到 `.items()`／`set_many` 的迭代才炸。实测 `cfg.set_many(5)` 与 `bot.chat_config = 5` 都得到裸 `TypeError: 'int' object is not iterable`，而 `cfg.set_many("abc")` 更糟——字符串是合法的可迭代对象，它被拆成一串单字符字段名，抛出 `KeyError: "SessionConfig 没有字段 'a'。"`（`bot.chat_config = "abc"` 同理）。同一个「配置写错」的收场不该取决于写错的是标量还是映射：非法**字段名**早已给带指引的 `ValueError`，现在非法**容器**也是。两处都在任何写入之前判形态（`str`／`bytes`／`bytearray` 显式排除），`chat_config` setter 的既有原子性契约（`deepcopy` 副本上写入）保持不变。
 
+- **补齐 `retrieval_method` 的取值收敛**：该字段声明为 `RetrievalMethod`，但 `SessionConfig` 是公开类、普通属性没有 `__setattr__` 守卫，嵌入方（或携带异常取值的 pickle 快照）可以直写成任何形态。三个取用点此前各自假设它是枚举成员：
+
+  - **`RetrievalService.retrieve` 静默走错检索路径**（最要紧的一条）：`retrieve` 用 `==` 判分支，而它是该函数里**唯一没有形态收敛**的字段——同一函数里 `top_k`、候选倍率、`score_threshold`、`rerank_enabled`、`hybrid_fusion_strategy` 都有对应的 `_coerce_*` 助手。实测 `cfg.retrieval_method = "hybrid"`／`None`／`5` 全部静默落进 `else` 分支，**退化成纯关键词检索**（记录调用可见只走了 `keyword_search`）；`"语义"` 同理。用户看到的是「混合检索配好了但只召回关键词命中」，而不是一条配置错误。`"hybrid"` 这条尤其容易踩：它是 `"混合检索"` 的英文写法。
+  - **`display_chat_config` 在启动横幅处终止会话**：该函数读 `.value`，而它在 `start_chat_session_async` 里于任何提示符**之前**被调用。实测直写 `5`／`None` 抛裸 `AttributeError: 'int' object has no attribute 'value'`——用户刚看到「知识快照加载成功」，会话随即终止。
+  - **`config_menu.edit_retrieval_params` 读同一个 `.value`**，菜单根本渲染不出来。
+
+  现新增共享助手 `require_retrieval_method`（`src/utils/config.py`，`RetrievalMethod` 的归属地），三个取用点与 `SessionConfig._validate_retrieval_method` 共用它——配置边界与运行期读取侧从此只有一处判据、一种消息。判据按**属性存在性**而不是具体类型（与同文件 `require_detail_attributes` 同一约定：使用方只要求取值提供 `.value`，任何具备它的对象都能工作，仓库既有测试就用 `SimpleNamespace(value="混合检索")` 作替身）。接受枚举成员与它的字符串取值（`config.toml` 的 `chat_retrieval_method` 走的就是后者）；**不做**大小写／别名归一——静默接受 `"hybrid"` 等于把「配置写错了」变成「检索行为悄悄变了」。
+
 ### 测试
+
+- 新增第八轮的回归用例（19 个用例；回退源码后其中 12 个变红，7 个「不误伤」反向守卫保持绿）：`retrieve` 对六类不可用 `retrieval_method`（英文别名／缩写／`None`／`int`／`list`／位数超限整数）的拒绝**且断言被拒前未发起任何一路检索**（只断言「抛了 ValueError」会让「先检索再校验」的实现也通过）、`display_chat_config` 对四类的拒绝、六条合法取值（枚举成员与字符串取值 × 三种模式）照旧走对分支、合法取值照旧渲染、配置边界与运行期读取侧对同一取值给出同一种收场（这条盯「只修一边」），以及共享助手对鸭子类型替身的接受与对取值形态不对时的拒绝。
 
 - 新增第七轮的回归用例（14 个用例；回退源码后其中 10 个变红，4 个「不误伤」反向守卫保持绿）：`SessionConfig.set_many` 对五类非映射容器（`int`／`None`／`str`／`bytes`／`list`）的拒绝、`Chatbot.chat_config` setter 对同样五类的拒绝、两条合法路径照旧工作（映射与 `SessionConfig` 实例），以及被拒时状态不被改了一半。
 

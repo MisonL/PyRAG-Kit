@@ -16,6 +16,7 @@ from src.utils.config import (
     RetrievalMethod,
     Settings,
     is_double_convertible,
+    require_retrieval_method,
     safe_repr,
     to_finite_float,
 )
@@ -371,15 +372,10 @@ class SessionConfig(MutableMapping[str, Any]):
 
     @classmethod
     def _validate_retrieval_method(cls, value: Any) -> RetrievalMethod:
-        if isinstance(value, RetrievalMethod):
-            return value
-        try:
-            return RetrievalMethod(value)
-        except ValueError as exc:
-            allowed = ", ".join(member.value for member in RetrievalMethod)
-            raise ValueError(
-                f"retrieval_method 必须是 {allowed} 之一，但得到 {safe_repr(value)}。"
-            ) from exc
+        # 判据与措辞都交给 ``require_retrieval_method``：同一字段在配置边界
+        # （这里）与运行期读取侧（``retrieval_service``／两个 UI 取用点）必须
+        # 给出同一种收场，否则「写进去被拒」与「读出来报错」会分成两套消息。
+        return require_retrieval_method(value)
 
     @staticmethod
     def _validate_fusion_strategy(value: Any) -> str:
