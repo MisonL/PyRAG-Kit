@@ -14,7 +14,7 @@ from ..utils.config import (
     safe_repr,
 )
 from ..utils.log_manager import get_module_logger  # 导入日志管理器
-from .display_utils import display_chat_config, markup_text
+from .display_utils import _render_value, display_chat_config, markup_text
 
 logger = get_module_logger(__name__)  # 获取当前模块的日志器
 console = Console()
@@ -68,7 +68,16 @@ def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
             f"向量: {safe_repr(chat_config['vector_weight'])}"
             f" / 关键词: {safe_repr(chat_config['keyword_weight'])}"
         )
-        current_fusion_strategy = chat_config["hybrid_fusion_strategy"].upper()
+        # 这里**不能**用 ``safe_repr``：它给字符串加引号（``'rrf'`` 而非 ``rrf``），
+        # 会改掉正常取值的显示形态。``_render_value`` 才是同一张表在
+        # ``display_utils`` 里用的渲染器——先 ``str()``，只在撞上整数位数上限时
+        # 降级成量级描述。``SessionConfig`` 的普通属性没有 ``__setattr__`` 守卫，
+        # 嵌入方或携带超大整数的 pickle 快照可以直写
+        # ``cfg.hybrid_fusion_strategy = 10**4301``（或 ``["RRF"]``／``None``）：
+        # 裸 ``.upper()`` 对非字符串抛 ``AttributeError``，冲穿聊天主循环的
+        # ``except ValueError`` 分类；``str(10**4301)`` 则抛 ``ValueError:
+        # Exceeds the limit``，菜单根本渲染不出来。
+        current_fusion_strategy = _render_value(chat_config["hybrid_fusion_strategy"]).upper()
         current_candidate_multiplier = chat_config["retrieval_candidate_multiplier"]
 
         choice = questionary.select(
@@ -209,7 +218,11 @@ def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
             new_multiplier = questionary.text(
                 f"输入候选过量招募倍率 (1-{safe_repr(multiplier_ceiling)}, 当前: {safe_repr(current_candidate_multiplier)}):",
                 validate=_bounded_int_validator(multiplier_ceiling),
-                default=str(current_candidate_multiplier),
+                # 与同函数 top_k 分支的 ``default=safe_repr(current_top_k)`` 保持
+                # 一致：``str()`` 对位数超限的整数抛 ``ValueError: Exceeds the
+                # limit``，菜单在这一步直接报错；``safe_repr`` 退回量级描述，
+                # 校验器随后会把它作为非法输入拒掉，用户仍能改。
+                default=safe_repr(current_candidate_multiplier),
             ).ask()
             if new_multiplier:
                 chat_config["retrieval_candidate_multiplier"] = parse_decimal_int(new_multiplier)

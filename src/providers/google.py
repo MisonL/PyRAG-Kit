@@ -44,7 +44,13 @@ from src.providers.__base__.model_provider import (
     validate_complete_tool_call,
 )
 from src.providers.resources import AsyncGoogleResources, GoogleResources
-from src.utils.config import get_settings, is_double_convertible, parse_decimal_int, safe_repr
+from src.utils.config import (
+    _MAX_EMBEDDING_DIMENSION,
+    get_settings,
+    is_double_convertible,
+    parse_decimal_int,
+    safe_repr,
+)
 from src.utils.log_manager import get_module_logger
 from src.utils.security import (
     _model_dump_mapping,
@@ -61,6 +67,18 @@ logger = get_module_logger(__name__)
 # 上界，不设界时 ``options.max_output_tokens = 10**400`` 会被原样编进请求体
 # 发给服务端。取值本身也不需要超过这个量——主流模型的最大输出是数万 token。
 _MAX_GENERATION_TOKENS = 1_000_000
+
+# Vertex ``PartialArg.json_path`` 里数组下标的**上界**。
+#
+# 下标由模型输出决定，而 ``_partial_args_to_mapping`` 用
+# ``while len(current) <= token: current.append(None)`` 把列表**填充**到该下标，
+# 因此这个值直接决定一次分片要分配多少个元素。实测 ``$.items[20000000]``
+# 分配 2000 万个 ``None``（RSS 峰值 +76MB、耗时 6.5 秒），而它只是一个
+# 字符串字段的下标——模型（或中转网关）用一个数字就能让进程卡住。
+#
+# 上界取 10 万：真实函数参数里的数组不会有比这更长的，而 10 万个元素是
+# 毫秒级、几 MB 的量。与 ``_MAX_GENERATION_TOKENS`` 同一用途。
+_MAX_PARTIAL_ARG_INDEX = 100_000
 
 
 class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
@@ -851,7 +869,33 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             "document_ocr",
             "audio_track_extraction",
         }
-        return {key: value for key, value in self._options.items() if key in supported}
+        values = {key: value for key, value in self._options.items() if key in supported}
+        # ``output_dimensionality`` 此前只过键名白名单，取值原样透传给
+        # ``EmbedContentConfig``。实测 ``-1``／``0``／``"abc"``／``1.5``／``True``
+        # 全部构造成功并进入 ``embedContent`` 请求体，由服务端返回语义不明的 400；
+        # ``10**4301`` 更糟——它在 ``json.dumps`` 编码请求体时才抛「整数转字符串
+        # 超限」。项目里 ``_MAX_EMBEDDING_DIMENSION`` 早就是这个量的上界，
+        # ``openai_compatible._validate_embedding_dimensions`` 已在同一语义上
+        # 校验，这里是 google 渠道的对应实现。
+        if "output_dimensionality" in values:
+            values["output_dimensionality"] = self._validate_embedding_dimensions(
+                values["output_dimensionality"]
+            )
+        return values
+
+    @staticmethod
+    def _validate_embedding_dimensions(value: Any) -> int:
+        """校验 ``options.output_dimensionality``，拒绝越界、非整数与超大字面量。"""
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                f"Google options.output_dimensionality 必须是整数，但得到 {safe_repr(value)}。"
+            )
+        if not 1 <= value <= _MAX_EMBEDDING_DIMENSION:
+            raise ValueError(
+                f"Google options.output_dimensionality 必须在 1 到 "
+                f"{_MAX_EMBEDDING_DIMENSION} 之间，但得到 {safe_repr(value)}。"
+            )
+        return value
 
     @staticmethod
     def _resource_config(config_type: Any, config: Any, values: dict[str, Any]) -> Any:
@@ -1159,10 +1203,15 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
 
         converted_tools: list[Any] = []
         declarations = []
-        for tool in tools:
-            if not isinstance(tool, dict):
-                converted_tools.append(tool)
-                continue
+        for index, tool in enumerate(tools):
+            # 非 Mapping 的工具定义此前被原样放进 ``converted_tools``，直到
+            # ``types.Tool(**tool)`` 或 ``function.get("name")`` 才以裸
+            # ``AttributeError`` / ``TypeError`` 暴露——两者都不在调用方按
+            # ``ValueError`` 建立的错误分类内。Anthropic 的同一入口（
+            # ``anthropic.py`` 的 ``_convert_tools``）早已转成带序号的
+            # ``ValueError``，这里补齐同一判据。
+            if not isinstance(tool, Mapping):
+                raise ValueError(f"Google 工具定义[{index}] 必须是对象，但得到 {safe_repr(tool)}。")
             native_keys = {
                 "retrieval",
                 "computer_use",
@@ -1178,6 +1227,12 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                 "exa_ai_search",
             }
             type_name = tool.get("type")
+            # ``type_name in type_aliases`` 对不可哈希取值抛
+            # ``TypeError: unhashable type``；下面 ``native_keys.intersection(tool)``
+            # 同理。类型标记本来就该是字符串，非字符串一律按「不是原生工具」处理，
+            # 落到下面的 function schema 分支（与未知类型标记同一条路径）。
+            if not isinstance(type_name, str):
+                type_name = None
             type_aliases = {
                 "google_search": "google_search",
                 "code_execution": "code_execution",
@@ -1194,9 +1249,13 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                 converted_tools.append(types.Tool(**tool))
                 continue
             function = tool.get("function", tool)
+            if not isinstance(function, Mapping):
+                raise ValueError(
+                    f"Google 工具定义[{index}].function 必须是对象，但得到 {safe_repr(function)}。"
+                )
             name = function.get("name")
-            if not name:
-                raise ValueError("Google 工具定义缺少 function.name。")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(f"Google 工具定义[{index}] 缺少 function.name。")
             declarations.append(
                 types.FunctionDeclaration(
                     name=name,
@@ -1288,7 +1347,16 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         if configured_max_tokens is not None and configured_max_output_tokens is not None:
             raise ValueError("Google options.max_tokens 与 options.max_output_tokens 重复。")
         if configured_max_tokens is not None:
-            values["max_output_tokens"] = configured_max_tokens
+            # 与 ``_generation_options`` 里的 ``max_output_tokens`` 同一判据：
+            # 此前这条赋值绕过了 ``_validate_generation_count``，于是
+            # ``options.max_tokens = -1``／``0``／``True``／``10**400`` 全部
+            # 原样进入 ``GenerateContentConfig``（实测 pydantic 对
+            # ``-1``／``True``／超大整数都不报错），非法取值由服务端返回语义
+            # 不明的 400。同一个量在 ``max_output_tokens`` 名下会被拒绝，
+            # 换个别名就放行，判据必须一致。
+            values["max_output_tokens"] = self._validate_generation_count(
+                configured_max_tokens, "max_tokens"
+            )
         configured_thinking = self._options.get("thinking")
         configured_thinking_config = values.get("thinking_config")
         if configured_thinking is not None and configured_thinking_config is not None:
@@ -1309,13 +1377,15 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         if temperature is not None or "temperature" not in values:
             values["temperature"] = 0.7 if temperature is None else temperature
         if max_tokens is not None:
-            values["max_output_tokens"] = max_tokens
+            values["max_output_tokens"] = self._validate_generation_count(max_tokens, "max_tokens")
         if top_p is not None:
             values["top_p"] = top_p
         if top_k is not None:
             values["top_k"] = top_k
         if candidate_count is not None:
-            values["candidate_count"] = candidate_count
+            values["candidate_count"] = self._validate_generation_count(
+                candidate_count, "candidate_count"
+            )
         if frequency_penalty is not None:
             values["frequency_penalty"] = frequency_penalty
         if presence_penalty is not None:
@@ -1931,6 +2001,14 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                     raise ValueError(
                         f"Google FunctionCall.partial_args 的 json_path 索引无效: {json_path!r}"
                     )
+                # 上界与 ``_MAX_PARTIAL_ARG_INDEX`` 同源：下界由下面写入循环里的
+                # ``token < 0`` 判据覆盖，这里补上界。缺失时 ``_partial_args_to_mapping``
+                # 会按该下标把列表填充到那么大。
+                if index_value > _MAX_PARTIAL_ARG_INDEX:
+                    raise ValueError(
+                        f"Google FunctionCall.partial_args 的 json_path 索引过大: "
+                        f"{json_path!r}（下标不得超过 {_MAX_PARTIAL_ARG_INDEX}）。"
+                    )
                 tokens.append(index_value)
                 rest = rest[indexed.end() :]
                 continue
@@ -2286,6 +2364,19 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                         "type": "function",
                         "name": field(function_call, "name"),
                         "arguments": cls._function_call_arguments(function_call),
+                        # Vertex 开启 ``stream_function_call_arguments`` 时会把一次
+                        # 调用的参数拆成多个 chunk（SDK 自带 fixture
+                        # ``test_function_call_streaming.py`` 记录的正是这个形状：
+                        # 分片1 带 ``will_continue=True``，分片2 带 ``partial_args``
+                        # 与 ``will_continue=False``，两者都**没有** id/index）。
+                        # 读侧 ``_merge_tool_call`` 专门为它写了判据（
+                        # ``tool_call.get("will_continue") is True``），
+                        # ``_merge_tool_call`` 的字段循环也早已把
+                        # ``will_continue`` 列入复制名单，唯独这里构造 delta 字典时
+                        # 漏掉了它——于是第二个分片三项判据全假，抛
+                        # ``RuntimeError: 缺少稳定 id/index``，该 SDK 模式下**每一个**
+                        # 多分片调用都失败。
+                        "will_continue": field(function_call, "will_continue"),
                     }
                     events.append(
                         StreamEvent(

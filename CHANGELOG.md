@@ -1,23 +1,42 @@
-### 修复
-
-- **补回 `GoogleProvider.embed_query`／`aembed_query` 丢失的空结果兜底**：基类 `TextEmbeddingModel.embed_query` 先判 `if not vectors` 再取 `[0]`，空结果得到带指引的 `ValueError("Embedding provider 返回空结果。")`；`GoogleProvider` 为设 `task_type` 覆写了这两个方法，却把那条兜底一并丢掉，直接下标取 `[0]`——provider 返回空列表时抛裸 `IndexError: list index out of range`。空返回不是假想输入：`embed_documents` 的条数校验按 `len(texts)` 做，传空 `texts` 时 `len(values) == len(texts) == 0` 成立、方法正常返回 `[]`；网关截断响应或返回空 `embeddings` 字段也走到同一形态。`IndexError` 不是 `ValueError`／`RuntimeError`，会穿透调用方按这两类做的错误分类与日志脱敏，消息也与「provider 返回了什么」毫无关系。现按基类逐字对齐补回，`task_type` 覆写的理由保持不变。
-- **补齐父块索引写入侧的顶层形态守卫**：`register_parent_documents` 直接写 `for ... in parent_documents.items()`，非映射传进来时抛裸 `AttributeError: 'int' object has no attribute 'items'`；而载入侧的 `_normalize_documents` 对同一形态给的是带指引的 `ValueError: 知识快照不自洽：父块索引的顶层不是映射（int）…`。两者都是 `VectorStoreBase` 的公开契约方法，而 `_normalize_documents` 的注释本就写明「直接调它们的嵌入方不经过那道校验」——同一取舍只在一侧执行了。本仓自带流程到不了写入侧这条分支（`knowledge_build_service` 传的是 `dict`，且前面已用 `isinstance(..., dict)` 过滤），因此这是一致性修复而非崩溃修复。
-- **补齐向量载入侧的非有限值校验**：写入侧 `EmbeddingService._as_float32_matrix` 早就拒绝 NaN／inf 向量，理由也写在注释里（FAISS 把 NaN 向量照单收下，`ntotal` 正常增加，既不报错也不跳过），但两个载入入口 `FaissStore.load`（legacy pkl）与 `load_snapshot` 共用的 `_validate_embeddings_shape` 只判 `ndim`——同一份内容**写入侧拒绝、载入侧放行**。实测载入后 `semantic_search` 对任意查询都只返回好文档、坏文档的下标干脆不出现，用户看到的是「搜到了」而不是「这份快照坏了」；而 `upsert_embeddings` 是 `VectorStoreBase` 的公开契约方法，直接调它的嵌入方绕开 `EmbeddingService`，坏向量还会被 `save_snapshot` 落盘、由 `validate_snapshot_dir` 放行成活动快照。判据落在 `astype(np.float32)` **之后**：`1e300` 在 float64 里是有限的，cast 成 float32 才溢出成 `inf`——只对原数组调 `isfinite` 会让载入侧在这一点上再次与写入侧分叉。cast 只是校验用副本，失败时 store 仍保持原状。
-- **补齐配置编辑器模型菜单的容器形态校验**：`edit_model_params` 原先直接写 `list(chat_config["llm_configurations"].keys())`，取值不是映射时抛裸 `AttributeError: 'int' object has no attribute 'keys'`——不是 `ValueError`，会以裸 traceback 终止会话（主循环只捕获 `KeyboardInterrupt`／`EOFError`）。现经 `_configuration_keys` 收敛，判据与 `display_utils._require_model_detail` 一致。**只判容器、不判取值**：`display_chat_config` 在上游读值时会直接拒绝形态坏掉的配置项，菜单是用户唯一还能把激活项切走的入口，按取值判会让配置写坏后彻底没有修复路径——这条取舍由 `test_edit_model_params_lists_unusable_details_without_reading_them` 锁住。
-- **补齐配置映射「取值」与「容器」两处形态校验**（同一缺陷类，`llm_configurations`／`embedding_configurations`／`rerank_configurations` 三个角色同源）：
-  - **取值不可用**：`key in mapping` 只证明**键**在，不证明**值**可用。`{"k": None}` 的键确实存在，于是 `ModelProviderFactory._get_model_detail` 不会走「未找到key」那条分支，而是把 `None` 原样返回给调用方；三个入口紧接着都读 `config.provider`，在那里抛裸 `AttributeError: 'NoneType' object has no attribute 'provider'`——它不是 `ValueError`，穿透 `Chatbot.reload_llm` 的 `except ValueError` 分类。取值来源是 `SessionConfig.llm_configurations` 等可直写映射（`_VALIDATORS` 明确不登记这几个字段）。现新增 `require_detail_attributes` 统一收敛，三处调用点（工厂、`RetrievalService._get_rerank_provider`、`display_utils._require_model_detail`）共用。**判据用属性存在性而不是 `isinstance(detail, ModelDetail)`**：使用方只要求取值提供这几个属性，按具体类型收窄会把仓库里用 `SimpleNamespace` 构造的等价配置一并拒掉（实测一次按类型收窄让 17 个既有用例变红）。
-  - **容器不可迭代**：`_get_model_detail` 直接写 `provider_key not in configurations`。取值不可迭代时抛裸 `TypeError: argument of type 'int' is not iterable`；是字符串时走**子串**判定（`"k" in "k"` 为真），随后 `"k"["k"]` 抛 `TypeError: string indices must be integers`。两者都不是 `ValueError`。取值经 `Chatbot.reload_llm` 从 `session_config.llm_configurations` 原样传到这里。
-- **修复 `RetrievalService._get_rerank_provider` 对 rerank 缓存键两个分量的形态假设**：
-  - `provider`／`model_name` 此前只经 `getattr(..., "")` 取值，有默认值但**没有类型判据**。`ModelDetail` 是 pydantic 模型、**构造**时会拒绝非字符串，但普通属性没有赋值守卫（`validate_assignment` 未开）——实测 `detail.provider = ["p"]` 与 `detail.model_name = ["m"]` 都直接成功。两者都进 `cache_key` 元组，在 `self._rerank_providers.get(...)` 处抛裸 `TypeError: unhashable type: 'list'`。
-  - 属性被 `del` 掉时（实测 `del detail.provider` 成功）`getattr` 兜出的空串会把「属性没了」伪装成「provider 名为空」，一路带到工厂再抛 `AttributeError`。
-  - 新增 `_is_hashable`：判据用**可哈希**而不是 `isinstance(..., str)`，非字符串但可哈希的取值（整数、元组）本来就能正常工作，按类型收窄会误伤；位数超限的整数是可哈希的，不必在此拦截。
-- **修复注释里的 `type:` 被 mypy 当成类型注释**：`#     type: 'list'``；` 这类行在 Python 解析器看来是普通注释（`ast.parse`／`ruff`／`compileall` 全部通过、测试全绿），但 mypy 会把紧跟缩进后的 `type:` 识别为**类型注释**（PEP 484 风格）并去解析其后的内容，于是报 `Invalid syntax` 且**阻断整个项目的类型检查**（`errors prevented further checking`）。本次是写注释时踩到的，改动只是把该行拆成两句。记录在此是因为该类行的失败模式很隐蔽：语法错误只在 mypy 出现，其余工具全绿。
+# 更新日志
 
 所有此项目的显著更改都将记录在此文件中。
 
 ## [Unreleased]
 
 ### 修复
+
+- **收敛 24 处边界缺陷（异常分类泄漏、读写不对称、静默语义破坏）**。全部来自一次六维对抗审查，每条都在修复前实测复现、修复后加了回归测试（`tests/test_boundary_hardening_regressions.py`，82 个用例；回退源码后其中 58 个变红）。
+
+  **异常分类泄漏**（守卫抛出的异常不在调用方的 `except ValueError`／`RuntimeError` 之内）：
+
+  - 流式工具调用的累加器把网关给的 `index`／`id` 直接当字典键。`openai` SDK 的流式解析走 `construct_type`、**跳过已声明字段的 Literal/int 校验**，实测 `{"tool_calls": [{"index": [1, 2]}]}` 原样产出 `ChoiceDeltaToolCall(index=[1, 2])`（声明类型是 `int`），随后 `setdefault` 抛裸 `TypeError: unhashable type`。新增 `hashable_key_part`，不可哈希等价于「没有稳定标识」，按既有优先级退回 `id`／位置键；Responses 路径的 `_merge_response_tool_call` 与同文件 `_response_tool_keys` 已有的 `hash()` 守卫对齐。
+  - `choices` 非序列时 `_raise_for_chat_response_error` 的两条判据都不命中，调用方的 `choices[0]` 抛裸 `KeyError: 0`／`TypeError`。补一条容器形态判据（流式 usage chunk 不带 `choices` 的既有语义保持不变）。
+  - 请求级 `timeout` 未经校验直达 httpx，SDK 把 `OverflowError`／`TypeError` 统一包成 `APIConnectionError('Connection error.')`，而 `is_retryable_error` 按类名匹配到 `connection` 判定**可重试**——同一个注定失败的请求被重试 3 次，用户看到的是「连接错误」而不是「超时配错了」。现与构造期 `options.timeout` 共用 `normalize_client_timeout`（`httpx.Timeout` 对象原样保留）。
+  - Google 的 `_convert_tools` 对畸形工具定义抛裸 `AttributeError`／`TypeError`；同一形态在 `anthropic.py` 早已转成带序号的 `ValueError`。
+  - `cleanup_old_logs` 的 `os.path.exists` 对**文件**也返回 True，`log_path` 指向普通文件时抛裸 `NotADirectoryError`。写入侧对此的处置是降级为仅控制台，清理侧由退出钩子调用——异常让程序在退出路径上以裸 traceback 终止。改用 `isdir`。
+  - 融合策略的显示路径：`display_utils` 与 `config_menu` 对可直写的 `hybrid_fusion_strategy` 用裸 `str()`／`.upper()`，位数超限的整数抛 `ValueError: Exceeds the limit`、非字符串抛 `AttributeError`。统一走 `_render_value`（`safe_repr` 会给字符串加引号，改掉正常取值的显示形态，不能用）。
+  - `SessionConfig.__setitem__` 的组合校验读兄弟字段时不做收敛，与同文件 `set_many` 不对称：`top_k` 的兄弟是 list 时抛裸 `TypeError`；兄弟权重是 `nan` 时**静默放行**（`nan == 0.0` 恒为 False），两个权重同时失效。现复用 `set_many` 的 `_require_finite_number`／`_require_int_value`。
+  - `_runtime_verified_protocols` 在容器形态校验之前就把 `options` 当 Mapping 用：`"http_options" in options` 对整数抛裸 `TypeError`、命中后 `options.items()` 抛裸 `AttributeError`。非 google 渠道走 else 分支本来就得到 `ValueError`，两个分支的分类必须一致。
+  - 深层嵌套的 TOML 让 `tomllib` 抛 `RecursionError`——它继承 `RuntimeError` 而**不是** `ValueError`，`get_settings` 的四个 handler 一个都接不住，`import main` 直接以数千帧裸 traceback 终止（深度 500 即触发）。新增 `except RecursionError` 分支。
+
+  **读写／入口校验不对称**：
+
+  - 流式工具调用的 `arguments` 未归一化：同一个输入在流式路径交付 dict/list/int，非流式路径经 `normalize_tool_arguments` 交付 JSON 文本——调用方按字符串 `json.loads` 时拿到 dict 并抛 `TypeError`。
+  - `options.max_tokens` 赋值给 `values["max_output_tokens"]` 时绕过了 `_validate_generation_count`（`-1`／`0`／`True`／`10**400` 全部原样进入 `GenerateContentConfig`）；请求级 `max_tokens`／`candidate_count` 同样无校验。
+  - Google 的 `output_dimensionality` 此前只过键名白名单，取值原样透传（`-1`／`0`／`"abc"`／`1.5`／`True` 全部通过，`10**4301` 更在 `json.dumps` 时才炸）；`openai_compatible._validate_embedding_dimensions` 已在同一语义上校验。
+  - `_validate_hierarchical_sizes` 只校验**子**分片器的 `overlap < size`，父分片器缺同一判据，而父分片器在两种结构模式下都会构造。LangChain 对 `overlap == size` **静默接受**（实测 size=100/ov=100 通过、ov=101 抛错）。
+  - `upsert_embeddings`（写入侧）不校验向量有限性，而载入侧 `_validate_embeddings_shape` 已校验——同一份内容「写得进、读不出」：FAISS 把 NaN/inf 照单收下（`ntotal` 正常增加），那个下标在查询时静默消失，而 `save_snapshot` 会把它落盘。
+  - `load_snapshot` 只把 `lexical.index` 的条数对齐 `documents`，未对齐 `semantic.index` 的行数——`documents=2` 而索引 1 个向量时加载成功、无任何提示，第 2 篇文档永远搜不到；反向则抛 `IndexError`。
+
+  **静默语义破坏／数据丢失**：
+
+  - Vertex 的流式 tool_call delta 字典漏写 `will_continue`（读侧专门为它写了判据、`_merge_tool_call` 的字段循环也早已列入复制名单，唯独构造 delta 时漏掉），于是 `stream_function_call_arguments` 模式下**每一个**多分片调用都抛 `RuntimeError: 缺少稳定 id/index`。用 google-genai 自带 fixture 的真实形状验证。
+  - `_partial_args_to_mapping` 的 `json_path` 下标无上界，写入循环按该下标把列表填充到那么大——模型返回 `$.items[20000000]` 即分配 2000 万个元素（实测 RSS 峰值 +76MB、耗时 6.5 秒）。新增 `_MAX_PARTIAL_ARG_INDEX = 100_000`。
+  - `load_toml_config` 的 `normalize_mapping` 把 `options` 内每一层嵌套字典的键小写化，破坏用户载荷：`required = ["OrderId"]` 与 `properties = { OrderId = ... }` 被拆成 `["OrderId"]` 与 `["orderid"]`，JSON Schema 的 required 与 properties 不再对应，结构化输出静默失效。现区分「选项名」（项目/SDK 词汇，照旧归一，`MAX_TOKENS` 仍有效）与「选项载荷」（原样保留）。
+  - `retrieval_candidate_multiplier` 的 `int(v)` 与其它整数字段**判据不一致**：`1.9` 被静默截断成 `1`，`"1_0"` 被接受为 10、`"+7"` 被接受为 7——而 `parse_decimal_int` 的 docstring 明确写着这两类「安静的错值」要明确拒绝。改走 `_coerce_number`，与 `chat_top_k` 对齐。
+  - `_key_text` 的 `safe_repr` 降级描述只保留量级，不同的超限整数塌成同一个键（实测 `10**4301` 与 `10**4301 + 1` 相同），`_merge_hybrid_results` 于是把两条不同的文档并成一条、其中一条静默消失。改按二进制补码取摘要（`to_bytes` 不经过十进制转换），符号一并编进去。
+  - `_should_apply_score_threshold` 用**原始**取值与字面量 `"rrf"` 比较，而 `HybridReranker` 会先 `.strip().lower()`：`"RRF"` 走 RRF 融合（分数是排名倒数之和）却不被识别为 RRF，阈值过滤照常套用——两种量纲混在一起，结果被静默清空。归一化收敛到 `_coerce_fusion_strategy` 一处。
 
 - **重写流式工具调用完整性校验的判据方向**：`validate_complete_tool_call` 里相邻两条判据方向相反——「必须有非空 arguments」用黑名单（`type != "custom_tool_call"`），「必须校验 JSON」却用白名单（`type == "function_call"`）。任何不在白名单里的取值于是同时满足「必须有参数」与「不必校验参数」，半截 JSON 被当作完整调用交付。四个问题同源于此：
   - **`function` 绕过校验**：流式片段的 `type` 在两条协议上取值不同——Chat Completions 与各家 OpenAI 兼容片段用 `function`（`merge_tool_call_fragment` 的补默认值与四个 provider 的片段构造都写这个值），Responses 用 `function_call`。判据只认后者，实测四条真实流式路径（OpenAI Chat Completions、Google Gemini、Anthropic Messages、Ark Chat Completions）传 `'{"order_id":'` 时都把这段文本当完整调用交付。
@@ -355,6 +374,19 @@
 - 修复 Anthropic 采样字段弃用识别：家族名不再限定 `opus`/`sonnet`/`haiku`，覆盖 5 代新增的 `claude-fable-5`、`claude-mythos-5` 等命名；此前这些模型会被透传 `temperature`/`top_p`/`top_k`，而 Python SDK v1.0+ 已移除这些参数，请求会直接失败。
 
 ### 审查修复
+
+- **补回 `GoogleProvider.embed_query`／`aembed_query` 丢失的空结果兜底**：基类 `TextEmbeddingModel.embed_query` 先判 `if not vectors` 再取 `[0]`，空结果得到带指引的 `ValueError("Embedding provider 返回空结果。")`；`GoogleProvider` 为设 `task_type` 覆写了这两个方法，却把那条兜底一并丢掉，直接下标取 `[0]`——provider 返回空列表时抛裸 `IndexError: list index out of range`。空返回不是假想输入：`embed_documents` 的条数校验按 `len(texts)` 做，传空 `texts` 时 `len(values) == len(texts) == 0` 成立、方法正常返回 `[]`；网关截断响应或返回空 `embeddings` 字段也走到同一形态。`IndexError` 不是 `ValueError`／`RuntimeError`，会穿透调用方按这两类做的错误分类与日志脱敏，消息也与「provider 返回了什么」毫无关系。现按基类逐字对齐补回，`task_type` 覆写的理由保持不变。
+- **补齐父块索引写入侧的顶层形态守卫**：`register_parent_documents` 直接写 `for ... in parent_documents.items()`，非映射传进来时抛裸 `AttributeError: 'int' object has no attribute 'items'`；而载入侧的 `_normalize_documents` 对同一形态给的是带指引的 `ValueError: 知识快照不自洽：父块索引的顶层不是映射（int）…`。两者都是 `VectorStoreBase` 的公开契约方法，而 `_normalize_documents` 的注释本就写明「直接调它们的嵌入方不经过那道校验」——同一取舍只在一侧执行了。本仓自带流程到不了写入侧这条分支（`knowledge_build_service` 传的是 `dict`，且前面已用 `isinstance(..., dict)` 过滤），因此这是一致性修复而非崩溃修复。
+- **补齐向量载入侧的非有限值校验**：写入侧 `EmbeddingService._as_float32_matrix` 早就拒绝 NaN／inf 向量，理由也写在注释里（FAISS 把 NaN 向量照单收下，`ntotal` 正常增加，既不报错也不跳过），但两个载入入口 `FaissStore.load`（legacy pkl）与 `load_snapshot` 共用的 `_validate_embeddings_shape` 只判 `ndim`——同一份内容**写入侧拒绝、载入侧放行**。实测载入后 `semantic_search` 对任意查询都只返回好文档、坏文档的下标干脆不出现，用户看到的是「搜到了」而不是「这份快照坏了」；而 `upsert_embeddings` 是 `VectorStoreBase` 的公开契约方法，直接调它的嵌入方绕开 `EmbeddingService`，坏向量还会被 `save_snapshot` 落盘、由 `validate_snapshot_dir` 放行成活动快照。判据落在 `astype(np.float32)` **之后**：`1e300` 在 float64 里是有限的，cast 成 float32 才溢出成 `inf`——只对原数组调 `isfinite` 会让载入侧在这一点上再次与写入侧分叉。cast 只是校验用副本，失败时 store 仍保持原状。
+- **补齐配置编辑器模型菜单的容器形态校验**：`edit_model_params` 原先直接写 `list(chat_config["llm_configurations"].keys())`，取值不是映射时抛裸 `AttributeError: 'int' object has no attribute 'keys'`——不是 `ValueError`，会以裸 traceback 终止会话（主循环只捕获 `KeyboardInterrupt`／`EOFError`）。现经 `_configuration_keys` 收敛，判据与 `display_utils._require_model_detail` 一致。**只判容器、不判取值**：`display_chat_config` 在上游读值时会直接拒绝形态坏掉的配置项，菜单是用户唯一还能把激活项切走的入口，按取值判会让配置写坏后彻底没有修复路径——这条取舍由 `test_edit_model_params_lists_unusable_details_without_reading_them` 锁住。
+- **补齐配置映射「取值」与「容器」两处形态校验**（同一缺陷类，`llm_configurations`／`embedding_configurations`／`rerank_configurations` 三个角色同源）：
+  - **取值不可用**：`key in mapping` 只证明**键**在，不证明**值**可用。`{"k": None}` 的键确实存在，于是 `ModelProviderFactory._get_model_detail` 不会走「未找到key」那条分支，而是把 `None` 原样返回给调用方；三个入口紧接着都读 `config.provider`，在那里抛裸 `AttributeError: 'NoneType' object has no attribute 'provider'`——它不是 `ValueError`，穿透 `Chatbot.reload_llm` 的 `except ValueError` 分类。取值来源是 `SessionConfig.llm_configurations` 等可直写映射（`_VALIDATORS` 明确不登记这几个字段）。现新增 `require_detail_attributes` 统一收敛，三处调用点（工厂、`RetrievalService._get_rerank_provider`、`display_utils._require_model_detail`）共用。**判据用属性存在性而不是 `isinstance(detail, ModelDetail)`**：使用方只要求取值提供这几个属性，按具体类型收窄会把仓库里用 `SimpleNamespace` 构造的等价配置一并拒掉（实测一次按类型收窄让 17 个既有用例变红）。
+  - **容器不可迭代**：`_get_model_detail` 直接写 `provider_key not in configurations`。取值不可迭代时抛裸 `TypeError: argument of type 'int' is not iterable`；是字符串时走**子串**判定（`"k" in "k"` 为真），随后 `"k"["k"]` 抛 `TypeError: string indices must be integers`。两者都不是 `ValueError`。取值经 `Chatbot.reload_llm` 从 `session_config.llm_configurations` 原样传到这里。
+- **修复 `RetrievalService._get_rerank_provider` 对 rerank 缓存键两个分量的形态假设**：
+  - `provider`／`model_name` 此前只经 `getattr(..., "")` 取值，有默认值但**没有类型判据**。`ModelDetail` 是 pydantic 模型、**构造**时会拒绝非字符串，但普通属性没有赋值守卫（`validate_assignment` 未开）——实测 `detail.provider = ["p"]` 与 `detail.model_name = ["m"]` 都直接成功。两者都进 `cache_key` 元组，在 `self._rerank_providers.get(...)` 处抛裸 `TypeError: unhashable type: 'list'`。
+  - 属性被 `del` 掉时（实测 `del detail.provider` 成功）`getattr` 兜出的空串会把「属性没了」伪装成「provider 名为空」，一路带到工厂再抛 `AttributeError`。
+  - 新增 `_is_hashable`：判据用**可哈希**而不是 `isinstance(..., str)`，非字符串但可哈希的取值（整数、元组）本来就能正常工作，按类型收窄会误伤；位数超限的整数是可哈希的，不必在此拦截。
+- **修复注释里的 `type:` 被 mypy 当成类型注释**：`#     type: 'list'``；` 这类行在 Python 解析器看来是普通注释（`ast.parse`／`ruff`／`compileall` 全部通过、测试全绿），但 mypy 会把紧跟缩进后的 `type:` 识别为**类型注释**（PEP 484 风格）并去解析其后的内容，于是报 `Invalid syntax` 且**阻断整个项目的类型检查**（`errors prevented further checking`）。本次是写注释时踩到的，改动只是把该行拆成两句。记录在此是因为该类行的失败模式很隐蔽：语法错误只在 mypy 出现，其余工具全绿。
 
 - 恢复 `src/etl/splitters/recursive_text_splitter.py` 的 Dify 移植声明头。该文件在引入 tiktoken 与层级分片的重写中被误删头部，此后 `sync dify rag hierarchical retrieval` 又向这个已无头的文件移植了父子分片逻辑，导致文件含 Dify 衍生代码却没有版权与许可证声明，与 `AGENTS.md` 的合规要求及 Apache 2.0 第 4(b) 条不符。
 - Responses 错误出口补齐脱敏：`_raise_for_response_error` 此前把服务端消息直接拼进异常，而同一适配器的 Chat Completions 出口已经过 `redact_sensitive_text`。服务端错误常回显请求头或 URL，异常文本会进日志与终端，是凭证最容易泄漏的出口，现两个出口行为一致。

@@ -333,6 +333,16 @@ class ModelProviderFactory:
         """读取诊断调用使用的实例级服务端协议登记。"""
         if options is None:
             return frozenset()
+        # 容器形态必须先判，且要用与 ``validate_secret_free_options`` 相同的
+        # ``ValueError``：``"http_options" in options`` 对**列表**是元素成员判断
+        # （``["http_options"]`` 会命中 google 分支），对整数抛裸
+        # ``TypeError: argument of type 'int' is not iterable``，命中后
+        # ``options.items()`` 又抛裸 ``AttributeError``。``capability_report`` 与
+        # ``protocol_status`` 是公开诊断入口，调用方按 ``ValueError`` 分类；
+        # 非 google 渠道走 else 分支时本来就得到 ``ValueError``，两个分支的
+        # 异常分类必须一致。
+        if not isinstance(options, Mapping):
+            raise ValueError("Provider options 必须是对象。")
         if str(provider_name or "").strip().lower() == "google" and "http_options" in options:
             # ``http_options`` is a supported google-genai SDK container. Keep
             # the general options boundary strict while allowing only this

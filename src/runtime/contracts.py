@@ -129,15 +129,32 @@ class SessionConfig(MutableMapping[str, Any]):
         validator = self._VALIDATORS.get(key)
         validated = validator(value) if validator is not None else value
         if key in ("vector_weight", "keyword_weight"):
+            # 兄弟字段可能绕过 validator 被属性直写（``SessionConfig`` 是公开类，
+            # 普通属性没有 ``__setattr__`` 守卫）。``set_many`` 对同一情形有
+            # ``_require_finite_number`` 收敛，这里必须用同一判据——否则
+            # ``cfg.keyword_weight = nan`` 之后 ``cfg["vector_weight"] = 0.0``
+            # 会静默放行（``nan == 0.0`` 恒为 False），两个权重同时失效，
+            # 混合检索的所有得分都是 0 并被阈值全部过滤。
+            other_key = "keyword_weight" if key == "vector_weight" else "vector_weight"
+            self._require_finite_number(getattr(self, other_key, None), other_key)
             self._reject_both_weights_zero(key, validated)
         if key in ("top_k", "retrieval_candidate_multiplier"):
             # 改任一个都可能让乘积越界，因此按「改完之后」的组合判一次。
+            # 兄弟字段同样可能未经 validator：``getattr`` 拿到 list/str 后
+            # ``top_k * multiplier`` 与随后的 ``>`` 比较抛裸 ``TypeError``，
+            # 穿透调用方按 ``ValueError`` 建立的分类。用与 ``set_many`` 同一套
+            # ``_require_int_value`` 收敛。
             other_key = "retrieval_candidate_multiplier" if key == "top_k" else "top_k"
             self._reject_oversized_candidate_pool(
-                validated if key == "top_k" else getattr(self, "top_k", validated),
-                validated
-                if key == "retrieval_candidate_multiplier"
-                else getattr(self, other_key, validated),
+                self._require_int_value(
+                    validated if key == "top_k" else getattr(self, "top_k", validated), "top_k"
+                ),
+                self._require_int_value(
+                    validated
+                    if key == "retrieval_candidate_multiplier"
+                    else getattr(self, other_key, validated),
+                    other_key,
+                ),
             )
         setattr(self, key, validated)
 

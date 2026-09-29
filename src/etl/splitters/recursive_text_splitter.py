@@ -197,6 +197,43 @@ class RecursiveTextSplitter(BaseSplitter):
             self.structure_mode,
         )
 
+    def _parent_sizes(self) -> tuple[int, int]:
+        """返回当前生效的父分片 ``(size, overlap)``。"""
+        settings = get_settings()
+        size = (
+            self.parent_chunk_size if self.parent_chunk_size is not None else settings.kb_chunk_size
+        )
+        overlap = (
+            self.parent_chunk_overlap
+            if self.parent_chunk_overlap is not None
+            else settings.kb_chunk_overlap
+        )
+        return size, overlap
+
+    def _validate_parent_sizes(self) -> None:
+        """校验父分片器的 ``overlap < size``，两种结构模式都要过。
+
+        为什么必须在这里判：``Settings.validate_overlap_smaller_than_size`` 只要求
+        ``overlap < size``，因此 ``kb_chunk_size=1500, kb_chunk_overlap=1499``
+        完全合法；而 LangChain 的 ``RecursiveCharacterTextSplitter`` 只在
+        ``overlap > size`` 时报错，**相等时静默接受**（实测 size=100/ov=100 通过，
+        ov=101 抛 ValueError）。于是每个分片只前进 1 个字符：实测一篇 15000 字符的
+        文档产出 13751 个分片、合计 1718 万字符（放大 1146 倍），随后全部进入
+        embedding 与 FAISS 写入。
+
+        ``_validate_hierarchical_sizes`` 对**子**分片早有同一判据（注释写明「相等
+        会让子分片器无法推进」），父分片这条同一语义的判据此前缺失；而父分片器在
+        standard 与 hierarchical 两种模式下都会构造（见 ``_init_splitter``），
+        因此这条校验不能只挂在层级分支上。
+        """
+        size, overlap = self._parent_sizes()
+        if overlap >= size:
+            raise ValueError(
+                "kb_chunk_overlap 必须小于 kb_chunk_size，"
+                f"但得到 overlap={safe_repr(overlap)}、size={safe_repr(size)}。"
+                " 相等会让父分片器几乎无法推进，产出成百上千倍的冗余分片。"
+            )
+
     def _validate_hierarchical_sizes(self) -> None:
         """层级模式下校验子分片与父分片的尺寸关系。
 
@@ -216,6 +253,7 @@ class RecursiveTextSplitter(BaseSplitter):
           == 分块数，15/15）。
         * ``child_overlap >= child_size``：子分片器无法推进（得到空分片或死循环）。
         """
+        self._validate_parent_sizes()
         settings = get_settings()
         child_size = (
             self.child_chunk_size
@@ -227,9 +265,7 @@ class RecursiveTextSplitter(BaseSplitter):
             if self.child_chunk_overlap is not None
             else settings.kb_child_chunk_overlap
         )
-        parent_size = (
-            self.parent_chunk_size if self.parent_chunk_size is not None else settings.kb_chunk_size
-        )
+        parent_size = self._parent_sizes()[0]
         if child_overlap >= child_size:
             raise ValueError(
                 "kb_child_chunk_overlap 必须小于 kb_child_chunk_size，"
@@ -408,6 +444,9 @@ class RecursiveTextSplitter(BaseSplitter):
             self._validate_hierarchical_sizes()
             all_chunks = self.split_hierarchical(documents)
         else:
+            # 父分片器的 ``overlap < size`` 与结构模式无关：standard 分支同样会
+            # 构造并使用它，这条校验不能只挂在层级分支上。
+            self._validate_parent_sizes()
             all_chunks = self._split_standard_documents(documents)
 
         logger.info(

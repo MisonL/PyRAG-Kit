@@ -865,8 +865,20 @@ class Settings(BaseSettings):
         # ``OverflowError`` 会让第二条路径裸崩。两条路径各有回归测试。
         if isinstance(v, float) and not math.isfinite(v):
             raise ValueError(f"检索候选倍率必须是整数，但得到 {safe_repr(v)}。")
+        # 与同文件的 ``chat_top_k``／``log_retention_days``／``kb_chunk_size``
+        # 用同一套解析：走 ``_coerce_number``（内部用 ``parse_decimal_int``，
+        # 只认纯十进制字面量）。此前这里直接 ``int(v)``，与其它整数字段**判据
+        # 不一致**，两条后果都实测复现：
+        #
+        # * ``1.9`` 被静默截断成 ``1``（``chat_top_k=1.9`` 会被拒绝）；
+        # * ``"1_0"`` 被 ``int()`` 接受为 10、``"+7"`` 被接受为 7——而
+        #   ``parse_decimal_int`` 的 docstring 明确写着这两类「安静的错值」
+        #   「正是本项目反复踩到的模式，宁愿在这里明确拒绝」。
+        number = _coerce_number(v, "检索候选倍率")
+        if isinstance(number, float) and not number.is_integer():
+            raise ValueError(f"检索候选倍率必须是整数，但得到 {safe_repr(v)}。")
         try:
-            value = int(v)
+            value = int(number)
         except (ValueError, TypeError, OverflowError) as exc:
             raise ValueError(f"无法将检索候选倍率 '{safe_repr(v)}' 转换为整数。") from exc
 
@@ -996,6 +1008,12 @@ class Settings(BaseSettings):
     )
 
 
+# ``options`` 的取值是原样交给 SDK／服务端的用户载荷（``response_format`` 的
+# JSON Schema、``extra_body`` 的内容等），键名属于用户，不能按项目词汇小写化。
+# 见 ``load_toml_config`` 里 ``normalize_mapping`` 的说明。
+_OPAQUE_VALUE_CONTAINERS = frozenset({"options"})
+
+
 def load_toml_config() -> dict[str, Any]:
     """
     从全局 CONFIG_TOML_PATH 路径加载 config.toml 文件配置。
@@ -1006,33 +1024,59 @@ def load_toml_config() -> dict[str, Any]:
     with CONFIG_TOML_PATH.open("rb") as f:
         raw_config = tomllib.load(f)
 
-    def normalize_mapping(value: Any, preserve_keys: set[str] | None = None) -> Any:
+    def normalize_mapping(
+        value: Any, preserve_keys: set[str] | None = None, *, opaque: bool = False
+    ) -> Any:
+        """把 TOML 的键名归一成项目的小写词汇，但**不碰用户载荷**。
+
+        归一化的理由是配置项名大小写不敏感（``CHAT_TOP_K``／``chat_top_k`` 等价），
+        而这条理由**不适用于取值**：``options`` 里的 ``response_format``、
+        ``extra_body`` 是原样交给 SDK／服务端的 JSON，键名属于用户。
+        此前每一层嵌套字典的键都被小写化，实测
+        ``required = ["OrderId"]`` 与 ``properties = { OrderId = ... }`` 被拆成
+        ``["OrderId"]`` 与 ``["orderid"]``——schema 的 required 与 properties
+        不再对应，结构化输出静默失效。
+
+        * ``opaque=True``：整个子树原样保留键名（进入用户载荷之后）。
+        * ``preserve_keys``：只保留**本层**键名（``llm_configurations`` 下的条目名
+          由用户命名、别处按名查找），条目内部的字段名仍按项目词汇归一。
+        * ``options``：本层键名是项目／SDK 的字段词汇（大小写不敏感，照旧归一，
+          于是 ``MAX_TOKENS`` 仍然有效），其下的取值是用户载荷，原样保留。
+        """
         if not isinstance(value, dict):
             return value
 
         preserved = preserve_keys or set()
         normalized: dict[str, Any] = {}
         for raw_key, raw_value in value.items():
-            key = str(raw_key).lower()
-            if key in preserved and isinstance(raw_value, dict):
+            key = str(raw_key) if opaque else str(raw_key).lower()
+            if not isinstance(raw_value, dict):
+                if isinstance(raw_value, list):
+                    normalized[key] = [normalize_mapping(item, opaque=opaque) for item in raw_value]
+                else:
+                    normalized[key] = raw_value
+                continue
+
+            if opaque:
+                normalized[key] = {
+                    str(item_key): normalize_mapping(item_value, opaque=True)
+                    for item_key, item_value in raw_value.items()
+                }
+            elif key in preserved:
                 normalized[key] = {
                     str(item_key): normalize_mapping(item_value)
                     for item_key, item_value in raw_value.items()
                 }
-                continue
-
-            if isinstance(raw_value, dict):
+            elif key in _OPAQUE_VALUE_CONTAINERS:
+                normalized[key] = {
+                    str(item_key).lower(): normalize_mapping(item_value, opaque=True)
+                    for item_key, item_value in raw_value.items()
+                }
+            else:
                 normalized[key] = {
                     str(item_key).lower(): normalize_mapping(item_value)
                     for item_key, item_value in raw_value.items()
                 }
-                continue
-
-            if isinstance(raw_value, list):
-                normalized[key] = [normalize_mapping(item) for item in raw_value]
-                continue
-
-            normalized[key] = raw_value
         return normalized
 
     raw_config = normalize_mapping(
@@ -1169,6 +1213,19 @@ def get_settings() -> Settings:
         # 位置与原因，不回显该行的内容，因此不涉及凭证回显；仍走一次脱敏以防
         # 上游改动，成本可忽略。
         raise ValueError(f"配置解析失败 - {redact_sensitive_text(str(exc))}") from None
+    except RecursionError as exc:
+        # ``tomllib`` 对**深层嵌套**的表/数组会递归解析，超过解释器递归上限时抛
+        # ``RecursionError``。它继承 ``RuntimeError`` 而**不是** ``ValueError``，
+        # 因此上面四个 handler 一个都接不住——实测 ``config.toml`` 写
+        # ``a = [[[[...]]]]``（深度 500 即触发）后 ``import main`` 直接以
+        # 2990 帧裸 traceback 终止，早于任何入口的 ``try``。
+        #
+        # 与下面 ``except ValueError`` 同属「配置写错」的收场，消息里带上原因：
+        # 用户需要知道是嵌套层级而不是取值出的问题。
+        raise ValueError(
+            f"配置解析失败 - 嵌套层级过深（{redact_sensitive_text(str(exc))}）；"
+            "请检查 config.toml 中是否存在过深的表或数组嵌套。"
+        ) from None
     except ValueError as exc:
         # ``tomllib`` 解析 ``config.toml`` 时还有一类失败**不是**
         # ``TOMLDecodeError``：整数位数超过 ``sys.get_int_max_str_digits()``

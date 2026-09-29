@@ -333,7 +333,11 @@ def display_chat_config(console: Console, chat_config: dict[str, Any]):
             f" / {_render_value(chat_config['keyword_weight'])}"
         ),
     )
-    chat_table.add_row("混合融合策略:", Text(str(chat_config["hybrid_fusion_strategy"]).upper()))
+    # 与同一张表的其它单元格一致走 ``_render_value``：裸 ``str()`` 对位数超限的
+    # 整数抛 ``ValueError: Exceeds the limit``，聊天会话在启动横幅这一步就终止。
+    chat_table.add_row(
+        "混合融合策略:", Text(_render_value(chat_config["hybrid_fusion_strategy"]).upper())
+    )
     chat_table.add_row(
         "候选过量招募倍率:", Text(_render_value(chat_config["retrieval_candidate_multiplier"]))
     )

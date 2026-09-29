@@ -281,6 +281,30 @@ class StreamEvent:
     raw: Any = None
 
 
+def hashable_key_part(value: Any) -> Any:
+    """把要参与累加器键的值收敛成可哈希形态。
+
+    为什么需要它：``accumulator.setdefault(("index", value), ...)`` 对不可哈希的
+    ``value`` 抛 ``TypeError: unhashable type``。这些值来自不可信的兼容网关 SSE
+    JSON——``openai`` SDK 的流式解析走 ``construct_type``，**跳过已声明字段的
+    Literal/int 校验**，实测 ``{"tool_calls": [{"index": [1, 2]}]}`` 会原样产出
+    ``ChoiceDeltaToolCall(index=[1, 2])``（声明类型是 ``int``）。调用方按
+    ``ValueError`` / ``RuntimeError`` 分类错误，于是「网关片段形态异常」变成裸
+    ``TypeError``，日志脱敏与用户提示都接不住。
+
+    收敛而不是抛错，是因为键只用于**归并同一调用的分片**：不可哈希的形态本来就
+    无法充当稳定标识，退回 ``("position", ...)`` 与「没有 id/index」走同一条
+    分支，语义一致。可哈希的取值原样返回，行为不变。
+    """
+    if value is None:
+        return None
+    try:
+        hash(value)
+    except TypeError:
+        return None
+    return value
+
+
 def merge_tool_call_fragment(
     accumulator: dict[Any, dict[str, Any]],
     tool_call: Mapping[str, Any],
@@ -291,8 +315,8 @@ def merge_tool_call_fragment(
     供应商通常只在第一个片段发送 id/name，后续片段只发送 index 和
     partial arguments。统一在适配层保留这些字段，避免调用方自行拼接。
     """
-    index = tool_call.get("index", fallback_index)
-    call_id = tool_call.get("id") or tool_call.get("call_id")
+    index = hashable_key_part(tool_call.get("index", fallback_index))
+    call_id = hashable_key_part(tool_call.get("id") or tool_call.get("call_id"))
     if index is not None:
         key: Any = ("index", index)
     elif call_id:

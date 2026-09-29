@@ -429,7 +429,12 @@ class FaissStore(VectorStoreBase):
         if not documents:
             return
 
-        new_embeddings = np.array(embeddings, dtype=np.float32)
+        # cast 溢出（``1e300`` → ``inf``）在这里是**被校验的对象**，不是要给
+        # 调用方的警告：下面的有限性判据正是靠它把这一类拦住。不抑制的话它会以
+        # ``RuntimeWarning`` 的形式泄漏出去，且出现在报错之前。
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            new_embeddings = np.array(embeddings, dtype=np.float32)
         if new_embeddings.ndim != 2:
             raise ValueError("embeddings 必须是二维数组。")
         if len(documents) != len(new_embeddings):
@@ -442,6 +447,27 @@ class FaissStore(VectorStoreBase):
         # ``indices`` 去索引 ``documents``，越界或错配）。失败必须不留痕。
         if self.embeddings is not None and self.embeddings.shape[1] != new_embeddings.shape[1]:
             raise ValueError("新增向量维度与现有索引不一致。")
+
+        # 有限性：与载入侧 ``_validate_embeddings_shape`` 同一判据。此前只有载入
+        # 侧校验，写入侧放行——同一份内容「写得进、读不出」：FAISS 把 NaN/inf
+        # 向量照单收下（``ntotal`` 正常增加），既不报错也不跳过，直到查询时那个
+        # 下标干脆不出现在结果里，用户看到的是「搜到了」而不是「这份数据坏了」。
+        # 更糟的是 ``save_snapshot`` 会把它落盘，此后**载入侧**才拒绝——快照
+        # 已经写坏，而报错现场离写入处很远。
+        #
+        # 判 ``new_embeddings``（已经 cast 成 float32）而不是原数组：``1e300``
+        # 在 float64 里有限、cast 成 float32 才溢出成 ``inf``，载入侧正是靠这个
+        # 顺序把这一类也拦住。``np.array(..., dtype=np.float32)`` 在溢出时会发
+        # ``RuntimeWarning``，那是预期行为，在下面统一抑制，避免冒充成新的警告
+        # 泄漏给调用方。
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            cast = np.asarray(embeddings, dtype=np.float32)
+        if not np.isfinite(cast).all():
+            raise ValueError(
+                "待写入的 embeddings 包含非有限值（NaN 或无穷大），已拒绝写入。"
+                " 请修正向量来源后重试。"
+            )
 
         # 条目形态同样必须在改动 ``self.documents`` **之前**确认，理由与上面那条
         # 维度检查一致：写入侧原先只校验 embeddings，文档形态则放任 ``extend``
@@ -751,6 +777,24 @@ class FaissStore(VectorStoreBase):
         # 缺它是合法状态（下面的 ``else`` 分支就是为它准备的）。``load()`` 早已
         # 是正确的顺序，两处对齐。
         documents, parent_documents = self._normalize_documents(raw_documents, raw_parent_documents)
+        # ``semantic.index`` 的行数是**第三条**必须与 ``documents`` 对齐的量，
+        # 而此前只校验了 ``lexical.index`` 的条数。实测 documents=2、embeddings
+        # 两行、但索引里只有 1 个向量时：加载成功、无任何提示，而
+        # ``semantic_search`` 拿 ``indices`` 去索引 ``documents``——第 2 条文档
+        # 永远不出现在结果里，用户看到的是「搜不到」而不是「这份快照坏了」。
+        # 反向（索引比文档多）同样危险：``self.documents[doc_index]`` 抛
+        # ``IndexError``，与「快照不自洽」无关的类型。
+        #
+        # 只断言这一条最小不变量，不比对向量内容：``embeddings`` 与索引由
+        # ``save_snapshot`` 从同一份内存状态写出，条数一致即可保证下标对应关系。
+        if faiss_index is not None:
+            index_rows = int(faiss_index.ntotal)
+            if index_rows != len(documents):
+                raise ValueError(
+                    "知识快照不自洽：语义索引条数与分块数不一致。"
+                    f" semantic.index={index_rows}，chunks.pkl={len(documents)}。"
+                    " 快照可能在写入或复制过程中被截断，请重建。"
+                )
         lexical_path = snapshot_path / "lexical.index"
         if lexical_path.exists():
             with lexical_path.open("rb") as file:

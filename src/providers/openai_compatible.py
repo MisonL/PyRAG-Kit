@@ -20,6 +20,7 @@ from src.providers.__base__.model_provider import (
     content_to_text,
     enum_field,
     field,
+    hashable_key_part,
     is_retryable_error,
     merge_tool_call_fragment,
     normalize_client_retries,
@@ -345,6 +346,29 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 raise ValueError("server_verified_protocols 中的协议必须是非空字符串。")
             normalized.add(cls._normalize_protocol(value))
         return frozenset(normalized)
+
+    @classmethod
+    @classmethod
+    def _normalize_request_timeout(cls, timeout: Any) -> Any:
+        """校验请求级 ``timeout``，与构造期 ``options.timeout`` 用同一判据。
+
+        为什么不能直接 ``request["timeout"] = timeout``：SDK 对请求级超时不做
+        任何检查，非法取值要到 httpx 计算超时时才以形态各异的异常暴露，而
+        ``openai`` SDK 会把它们统一包成 ``APIConnectionError('Connection error.')``
+        ——``is_retryable_error`` 按类名匹配到 ``connection`` 就判定可重试，于是
+        **同一个注定失败的请求被重试 3 次**，原始异常只留在 ``__cause__`` 里。
+        实测 ``timeout=1e306`` → ``OverflowError: timestamp out of range for
+        platform time_t``；``timeout="abc"`` → ``TypeError``；``timeout=-1`` →
+        ``ValueError: Timeout value out of range``。用户看到的是「连接错误」，
+        与「超时配错了」毫无关联。
+
+        构造期的 ``options.timeout`` 早已走 ``normalize_client_timeout``（见
+        ``_normalize_client_options``），同一个量在两个入口的判据必须一致。
+        ``httpx.Timeout`` 对象原样保留：SDK 接受，且无法用 TOML 表达。
+        """
+        if timeout is None or hasattr(timeout, "connect"):
+            return timeout
+        return normalize_client_timeout(timeout, "OpenAI 兼容渠道", "请求级 timeout")
 
     @classmethod
     def _normalize_client_options(cls, options: Mapping[str, Any]) -> dict[str, Any]:
@@ -1111,7 +1135,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         if user is not None:
             request["user"] = user
         if timeout is not None:
-            request["timeout"] = timeout
+            request["timeout"] = self._normalize_request_timeout(timeout)
         if extra_headers is not None:
             request["extra_headers"] = extra_headers
         if extra_query is not None:
@@ -1485,7 +1509,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         if user is not None:
             request["user"] = user
         if timeout is not None:
-            request["timeout"] = timeout
+            request["timeout"] = self._normalize_request_timeout(timeout)
         if extra_headers is not None:
             request["extra_headers"] = extra_headers
         if extra_query is not None:
@@ -1777,11 +1801,21 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             raise RuntimeError(f"{provider} 返回业务错误 (status={safe_repr(status)}){suffix}")
 
         choices = field(response, "choices")
+        # ``choices`` 必须先是序列，才谈得上「空」。此前只判了 None 与「序列为空」，
+        # 网关返回 ``{"choices": {"0": {...}}}``（对象）或整数时两条判据都不命中，
+        # 调用方的 ``choices[0]`` 于是抛裸 ``KeyError: 0`` / ``TypeError``——按
+        # ValueError/RuntimeError 分类的错误处理与日志脱敏全部接不住。流式路径的
+        # usage chunk 不带 choices（None），仍按原语义放行。
+        if choices is not None and not isinstance(choices, (list, tuple)):
+            suffix = f": {detail}" if detail else "。"
+            raise RuntimeError(
+                f"{provider} 响应的 choices 必须是列表，但得到 {safe_repr(choices)}{suffix}"
+            )
         if allow_empty_choices:
             if choices is None and detail is not None:
                 raise RuntimeError(f"{provider} 返回错误: {detail}")
             return
-        if choices is None or (isinstance(choices, (list, tuple)) and not choices):
+        if choices is None or not choices:
             suffix = f": {detail}" if detail else "。"
             raise RuntimeError(f"{provider} 响应缺少有效 choices{suffix}")
 
@@ -1914,7 +1948,14 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                             "index": field(call, "index", position),
                             "type": field(call, "type", "function"),
                             "name": field(function, "name"),
-                            "arguments": field(function, "arguments", ""),
+                            # 与 ``_extract_tool_calls``（非流式）同一判据：网关可以
+                            # 把 ``arguments`` 写成对象/数组/整数（``construct_type``
+                            # 不做校验），非流式路径经 ``normalize_tool_arguments``
+                            # 统一成 JSON 字符串，流式路径此前原样交付，于是**同一个
+                            # 输入在两条路径上给出不同类型**——调用方按字符串
+                            # ``json.loads`` 时会拿到 dict 并抛 ``TypeError``。
+                            # 字符串片段原样透传，拼接语义不变。
+                            "arguments": normalize_tool_arguments(field(function, "arguments", "")),
                         },
                         response_id=response_id,
                         raw=chunk,
@@ -2175,8 +2216,14 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         ``function_call_arguments.done`` 使用 item_id，而
         ``output_item.done`` 通常带 call_id；两者必须按 output_index 归并。
         """
-        index = tool_call.get("index")
-        call_id = tool_call.get("call_id") or tool_call.get("id")
+        # ``index``/``call_id`` 来自 Responses 事件 JSON。``construct_type`` 与
+        # ``extra="allow"`` 都会让数组/对象形态原样到达这里，而
+        # ``accumulator.setdefault(("index", [1, 2]), ...)`` 抛裸
+        # ``TypeError: unhashable type``——调用方按 ValueError/RuntimeError 分类，
+        # 接不住。同文件 ``_response_tool_keys`` 对同一批取值已有 ``hash()`` 守卫，
+        # 这里补齐同一判据（不可哈希等价于「没有稳定标识」，退回位置键）。
+        index = hashable_key_part(tool_call.get("index"))
+        call_id = hashable_key_part(tool_call.get("call_id") or tool_call.get("id"))
         key: Any = ("index", index) if index is not None else ("id", call_id)
         if key == ("id", None):
             key = ("position", len(accumulator))

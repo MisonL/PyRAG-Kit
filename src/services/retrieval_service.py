@@ -332,15 +332,23 @@ def _coerce_rerank_enabled(value: Any) -> bool:
 
 
 def _coerce_fusion_strategy(value: Any) -> str:
-    """把融合策略收敛成字符串，非法形态给出带字段名的 ``ValueError``。
+    """把融合策略收敛成规范形态，非法取值给出带字段名的 ``ValueError``。
 
-    ``_should_apply_score_threshold`` 先按它判分支、``HybridReranker`` 再按它
-    选算法；非字符串在后者那里也会被拒，但报错字段名是 ``HybridReranker`` 的
-    参数而非配置项，且只在混合检索路径上才触发。
+    归一化（``.strip().lower()``）必须发生在这里，**且只发生在这里**：
+    ``HybridReranker`` 的构造器对同一字段做 ``fusion_strategy.strip().lower()``，
+    而 ``_should_apply_score_threshold`` 此前用**原始**取值与字面量 ``"rrf"``
+    比较。于是 ``"RRF"``／``" rrf "`` 走的是 RRF 融合（分数是排名倒数之和），
+    却**不**被识别为 RRF，阈值过滤照常套用——两种量纲混在一起，结果被静默
+    清空。同一个字段在两处的判据必须一致。
+
+    与 ``SessionConfig._validate_fusion_strategy`` 的关系：那里只接受已规范化
+    的 ``"rrf"``／``"weighted"``，是配置边界的严格判据；这里是运行期把可直写
+    的字段收敛到同一形态，宽容但不静默——无法识别成任一策略时仍抛错，由
+    ``HybridReranker`` 给出「不支持的融合策略」。
     """
     if not isinstance(value, str):
         raise ValueError(f"hybrid_fusion_strategy 必须是字符串，但得到 {safe_repr(value)}。")
-    return value
+    return value.strip().lower()
 
 
 def _coerce_rank(value: Any) -> int:
@@ -435,10 +443,29 @@ def _key_text(value: Any) -> str:
     不能直接写 ``str(value)``：元数据来自知识快照，而本项目加载 pickle 格式的
     快照——pickle 是二进制格式、不受 CPython 十进制位数限制，一个 4301 位的
     整数让 ``str()`` 抛 ``ValueError: Exceeds the limit``，于是「计算文档去重
-    键」这一步在正要合并检索结果时崩掉。``safe_repr`` 对位数超限的值给出量级
-    描述，键仍然稳定且唯一（同一值总是得到同一描述）。
+    键」这一步在正要合并检索结果时崩掉。
+
+    但 ``safe_repr`` 的降级描述**只保留量级**（``<整数，约 4302 位十进制>``），
+    用它当键会让不同的超限整数塌成同一个字符串：实测 ``10**4301`` 与
+    ``10**4301 + 1`` 得到同一个键，于是 ``_merge_hybrid_results`` 把两条不同的
+    文档并成一条，其中一条静默消失。位数超限的整数**无法**转成十进制文本，
+    但 ``int.to_bytes`` 不经过十进制转换，可以对它取摘要——键因此既稳定又唯一。
+
+    非整数的失败形态（``repr`` 抛其它异常）退回 ``safe_repr``：那时没有更好的
+    取值，而量级描述至少保持稳定。
     """
-    return value if isinstance(value, str) else safe_repr(value)
+    if isinstance(value, str):
+        return value
+    if isinstance(value, int):
+        try:
+            repr(value)
+        except (ValueError, RuntimeError, RecursionError):
+            # 位数超过 ``sys.get_int_max_str_digits()``。按二进制补码取摘要，
+            # 符号一并编进去，避免 ``n`` 与 ``-n`` 碰撞。
+            raw = value.to_bytes((value.bit_length() + 8) // 8, "big", signed=True)
+            digest = hashlib.sha256(raw, usedforsecurity=False).hexdigest()
+            return f"<整数，{digest}>"
+    return safe_repr(value)
 
 
 def _document_key(document: dict[str, Any]) -> str:

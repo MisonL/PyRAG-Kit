@@ -182,7 +182,13 @@ def cleanup_old_logs():
     log_dir = current_settings.log_path
     log_retention_days = current_settings.log_retention_days
 
-    if not os.path.exists(log_dir):
+    # ``exists`` 对**文件**也返回 True，于是下面 ``os.listdir`` 抛
+    # ``NotADirectoryError``。``log_path`` 是用户可配置项，指向一个已存在的
+    # 普通文件完全可能（写入侧对此的处置是降级为仅控制台，见
+    # ``_build_rotating_handler`` 的 ``except (OSError, ValueError)``），而本函数
+    # 由退出钩子调用——异常会让程序在退出路径上以裸 traceback 终止。清理不是
+    # 必须完成的能力，形态不对就跳过。
+    if not os.path.isdir(log_dir):
         return
 
     now = datetime.now().astimezone()
