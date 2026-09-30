@@ -328,7 +328,13 @@
 
 - **补齐配置编辑器动态上界的规模字段收敛**：`config_menu._top_k_ceiling` 与 `_multiplier_ceiling` 读取另一个可直写的规模字段来算动态上界。修复前实测「`retrieval_candidate_multiplier` 被直写成 `"abc"`、用户在菜单里选择『调整 Top K』」时，`max()` 抛裸 `TypeError: '>' not supported between instances of 'str' and 'int'`；`top_k` 被直写成 `None` 时对称复现。配置编辑器在聊天主循环的 `try` 之外，内层只接 `KeyboardInterrupt`／`EOFError`，裸 `TypeError` 会以 traceback 终止整个会话。`retrieve` 对同一字段早有收敛判据，现将它上移为 `require_scale_field`（`src/utils/config.py`），服务层与 UI 共用；UI 不反向依赖服务层私有函数。非正整数继续按既有读取语义收敛为 1，`bool`／非整数／超上界取值给出带字段名的 `ValueError`。
 
+- **补齐 `markup_text` 的模板形态校验**：该函数对**值**参数早已用 `_render_value` 完整收敛（位数超限的整数降级成量级描述），对占位符数量不符与 NUL 字符也都抛 `ValueError`；唯独**模板**参数没有形态判据，而函数体第一行就对它做成员测试（`if _MARKUP_PLACEHOLDER in template`）。实测修复前非字符串模板抛裸 `TypeError`，消息还随形态各不相同——`5`／`None` 是 `argument of type 'int' is not iterable`，`list`／`tuple`／`dict` 是 `expected string or bytes-like object`，`bytes` 是 `a bytes-like object is required`。三种消息都不指向「模板写错了」，也不是 `ValueError`：同一个「入参形态非法」的处置，同一个函数里两种收场。现统一收敛成带取值的 `ValueError`。
+
+  可达性说明：44 个调用点里 43 个模板是字符串字面量，剩下 1 个（`scripts/embed_knowledge_base.py` 的 `mask_api_key(api_key_value)`）两个分支都返回字面量，因此本仓自带流程走不到——修的是**公开函数**的契约一致性。
+
 ### 测试
+
+- 新增第十二轮的回归用例（12 个用例；回退源码后其中 7 个变红，5 个「不误伤」反向守卫保持绿）：`markup_text` 对七类非字符串模板（`int`／`None`／`list`／`tuple`／`dict`／`bytes`／位数超限整数）的拒绝、四类合法模板（含零占位符与多占位符）照旧渲染，以及「形态守卫不得盖掉既有占位符判据」——模板是合法字符串但数量不符时仍须给出原来那条消息。
 
 - 新增第十一轮的回归用例（16 个用例；回退源码后其中 11 个变红，5 个「不误伤」反向守卫保持绿）：两个动态上界助手对字符串／`None`／列表／`bool`／位数超限整数的拒绝、两种方向的合法上界照旧工作、真实 `edit_retrieval_params` 入口在坏倍率下给出可读错误而不是终止，以及 `require_scale_field` 与服务层既有的 `max(1, ...)` 读取语义对齐。
 

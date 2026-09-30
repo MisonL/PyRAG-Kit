@@ -64,6 +64,15 @@ def markup_text(template: str, *values: object) -> Text:
     Returns:
         Text: 可直接交给 ``console.print`` / ``Table.add_row`` 的文本。
     """
+    # 模板形态先判：本函数是**公开**的，而下面第一行就对 ``template`` 做成员测试。
+    # 非字符串取值在那里抛的是裸 ``TypeError: argument of type 'int' is not
+    # iterable``（``None``／``int``）、``expected string or bytes-like object``
+    # （list／tuple／dict）或 ``a bytes-like object is required``（bytes）——三种
+    # 消息都不指向「模板写错了」，也不是 ``ValueError``。而本函数对**值**参数早已
+    # 用 ``_render_value`` 完整收敛、对占位符数量不符与 NUL 也都抛 ``ValueError``：
+    # 同一个「入参形态非法」的处置，模板这一半此前漏了。
+    if not isinstance(template, str):
+        raise ValueError(f"标记模板必须是字符串，但得到 {safe_repr(template)}。")
     if _MARKUP_PLACEHOLDER in template:
         raise ValueError("标记模板不得包含 NUL 字符。")
     # 占位符落在标记**参数**内部（``[link={}]``）时，值会被并进标记语法本身：

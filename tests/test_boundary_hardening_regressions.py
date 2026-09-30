@@ -2609,3 +2609,72 @@ def test_require_scale_field_matches_the_service_layer_semantics():
             require_scale_field(bad_value, "top_k")
     with pytest.raises(ValueError, match="超出合理范围"):
         require_scale_field(_MAX_RETRIEVAL_CANDIDATES + 1, "top_k")
+
+
+# ── markup_text 的模板形态 ──
+#
+# ``markup_text`` 对**值**参数早已用 ``_render_value`` 完整收敛（``10**4301``
+# 降级成量级描述），对占位符数量不符与 NUL 也都抛 ``ValueError``；唯独**模板**
+# 参数没有形态判据，而函数体第一行就对它做成员测试。实测修复前非字符串模板抛
+# 裸 ``TypeError``，且消息随形态各不相同：
+#
+#   * ``5``／``None`` -> ``argument of type 'int' is not iterable``
+#   * ``['a']``／``('a',)``／``{'a': 1}`` -> ``expected string or bytes-like object``
+#   * ``b'x'`` -> ``a bytes-like object is required, not 'str'``
+#
+# 三种消息都不指向「模板写错了」，也不是 ``ValueError``。同一个「入参形态非法」
+# 的处置，同一个函数里两种收场——判据只做了一半。
+#
+# 可达性：44 个调用点里 43 个模板是字符串字面量，剩下 1 个
+# （``scripts/embed_knowledge_base.py`` 的 ``mask_api_key(api_key_value)``）两个
+# 分支都返回字面量。因此本仓自带流程走不到——修的是**公开函数**的契约一致性。
+
+
+@pytest.mark.parametrize(
+    "bad_template",
+    [
+        pytest.param(5, id="int"),
+        pytest.param(None, id="none"),
+        pytest.param(["a"], id="list"),
+        pytest.param(("a",), id="tuple"),
+        pytest.param({"a": 1}, id="dict"),
+        pytest.param(b"x", id="bytes"),
+        pytest.param(_HUGE_INT, id="beyond-int-max-str-digits"),
+    ],
+)
+def test_markup_text_rejects_unusable_template(bad_template):
+    """非字符串模板必须收敛成 ``ValueError``，而不是形态各异的裸 ``TypeError``。"""
+    from src.ui.display_utils import markup_text
+
+    with pytest.raises(ValueError, match="标记模板必须是字符串"):
+        markup_text(bad_template)
+
+
+@pytest.mark.parametrize(
+    ("template", "values", "expected"),
+    [
+        ("纯文本", (), "纯文本"),
+        ("[bold]{}[/bold]", ("x",), "x"),
+        ("[dim]本地模型，无需设置[/dim]", (), "本地模型，无需设置"),
+        ("[green]a: {} / b: {}[/green]", (1, 2), "a: 1 / b: 2"),
+    ],
+)
+def test_markup_text_keeps_working_for_valid_templates(template, values, expected):
+    """收紧不能误伤：字符串模板（含零占位符与多占位符）照旧渲染。"""
+    from src.ui.display_utils import markup_text
+
+    assert markup_text(template, *values).plain == expected
+
+
+def test_markup_text_placeholder_errors_still_win_over_shape_guard():
+    """形态守卫不能改变既有的占位符判据。
+
+    模板是合法字符串但占位符数量不符时，仍须给出原来那条消息——新加的守卫放在
+    最前面，不能把它盖掉。
+    """
+    from src.ui.display_utils import markup_text
+
+    with pytest.raises(ValueError, match="占位符少于实参数量"):
+        markup_text("无占位符", "多余的值")
+    with pytest.raises(ValueError, match="占位符多于实参数量"):
+        markup_text("{} 与 {}", "只有一个")
