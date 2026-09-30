@@ -6,6 +6,17 @@
 
 ### 修复
 
+- **子分片的 50% 比例上界缺失：上一轮只修了父分片**（`src/etl/splitters/recursive_text_splitter.py`）。`_validate_parent_sizes` 有 `overlap * 2 > size` 的比例上界，而 `_validate_hierarchical_sizes` 里的**子**分片只有 `child_overlap >= child_size` 的相等判据——`child_overlap < child_size` 成立即通过，比例上界那一条漏了。子分片器同样产出分片（每个父块都要过它一次），同一个静默放大在子侧完全存在。实测父=1500/150、子 `size=300`、一篇 15000 字符的文档：
+
+  | 子 overlap | 子块数 | 放大倍数 |
+  |---|---|---|
+  | 30（10%） | 66 | 1.0x |
+  | 150（50%） | 99 | 1.5x |
+  | 270（90%） | 451 | 6.8x |
+  | 299（99.7%） | 13211 | **200.2x** |
+
+  全部进入 embedding 与 FAISS 写入。**配置侧同样放行**：`Settings.validate_overlap_smaller_than_size` 只判 `kb_chunk_overlap` 与 `kb_chunk_size`（子分片的两条关系按该处注释所述有意留给分片器，因为模式是运行时参数），实测 `Settings(kb_child_chunk_size=300, kb_child_chunk_overlap=299)` 被静默接受，而父分片的同一比例取值被正确拒绝。现按父侧同一判据补上子侧的比例上界；恰好 50%（`overlap * 2 == size`）照旧放行，与父侧一致。
+
 - **`HybridReranker._weight_tuple` 同一判据的两个分支用了两种渲染**（`src/services/retrieval_service.py`）。该函数对同一句「必须是和为正的有限数值」有两个触发点：前者是 `is_double_convertible` 判单个权重失败（用 `safe_repr`），后者是**派生值** `total` 判和溢出（用裸 `!r`）。裸 `!r` 的两条后果都实测复现：
 
   - `HybridReranker(10**308, 10**308)`——**普通 int**，两个权重各自都在 double 范围内、只有和溢出——报错 **759 字符**，而 `safe_repr` 的截断上限是 80；这正是 `safe_repr` 的 docstring 写明的「一条校验消息不该刷屏」。

@@ -283,6 +283,31 @@ class RecursiveTextSplitter(BaseSplitter):
                 f"但得到 overlap={safe_repr(child_overlap)}、size={safe_repr(child_size)}。"
                 " 相等会让子分片器无法推进。"
             )
+        # 比例上界：与父分片的 ``_validate_parent_sizes`` 同判据、同理由。
+        # 这两条判据此前只落在**父**侧，而子分片器同样产出分片（每个父块都要
+        # 过它一次），同一个静默放大在子侧完全存在。实测父=1500/150、子=300 时
+        # 一篇 15000 字符的文档：
+        #
+        #   ===========  ==========  ==========
+        #   子 overlap    子块数      放大倍数
+        #   ===========  ==========  ==========
+        #   30    (10%)    66         1.0x
+        #   150   (50%)    99         1.5x
+        #   270   (90%)    451        6.8x
+        #   299   (99.7%)  13211      200.2x
+        #   ===========  ==========  ==========
+        #
+        # 全部进入 embedding 与 FAISS 写入。``child_overlap >= child_size`` 那条
+        # 拦不住它们——299 < 300 成立、直接通过。配置侧同样放行：
+        # ``Settings.validate_overlap_smaller_than_size`` 只判 ``kb_chunk_overlap``
+        # 与 ``kb_chunk_size``，子分片的两条关系按注释所述有意留给本函数（模式
+        # 是运行时参数），因此这里是唯一的判据位置。
+        if child_overlap * 2 > child_size:
+            raise ValueError(
+                "kb_child_chunk_overlap 不能超过 kb_child_chunk_size 的一半，"
+                f"但得到 overlap={safe_repr(child_overlap)}、size={safe_repr(child_size)}。"
+                " 重叠比例过高会让子分片器几乎无法推进，产出成百上千倍的冗余分片。"
+            )
         if child_size >= parent_size:
             raise ValueError(
                 "kb_child_chunk_size 必须小于 kb_chunk_size（子分片不得大于或等于父分片），"

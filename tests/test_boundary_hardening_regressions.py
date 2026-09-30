@@ -3622,3 +3622,71 @@ def test_hybrid_reranker_weight_message_survives_unrepresentable_values():
 
     with pytest.raises(ValueError, match="有限数值"):
         HybridReranker(_UnreprUnstyled(10**308), 10**308)._weight_tuple()
+
+
+# ── 子分片的 50% 比例上界：父侧修了，子侧漏了 ──
+#
+# 上一轮给**父**分片加了 `overlap <= size / 2`（`_validate_parent_sizes`），
+# 而**子**分片只有 `child_overlap >= child_size` 的相等判据，没有比例上界。
+# 子分片器同样产出分片（每个父块都要过它一次），同一个静默放大在子侧完全存在。
+#
+# 实测（父=1500/150、子 size=300，一篇 15000 字符的文档）：
+#
+#   子 overlap    子块数      放大倍数
+#   30    (10%)    66         1.0x
+#   150   (50%)    99         1.5x
+#   270   (90%)    451        6.8x
+#   299   (99.7%)  13211      200.2x
+#
+# `child_overlap >= child_size` 拦不住它们——299 < 300 成立、直接通过。
+# 配置侧同样放行：`Settings.validate_overlap_smaller_than_size` 只判
+# `kb_chunk_overlap` 与 `kb_chunk_size`，子分片的两条关系按注释所述有意留给
+# `_validate_hierarchical_sizes`（模式是运行时参数），因此那里是唯一判据位置。
+
+
+@pytest.mark.parametrize(
+    ("child_size", "child_overlap", "label"),
+    [
+        pytest.param(300, 151, "50.3%", id="just-over-half"),
+        pytest.param(300, 270, "90%", id="ninety-percent"),
+        pytest.param(300, 299, "99.7%", id="just-under-size"),
+    ],
+)
+def test_hierarchical_child_overlap_ratio_is_bounded(child_size, child_overlap, label):
+    """子分片的 ``overlap`` 超过 ``size / 2`` 必须被拒，而不是静默产出上百倍分片。"""
+    from src.etl.splitters.recursive_text_splitter import RecursiveTextSplitter
+    from src.models.document import Document
+
+    with pytest.raises(ValueError, match="kb_child_chunk_overlap 不能超过"):
+        RecursiveTextSplitter(
+            mode="char",
+            structure_mode="hierarchical",
+            parent_chunk_size=1500,
+            parent_chunk_overlap=150,
+            child_chunk_size=child_size,
+            child_chunk_overlap=child_overlap,
+        ).split([Document(content="正文" * 500, metadata={"source": "a.md"})])
+
+
+@pytest.mark.parametrize(
+    ("child_size", "child_overlap"),
+    [
+        pytest.param(300, 30, id="ten-percent"),
+        pytest.param(300, 150, id="exactly-half-is-legal"),
+    ],
+)
+def test_hierarchical_child_overlap_ratio_does_not_over_tighten(child_size, child_overlap):
+    """收紧不能误伤：10% 与恰好 50% 都必须照旧通过并产出分片。"""
+    from src.etl.splitters.recursive_text_splitter import RecursiveTextSplitter
+    from src.models.document import Document
+
+    splitter = RecursiveTextSplitter(
+        mode="char",
+        structure_mode="hierarchical",
+        parent_chunk_size=1500,
+        parent_chunk_overlap=150,
+        child_chunk_size=child_size,
+        child_chunk_overlap=child_overlap,
+    )
+    chunks = splitter.split([Document(content="正文" * 500, metadata={"source": "a.md"})])
+    assert chunks, "合法比例不应产出空结果"
