@@ -3781,3 +3781,159 @@ def test_pipeline_legal_path_still_works():
 
     assert chunks
     assert all(isinstance(chunk, Document) for chunk in chunks)
+
+
+# ── ChatService 的标量入参：与同文件的 <content> 收敛同一判据 ──
+#
+# `_build_prompt` 对检索结果里的文档字段已经收敛（`page_content=None` 时整条
+# 跳过，绝不把字面量 `内容: None` 喂给模型——由
+# `test_build_prompt_does_not_feed_malformed_content_to_the_model` 钉住），
+# 但**同一次调用**的两个标量参数 `user_input` / `intent` 完全没有守卫。
+#
+# 实测（修复前）：
+#   user_input=None  -> 静默生成 "用户问题: None"，模型把 None 当成真实问题
+#   user_input=5     -> 静默生成 "用户问题: 5"
+#   user_input=['a'] -> 静默生成 "用户问题: ['a']"
+#   user_input=10**4301 -> 裸 ValueError: Exceeds the limit (4300 digits)
+#
+# 同一个「非字符串值以字面量进 prompt」的形态，文档字段那一半修了、标量这一半
+# 漏了。`identify_intent` 的 f-string 更靠前（在 try **之外**），位数超限时抛的
+# 甚至不是本类承诺的 `RuntimeError: 意图识别失败`。
+
+
+@pytest.mark.parametrize(
+    ("user_input", "intent"),
+    [
+        pytest.param(None, "意图", id="user-input-none"),
+        pytest.param(5, "意图", id="user-input-int"),
+        pytest.param(["a"], "意图", id="user-input-list"),
+        pytest.param(10**4301, "意图", id="user-input-beyond-int-str-digits"),
+        pytest.param("问题", None, id="intent-none"),
+        pytest.param("问题", ["a"], id="intent-list"),
+        pytest.param("问题", 10**4301, id="intent-beyond-int-str-digits"),
+    ],
+)
+def test_build_prompt_rejects_non_string_scalars(user_input, intent):
+    """非字符串的 ``user_input``／``intent`` 不得以字面量进入 prompt。"""
+    from src.services.chat_service import ChatService
+
+    with pytest.raises(ValueError, match="必须是字符串"):
+        ChatService._build_prompt(user_input, intent, [])
+
+
+def test_build_prompt_still_accepts_strings():
+    """收紧不能误伤：两个字符串参数照旧产出 prompt。
+
+    带一条可用知识走**有知识**那一支——``intent`` 只出现在该分支的模板里
+    （无知识分支按既有设计只回显问题），因此这里必须给出正文才能同时断言两者。
+    """
+    from src.services.chat_service import ChatService
+
+    prompt = ChatService._build_prompt("问题内容", "检索意图", [{"page_content": "正文"}])
+
+    assert "问题内容" in prompt
+    assert "检索意图" in prompt
+    assert "正文" in prompt
+
+
+@pytest.mark.parametrize(
+    "user_query",
+    [
+        pytest.param(None, id="none"),
+        pytest.param(5, id="int"),
+        pytest.param(10**4301, id="beyond-int-str-digits"),
+    ],
+)
+def test_identify_intent_rejects_non_string_query(user_query):
+    """``identify_intent`` 的 prompt 构造在 ``try`` 之外，必须自己守卫入参。"""
+    import asyncio
+
+    from src.services.chat_service import ChatService
+
+    service = ChatService.__new__(ChatService)
+    with pytest.raises(ValueError, match="必须是字符串"):
+        asyncio.run(service.identify_intent(user_query))
+
+
+# ── embed_in_batches 的批次规模：max(1, ...) 只挡下界 ──
+#
+# `EmbeddingService.embed_in_batches` 原先写 `max(1, run_config.kb_embedding_batch_size)`
+# ——只挡下界，不挡形态。`RunConfig` 是 `frozen dataclass`、字段无校验器，而生产
+# 路径的唯一构造点 `build_run_config` 直接照搬 `Settings` 的值（那里有
+# 1.._MAX_KB_CHUNK_TOKENS 的双向界），因此嵌入方自己拼一个 `RunConfig` 就能把
+# 任意形态送进来。实测（修复前）：
+#   "32"      -> 裸 TypeError: '>' not supported between instances of 'str' and 'int'
+#   None      -> 裸 TypeError: '>' not supported between instances of 'NoneType' and 'int'
+#   10**4301  -> 裸 ValueError: Exceeds the limit (4300 digits)
+#
+# 同文件的其余判据都收敛成带字段名的 `ValueError`（见 `_as_float32_matrix`）。
+#
+# **上界必须用本字段自己的语义上界。** 这里不能复用 `require_scale_field`：它的
+# 上界是 `_MAX_RETRIEVAL_CANDIDATES`（2000，检索候选数），而本字段批到
+# `_MAX_KB_CHUNK_TOKENS`（1_000_000）。实测 `kb_embedding_batch_size=2001` 被
+# `Settings` 正常接受，用那个 helper 会把它判为「超出合理范围」——把一个合法配置
+# 在运行时拒掉，比原缺陷更严重。下面两条对偶用例就是钉住这一点的。
+
+
+def _embedding_service_with_batch_size(value):
+    from unittest.mock import MagicMock
+
+    import numpy as np
+
+    from src.services.embedding_service import EmbeddingService
+
+    service = EmbeddingService.__new__(EmbeddingService)
+    service.run_config = MagicMock()
+    service.run_config.kb_embedding_batch_size = value
+
+    async def _embed_texts(texts):
+        return np.zeros((len(texts), 3), dtype=np.float32)
+
+    service.embed_texts = _embed_texts
+    return service
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("32", id="numeric-string"),
+        pytest.param(None, id="none"),
+        pytest.param(0, id="zero"),
+        pytest.param(-1, id="negative"),
+        pytest.param(True, id="bool"),
+        pytest.param(10**4301, id="beyond-int-str-digits"),
+    ],
+)
+def test_embed_in_batches_rejects_malformed_batch_size(value):
+    """非法批次规模必须收敛成带字段名的 ``ValueError``。"""
+    import asyncio
+
+    service = _embedding_service_with_batch_size(value)
+
+    with pytest.raises(ValueError, match="kb_embedding_batch_size"):
+        asyncio.run(service.embed_in_batches(["x"]))
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(1, id="one"),
+        pytest.param(32, id="default"),
+        pytest.param(2000, id="retrieval-bound-not-this-field"),
+        pytest.param(2001, id="above-retrieval-bound-but-legal-here"),
+        pytest.param(1000000, id="own-upper-bound"),
+    ],
+)
+def test_embed_in_batches_accepts_every_settings_legal_batch_size(value):
+    """``Settings`` 接受的取值一个都不能被误拒——上界必须用本字段自己的。"""
+    import asyncio
+
+    from src.utils.config import Settings
+
+    # 前提：这些取值在配置边界确实合法（否则本用例失去意义）。
+    assert Settings(kb_embedding_batch_size=value).kb_embedding_batch_size == value
+
+    service = _embedding_service_with_batch_size(value)
+    matrix = asyncio.run(service.embed_in_batches(["x"]))
+
+    assert matrix.shape == (1, 3)

@@ -11,6 +11,7 @@ from src.providers.factory import ModelProviderFactory
 from src.runtime.contracts import RunConfig
 from src.utils.config import (
     _MAX_EMBEDDING_DIMENSION,
+    _MAX_KB_CHUNK_TOKENS,
     is_double_convertible,
     require_detail_attributes,
     safe_repr,
@@ -126,7 +127,33 @@ class EmbeddingService:
         return matrix[0]
 
     async def embed_in_batches(self, texts: list[str]) -> np.ndarray:
-        batch_size = max(1, self.run_config.kb_embedding_batch_size)
+        # 批次规模的可直写来源只有 ``RunConfig``——它是 ``frozen dataclass``，
+        # 字段没有校验器，而生产路径的唯一构造点 ``build_run_config`` 直接照搬
+        # ``Settings.kb_embedding_batch_size``（那里有 1.._MAX_KB_CHUNK_TOKENS 的
+        # 双向界）。因此嵌入方若自己拼一个 ``RunConfig``，这里的 ``max(1, ...)``
+        # 只挡得住下界：实测 ``"32"``／``None`` 抛裸
+        # ``TypeError: '>' not supported between instances of ...``，位数超限的
+        # 整数抛 ``ValueError: Exceeds the limit``——两条都与「批次配错了」无关，
+        # 而本文件的其余判据都按 ``ValueError`` 收敛（见 ``_as_float32_matrix``）。
+        #
+        # 上界必须用**本字段自己的**语义上界 ``_MAX_KB_CHUNK_TOKENS``。
+        # 不能复用 ``require_scale_field``：它的上界是
+        # ``_MAX_RETRIEVAL_CANDIDATES``（2000，检索候选数的上界），而
+        # ``Settings.validate_positive_sizes`` 对这个字段批的界是
+        # 1.._MAX_KB_CHUNK_TOKENS（1_000_000）。实测 ``kb_embedding_batch_size
+        # = 2001`` 被 ``Settings`` 正常接受，却会被那个 helper 判为「超出合理
+        # 范围」——把一个合法配置在运行时拒掉，是比原缺陷更严重的过度收紧。
+        batch_size_value = self.run_config.kb_embedding_batch_size
+        if isinstance(batch_size_value, bool) or not isinstance(batch_size_value, int):
+            raise ValueError(
+                f"kb_embedding_batch_size 必须是整数，但得到 {safe_repr(batch_size_value)}。"
+            )
+        if not 1 <= batch_size_value <= _MAX_KB_CHUNK_TOKENS:
+            raise ValueError(
+                f"kb_embedding_batch_size 必须是 1 到 {_MAX_KB_CHUNK_TOKENS} 之间的整数，"
+                f"但得到 {safe_repr(batch_size_value)}。"
+            )
+        batch_size = batch_size_value
         batches: list[np.ndarray] = []
         for start in range(0, len(texts), batch_size):
             batch = texts[start : start + batch_size]

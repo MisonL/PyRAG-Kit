@@ -6,6 +6,12 @@
 
 ### 修复
 
+- **`ChatService` 的标量入参：与同文件的 `<content>` 收敛同一判据**（`src/services/chat_service.py`）。`_build_prompt` 对检索结果里的文档字段已经收敛（`page_content=None` 时整条跳过，绝不把字面量 `内容: None` 喂给模型），但**同一次调用**的两个标量参数 `user_input` 与 `intent` 完全没有守卫。实测修复前 `user_input=None`／`5`／`["a"]` 静默生成 `用户问题: None`／`用户问题: 5`／`用户问题: ['a']`，模型会把字面量 `None` 当成一个真实的用户问题去回答；`10**4301` 则抛裸 `ValueError: Exceeds the limit (4300 digits)`。同一个「非字符串值以字面量进 prompt」的形态，文档字段那一半修了、标量这一半漏了。`identify_intent` 的 f-string 更靠前（在 `try` **之外**），位数超限时抛的甚至不是本类承诺的 `RuntimeError: 意图识别失败`。两处现按同一判据拒绝并给出字段名。
+
+- **`embed_in_batches` 的批次规模：`max(1, ...)` 只挡下界**（`src/services/embedding_service.py`）。原实现只做 `max(1, run_config.kb_embedding_batch_size)`，不挡形态。`RunConfig` 是 `frozen dataclass`、字段无校验器，生产路径的唯一构造点 `build_run_config` 直接照搬 `Settings` 的值（那里有 `1.._MAX_KB_CHUNK_TOKENS` 的双向界），因此嵌入方自己拼一个 `RunConfig` 就能送进任意形态：实测 `"32"`／`None` 抛裸 `TypeError: '>' not supported between instances of ...`，`10**4301` 抛 `ValueError: Exceeds the limit`——两条都与「批次配错了」无关，而同文件其余判据都收敛成带字段名的 `ValueError`。
+
+  **上界用的是本字段自己的语义上界**：初版复用了 `require_scale_field`，而它的上界是 `_MAX_RETRIEVAL_CANDIDATES`（2000，检索候选数），比本字段的 `_MAX_KB_CHUNK_TOKENS`（1,000,000）小三个数量级——实测 `kb_embedding_batch_size=2001` 被 `Settings` 正常接受，却会被那个 helper 判为「超出合理范围」。那会把一个合法配置在运行时拒掉，比原缺陷更严重，因此改为按 `Settings.validate_positive_sizes` 的同一对界判定，并加了两条对偶回归用例（2001 与 1000000 必须放行）钉住这一点。
+
 - **`Pipeline.process` 守卫了入参，却没守卫三个阶段的返回值**（`src/etl/pipeline.py`）。`process` 第一行就校验 `document` 是 `Document`（数据问题 → `ValueError`），而 `self.extractor.extract`／`self.cleaner.clean`／`self.splitter.split` 三个**协作者**的返回值此前没有任何守卫。实测 `splitter.split` 返回 `None` 时，紧随其后的日志行 `len(final_chunks)` 抛裸 `TypeError: object of type 'NoneType' has no len()`——报错现场在日志行，消息里既没有阶段名也没有「是谁违反了契约」。
 
   可达性：三个协作者都是 `BaseExtractor`／`BaseCleaner`／`BaseSplitter` 的实现，而 `Pipeline.__init__` 接受任意实现（抽象基类正是为替换实现而存在的）。同项目的 `RetrievalService._require_document_list` 对「协作者返回值」已有同一处置，其 docstring 写明：这是**接口契约**问题、抛 `TypeError`（入参形态错误才是数据问题、用 `ValueError`）。现新增 `_require_chunk_list` 并接在三个阶段上，两半都补：非列表（`None`／`5`／`"abc"`）与列表里的非 `Document` 项（`[None]`／`["x"]`）。不静默丢弃不合规条目——丢弃会让「实现错了」表现为「分片变少了」。

@@ -7,7 +7,7 @@ from src.providers.__base__.model_provider import LargeLanguageModel
 from src.runtime.contracts import SessionConfig
 from src.services.retrieval_service import RetrievalService
 from src.ui.display_utils import document_content, document_source
-from src.utils.config import require_chat_temperature
+from src.utils.config import require_chat_temperature, safe_repr
 from src.utils.log_manager import get_chat_logger
 from src.utils.security import safe_exception_text
 
@@ -25,6 +25,13 @@ class ChatService:
         return {}
 
     async def identify_intent(self, user_query: str) -> str:
+        # 与 ``_build_prompt`` 同判据：非字符串取值不得以字面量进 prompt。
+        # 这里的 f-string 在 ``try`` **之外**，因此位数超限的整数抛的是裸
+        # ``ValueError: Exceeds the limit``（而不是本类承诺的
+        # ``RuntimeError: 意图识别失败``），``None``／``5`` 则静默生成
+        # ``用户问题: None`` 交给模型。
+        if not isinstance(user_query, str):
+            raise ValueError(f"用户输入必须是字符串，但得到 {safe_repr(user_query)}。")
         prompt = f"你是一个意图识别助手。判断用户意图。\n用户问题: {user_query}\n直接输出意图简述。"
         response = ""
         try:
@@ -69,6 +76,23 @@ class ChatService:
 
     @staticmethod
     def _build_prompt(user_input: str, intent: str, documents: list[dict[str, Any]]) -> str:
+        # 标量入参的形态先收敛，判据与下面文档处理**同一条**：非字符串值不得以
+        # 字面量进 prompt。这两个参数此前完全没有守卫，实测
+        # ``user_input=None``／``5``／``["a"]`` 静默生成
+        # ``用户问题: None``／``用户问题: 5``／``用户问题: ['a']``——模型会把
+        # 字面量 ``None`` 当成一个真实的用户问题去回答（与
+        # ``test_build_prompt_does_not_feed_malformed_content_to_the_model``
+        # 钉住的 ``内容: None`` 是同一形态，只是那一条盯的是文档字段）。
+        # 位数超限的整数则更干脆：``f"{10**4301}"`` 抛裸
+        # ``ValueError: Exceeds the limit``，消息与「问题写错了」毫无关系。
+        #
+        # 抛 ``ValueError`` 而不是静默替换成空串：本方法的两个调用点
+        # （``ChatService.generate_reply`` 与 ``Chatbot.chat_async`` 的内联分支）
+        # 都在按 ``ValueError`` 分类的边界内，而「用户输入不是文本」是调用方的
+        # 编码错误，不该被掩盖成一次正常问答。
+        for label, value in (("用户输入", user_input), ("意图", intent)):
+            if not isinstance(value, str):
+                raise ValueError(f"{label}必须是字符串，但得到 {safe_repr(value)}。")
         # 字段形态统一由 display_utils 的助手收敛。检索结果可以来自任何
         # ``VectorStoreBase`` 实现——``FaissStore`` 会在载入期校验并归一化，
         # 第三方 store 不会。两处后果：``metadata`` 非映射时抛
