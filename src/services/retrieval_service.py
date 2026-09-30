@@ -23,6 +23,7 @@ from src.utils.config import (
     is_double_convertible,
     parse_decimal_int,
     require_detail_attributes,
+    require_provider_name,
     require_retrieval_method,
     safe_repr,
     to_finite_float,
@@ -758,12 +759,9 @@ class RetrievalService:
                 key=provider_key,
                 role_label="Rerank",
             )
-            provider_field = detail.provider
-            if not isinstance(provider_field, str):
-                raise ValueError(
-                    f"rerank 配置 {provider_key} 的 provider 必须是字符串，"
-                    f"但得到 {safe_repr(provider_field)}。"
-                )
+            provider_field = require_provider_name(
+                detail.provider, label=f"rerank 配置 {provider_key} 的 provider"
+            )
             # ``model_name`` 同样进 ``cache_key`` 元组（``detail.model_name =
             # ["m"]`` 实测直接成功，会在这里抛裸 ``TypeError: unhashable type``）。
             model_name = detail.model_name

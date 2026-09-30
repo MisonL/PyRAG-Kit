@@ -264,8 +264,10 @@ def edit_model_params(chat_config: dict[str, Any]) -> bool:
     logger.info("进入模型参数编辑菜单。")
     llm_changed = False
     while True:
-        current_llm = chat_config["active_llm_configuration"]
-        current_rerank = chat_config["active_rerank_configuration"]
+        # 与 ``edit_retrieval_params`` 同因：``active_*_configuration`` 可被直写，
+        # 裸插值对位数超限的整数抛 ``ValueError: Exceeds the limit``，菜单渲染不出来。
+        current_llm = _render_value(chat_config["active_llm_configuration"])
+        current_rerank = _render_value(chat_config["active_rerank_configuration"])
 
         choice = questionary.select(
             "选择要切换的模型:",

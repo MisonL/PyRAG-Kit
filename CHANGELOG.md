@@ -320,7 +320,15 @@
 
 - **修正 `_should_apply_score_threshold` 兜底分支的判据方向**：该方法的 docstring 写着「`fusion_strategy` 由调用方传入**已收敛**的取值：`retrieve` 已经校验过，这里再读一次原属性会绕过那道校验」，但它的**兜底分支**恰恰就在读原属性。判据是 `strategy == "rrf"`，而 `"RRF"`／`" rrf "`／`"Rrf"` 走的是 RRF 融合却不等于这个字面量——阈值过滤被错误地套用在排名倒数的量纲上（结果被静默清空），正是 `_coerce_fusion_strategy` 的 docstring 记录过的那个缺陷，只是留在了库调用方这条路径上。实测修复前 `hybrid_fusion_strategy="RRF"` 返回 `True`。同一处还把 `retrieval_method` 改为经 `require_retrieval_method` 收敛——与字面量比较对未知取值不会报错，而是静默判定「不是混合检索」。生产路径（`retrieve`）传的是收敛后的值，因此这条只在库调用方直接调本方法时可达，属契约一致性修复。
 
+- **补齐模型配置展示路径的两类收敛**：`ModelDetail.provider` 声明为 `str`，但 `SessionConfig.llm_configurations`／`rerank_configurations` 的 `_VALIDATORS` 明确不登记（「按原样写入，由使用方负责其内部结构」），嵌入方可以往映射里放任意取值。`display_chat_config` 在 `start_chat_session_async` 里于任何提示符**之前**被调用，于是以下每一条都让会话在「知识快照加载成功」之后立刻终止：
+
+  - **非字符串 `provider` 抛裸异常**：`display_chat_config` 拿它拼 `f"{provider.lower()}_api_key"`。实测 `provider=["openai"]` 更早一步——它在 `active_providers = {…provider}` 这个**集合**里就抛 `TypeError: unhashable type: 'list'`；`provider=None`／`5` 则抛 `AttributeError: 'NoneType' object has no attribute 'lower'`。两处判据（集合成员与 `.lower()`）都要收敛。现抽出共享助手 `require_provider_name`，`RetrievalService._get_rerank_provider` 里原本内联的同一判据改为复用它——两处不再各写一份。判据只要求「是字符串」，**不**查 `_provider_map` 白名单：白名单是工厂的职责，在展示层提前套它会让「配置里有个尚未支持的 provider」从「启动时列出配置」变成「启动时崩溃」。
+  - **同一张表的裸 f-string 插值**：`model_name`、`active_llm_configuration`、`active_rerank_configuration` 是位数超限整数时抛 `ValueError: Exceeds the limit`。而**同一个函数**的 `top_k`／`score_threshold`／权重早已走 `_render_value`，注释还明确写着「本函数在任何提示符之前被调用，会话在启动横幅这一步就终止」——判据只做了一部分单元格。现四处统一经 `_render_value`（降级成量级描述，正常取值显示形态不变）。
+  - 顺带把该函数里五处 `logger.debug(f"…{取值}")` 改成惰性 `%s` 参数：f-string 在 DEBUG 关闭时也**已经求值**，裸插值对同一取值照样抛。
+
 ### 测试
+
+- 新增第十轮的回归用例（15 个用例；回退源码后其中 9 个变红，6 个「不误伤」反向守卫保持绿）：`display_chat_config` 对四类非字符串 provider（`list`／`dict`／`None`／`int`）的拒绝、Rerank 侧同一判据、三类位数超限取值（`model_name`／两个 `active_*_configuration`）**必须可渲染**而不是终止会话、合法配置照旧渲染，以及共享助手 `require_provider_name` 接受任意字符串（含尚未支持的 provider）并拒绝其余形态。位数超限那两条特意把激活名与配置键一并设成同一取值——它们同源，只设激活名会先撞上「未找到key」那条判据，测不到渲染路径。
 
 - 新增第九轮的回归用例（18 个用例；回退源码后其中 11 个变红，7 个「不误伤」反向守卫保持绿）：`generate_reply` 对六类不可用 `chat_temperature`（`str`／`None`／`list`／`bool`／负数／位数超限整数）的拒绝**且断言被拒前未发起请求**（只断言「抛了 ValueError」会让「先发请求再校验」的实现也通过）、五条合法取值照旧传给模型并收敛成 `float`、配置边界与运行期读取侧对同一取值给出同一种收场（这条盯「只修一边」）；以及 RRF 融合在任何大小写／空白形态下都跳过阈值过滤、`weighted` 与非混合检索仍套用阈值、兜底分支对无法识别的策略报错而不是静默当成「非 RRF」。
 

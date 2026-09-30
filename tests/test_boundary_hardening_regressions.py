@@ -2351,3 +2351,153 @@ def test_score_threshold_rejects_unusable_fusion_strategy_in_default_branch():
         config.hybrid_fusion_strategy = bad_value
         with pytest.raises(ValueError, match="hybrid_fusion_strategy"):
             RetrievalService._should_apply_score_threshold(config)
+
+
+# ── 模型配置的展示路径（provider 形态 / 裸插值） ──
+#
+# ``ModelDetail.provider`` 声明为 ``str``，但 ``SessionConfig.llm_configurations``
+# ／``rerank_configurations`` 的 ``_VALIDATORS`` 明确不登记（「按原样写入，由使用方
+# 负责其内部结构」），嵌入方可以往映射里放任意取值。``display_chat_config`` 拿它拼
+# ``f"{provider.lower()}_api_key"``——实测修复前：
+#
+#   * ``provider=["openai"]`` -> 更早一步，在 ``active_providers = {…provider}``
+#     这个**集合**里抛 ``TypeError: unhashable type: 'list'``；
+#   * ``provider=None``／``5`` -> ``AttributeError: 'NoneType' object has no
+#     attribute 'lower'``；
+#   * ``active_*_configuration``／``model_name`` 是位数超限整数时，同一张表的裸
+#     f-string 抛 ``ValueError: Exceeds the limit``——而**同一个函数**的
+#     ``top_k``／``score_threshold``／权重早已走 ``_render_value``（注释写明
+#     「本函数在任何提示符之前被调用，会话在启动横幅这一步就终止」）。
+#   * ``logger.debug(f"…{active_llm}")`` 的裸插值在 DEBUG 关闭时也**已经求值**，
+#     同一个取值照样抛。
+#
+# 本函数在 ``start_chat_session_async`` 里于任何提示符**之前**被调用，因此以上
+# 每一条都让会话在「知识快照加载成功」之后立刻终止。
+
+
+def _model_config(**overrides):
+    """构造一个 ``display_chat_config`` 能完整渲染的 ``SessionConfig``。"""
+    values = {
+        "retrieval_method": RetrievalMethod.HYBRID_SEARCH,
+        "vector_weight": 0.5,
+        "keyword_weight": 0.5,
+        "hybrid_fusion_strategy": "rrf",
+        "retrieval_candidate_multiplier": 2,
+        "rerank_enabled": False,
+        "top_k": 5,
+        "score_threshold": 0.0,
+        "active_llm_configuration": "demo",
+        "active_rerank_configuration": "demo",
+        "llm_configurations": {"demo": SimpleNamespace(provider="openai", model_name="gpt-5")},
+        "rerank_configurations": {
+            "demo": SimpleNamespace(provider="siliconflow", model_name="bge-reranker-v2-m3")
+        },
+        "chat_temperature": 0.7,
+    }
+    values.update(overrides)
+    return SessionConfig(**values)
+
+
+@pytest.mark.parametrize(
+    "bad_provider",
+    [
+        pytest.param(["openai"], id="list"),
+        pytest.param({"a": 1}, id="dict"),
+        pytest.param(None, id="none"),
+        pytest.param(5, id="int"),
+    ],
+)
+def test_display_chat_config_rejects_unusable_provider(bad_provider):
+    """非字符串 provider 必须收敛成 ``ValueError``，而不是裸 ``AttributeError``／``TypeError``。
+
+    ``["openai"]`` 这条走的是**集合**（``{provider}``）而不是 ``.lower()``，因此
+    它抛的是 ``TypeError: unhashable type``——两处判据必须都收敛。
+    """
+    from rich.console import Console
+
+    from src.ui.display_utils import display_chat_config
+
+    config = _model_config(
+        llm_configurations={"demo": SimpleNamespace(provider=bad_provider, model_name="gpt-5")}
+    )
+
+    with pytest.raises(ValueError, match="provider 必须是字符串"):
+        display_chat_config(Console(quiet=True), config)
+
+
+def test_display_chat_config_rejects_unusable_rerank_provider():
+    """Rerank 侧同一判据：``rerank_enabled=True`` 时才读它。"""
+    from rich.console import Console
+
+    from src.ui.display_utils import display_chat_config
+
+    config = _model_config(
+        rerank_enabled=True,
+        rerank_configurations={"demo": SimpleNamespace(provider=5, model_name="m")},
+    )
+
+    with pytest.raises(ValueError, match="provider 必须是字符串"):
+        display_chat_config(Console(quiet=True), config)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["model_name", "active_llm_configuration", "active_rerank_configuration"],
+)
+def test_display_chat_config_renders_values_beyond_the_conversion_limit(field):
+    """位数超限的整数必须**可渲染**（降级成量级描述），而不是让会话终止。
+
+    同一张表的 ``top_k``／``score_threshold``／权重早已按这条处理；这条盯住
+    「只修了一部分单元格」。
+    """
+    from rich.console import Console
+
+    from src.ui.display_utils import display_chat_config
+
+    if field == "model_name":
+        config = _model_config(
+            llm_configurations={"demo": SimpleNamespace(provider="openai", model_name=_HUGE_INT)}
+        )
+    elif field == "active_llm_configuration":
+        # 激活名与配置键同源（都来自 config.toml 或快照），因此要让键也存在，
+        # 否则先撞上「未找到key」那条（那是另一条判据，不是本条要测的渲染）。
+        config = _model_config(
+            active_llm_configuration=_HUGE_INT,
+            llm_configurations={_HUGE_INT: SimpleNamespace(provider="openai", model_name="gpt-5")},
+        )
+    else:
+        config = _model_config(
+            rerank_enabled=True,
+            active_rerank_configuration=_HUGE_INT,
+            rerank_configurations={
+                _HUGE_INT: SimpleNamespace(provider="siliconflow", model_name="m")
+            },
+        )
+
+    # 不得抛异常——这正是修复点。
+    display_chat_config(Console(quiet=True), config)
+
+
+def test_display_chat_config_keeps_working_for_valid_model_config():
+    """收紧不能误伤：合法配置照旧渲染。"""
+    from rich.console import Console
+
+    from src.ui.display_utils import display_chat_config
+
+    display_chat_config(Console(quiet=True), _model_config(rerank_enabled=True))
+
+
+def test_require_provider_name_accepts_any_string_and_rejects_the_rest():
+    """共享助手只要求「是字符串」，不查 provider 白名单。
+
+    白名单是**工厂**的职责（``_get_provider_class`` 会给「不支持的模型提供商」）。
+    在展示层提前套白名单会让「配置里有个尚未支持的 provider」从「启动时列出配置」
+    变成「启动时崩溃」——那是更差的收场。
+    """
+    from src.utils.config import require_provider_name
+
+    assert require_provider_name("openai") == "openai"
+    assert require_provider_name("not-yet-supported") == "not-yet-supported"
+    for bad_value in (None, 5, ["openai"], {"a": 1}, True, _HUGE_INT):
+        with pytest.raises(ValueError, match="必须是字符串"):
+            require_provider_name(bad_value)

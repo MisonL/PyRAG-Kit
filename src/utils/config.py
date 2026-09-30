@@ -400,6 +400,34 @@ def require_retrieval_method(value: Any, *, label: str = "retrieval_method") -> 
     raise ValueError(f"{label} 必须是 {allowed} 之一，但得到 {safe_repr(value)}。")
 
 
+def require_provider_name(value: Any, *, label: str = "provider") -> str:
+    """确认 ``provider`` 是字符串并原样返回，否则给出带字段名的 ``ValueError``。
+
+    ``ModelDetail.provider`` 声明为 ``str``，但 ``SessionConfig.llm_configurations``
+    ／``rerank_configurations`` 的 ``_VALIDATORS`` 明确不登记（「按原样写入，由
+    使用方负责其内部结构」），嵌入方可以往映射里放任意取值。两个使用方此前各自
+    假设它是字符串：
+
+    * ``display_chat_config`` 拿它拼 ``f"{provider.lower()}_api_key"`` —— 实测
+      ``provider=None``／``5`` 抛裸 ``AttributeError: 'NoneType' object has no
+      attribute 'lower'``；``provider=["openai"]`` 更早一步，在
+      ``active_providers = {llm_model_details.provider}`` 这个**集合**里就抛
+      ``TypeError: unhashable type: 'list'``。本函数在
+      ``start_chat_session_async`` 里于任何提示符**之前**被调用，会话在启动横幅
+      这一步就终止。
+    * ``RetrievalService._get_rerank_provider`` 已经内联了同一判据（provider 进
+      ``cache_key`` 元组），这里抽成共享实现，两处不再各写一份。
+
+    判据只要求「是字符串」，不查 ``_provider_map`` 白名单：白名单是**工厂**的
+    职责（``_get_provider_class`` 会给「不支持的模型提供商」），而展示层与缓存键
+    只需要一个可哈希、可拼串的取值。在展示层提前套白名单会让「配置里有个尚未
+    支持的 provider」从「启动时列出配置」变成「启动时崩溃」——那是更差的收场。
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"{label} 必须是字符串，但得到 {safe_repr(value)}。")
+    return value
+
+
 def require_chat_temperature(value: Any) -> float:
     """把 ``chat_temperature`` 收敛成非负有限浮点，非法取值给出带字段名的 ``ValueError``。
 

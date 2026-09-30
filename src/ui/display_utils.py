@@ -14,6 +14,7 @@ from ..utils.config import (  # 导入 get_settings 函数
     get_settings,
     is_double_convertible,
     require_detail_attributes,
+    require_provider_name,
     require_retrieval_method,
     safe_repr,
 )
@@ -359,14 +360,24 @@ def display_chat_config(console: Console, chat_config: dict[str, Any]):
         rerank_model_details = _require_model_detail(
             chat_config["rerank_configurations"], active_rerank, "Rerank"
         )
+        # 这一格与同一张表的权重／top_k 同因（见下方注释）：``active_*`` 与
+        # ``model_name`` 都可被直写，裸 f-string 对位数超限的整数抛
+        # ``ValueError: Exceeds the limit``；``provider`` 还可能是非字符串，
+        # 在 ``provider.lower()`` 处抛裸 ``AttributeError``。全部经
+        # ``_render_value`` / ``require_provider_name`` 收敛。
+        rerank_provider = require_provider_name(
+            rerank_model_details.provider, label="Rerank provider"
+        )
         chat_table.add_row(
             "激活的Rerank模型:",
             Text(
-                f"{active_rerank} "
-                f"({rerank_model_details.provider}: {rerank_model_details.model_name})"
+                f"{_render_value(active_rerank)} "
+                f"({rerank_provider}: {_render_value(rerank_model_details.model_name)})"
             ),
         )
-        logger.debug(f"Rerank模型已启用，激活模型: {active_rerank}")
+        # 惰性 ``%s`` 而不是 f-string：后者在 DEBUG 关闭时也**已经求值**，
+        # 裸插值对位数超限的整数照样抛 ``ValueError``。
+        logger.debug("Rerank模型已启用，激活模型: %s", active_rerank)
     else:
         logger.debug("Rerank模型未启用。")
     # 这三个字段与上面的权重同理：``SessionConfig`` 是公开类、普通属性没有
@@ -378,11 +389,15 @@ def display_chat_config(console: Console, chat_config: dict[str, Any]):
     chat_table.add_row("语义搜索阈值:", Text(_render_value(chat_config["score_threshold"])))
     active_llm = chat_config["active_llm_configuration"]
     llm_model_details = _require_model_detail(chat_config["llm_configurations"], active_llm, "LLM")
+    llm_provider = require_provider_name(llm_model_details.provider, label="LLM provider")
     chat_table.add_row(
         "激活的LLM:",
-        Text(f"{active_llm} ({llm_model_details.provider}: {llm_model_details.model_name})"),
+        Text(
+            f"{_render_value(active_llm)} "
+            f"({llm_provider}: {_render_value(llm_model_details.model_name)})"
+        ),
     )
-    logger.debug(f"激活的LLM: {active_llm}")
+    logger.debug("激活的LLM: %s", active_llm)
 
     # --- API与URL配置 ---
     # API密钥和URL仍然从全局的、不可变的settings对象中读取，因为它们不应该在运行时被修改。
@@ -416,9 +431,9 @@ def display_chat_config(console: Console, chat_config: dict[str, Any]):
             # 行标签由 provider 名拼出。provider 有 ``_provider_map`` 白名单，
             # 但仍按字面呈现——标签里的 ``[`` 会被解析。
             api_table.add_row(Text(f"{key_name.upper()}:"), mask_api_key(api_key))
-            logger.debug(f"显示提供商 '{provider_name}' 的 API Key。")
+            logger.debug("显示提供商 '%s' 的 API Key。", provider_name)
         else:
-            logger.debug(f"提供商 '{provider_name}' 的 API Key 未设置。")
+            logger.debug("提供商 '%s' 的 API Key 未设置。", provider_name)
 
         url_key_name = f"{provider_name.lower()}_base_url"
         api_url = getattr(current_settings, url_key_name, None)
@@ -435,7 +450,7 @@ def display_chat_config(console: Console, chat_config: dict[str, Any]):
             )
             logger.debug("显示提供商 '%s' 的 Base URL。", provider_name)
         else:
-            logger.debug(f"提供商 '{provider_name}' 的 Base URL 未设置。")
+            logger.debug("提供商 '%s' 的 Base URL 未设置。", provider_name)
 
     console.print(
         Panel(
