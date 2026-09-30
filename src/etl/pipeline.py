@@ -4,6 +4,7 @@
 
 import time
 from pathlib import Path
+from typing import Any
 
 from src.etl.cleaners.base import BaseCleaner
 from src.etl.cleaners.basic_cleaner import BasicCleaner
@@ -16,6 +17,38 @@ from src.utils.config import safe_repr
 from src.utils.log_manager import get_module_logger
 
 logger = get_module_logger(__name__)
+
+
+def _require_chunk_list(chunks: Any, stage: str) -> list[Document]:
+    """确认流水线某阶段返回的是「文档列表」。
+
+    与 ``RetrievalService._require_document_list`` 同一判据、同一收场：三个阶段
+    都是 ``BaseExtractor``／``BaseCleaner``／``BaseSplitter`` 的实现，抽象基类
+    正是为替换实现而存在的，而 ``Pipeline.__init__`` 接受任意实现。实测
+    ``split`` 返回 ``None`` 时，下面那条日志里的 ``len(final_chunks)`` 抛裸
+    ``TypeError: object of type 'NoneType' has no len()``——报错现场在日志行，
+    消息里既没有阶段名也没有「是谁违反了契约」。
+
+    这里抛 ``TypeError`` 而不是 ``ValueError``，理由与
+    ``_require_document_list`` 逐字相同：这是**接口契约**问题，不是数据内容
+    问题。入参 ``document`` 形态错误（调用方给了非 ``Document``）才是数据问题，
+    那一处用 ``ValueError``。
+
+    不静默丢弃不合规条目：丢弃会让「实现错了」表现为「分片变少了」。
+    """
+    if not isinstance(chunks, list):
+        raise TypeError(
+            f"{stage}返回的必须是文档列表，但得到 {type(chunks).__name__}。"
+            " 请检查 BaseExtractor/BaseCleaner/BaseSplitter 实现是否遵守契约。"
+        )
+    for position, chunk in enumerate(chunks):
+        if not isinstance(chunk, Document):
+            raise TypeError(
+                f"{stage}返回的第 {position} 项不是 Document"
+                f"（{type(chunk).__name__}）。"
+                " 请检查 BaseExtractor/BaseCleaner/BaseSplitter 实现是否遵守契约。"
+            )
+    return chunks
 
 
 class Pipeline:
@@ -77,17 +110,17 @@ class Pipeline:
 
         # 抽取
         start_step = time.perf_counter()
-        extracted_docs = self.extractor.extract(document)
+        extracted_docs = _require_chunk_list(self.extractor.extract(document), "抽取阶段")
         logger.info(f"抽取完成: {source}, 耗时: {time.perf_counter() - start_step:.4f}s")
 
         # 清洗
         start_step = time.perf_counter()
-        cleaned_docs = self.cleaner.clean(extracted_docs)
+        cleaned_docs = _require_chunk_list(self.cleaner.clean(extracted_docs), "清洗阶段")
         logger.info(f"清洗完成: {source}, 耗时: {time.perf_counter() - start_step:.4f}s")
 
         # 分割
         start_step = time.perf_counter()
-        final_chunks = self.splitter.split(cleaned_docs)
+        final_chunks = _require_chunk_list(self.splitter.split(cleaned_docs), "分割阶段")
         logger.info(
             f"分割完成: {source}, 耗时: {time.perf_counter() - start_step:.4f}s, 分片数: {len(final_chunks)}"
         )

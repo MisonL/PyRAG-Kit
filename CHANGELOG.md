@@ -6,6 +6,10 @@
 
 ### 修复
 
+- **`Pipeline.process` 守卫了入参，却没守卫三个阶段的返回值**（`src/etl/pipeline.py`）。`process` 第一行就校验 `document` 是 `Document`（数据问题 → `ValueError`），而 `self.extractor.extract`／`self.cleaner.clean`／`self.splitter.split` 三个**协作者**的返回值此前没有任何守卫。实测 `splitter.split` 返回 `None` 时，紧随其后的日志行 `len(final_chunks)` 抛裸 `TypeError: object of type 'NoneType' has no len()`——报错现场在日志行，消息里既没有阶段名也没有「是谁违反了契约」。
+
+  可达性：三个协作者都是 `BaseExtractor`／`BaseCleaner`／`BaseSplitter` 的实现，而 `Pipeline.__init__` 接受任意实现（抽象基类正是为替换实现而存在的）。同项目的 `RetrievalService._require_document_list` 对「协作者返回值」已有同一处置，其 docstring 写明：这是**接口契约**问题、抛 `TypeError`（入参形态错误才是数据问题、用 `ValueError`）。现新增 `_require_chunk_list` 并接在三个阶段上，两半都补：非列表（`None`／`5`／`"abc"`）与列表里的非 `Document` 项（`[None]`／`["x"]`）。不静默丢弃不合规条目——丢弃会让「实现错了」表现为「分片变少了」。
+
 - **子分片的 50% 比例上界缺失：上一轮只修了父分片**（`src/etl/splitters/recursive_text_splitter.py`）。`_validate_parent_sizes` 有 `overlap * 2 > size` 的比例上界，而 `_validate_hierarchical_sizes` 里的**子**分片只有 `child_overlap >= child_size` 的相等判据——`child_overlap < child_size` 成立即通过，比例上界那一条漏了。子分片器同样产出分片（每个父块都要过它一次），同一个静默放大在子侧完全存在。实测父=1500/150、子 `size=300`、一篇 15000 字符的文档：
 
   | 子 overlap | 子块数 | 放大倍数 |

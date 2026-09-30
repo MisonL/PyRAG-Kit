@@ -3690,3 +3690,94 @@ def test_hierarchical_child_overlap_ratio_does_not_over_tighten(child_size, chil
     )
     chunks = splitter.split([Document(content="正文" * 500, metadata={"source": "a.md"})])
     assert chunks, "合法比例不应产出空结果"
+
+
+# ── Pipeline.process：守卫了入参，却没守卫三个阶段的返回值 ──
+#
+# `Pipeline.process` 第一行就校验 `document` 是 `Document`（数据问题 -> ValueError），
+# 而 `self.extractor.extract` / `self.cleaner.clean` / `self.splitter.split` 三个
+# 协作者的返回值此前**没有任何守卫**：`splitter.split` 返回 `None` 时，紧随其后的
+# 日志行 `len(final_chunks)` 抛裸 `TypeError: object of type 'NoneType' has no len()`
+# ——报错现场在日志行，消息里既没有阶段名也没有「是谁违反了契约」。
+#
+# 三个协作者都是抽象基类的实现，而 `Pipeline.__init__` 接受任意实现（抽象基类正是
+# 为替换实现而存在的）。同项目的 `RetrievalService._require_document_list` 对
+# 「协作者返回值」已有同一处置，其 docstring 写明：这是**接口契约**问题，抛
+# `TypeError`（入参形态错误才是数据问题、用 `ValueError`）。这里与那条判据对齐。
+#
+# 两半都补：非列表（`None`／`5`／`"abc"`）与列表里的非 `Document` 项。
+
+
+class _StageReturning:
+    """按阶段替换返回值的 Pipeline 协作者替身。"""
+
+    def __init__(self, value):
+        self._value = value
+
+    def extract(self, document, **kwargs):
+        return self._value
+
+    def clean(self, documents, **kwargs):
+        return self._value
+
+    def split(self, documents, **kwargs):
+        return self._value
+
+
+@pytest.mark.parametrize(
+    ("value", "label"),
+    [
+        pytest.param(None, "NoneType", id="none"),
+        pytest.param(5, "int", id="int"),
+        pytest.param("abc", "str", id="str"),
+    ],
+)
+def test_pipeline_stage_return_must_be_a_list(value, label):
+    """三个阶段返回非列表必须收敛成带阶段名的 ``TypeError``，而不是裸 ``len()`` 错误。"""
+    from src.etl.pipeline import Pipeline
+    from src.models.document import Document
+
+    stub = _StageReturning(value)
+    pipeline = Pipeline(extractor=stub, cleaner=stub, splitter=stub)
+
+    with pytest.raises(TypeError, match=r"抽取阶段返回的必须是文档列表"):
+        pipeline.process(Document(content="正文" * 10, metadata={"source": "a.md"}))
+
+
+@pytest.mark.parametrize(
+    ("stage", "position"),
+    [
+        pytest.param("extractor", 0, id="extractor"),
+        pytest.param("cleaner", 1, id="cleaner"),
+        pytest.param("splitter", 2, id="splitter"),
+    ],
+)
+def test_pipeline_stage_return_items_must_be_documents(stage, position):
+    """列表里的非 ``Document`` 项必须带位置与阶段名报错。"""
+    from src.etl.cleaners.basic_cleaner import BasicCleaner
+    from src.etl.extractors.markdown_extractor import MarkdownExtractor
+    from src.etl.pipeline import Pipeline
+    from src.etl.splitters.recursive_text_splitter import RecursiveTextSplitter
+    from src.models.document import Document
+
+    good = [MarkdownExtractor(), BasicCleaner(), RecursiveTextSplitter()]
+    parts = list(good)
+    parts[position] = _StageReturning([None])
+    pipeline = Pipeline(extractor=parts[0], cleaner=parts[1], splitter=parts[2])
+
+    with pytest.raises(TypeError, match=r"返回的第 0 项不是 Document"):
+        pipeline.process(Document(content="正文" * 10, metadata={"source": "a.md"}))
+
+
+def test_pipeline_legal_path_still_works():
+    """收紧不能误伤：默认三阶段照旧产出 ``Document`` 分片。"""
+    from pathlib import Path
+
+    from src.etl.pipeline import Pipeline
+    from src.models.document import Document
+
+    pipeline = Pipeline.from_file_path(Path("kb.md"))
+    chunks = pipeline.process(Document(content="正文" * 500, metadata={"source": "a.md"}))
+
+    assert chunks
+    assert all(isinstance(chunk, Document) for chunk in chunks)
