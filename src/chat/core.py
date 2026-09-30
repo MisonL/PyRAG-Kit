@@ -37,7 +37,7 @@ from ..ui.display_utils import (
     get_relative_path,
     markup_text,
 )
-from ..utils.config import get_settings, safe_repr
+from ..utils.config import get_settings, require_chat_temperature, safe_repr
 from ..utils.log_manager import get_chat_logger
 from ..utils.security import safe_exception_text
 
@@ -317,7 +317,11 @@ class Chatbot:
                 invoke_kwargs: dict[str, Any] = {"prompt": prompt, "stream": True}
                 supports_sampling = getattr(llm_model, "supports_sampling_option", None)
                 if callable(supports_sampling) and supports_sampling("temperature"):
-                    invoke_kwargs["temperature"] = self.session_config["chat_temperature"]
+                    # 与 ``ChatService.generate_reply`` 同判据：这里读的是可直写的
+                    # 字段，非法取值同样会静默进请求 kwargs。
+                    invoke_kwargs["temperature"] = require_chat_temperature(
+                        self.session_config["chat_temperature"]
+                    )
                 async for chunk in llm_model.ainvoke(**invoke_kwargs):
                     full_response += chunk
                     yield chunk

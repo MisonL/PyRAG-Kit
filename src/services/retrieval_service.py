@@ -967,14 +967,21 @@ class RetrievalService:
     ) -> bool:
         """RRF 融合的分数是排名倒数之和，与阈值不同量纲，因此跳过阈值过滤。
 
-        ``fusion_strategy`` 由调用方传入**已收敛**的取值：``retrieve`` 已经
-        校验过，这里再读一次原属性会绕过那道校验（该字段可被直写）。
+        ``fusion_strategy`` 优先用调用方传入的**已收敛**取值：``retrieve`` 已经
+        校验过。但兜底分支必须自己收敛，不能回落到原属性——本函数的判据是
+        ``strategy == "rrf"``，而 ``"RRF"``／``" rrf "`` 走的是 RRF 融合却不等于
+        这个字面量，阈值过滤会被错误地套用在排名倒数的量纲上（正是
+        ``_coerce_fusion_strategy`` 的 docstring 记录的那个缺陷）。原先的兜底
+        分支直接读原属性，等于把那条缺陷留在库调用方这条路径上（实测
+        ``hybrid_fusion_strategy="RRF"`` 时返回 True）。
+
+        ``retrieval_method`` 同理收敛：与字面量比较对未知取值**不会报错**，而是
+        静默判定「不是混合检索」，于是阈值过滤照常套用。
         """
         strategy = (
             fusion_strategy
             if fusion_strategy is not None
-            else session_config.hybrid_fusion_strategy
+            else _coerce_fusion_strategy(session_config.hybrid_fusion_strategy)
         )
-        return not (
-            session_config.retrieval_method == RetrievalMethod.HYBRID_SEARCH and strategy == "rrf"
-        )
+        method = require_retrieval_method(session_config.retrieval_method)
+        return not (method == RetrievalMethod.HYBRID_SEARCH and strategy == "rrf")

@@ -2186,3 +2186,168 @@ def test_require_retrieval_method_accepts_duck_typed_substitutes():
         require_retrieval_method(SimpleNamespace(value="hybrid"))
     with pytest.raises(ValueError, match="retrieval_method 必须是"):
         require_retrieval_method(SimpleNamespace())
+
+
+# ── chat_temperature 的取值收敛（两个读取点） ──
+#
+# ``chat_temperature`` 有**完整**的校验器——``Settings.validate_chat_temperature``
+# 与 ``SessionConfig._validate_chat_temperature`` 各自一份，判据一致（拒 bool、
+# 非数值、非有限、负数、超出双精度的整数）。但两个**读取点**都直读原属性，而
+# ``SessionConfig`` 是公开类、普通属性没有 ``__setattr__`` 守卫。实测修复前
+# ``"abc"``／``None``／``[0.5]``／``True``／``-1`` 全部**静默**通过并原样成为
+# SDK 的请求 kwargs——而它们正是 ``session_config["chat_temperature"] = ...``
+# 会明确拒绝的取值。同一个字段「写得进就合法、直写就非法」两种口径。
+
+
+class _RecordingSamplingModel:
+    """支持 sampling 的模型替身，记录收到的 kwargs。"""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def supports_sampling_option(self, name):
+        return name == "temperature"
+
+    async def ainvoke(self, **kwargs):
+        self.calls.append(kwargs)
+        yield "回复"
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        pytest.param("abc", id="str"),
+        pytest.param(None, id="none"),
+        pytest.param([0.5], id="list"),
+        pytest.param(True, id="bool"),
+        pytest.param(-1, id="negative"),
+        pytest.param(_HUGE_INT, id="beyond-int-max-str-digits"),
+    ],
+)
+def test_generate_reply_rejects_unusable_chat_temperature(bad_value):
+    """不可用的 ``chat_temperature`` 必须在本地被拒，而不是进请求 kwargs。
+
+    修复前实测：这些取值全部**静默**通过，``"abc"`` 与 ``[0.5]`` 原样成为 SDK
+    参数，``-1`` 被网关按默认值接受。用户看到的是服务端的参数错误，而不是一条
+    本地配置错误。
+    """
+    import asyncio
+
+    from src.runtime.contracts import build_session_config
+    from src.services.chat_service import ChatService
+    from src.utils.config import get_settings
+
+    model = _RecordingSamplingModel()
+    service = ChatService(model, None)
+    config = build_session_config(get_settings())
+    config.chat_temperature = bad_value
+
+    async def consume():
+        return [chunk async for chunk in service.generate_reply("问题", "意图", [], config)]
+
+    with pytest.raises(ValueError, match="chat_temperature"):
+        asyncio.run(consume())
+
+    # 关键断言：被拒之前**没有**发起请求。只断言「抛了 ValueError」会让
+    # 「先发请求再校验」的实现也通过。
+    assert model.calls == []
+
+
+@pytest.mark.parametrize("value", [0.0, 0.7, 1.0, 2, 0])
+def test_generate_reply_keeps_working_for_valid_chat_temperature(value):
+    """收紧不能误伤：合法的非负数值照旧传给模型。"""
+    import asyncio
+
+    from src.runtime.contracts import build_session_config
+    from src.services.chat_service import ChatService
+    from src.utils.config import get_settings
+
+    model = _RecordingSamplingModel()
+    service = ChatService(model, None)
+    config = build_session_config(get_settings())
+    config.chat_temperature = value
+
+    async def consume():
+        return [chunk async for chunk in service.generate_reply("问题", "意图", [], config)]
+
+    assert asyncio.run(consume()) == ["回复"]
+    assert model.calls[0]["temperature"] == float(value)
+
+
+def test_chat_temperature_reader_and_validator_agree():
+    """配置边界与运行期读取侧对同一取值必须给出同一种收场。
+
+    两边此前各写一份判据（``SessionConfig._validate_chat_temperature`` 与两个读取
+    点的裸属性访问），现在共用 ``require_chat_temperature``。这条盯住「只修一边」。
+    """
+    from src.runtime.contracts import build_session_config
+    from src.utils.config import get_settings, require_chat_temperature
+
+    config = build_session_config(get_settings())
+    for bad_value in ("abc", None, [0.5], True, -1, _HUGE_INT):
+        with pytest.raises(ValueError, match="chat_temperature"):
+            config["chat_temperature"] = bad_value
+        with pytest.raises(ValueError, match="chat_temperature"):
+            require_chat_temperature(bad_value)
+    # 合法取值两侧都要接受，且收敛成同一形态（float）。
+    for good_value in (0.0, 0.7, 2):
+        config["chat_temperature"] = good_value
+        assert config.chat_temperature == require_chat_temperature(good_value) == float(good_value)
+
+
+# ── 阈值过滤的融合策略判据（库调用方的默认分支） ──
+#
+# ``_should_apply_score_threshold`` 的 docstring 写着「``fusion_strategy`` 由调用方
+# 传入**已收敛**的取值：``retrieve`` 已经校验过，这里再读一次原属性会绕过那道
+# 校验」，但它的**兜底分支**恰恰就在读原属性。判据是 ``strategy == "rrf"``，而
+# ``"RRF"``／``" rrf "`` 走的是 RRF 融合却不等于这个字面量——阈值过滤会被错误地
+# 套用在排名倒数的量纲上，正是 ``_coerce_fusion_strategy`` 记录的那个缺陷。生产
+# 路径（``retrieve``）传的是收敛后的值，因此这条只在库调用方直接调本方法时可达。
+
+
+@pytest.mark.parametrize("value", ["rrf", "RRF", " rrf ", "Rrf"])
+def test_score_threshold_skipped_for_rrf_regardless_of_case(value):
+    """RRF 融合（任何大小写／空白形态）都必须跳过阈值过滤。"""
+    from src.runtime.contracts import build_session_config
+    from src.services.retrieval_service import RetrievalService
+    from src.utils.config import RetrievalMethod, get_settings
+
+    config = build_session_config(get_settings())
+    config.retrieval_method = RetrievalMethod.HYBRID_SEARCH
+    config.hybrid_fusion_strategy = value
+
+    assert RetrievalService._should_apply_score_threshold(config) is False
+
+
+def test_score_threshold_applied_for_weighted_and_other_methods():
+    """反向守卫：weighted 融合与非混合检索仍要套用阈值。"""
+    from src.runtime.contracts import build_session_config
+    from src.services.retrieval_service import RetrievalService
+    from src.utils.config import RetrievalMethod, get_settings
+
+    config = build_session_config(get_settings())
+    config.retrieval_method = RetrievalMethod.HYBRID_SEARCH
+    config.hybrid_fusion_strategy = "weighted"
+    assert RetrievalService._should_apply_score_threshold(config) is True
+
+    config.hybrid_fusion_strategy = "rrf"
+    config.retrieval_method = RetrievalMethod.SEMANTIC_SEARCH
+    assert RetrievalService._should_apply_score_threshold(config) is True
+
+
+def test_score_threshold_rejects_unusable_fusion_strategy_in_default_branch():
+    """兜底分支不得把无法识别的策略静默当成「非 RRF」。
+
+    静默判定会让阈值过滤套用在排名倒数的量纲上（结果被清空），而正确收场是一条
+    配置错误。
+    """
+    from src.runtime.contracts import build_session_config
+    from src.services.retrieval_service import RetrievalService
+    from src.utils.config import RetrievalMethod, get_settings
+
+    config = build_session_config(get_settings())
+    config.retrieval_method = RetrievalMethod.HYBRID_SEARCH
+    for bad_value in (None, 5, ["rrf"]):
+        config.hybrid_fusion_strategy = bad_value
+        with pytest.raises(ValueError, match="hybrid_fusion_strategy"):
+            RetrievalService._should_apply_score_threshold(config)

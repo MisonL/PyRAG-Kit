@@ -16,6 +16,7 @@ from src.utils.config import (
     RetrievalMethod,
     Settings,
     is_double_convertible,
+    require_chat_temperature,
     require_retrieval_method,
     safe_repr,
     to_finite_float,
@@ -398,14 +399,11 @@ class SessionConfig(MutableMapping[str, Any]):
 
     @staticmethod
     def _validate_chat_temperature(value: Any) -> float:
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise ValueError(f"chat_temperature 必须是数值，但得到 {safe_repr(value)}。")
-        if not is_double_convertible(value):
-            raise ValueError(f"chat_temperature 必须是非负有限数值，但得到 {safe_repr(value)}。")
-        number = float(value)
-        if not math.isfinite(number) or number < 0.0:
-            raise ValueError(f"chat_temperature 必须是非负有限数值，但得到 {safe_repr(value)}。")
-        return number
+        # 判据与措辞都交给 ``require_chat_temperature``：同一字段在配置边界（这里）
+        # 与运行期读取侧（``ChatService.generate_reply``／``Chatbot.chat_async`` 的
+        # 兜底分支）必须给出同一种收场，否则「写进去被拒」与「读出来报错」会分成
+        # 两套消息。
+        return require_chat_temperature(value)
 
     def __delitem__(self, key: str) -> None:
         raise TypeError("SessionConfig 不支持删除字段。")

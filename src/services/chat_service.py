@@ -7,6 +7,7 @@ from src.providers.__base__.model_provider import LargeLanguageModel
 from src.runtime.contracts import SessionConfig
 from src.services.retrieval_service import RetrievalService
 from src.ui.display_utils import document_content, document_source
+from src.utils.config import require_chat_temperature
 from src.utils.log_manager import get_chat_logger
 from src.utils.security import safe_exception_text
 
@@ -55,7 +56,14 @@ class ChatService:
     ) -> AsyncGenerator[str, None]:
         prompt = self._build_prompt(user_input, intent, documents)
         invoke_kwargs: dict[str, Any] = {"prompt": prompt, "stream": True}
-        invoke_kwargs.update(self._temperature_kwargs(session_config.chat_temperature))
+        # 收敛后再用：``chat_temperature`` 的两个校验器都在**写入**侧，而
+        # ``SessionConfig`` 是公开类、普通属性没有 ``__setattr__`` 守卫——直写
+        # ``"abc"``／``None``／``[0.5]``／``True``／``-1`` 会原样进请求 kwargs
+        # （实测），而它们正是 ``session_config["chat_temperature"] = ...`` 明确
+        # 拒绝的取值。非法值到服务端才暴露，用户看到的是接口参数错误。
+        invoke_kwargs.update(
+            self._temperature_kwargs(require_chat_temperature(session_config.chat_temperature))
+        )
         async for chunk in self.llm_model.ainvoke(**invoke_kwargs):
             yield chunk
 

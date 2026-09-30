@@ -311,7 +311,18 @@
 
   现新增共享助手 `require_retrieval_method`（`src/utils/config.py`，`RetrievalMethod` 的归属地），三个取用点与 `SessionConfig._validate_retrieval_method` 共用它——配置边界与运行期读取侧从此只有一处判据、一种消息。判据按**属性存在性**而不是具体类型（与同文件 `require_detail_attributes` 同一约定：使用方只要求取值提供 `.value`，任何具备它的对象都能工作，仓库既有测试就用 `SimpleNamespace(value="混合检索")` 作替身）。接受枚举成员与它的字符串取值（`config.toml` 的 `chat_retrieval_method` 走的就是后者）；**不做**大小写／别名归一——静默接受 `"hybrid"` 等于把「配置写错了」变成「检索行为悄悄变了」。
 
+- **补齐 `chat_temperature` 的取值收敛**：该字段有**完整**的校验器（`Settings.validate_chat_temperature` 与 `SessionConfig._validate_chat_temperature` 各一份，判据一致：拒 `bool`、非数值、非有限、负数、超出双精度的整数），但两个**读取点**都直读原属性，而 `SessionConfig` 是公开类、普通属性没有 `__setattr__` 守卫：
+
+  - **`ChatService.generate_reply` 把非法取值静默送进请求**：`session_config.chat_temperature` 直接进 `CompletionRequest`，再原样成为 SDK 的 kwargs。实测 `"abc"`／`None`／`[0.5]`／`True`／`-1` 全部**静默通过**——而它们正是 `session_config["chat_temperature"] = ...` 会明确拒绝的取值。同一个字段「写得进就合法、直写就非法」两种口径；非法值要到服务端才暴露，用户看到的是接口返回的参数错误，而不是一条本地配置错误。
+  - **`Chatbot.chat_async` 的兜底分支**（`chat_service` 缺失时）读 `self.session_config["chat_temperature"]`，同一个值、同一后果。
+
+  现新增共享助手 `require_chat_temperature`（`src/utils/config.py`），两个读取点与 `SessionConfig._validate_chat_temperature` 共用它——与上一轮的 `require_retrieval_method` 同一模式。
+
+- **修正 `_should_apply_score_threshold` 兜底分支的判据方向**：该方法的 docstring 写着「`fusion_strategy` 由调用方传入**已收敛**的取值：`retrieve` 已经校验过，这里再读一次原属性会绕过那道校验」，但它的**兜底分支**恰恰就在读原属性。判据是 `strategy == "rrf"`，而 `"RRF"`／`" rrf "`／`"Rrf"` 走的是 RRF 融合却不等于这个字面量——阈值过滤被错误地套用在排名倒数的量纲上（结果被静默清空），正是 `_coerce_fusion_strategy` 的 docstring 记录过的那个缺陷，只是留在了库调用方这条路径上。实测修复前 `hybrid_fusion_strategy="RRF"` 返回 `True`。同一处还把 `retrieval_method` 改为经 `require_retrieval_method` 收敛——与字面量比较对未知取值不会报错，而是静默判定「不是混合检索」。生产路径（`retrieve`）传的是收敛后的值，因此这条只在库调用方直接调本方法时可达，属契约一致性修复。
+
 ### 测试
+
+- 新增第九轮的回归用例（18 个用例；回退源码后其中 11 个变红，7 个「不误伤」反向守卫保持绿）：`generate_reply` 对六类不可用 `chat_temperature`（`str`／`None`／`list`／`bool`／负数／位数超限整数）的拒绝**且断言被拒前未发起请求**（只断言「抛了 ValueError」会让「先发请求再校验」的实现也通过）、五条合法取值照旧传给模型并收敛成 `float`、配置边界与运行期读取侧对同一取值给出同一种收场（这条盯「只修一边」）；以及 RRF 融合在任何大小写／空白形态下都跳过阈值过滤、`weighted` 与非混合检索仍套用阈值、兜底分支对无法识别的策略报错而不是静默当成「非 RRF」。
 
 - 新增第八轮的回归用例（19 个用例；回退源码后其中 12 个变红，7 个「不误伤」反向守卫保持绿）：`retrieve` 对六类不可用 `retrieval_method`（英文别名／缩写／`None`／`int`／`list`／位数超限整数）的拒绝**且断言被拒前未发起任何一路检索**（只断言「抛了 ValueError」会让「先检索再校验」的实现也通过）、`display_chat_config` 对四类的拒绝、六条合法取值（枚举成员与字符串取值 × 三种模式）照旧走对分支、合法取值照旧渲染、配置边界与运行期读取侧对同一取值给出同一种收场（这条盯「只修一边」），以及共享助手对鸭子类型替身的接受与对取值形态不对时的拒绝。
 
