@@ -3380,3 +3380,198 @@ def test_model_detail_lookup_renders_a_huge_integer_key():
     configurations = {_HUGE_INT: detail}
 
     assert _require_model_detail(configurations, _HUGE_INT, "Rerank") is detail
+
+
+# ── 嵌套响应容器：与顶层同一判据 ──
+#
+# 前三轮把**顶层**容器收敛了（Google 的 candidates、Ark 的 output／tool_calls、
+# openai 兼容的 output／tool_calls／choices），但**嵌套**一层的容器仍是
+# ``field(x, ..., []) or []``——只挡 ``None`` 与空值。实测全部抛裸
+# ``TypeError: 'int' object is not iterable``，而各 provider 的错误分类按
+# ``RuntimeError`` 写。这正是「判据只做了一半」：同一个形态在顶层被拒、在下一层
+# 被放行。
+#
+# 可达性按 SDK 的响应构造方式分（对照表见第十四轮条目）：
+#   * openai / Ark / anthropic 走 ``construct_type``，**不校验** -> 线上可达；
+#   * google 走 ``model_validate``，畸形容器在 SDK 层被拒 -> 替身场景。
+
+
+def _google_response_with_parts(parts):
+    """构造 ``candidates[].content.parts`` 形态的 Google 响应替身。"""
+    return SimpleNamespace(candidates=[SimpleNamespace(content=SimpleNamespace(parts=parts))])
+
+
+@pytest.mark.parametrize(
+    "bad_parts",
+    [
+        pytest.param(5, id="int"),
+        pytest.param({"0": {}}, id="mapping"),
+        pytest.param("ab", id="str"),
+    ],
+)
+def test_google_nested_parts_must_be_a_list(bad_parts):
+    """``candidates[].content.parts`` 非列表必须收敛成 ``RuntimeError``。"""
+    with pytest.raises(RuntimeError, match="parts 必须是列表"):
+        GoogleProvider._response_text(_google_response_with_parts(bad_parts))
+
+
+def test_google_nested_parts_keeps_working_for_a_valid_response():
+    """收紧不能误伤：正常的 parts 照旧解析出正文。"""
+    response = _google_response_with_parts(
+        [SimpleNamespace(text="你好", thought=False), SimpleNamespace(text="世界", thought=False)]
+    )
+    assert GoogleProvider._response_text(response) == "你好世界"
+
+
+@pytest.mark.parametrize(
+    "bad_embeddings",
+    [
+        pytest.param(5, id="int"),
+        pytest.param({"0": {}}, id="mapping"),
+        pytest.param("ab", id="str"),
+    ],
+)
+def test_google_embeddings_must_be_a_list(bad_embeddings):
+    """Embedding 响应的 ``embeddings`` 非列表必须收敛成 ``RuntimeError``。"""
+    with pytest.raises(RuntimeError, match="embeddings 必须是列表"):
+        GoogleProvider._require_embeddings(
+            SimpleNamespace(embeddings=bad_embeddings), source="Embedding 响应"
+        )
+
+
+@pytest.mark.parametrize(
+    "bad_content",
+    [
+        pytest.param(5, id="int"),
+        pytest.param({"0": {}}, id="mapping"),
+        pytest.param("ab", id="str"),
+    ],
+)
+def test_ark_nested_output_content_must_be_a_list(bad_content):
+    """``output[].content`` 非列表必须收敛成 ``RuntimeError``（Ark 线上可达）。"""
+    from src.providers.volcengine import _ark_responses_output_text
+
+    response = SimpleNamespace(output=[SimpleNamespace(type="message", content=bad_content)])
+    with pytest.raises(RuntimeError, match="content 必须是列表"):
+        _ark_responses_output_text(response)
+
+
+def test_ark_nested_output_content_keeps_working_for_a_valid_response():
+    """收紧不能误伤：正常的嵌套 content 照旧解析出正文。"""
+    from src.providers.volcengine import _ark_responses_output_text
+
+    response = SimpleNamespace(
+        output=[
+            SimpleNamespace(
+                type="message",
+                content=[SimpleNamespace(type="output_text", text="hi")],
+            )
+        ]
+    )
+    assert _ark_responses_output_text(response) == "hi"
+
+
+@pytest.mark.parametrize(
+    "bad_choices",
+    [
+        pytest.param(5, id="int"),
+        pytest.param({"0": {}}, id="mapping"),
+        pytest.param("ab", id="str"),
+    ],
+)
+def test_openai_responses_path_guards_choices(bad_choices):
+    """Responses 路径下 ``choices`` 非列表必须收敛成 ``RuntimeError``。
+
+    **Responses 路径没有别处替它把关**：``_raise_for_chat_response_error``
+    （含 choices 形态守卫）只被 Chat 路径调用，而 ``_invoke_responses`` 走的是
+    ``_raise_for_response_error``——后者只查 ``error`` 与 ``status``。
+    """
+    response = SimpleNamespace(
+        choices=bad_choices, output=[], status="completed", id="r", usage=None
+    )
+    with pytest.raises(RuntimeError, match="choices 必须是列表"):
+        OpenAICompatibleProvider._extract_response_text(response)
+
+
+@pytest.mark.parametrize(
+    "bad_content",
+    [
+        pytest.param(5, id="int"),
+        pytest.param({"0": {}}, id="mapping"),
+        pytest.param("ab", id="str"),
+    ],
+)
+def test_openai_nested_output_content_must_be_a_list(bad_content):
+    """``output[].content`` 非列表必须收敛成 ``RuntimeError``。"""
+    response = SimpleNamespace(
+        choices=[], output=[SimpleNamespace(type="message", content=bad_content)], usage=None
+    )
+    with pytest.raises(RuntimeError, match=r"output\[\]\.content 必须是列表"):
+        OpenAICompatibleProvider._extract_response_text(response)
+
+
+@pytest.mark.parametrize(
+    "bad_content",
+    [
+        pytest.param(5, id="int"),
+        pytest.param({"0": {}}, id="mapping"),
+        pytest.param("ab", id="str"),
+    ],
+)
+def test_anthropic_content_must_be_a_list(bad_content):
+    """Anthropic 响应的顶层 ``content`` 非列表必须收敛成 ``RuntimeError``。
+
+    **线上可达**：anthropic SDK 的 ``_strict_response_validation`` 实测默认
+    ``False``，走 ``construct_type``，不执行 pydantic 校验（与 openai／Ark 同类）。
+    """
+    from src.providers.anthropic import AnthropicProvider
+
+    response = SimpleNamespace(content=bad_content, stop_reason="end_turn", usage=None)
+    with pytest.raises(RuntimeError, match="content 必须是列表"):
+        AnthropicProvider._extract_result(response)
+
+
+def test_anthropic_content_keeps_working_for_a_valid_response():
+    """收紧不能误伤：正常的 content 块照旧解析。"""
+    from src.providers.anthropic import AnthropicProvider
+
+    response = SimpleNamespace(
+        content=[SimpleNamespace(type="text", text="你好")],
+        stop_reason="end_turn",
+        usage=None,
+        id="x",
+        model="m",
+    )
+    assert AnthropicProvider._extract_result(response).text == "你好"
+
+
+@pytest.mark.parametrize(
+    "bad_data",
+    [
+        pytest.param(5, id="int"),
+        pytest.param({"0": {}}, id="mapping"),
+        pytest.param("ab", id="str"),
+    ],
+)
+def test_ark_tokenization_data_must_be_a_list(bad_data):
+    """Ark tokenization 响应的 ``data`` 非列表必须收敛成 ``RuntimeError``。"""
+    from unittest.mock import MagicMock
+
+    from src.providers.volcengine import VolcengineProvider
+
+    provider = VolcengineProvider.__new__(VolcengineProvider)
+    provider._provider = "volcengine"
+    provider._protocol = "chat_completions"
+    provider._model_name = "m"
+    provider._client = None
+    provider._aclient = None
+    provider._options = {}
+    provider._server_verified_protocols = frozenset()
+    client = MagicMock()
+    client.tokenization.create.return_value = SimpleNamespace(data=bad_data)
+
+    with (
+        patch.object(provider, "_get_client", return_value=client),
+        pytest.raises(RuntimeError, match="data 必须是列表"),
+    ):
+        provider.count_tokens("hi")

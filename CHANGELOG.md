@@ -382,7 +382,18 @@
 
   触发条件只是一个配置项：`config.toml` 里写 `cache_path = "/tmp"`（或 `/Users`／`/opt`）。判据补为**相等**，因此只挡系统根本身，卷内／目录内的正常缓存位置不受影响——`/tmp/myapp/cache`、`/opt/myapp/cache`、`/Volumes/MyDrive/cache`、`/Users/someone/Library/Caches/app` 全部继续放行（本函数从不过度拦截用户有意指定的缓存目录，见下方「目录名不是 `.cache` 时只警告不阻断」的既有取舍）。
 
+- **补齐嵌套响应容器的形态守卫**：第十三／十四轮把**顶层**容器收敛了（Google 的 `candidates`、Ark 的 `output`／`tool_calls`、OpenAI 兼容的 `output`／`tool_calls`／`choices`），但**嵌套一层**的容器仍是 `field(x, ..., []) or []`——只挡 `None` 与空值，挡不住其它形态。实测全部抛裸 `TypeError: 'int' object is not iterable`，而各 provider 的错误分类按 `RuntimeError` 写。这是「判据只做了一半」的又一实例：同一个形态在顶层被拒、在下一层被放行。
+
+  - **Google**（5 处 `candidates[].content.parts`、4 处 Embedding `embeddings`）：新增 `_require_parts` 与 `_require_embeddings`。可达性同 `_require_candidates`——google-genai 走 `model_validate`，畸形容器在 SDK 层就被拒，因此守的是替身场景与契约一致性。
+  - **Ark**（3 处 `output[].content`、2 处 tokenization `data`）：新增 `_require_ark_content`，`data` 复用既有的 `_require_ark_list`。**线上可达**（Ark SDK 走 `construct_type`，不校验）。
+  - **Anthropic**（顶层 `content`）：**线上可达**——实测 `anthropic` SDK 的 `_strict_response_validation` 默认 `False`，与 openai／Ark 同类。
+  - **OpenAI 兼容**（3 处 `output[].content`，以及 Responses 路径的 `choices`）：`choices` 这条尤其要紧——**Responses 路径没有别处替它把关**：`_raise_for_chat_response_error`（含 choices 形态守卫）只被 Chat 路径调用，而 `_invoke_responses` 走的是 `_raise_for_response_error`，后者只查 `error` 与 `status`。实测 Responses 响应带 `choices=5` 时抛裸 `TypeError`。
+
+  共 19 处读取点接入守卫；`None` 与空值的既有语义保持不变（`None` 继续表示「该字段不存在」，正常中间态依赖它）。
+
 ### 测试
+
+- 新增第十九轮的回归用例（20 个用例；回退源码后其中 21 个参数化实例变红）：Google 嵌套 `parts`／`embeddings`、Ark 嵌套 `content`／tokenization `data`、OpenAI 兼容 Responses `choices` 与嵌套 `content`、Anthropic 顶层 `content` 六类读取点各对 `int`／`mapping`／`str` 三种非法形态的拒绝；以及三条「不误伤」反向守卫——Google `parts`、Ark 嵌套 `content`、Anthropic `content` 的正常响应照旧解析。
 
 - 新增第十八轮的回归用例（20 个用例；回退源码后其中 16 个变红）：16 个系统级根（`/tmp`／`/private/tmp`／`/Users`／`/home`／`/opt`／`/dev`／`/proc`／`/sys`／`/boot`／`/run`／`/srv`／`/mnt`／`/media`／`/root`／`/Volumes`／`/private`）必须拒绝；以及 4 个「不误伤」反向守卫——系统根**内部**的缓存目录（`/tmp/myapp/cache`／`/opt/myapp/cache`／`/Volumes/MyDrive/cache`／`/Users/someone/Library/Caches/app`）照常放行。
 

@@ -1859,7 +1859,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             saw_parts = False
             for candidate in candidates:
                 content = field(candidate, "content")
-                for part in field(content, "parts", []) or []:
+                for part in GoogleProvider._require_parts(content, source="响应"):
                     saw_parts = True
                     if field(part, "thought", False):
                         continue
@@ -1877,7 +1877,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         chunks = []
         for candidate in candidates:
             content = field(candidate, "content")
-            for part in field(content, "parts", []) or []:
+            for part in GoogleProvider._require_parts(content, source="响应"):
                 if field(part, "thought", False):
                     continue
                 text = field(part, "text", "")
@@ -1896,6 +1896,43 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             "MODEL_ARMOR",
         }
     )
+
+    @staticmethod
+    def _require_parts(owner: Any, *, source: str) -> list[Any]:
+        """把内容块里的 ``parts`` 收敛成列表，非法形态给出可读的 ``RuntimeError``。
+
+        ``parts`` 是 ``candidates[].content`` 下的**嵌套**容器，本文件有 **5 处**
+        直接迭代它。此前每一处都只写 ``field(content, "parts", []) or []``——与
+        顶层 ``candidates`` 修复前的写法完全相同，同样只挡住 ``None`` 与空值。
+        实测 ``content.parts = 5`` 抛裸 ``TypeError: 'int' object is not iterable``，
+        而本 provider 的错误分类按 ``RuntimeError`` 写。
+
+        与 ``_require_candidates`` 的**可达性说明相同**：google-genai 的响应经
+        ``GenerateContentResponse._from_response`` → ``cls.model_validate(response)``
+        构造，**会**执行 pydantic 校验，畸形容器在 SDK 层就被拒。因此本条守的是
+        替身场景与「将来 SDK 改成不校验」的契约一致性，不是线上流量。
+        """
+        parts = field(owner, "parts", []) or []
+        if not isinstance(parts, (list, tuple)):
+            raise RuntimeError(f"Google {source}的 parts 必须是列表，但得到 {safe_repr(parts)}。")
+        return list(parts)
+
+    @staticmethod
+    def _require_embeddings(owner: Any, *, source: str) -> list[Any]:
+        """把 Embedding 响应的 ``embeddings`` 收敛成列表，非法形态抛 ``RuntimeError``。
+
+        本文件有 **4 处**读它（同步／异步 × Vertex 单内容／批量），此前都写
+        ``list(field(response, "embeddings", []) or [])``——``or []`` 只挡 ``None``
+        与空值，``list(5)`` 抛裸 ``TypeError: 'int' object is not iterable``，而
+        调用方的错误分类按 ``RuntimeError`` 写（紧邻的「返回数量与输入文本数量
+        不一致」就是 ``RuntimeError``）。可达性同 ``_require_parts``。
+        """
+        embeddings = field(owner, "embeddings", []) or []
+        if not isinstance(embeddings, (list, tuple)):
+            raise RuntimeError(
+                f"Google {source}的 embeddings 必须是列表，但得到 {safe_repr(embeddings)}。"
+            )
+        return list(embeddings)
 
     @staticmethod
     def _require_candidates(owner: Any, *, source: str) -> list[Any]:
@@ -1928,7 +1965,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
     def _candidate_refusal(cls, candidate: Any) -> str | None:
         """读取 Gemini 内容块或安全拦截元数据中的拒答原因。"""
         content = field(candidate, "content")
-        for part in field(content, "parts", []) or []:
+        for part in GoogleProvider._require_parts(content, source="响应"):
             value = field(part, "refusal")
             if not value and field(part, "type") == "refusal":
                 value = field(part, "text") or field(part, "reason")
@@ -2357,7 +2394,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         reasoning: list[str] = []
         for candidate in GoogleProvider._require_candidates(response, source="响应"):
             content = field(candidate, "content")
-            for part in field(content, "parts", []) or []:
+            for part in GoogleProvider._require_parts(content, source="响应"):
                 function_call = field(part, "function_call")
                 if function_call:
                     calls.append(
@@ -2392,7 +2429,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         response_id = field(chunk, "response_id")
         for candidate in cls._require_candidates(chunk, source="流块"):
             content = field(candidate, "content")
-            parts = field(content, "parts", []) or []
+            parts = cls._require_parts(content, source="流块")
             refusal_emitted = False
             for part in parts:
                 function_call = field(part, "function_call")
@@ -4431,7 +4468,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                     response = client.models.embed_content(
                         model=self._model_name, contents=[text], config=config
                     )
-                    values = list(field(response, "embeddings", []) or [])
+                    values = GoogleProvider._require_embeddings(response, source="Embedding 响应")
                     if len(values) != 1:
                         raise RuntimeError(
                             "Google Vertex Embedding 单内容请求未返回唯一 embedding。"
@@ -4441,7 +4478,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                 response = client.models.embed_content(
                     model=self._model_name, contents=texts, config=config
                 )
-                values = list(field(response, "embeddings", []) or [])
+                values = GoogleProvider._require_embeddings(response, source="Embedding 响应")
                 if len(values) != len(texts):
                     raise RuntimeError("Google Embedding 返回数量与输入文本数量不一致。")
                 embeddings = [normalize_embedding_vector(field(item, "values")) for item in values]
@@ -4497,7 +4534,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                             model=self._model_name, contents=[text], config=config
                         )
                     )
-                    values = list(field(response, "embeddings", []) or [])
+                    values = GoogleProvider._require_embeddings(response, source="Embedding 响应")
                     if len(values) != 1:
                         raise RuntimeError(
                             "Google Vertex Embedding 单内容请求未返回唯一 embedding。"
@@ -4509,7 +4546,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                         model=self._model_name, contents=texts, config=config
                     )
                 )
-                values = list(field(response, "embeddings", []) or [])
+                values = GoogleProvider._require_embeddings(response, source="Embedding 响应")
                 if len(values) != len(texts):
                     raise RuntimeError("Google Embedding 返回数量与输入文本数量不一致。")
                 embeddings = [normalize_embedding_vector(field(item, "values")) for item in values]

@@ -1636,7 +1636,13 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             return output_text
 
         chunks: list[str] = []
-        choices = field(response, "choices", []) or []
+        # ``choices`` 同样要收敛。**Responses 路径没有别处替它把关**：
+        # ``_raise_for_chat_response_error``（含 choices 形态守卫）只被 Chat 路径
+        # 调用，而 ``_invoke_responses`` 走的是 ``_raise_for_response_error``——
+        # 后者只查 ``error`` 与 ``status``，不碰 ``choices``。实测 Responses 响应
+        # 带 ``choices=5`` 时本行抛裸 ``TypeError: 'int' object is not iterable``，
+        # 而调用方的错误分类按 ``RuntimeError`` 写。
+        choices = cls._require_response_list(field(response, "choices", []) or [], label="choices")
         for choice in choices:
             message = field(choice, "message") or field(choice, "delta")
             text = field(message, "content")
@@ -1645,7 +1651,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         if chunks:
             return "".join(chunks)
         for item in cls._require_response_list(field(response, "output", []) or [], label="output"):
-            for content in field(item, "content", []) or []:
+            for content in cls._require_response_list(
+                field(item, "content", []) or [], label="output[].content"
+            ):
                 text = field(content, "text")
                 if isinstance(text, str):
                     chunks.append(text)
@@ -1735,7 +1743,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                         text = field(entry, "text")
                         if isinstance(text, str):
                             values.append(text)
-                for content in field(item, "content", []) or []:
+                for content in cls._require_response_list(
+                    field(item, "content", []) or [], label="output[].content"
+                ):
                     text = field(content, "text")
                     if isinstance(text, str):
                         values.append(text)
@@ -1757,7 +1767,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             refusal = field(item, "refusal")
             if isinstance(refusal, str) and refusal:
                 return refusal
-            for content in field(item, "content", []) or []:
+            for content in cls._require_response_list(
+                field(item, "content", []) or [], label="output[].content"
+            ):
                 if field(content, "type") != "refusal":
                     continue
                 refusal = field(content, "refusal") or field(content, "text")

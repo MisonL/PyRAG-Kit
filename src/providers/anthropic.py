@@ -1036,7 +1036,19 @@ class AnthropicProvider(LargeLanguageModel):
 
     @classmethod
     def _extract_result(cls, response: Any) -> CompletionResult:
+        # ``content`` 是 Anthropic 响应的顶层块容器。此前写
+        # ``field(response, "content", []) or []``
+        # ——那只挡住 ``None`` 与空值。实测 ``content=5`` 抛裸
+        # ``TypeError: 'int' object is not iterable``，而本 provider 的错误分类
+        # 按 ``RuntimeError`` 写（同一文件对拒答等情形用的就是它）。
+        #
+        # **本条线上可达**：anthropic SDK 的 ``_base_client`` 在
+        # ``_strict_response_validation`` 为假时走 ``construct_type``——该标志
+        # 实测默认 ``False``，与 openai／Ark 同类，不执行 pydantic 校验。
         blocks = field(response, "content", []) or []
+        if not isinstance(blocks, (list, tuple)):
+            raise RuntimeError(f"Anthropic 响应的 content 必须是列表，但得到 {safe_repr(blocks)}。")
+        blocks = list(blocks)
         # ``field`` 只在键不存在时返回默认值；键存在而值为 None 时仍返回 None，
         # 而 SDK 的部分块（如 thinking / redacted_thinking）确实会给出 None。
         # 直接 join 会抛 ``TypeError: expected str instance, NoneType found``。

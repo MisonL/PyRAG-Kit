@@ -107,6 +107,25 @@ def _require_ark_list(value: Any, *, label: str) -> list[Any]:
     return list(value)
 
 
+def _require_ark_content(item: Any, *, label: str) -> list[Any]:
+    """把 Responses 输出项里的嵌套 ``content`` 收敛成列表。
+
+    ``output[].content`` 是 ``output`` 之下的一层容器，本文件有 **3 处**直接迭代
+    它，此前都写 ``field(item, "content", []) or []``——与顶层 ``output`` 修复前的
+    写法完全相同。实测 ``item.content = 5`` 抛裸
+    ``TypeError: 'int' object is not iterable``，而本 provider 的错误分类按
+    ``RuntimeError`` 写（顶层 ``output``／``tool_calls``／``choices`` 都已按同一
+    判据修过）。
+
+    与 google 不同，**本条线上可达**：Ark SDK 的 ``_base_client`` 走
+    ``construct_type``，不执行 pydantic 校验（对照表见 ``_require_ark_list``）。
+    """
+    content = field(item, "content", []) or []
+    if not isinstance(content, (list, tuple)):
+        raise RuntimeError(f"Ark {label} 必须是列表，但得到 {safe_repr(content)}。")
+    return list(content)
+
+
 def _ark_responses_has_builtin_tool_items(response: Any) -> bool:
     """判断响应里是否含 Ark 内置工具的调用项。"""
     for item in _require_ark_list(field(response, "output", []) or [], label="响应的 output"):
@@ -125,7 +144,7 @@ def _ark_responses_output_text(response: Any) -> str:
     """
     chunks: list[str] = []
     for item in _require_ark_list(field(response, "output", []) or [], label="响应的 output"):
-        for content in field(item, "content", []) or []:
+        for content in _require_ark_content(item, label="响应的 output[].content"):
             if enum_field(content, "type") not in {"output_text", "text"}:
                 continue
             piece = field(content, "text")
@@ -1557,7 +1576,7 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
                         reasoning_text = field(entry, "text")
                         if isinstance(reasoning_text, str):
                             reasoning += reasoning_text
-                for content in field(item, "content", []) or []:
+                for content in _require_ark_content(item, label="响应的 output[].content"):
                     reasoning_text = field(content, "text")
                     if isinstance(reasoning_text, str):
                         reasoning += reasoning_text
@@ -1568,7 +1587,7 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
                 candidate_refusal = field(item, "refusal") or field(item, "text")
                 if isinstance(candidate_refusal, str) and candidate_refusal:
                     refusal = candidate_refusal
-            for content in field(item, "content", []) or []:
+            for content in _require_ark_content(item, label="响应的 output[].content"):
                 if field(content, "type") != "refusal":
                     continue
                 candidate_refusal = field(content, "refusal") or field(content, "text")
@@ -2471,7 +2490,13 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         response = self._get_client().tokenization.create(
             text=text, model=self._model_name, **kwargs
         )
-        values = field(response, "data", []) or []
+        # ``data`` 的形态同样要收敛：``or []`` 只挡 ``None`` 与空值，实测
+        # ``data=5`` 时下面的生成器迭代抛裸
+        # ``TypeError: 'int' object is not iterable``——而紧邻的「缺少 data」
+        # 是 ``RuntimeError``，同一份响应的两种形态不该得到两种异常分类。
+        values = _require_ark_list(
+            field(response, "data", []) or [], label="tokenization 响应的 data"
+        )
         if not values:
             raise RuntimeError("Ark tokenization 响应缺少 data。")
         # 与其余七个 token 计数入口（``require_token_count``）保持同一契约：
@@ -2821,7 +2846,13 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         response = await self._resolve_async_result(
             self._get_aclient().tokenization.create(text=text, model=self._model_name, **kwargs)
         )
-        values = field(response, "data", []) or []
+        # ``data`` 的形态同样要收敛：``or []`` 只挡 ``None`` 与空值，实测
+        # ``data=5`` 时下面的生成器迭代抛裸
+        # ``TypeError: 'int' object is not iterable``——而紧邻的「缺少 data」
+        # 是 ``RuntimeError``，同一份响应的两种形态不该得到两种异常分类。
+        values = _require_ark_list(
+            field(response, "data", []) or [], label="tokenization 响应的 data"
+        )
         if not values:
             raise RuntimeError("Ark tokenization 响应缺少 data。")
         # 与其余七个 token 计数入口（``require_token_count``）保持同一契约：
