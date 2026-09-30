@@ -616,7 +616,7 @@ class RetrievalService:
         ranked_results = _promote_parent_context(ranked_results, parent_resolver)
         ranked_results = _deduplicate_parent_documents(ranked_results)
         ranked_results = await self._rerank_if_needed(
-            query, ranked_results, session_config, rerank_enabled=rerank_enabled
+            query, ranked_results, session_config, rerank_enabled=rerank_enabled, top_k=top_k
         )
         # 出口统一把 ``score`` 收敛成有限浮点。三条检索路径的来源不同：
         # ``FaissStore`` 自己写的是 float，第三方 store 可能是数字字符串或
@@ -625,7 +625,14 @@ class RetrievalService:
         # 展示又各自按不同规则解释它。这里让出口的契约只有一种形态。
         for document in ranked_results:
             document["score"] = coerce_score(document.get("score"))
-        return ranked_results[: max(1, session_config.top_k)]
+        # 用**已收敛**的 ``top_k`` 而不是重读原属性：``retrieve`` 开头就把
+        # ``session_config.top_k`` 收敛进了局部变量，这里重读等于绕过那道校验。
+        # 该字段可被直写，而 ``max()`` 对非数值抛裸 ``TypeError``——实测并发场景下
+        # （``retrieve`` 是 async，中间有多处 ``await``）在检索飞行中把 ``top_k``
+        # 直写成 ``"abc"``，本行抛
+        # ``TypeError: '>' not supported between instances of 'str' and 'int'``，
+        # 穿透调用方的 ``except ValueError`` 分类。
+        return ranked_results[: max(1, top_k)]
 
     async def _gather_hybrid_results(
         self, query: str, top_k: int
@@ -842,6 +849,7 @@ class RetrievalService:
         session_config: SessionConfig,
         *,
         rerank_enabled: bool | None = None,
+        top_k: int | None = None,
     ) -> list[dict[str, Any]]:
         """按需重排。
 
@@ -871,7 +879,15 @@ class RetrievalService:
         docs_to_rerank = [document_content(doc, "") for doc in ranked_results]
         # Keep the requested output bounded by the available candidates after
         # thresholding and parent de-duplication.
-        rerank_top_n = max(1, min(session_config.top_k, len(docs_to_rerank)))
+        # 与 ``rerank_enabled`` 同一处置：优先用调用方传入的**已收敛**取值。
+        # 本方法的 docstring 明确「供库调用方直接调本方法」，而库调用方不经过
+        # ``retrieve`` 开头那道收敛——实测直写 ``top_k="abc"``／``None``／``[1]``
+        # 时 ``min()`` 抛裸 ``TypeError: '<' not supported between instances of
+        # 'int' and 'str'``，不是 ``ValueError``。
+        effective_top_k = (
+            require_scale_field(session_config.top_k, "top_k") if top_k is None else top_k
+        )
+        rerank_top_n = max(1, min(effective_top_k, len(docs_to_rerank)))
         rerank_result = await rerank_provider.arerank(query, docs_to_rerank, top_n=rerank_top_n)
         reranked_indices, reranked_scores = self._validate_rerank_output(
             *_unpack_rerank_result(rerank_result),

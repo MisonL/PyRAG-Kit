@@ -3173,3 +3173,123 @@ def test_config_menu_keeps_working_for_a_real_boolean():
         config["rerank_enabled"] = enabled
         assert _rerank_menu_label(config) == label
         assert _rerank_default(config) is enabled
+
+
+# ── top_k：已收敛的字段不得在同一个函数里被重读 ──
+#
+# ``RetrievalService.retrieve`` 在开头就把 ``session_config.top_k`` 收敛进局部
+# 变量（``require_scale_field``），但两处下游**重新读原属性**：
+#
+#   * ``retrieve`` 出口的切片 ``ranked_results[: max(1, session_config.top_k)]``；
+#   * ``_rerank_if_needed`` 的 ``max(1, min(session_config.top_k, ...))``——该
+#     方法的 docstring 明确写着「供库调用方直接调本方法」，而库调用方不经过
+#     ``retrieve`` 开头那道收敛。
+#
+# 该字段可被直写（``SessionConfig`` 是公开类，普通属性没有 ``__setattr__``
+# 守卫）。静态非法值会被开头那道收敛拦下，但 ``retrieve`` 是 async、中间有多处
+# ``await``——**检索飞行中**改写属性就会绕过它。实测两条路径都抛裸
+# ``TypeError: '>' not supported between instances of 'str' and 'int'``
+# （库调用方路径是 ``'<'``），不是调用方按 ``ValueError`` 写的分类。
+
+
+class _TopKStore:
+    """返回固定条目的最小向量存储替身。"""
+
+    def __init__(self, documents):
+        self._documents = documents
+
+    def semantic_search(self, query, top_k):
+        return [dict(doc) for doc in self._documents]
+
+    def keyword_search(self, query, top_k):
+        return [dict(doc) for doc in self._documents]
+
+
+class _RerankStub:
+    """返回「全部保留、分数相同」的 rerank 替身。"""
+
+    async def arerank(self, query, documents, top_n=None):
+        from src.providers.__base__.model_provider import RerankResult
+
+        return RerankResult(indices=list(range(len(documents))), scores=[0.5] * len(documents))
+
+
+@pytest.mark.parametrize(
+    "written",
+    [
+        pytest.param("abc", id="str"),
+        pytest.param(None, id="none"),
+        pytest.param([1], id="list"),
+        pytest.param(True, id="bool"),
+    ],
+)
+def test_rerank_if_needed_rejects_a_directly_written_top_k(written):
+    """库调用方直调 ``_rerank_if_needed`` 时，非法 ``top_k`` 必须收敛成 ``ValueError``。
+
+    ``min(1, session_config.top_k)`` 对非数值抛裸 ``TypeError``，而本方法的
+    docstring 明确支持库调用方直接调用（那条路径不经过 ``retrieve`` 的收敛）。
+    """
+    import asyncio
+
+    from src.services.retrieval_service import RetrievalService
+
+    detail = SimpleNamespace(provider="siliconflow", model_name="m")
+    config = _session_config(
+        rerank_enabled=True,
+        rerank_configurations={"y": detail},
+    )
+    config.top_k = written
+
+    service = RetrievalService(vector_store=object(), embedding_service=object())
+    service._get_rerank_provider = lambda *args, **kwargs: _RerankStub()
+
+    with pytest.raises(ValueError, match="top_k 必须是整数"):
+        asyncio.run(
+            service._rerank_if_needed(
+                "q", [{"page_content": "d", "metadata": {}, "score": 0.9}], config
+            )
+        )
+
+
+def test_retrieve_uses_the_coerced_top_k_even_if_it_changes_mid_flight():
+    """检索飞行中改写 ``top_k`` 不得让出口切片抛裸 ``TypeError``。
+
+    ``retrieve`` 是 async，中间有多处 ``await``；属性可被直写，因此「开头收敛过
+    就安全」不成立。修法是让出口用**已收敛的局部变量**，而不是重读原属性。
+    """
+    import asyncio
+
+    import numpy as np
+
+    from src.services.retrieval_service import RetrievalService
+
+    documents = [
+        {"page_content": f"d{index}", "metadata": {"source": "s"}, "score": 0.9}
+        for index in range(3)
+    ]
+    gate = asyncio.Event()
+
+    class _GateEmbedding:
+        async def embed_query(self, query):
+            gate.set()  # 通知并发任务：现在改写配置
+            await asyncio.sleep(0.05)  # 让改写真正发生
+            return np.zeros(4, dtype=np.float32)
+
+    config = _session_config(retrieval_method=RetrievalMethod.SEMANTIC_SEARCH)
+    service = RetrievalService(
+        vector_store=_TopKStore(documents), embedding_service=_GateEmbedding()
+    )
+
+    async def mutate_mid_flight():
+        await gate.wait()
+        config.top_k = "abc"
+
+    async def run():
+        mutator = asyncio.create_task(mutate_mid_flight())
+        try:
+            return await service.retrieve(query="q", session_config=config, console=None)
+        finally:
+            await mutator
+
+    results = asyncio.run(run())
+    assert len(results) == 3

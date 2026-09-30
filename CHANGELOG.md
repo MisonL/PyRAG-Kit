@@ -360,7 +360,18 @@
 
   **两处读取点的处置不同，这是有意的**：`display_chat_config` 与同一张表的 `retrieval_method` 一致，**直接拒绝**（它本就在启动横幅处对非法取值报错）；`config_menu` 则降级——菜单由 `launch_config_editor` 经 `asyncio.to_thread` 调用，调用点只接 `(KeyboardInterrupt, EOFError)`，抛 `ValueError` 会终止整个会话，而菜单是用户唯一还能改配置的入口（`display_chat_config` 在上游已经拒绝）。因此菜单里非法取值显示「未知」、`confirm` 的默认项传 `None`（questionary 的合法默认，不预选），用户仍能进菜单把它改回布尔。
 
+- **修正 `top_k` 在同一个函数里被重读**：`RetrievalService.retrieve` 开头就把 `session_config.top_k` 收敛进局部变量（`require_scale_field`），但两处下游**重新读原属性**：
+
+  - `retrieve` 出口的切片 `ranked_results[: max(1, session_config.top_k)]`；
+  - `_rerank_if_needed` 的 `max(1, min(session_config.top_k, ...))`——该方法的 docstring 明确写着「供库调用方直接调本方法」，而库调用方**不经过** `retrieve` 开头那道收敛。
+
+  该字段可被直写（`SessionConfig` 是公开类、普通属性没有 `__setattr__` 守卫）。静态非法值会被开头那道收敛拦下，但 `retrieve` 是 async、中间有多处 `await`——**检索飞行中**改写属性就绕过了它。实测两条路径都抛裸 `TypeError: '>' not supported between instances of 'str' and 'int'`（库调用方路径是 `'<'`），而调用方的错误分类按 `ValueError` 写。
+
+  修法与同函数里 `rerank_enabled` 的既有处置一致：出口切片改用**已收敛的局部变量**；`_rerank_if_needed` 新增 `top_k` 形参，由 `retrieve` 传入收敛后的值，`None` 时自行经 `require_scale_field` 收敛（供库调用方直接调用的场景）。两处都只保留一份判据。
+
 ### 测试
+
+- 新增第十六轮的回归用例（5 个用例，回退源码后全部变红）：库调用方直调 `_rerank_if_needed` 时四类非法 `top_k`（`"abc"`／`None`／`[1]`／`True`）必须收敛成带指引的 `ValueError`；以及检索飞行中把 `top_k` 直写成 `"abc"` 后，出口切片仍须正常返回（用已收敛的局部变量）。
 
 - 新增第十五轮的回归用例（10 个用例；回退源码后其中 9 个变红，1 个「不误伤」反向守卫保持绿）：六个非布尔取值（`"false"`／`"no"`／`"true"`／`0`／`1`／`None`）下 UI 与服务层必须给出同一种收场；配置表不得把 `"false"` 显示成「启用」（原始症状）；菜单的标签与 `confirm` 默认项对非法取值降级为「未知」／`None`；以及真布尔取值照旧渲染「启用」／「禁用」的反向守卫。
 
