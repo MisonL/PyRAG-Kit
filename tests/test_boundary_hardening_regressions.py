@@ -3937,3 +3937,102 @@ def test_embed_in_batches_accepts_every_settings_legal_batch_size(value):
     matrix = asyncio.run(service.embed_in_batches(["x"]))
 
     assert matrix.shape == (1, 3)
+
+
+# ── 公开诊断入口的 provider_name / role 形态（同 `_get_model_detail` 的判据）──
+#
+# `ModelProviderFactory` 的三个**公开**诊断入口（`capabilities`／
+# `capability_report`／`protocol_status`，源码注释写明「配置界面和诊断使用」）
+# 此前对非法 `provider_name` 与 `role` 抛的是与「名字写错了」无关的异常：
+#
+#   provider_name=["a"] / {"k":1}  -> 裸 TypeError: unhashable type: 'list'/'dict'
+#   provider_name=10**4301         -> ValueError: Exceeds the limit (4300 digits)
+#   role=10**4301                  -> 同上（各自函数开头的 str(role) 转换）
+#
+# 同文件的 `_get_model_detail` 早已用同一判据收敛（键先判字符串再进成员判断，
+# 消息经 safe_repr）。同一个「渠道名/角色名写错了」的收场不该取决于走的是哪条
+# 入口。
+#
+# 判据收口位置有两处，都必须覆盖：
+#   * `_provider_info_for_role`（三个入口的共同路径）；
+#   * 各入口开头**早于**它的 `str(role).strip().lower()` 与推断分支——
+#     `protocol_status` 在 `role is None` 时会先对 provider_name 做字典查找。
+
+
+@pytest.mark.parametrize(
+    "provider_name",
+    [
+        pytest.param(["a"], id="list"),
+        pytest.param({"k": 1}, id="dict"),
+        pytest.param(None, id="none"),
+        pytest.param(5, id="int"),
+        pytest.param(10**4301, id="beyond-int-str-digits"),
+    ],
+)
+@pytest.mark.parametrize(
+    "entry",
+    [
+        pytest.param("capabilities", id="capabilities"),
+        pytest.param("capability_report", id="capability_report"),
+        pytest.param("protocol_status", id="protocol_status"),
+    ],
+)
+def test_diagnostic_entries_reject_malformed_provider_name(entry, provider_name):
+    """三个诊断入口对非法渠道名必须给带指引的 ``ValueError``。"""
+    from src.providers.factory import ModelProviderFactory
+
+    method = getattr(ModelProviderFactory, entry)
+    with pytest.raises(ValueError, match="provider 名称必须是字符串"):
+        if entry == "protocol_status":
+            method(provider_name, "chat_completions")
+        else:
+            method(provider_name)
+
+
+@pytest.mark.parametrize(
+    "role",
+    [
+        pytest.param(["a"], id="list"),
+        pytest.param(10**4301, id="beyond-int-str-digits"),
+    ],
+)
+@pytest.mark.parametrize(
+    "entry",
+    [
+        pytest.param("capabilities", id="capabilities"),
+        pytest.param("capability_report", id="capability_report"),
+    ],
+)
+def test_diagnostic_entries_reject_malformed_role(entry, role):
+    """非法角色名同样收敛成 ``ValueError``，而不是整数转换错误。"""
+    from src.providers.factory import ModelProviderFactory
+
+    method = getattr(ModelProviderFactory, entry)
+    with pytest.raises(ValueError, match="模型角色必须是字符串"):
+        method("openai", role)
+
+
+def test_protocol_status_rejects_malformed_role():
+    """``protocol_status`` 的 ``role`` 是第 4 个位置参数。"""
+    from src.providers.factory import ModelProviderFactory
+
+    with pytest.raises(ValueError, match="模型角色必须是字符串"):
+        ModelProviderFactory.protocol_status("openai", "chat_completions", None, 10**4301)
+
+
+def test_diagnostic_entries_still_work_for_legal_inputs():
+    """收紧不能误伤：三个入口对合法入参照旧返回结果。"""
+    from src.providers.factory import ModelProviderFactory
+
+    assert "chat" in ModelProviderFactory.capabilities("openai")
+    report = ModelProviderFactory.capability_report("anthropic")
+    assert report["resolved_provider"] == "anthropic"
+    status = ModelProviderFactory.protocol_status("openai", "chat_completions")
+    assert status["adapter_supported"] is True
+    # ``role=None`` 是「自动推断」的合法默认值，必须继续可用。
+    assert (
+        ModelProviderFactory.protocol_status("openai", "chat_completions", None, None)[
+            "adapter_supported"
+        ]
+        is True
+    )

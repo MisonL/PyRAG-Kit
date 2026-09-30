@@ -6,6 +6,18 @@
 
 ### 修复
 
+- **公开诊断入口对非法 `provider_name`／`role` 的收场与工厂其余入口不一致**（`src/providers/factory.py`）。`ModelProviderFactory` 有三个**公开**诊断入口——`capabilities`／`capability_report`／`protocol_status`，源码注释写明供「配置界面和诊断」使用——它们的入参直接来自调用方，此前完全没有形态守卫：
+
+  | 入参 | 修复前的收场 |
+  |---|---|
+  | `provider_name=["a"]` / `{"k":1}` | 裸 `TypeError: unhashable type: 'list'/'dict'` |
+  | `provider_name=10**4301` | `ValueError: Exceeds the limit (4300 digits)` |
+  | `role=10**4301` | 同上（各入口开头的 `str(role)` 转换） |
+
+  两条都不是「渠道名/角色名写错了」。同文件的 `_get_model_detail` 早已用同一判据收敛（键先判字符串再进成员判断、消息经 `safe_repr`），同一个错误的收场不该取决于走的是哪条入口。
+
+  判据要落在**两处**才覆盖全：`_provider_info_for_role`（三入口的共同路径）以及各入口开头**早于**它的转换与推断分支——`protocol_status` 在 `role is None` 时会先对 `provider_name` 做两次字典查找、`capabilities`／`capability_report` 会先 `str(role).strip().lower()`。新增共享 helper `_normalize_role_text`（与既有的 `_normalize_protocol_text` 同一判据），四个调用点全部接上；`provider_name` 的判据在 `protocol_status` 里提到函数最前。`role=None`（自动推断）的既有语义保持不变。
+
 - **`ChatService` 的标量入参：与同文件的 `<content>` 收敛同一判据**（`src/services/chat_service.py`）。`_build_prompt` 对检索结果里的文档字段已经收敛（`page_content=None` 时整条跳过，绝不把字面量 `内容: None` 喂给模型），但**同一次调用**的两个标量参数 `user_input` 与 `intent` 完全没有守卫。实测修复前 `user_input=None`／`5`／`["a"]` 静默生成 `用户问题: None`／`用户问题: 5`／`用户问题: ['a']`，模型会把字面量 `None` 当成一个真实的用户问题去回答；`10**4301` 则抛裸 `ValueError: Exceeds the limit (4300 digits)`。同一个「非字符串值以字面量进 prompt」的形态，文档字段那一半修了、标量这一半漏了。`identify_intent` 的 f-string 更靠前（在 `try` **之外**），位数超限时抛的甚至不是本类承诺的 `RuntimeError: 意图识别失败`。两处现按同一判据拒绝并给出字段名。
 
 - **`embed_in_batches` 的批次规模：`max(1, ...)` 只挡下界**（`src/services/embedding_service.py`）。原实现只做 `max(1, run_config.kb_embedding_batch_size)`，不挡形态。`RunConfig` 是 `frozen dataclass`、字段无校验器，生产路径的唯一构造点 `build_run_config` 直接照搬 `Settings` 的值（那里有 `1.._MAX_KB_CHUNK_TOKENS` 的双向界），因此嵌入方自己拼一个 `RunConfig` 就能送进任意形态：实测 `"32"`／`None` 抛裸 `TypeError: '>' not supported between instances of ...`，`10**4301` 抛 `ValueError: Exceeds the limit`——两条都与「批次配错了」无关，而同文件其余判据都收敛成带字段名的 `ValueError`。

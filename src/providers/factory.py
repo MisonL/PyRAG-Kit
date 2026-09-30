@@ -43,6 +43,20 @@ def _normalize_protocol_text(value: Any, *, label: str) -> str:
     return value.strip().lower().replace("-", "_")
 
 
+def _normalize_role_text(value: Any) -> str:
+    """把角色名收敛成小写、去空白的形态。
+
+    与 ``_normalize_protocol_text`` 同一判据、同一理由：``str(10**4301)`` 自己就抛
+    ``ValueError: Exceeds the limit (4300 digits)``，于是「角色名写错了」变成整数
+    转换错误。三个公开诊断入口（``capabilities``／``capability_report``／
+    ``protocol_status``）此前各自写 ``str(role).strip().lower()``，**早于**
+    ``_provider_info_for_role`` 内部的守卫，因此那里单独加的判据覆盖不到它们。
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"模型角色必须是字符串，但得到 {safe_repr(value)}。")
+    return value.strip().lower()
+
+
 class ModelProviderFactory:
     """模型提供商工厂"""
 
@@ -233,7 +247,25 @@ class ModelProviderFactory:
 
     @classmethod
     def _provider_info_for_role(cls, provider_name: str, role: str) -> tuple[str, dict[str, Any]]:
-        normalized_role = str(role).strip().lower()
+        # 键形态必须在任何成员判断**之前**收敛，判据与同文件的
+        # ``_get_model_detail`` 逐字一致。这里此前完全漏了，而本函数是三个**公开**
+        # 诊断入口（``capabilities``／``capability_report``／``protocol_status``，
+        # 源码注释写明「配置界面和诊断使用」）的共同路径。实测修复前：
+        #   * ``["a"]``／``{"k": 1}`` —— 下面 ``_role_aliases.get(role, {}).get(...)``
+        #     与 ``_provider_map.get(...)`` 的字典查找抛裸 ``TypeError:
+        #     unhashable type: 'list'``；
+        #   * ``10**4301`` —— ``f"不支持的模型提供商: {provider_name}"`` 抛
+        #     ``ValueError: Exceeds the limit (4300 digits)``。
+        # 两条都不是「渠道名写错了」，而同一形态走 ``get_llm_provider`` 得到的是
+        # ``_get_model_detail`` 给出的带指引 ``ValueError``——同一个错误的收场
+        # 不该取决于调用的是哪条入口。
+        if not isinstance(provider_name, str):
+            raise ValueError(
+                f"provider 名称必须是字符串，但得到 {safe_repr(provider_name)}。"
+                " 请检查配置里的 *provider 字段。"
+            )
+        # ``role`` 同样要收敛（详见 ``_normalize_role_text``）。
+        normalized_role = _normalize_role_text(role)
         if normalized_role not in cls._roles:
             allowed = ", ".join(sorted(cls._roles))
             raise ValueError(f"不支持的模型角色: {role}。可选值: {allowed}")
@@ -394,7 +426,7 @@ class ModelProviderFactory:
     @classmethod
     def capabilities(cls, provider_name: str, role: str = "llm") -> frozenset[str]:
         """返回指定角色的渠道能力集合，供 UI/配置校验使用。"""
-        normalized_role = str(role).strip().lower()
+        normalized_role = _normalize_role_text(role)
         resolved, _info = cls._provider_info_for_role(provider_name, normalized_role)
         provider_class = cls._get_provider_class(resolved)
         if normalized_role in {"embedding", "rerank"}:
@@ -418,7 +450,7 @@ class ModelProviderFactory:
         ``server_verified`` 仍只表示目标服务端有明确验证证据，不会由 SDK
         的本地资源树自动推导。
         """
-        normalized_role = str(role).strip().lower()
+        normalized_role = _normalize_role_text(role)
         resolved, info = cls._provider_info_for_role(provider_name, normalized_role)
         provider_class = cls._get_provider_class(resolved)
         sdk_package = info.get("sdk_package")
@@ -477,6 +509,17 @@ class ModelProviderFactory:
         LLM 是默认角色；未显式指定时，对 embedding/rerank-only provider
         自动选择其唯一角色，以便诊断工具可以统一查询所有渠道。
         """
+        # 形态判据必须在**最前**：下面 ``role is None`` 的推断分支会先对
+        # ``provider_name`` 做两次字典查找（``_resolve_provider_name`` 与
+        # ``_provider_map.get``），不可哈希的取值在那里就抛裸
+        # ``TypeError: unhashable type``——早于 ``_provider_info_for_role`` 内部的
+        # 守卫，因此那里单独加的判据覆盖不到本入口。实测修复前
+        # ``protocol_status(["a"], "chat_completions")`` 复现。
+        if not isinstance(provider_name, str):
+            raise ValueError(
+                f"provider 名称必须是字符串，但得到 {safe_repr(provider_name)}。"
+                " 请检查配置里的 *provider 字段。"
+            )
         if role is None:
             candidates = ("llm", "embedding", "rerank")
             normalized_role = next(
@@ -493,7 +536,7 @@ class ModelProviderFactory:
             if normalized_role is None:
                 raise ValueError(f"无法为提供商 {provider_name} 推断模型角色，请显式传入 role。")
         else:
-            normalized_role = str(role).strip().lower()
+            normalized_role = _normalize_role_text(role)
         resolved, info = cls._provider_info_for_role(provider_name, normalized_role)
         normalized = _normalize_protocol_text(protocol, label="protocol")
         normalized = {
