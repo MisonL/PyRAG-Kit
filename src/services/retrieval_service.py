@@ -25,6 +25,7 @@ from src.utils.config import (
     require_detail_attributes,
     require_provider_name,
     require_retrieval_method,
+    require_scale_field,
     safe_repr,
     to_finite_float,
 )
@@ -272,42 +273,11 @@ def _fingerprint(value: Any, seen: set[int]) -> str:
         return f"<{type(value).__name__}>"
 
 
-def _coerce_scale_field(value: Any, label: str) -> int:
-    """把规模字段（``top_k``／候选倍率）收敛成正整数，非法形态给出可读 ``ValueError``。
-
-    ``retrieve`` 直接算 ``max(1, top_k) * max(1, multiplier)``，而
-    ``SessionConfig`` 是公开类、普通属性没有 ``__setattr__`` 守卫（见
-    ``_require_finite_number`` 的 docstring）：嵌入方或携带超大整数的 pickle
-    快照可以把这两个字段直写成任何形态，此时 ``max()`` 抛裸
-    ``TypeError: '>' not supported between instances of 'NoneType' and 'int'``
-    ——而 ``retrieve`` 是**生产入口**（``Chatbot.chat_async`` 每次提问都调它），
-    它的契约是返回文档列表或给出可读错误。
-
-    收敛语义与 ``retrieve`` 里的 ``max(1, ...)`` 一致：非正数视为 1（「至少要
-    取一条」），这与 ``__setitem__`` 的 1 下界不冲突——那里是拒绝写入，这里是
-    读取已有状态时的容错。``bool`` 显式拒绝：``max(1, True)`` 会静默变成 1，
-    而它几乎必然是上游把标志位写进了规模字段。
-    """
-    if isinstance(value, bool):
-        raise ValueError(f"{label} 必须是整数，但得到布尔值 {safe_repr(value)}。")
-    if isinstance(value, int):
-        # 位数上界：``top_k × multiplier`` 要送进 ``faiss_index.search()``，而
-        # FAISS 既不报错也不截断，按 k 分配结果数组。``10**4301`` 这类取值在
-        # 乘积处还会撞上双精度转换，收场各不相同。
-        if value > _MAX_RETRIEVAL_CANDIDATES:
-            raise ValueError(
-                f"{label} 超出合理范围（{safe_repr(value)}），"
-                f"上界 {_MAX_RETRIEVAL_CANDIDATES}。请检查该配置项。"
-            )
-        return max(1, value)
-    raise ValueError(f"{label} 必须是整数，但得到 {safe_repr(value)}。")
-
-
 def _coerce_threshold(value: Any) -> float:
     """把分数阈值收敛成有限浮点，非法形态给出可读 ``ValueError``。
 
     ``retrieve`` 直接算 ``coerce_score(...) >= session_config.score_threshold``，
-    而该字段可被直写（见 ``_coerce_scale_field``）。非数值形态抛裸
+    而该字段可被直写（见 ``require_scale_field``）。非数值形态抛裸
     ``TypeError: '>=' not supported between instances of 'float' and 'NoneType'``
     ——落在 ``retrieve`` 既有的错误分类之外。``bool`` 显式拒绝：``True`` 会静默
     变成 ``1.0``，看起来像一个真实阈值。
@@ -588,9 +558,9 @@ class RetrievalService:
         # 全部静默落进 else 分支，变成纯关键词检索（实测）。详见该助手的说明。
         retrieval_method = require_retrieval_method(session_config.retrieval_method)
         # 形态必须在这里收敛：``SessionConfig`` 的属性可被直写，而 ``max()`` 对
-        # 非数值抛裸 ``TypeError``（详见 ``_coerce_scale_field``）。
-        top_k = _coerce_scale_field(session_config.top_k, "top_k")
-        multiplier = _coerce_scale_field(
+        # 非数值抛裸 ``TypeError``（详见 ``require_scale_field``）。
+        top_k = require_scale_field(session_config.top_k, "top_k")
+        multiplier = require_scale_field(
             session_config.retrieval_candidate_multiplier, "retrieval_candidate_multiplier"
         )
         # 乘积同样要判：两个字段各自合法、乘积越界是既有缺陷类（``Settings`` 与

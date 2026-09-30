@@ -2501,3 +2501,111 @@ def test_require_provider_name_accepts_any_string_and_rejects_the_rest():
     for bad_value in (None, 5, ["openai"], {"a": 1}, True, _HUGE_INT):
         with pytest.raises(ValueError, match="必须是字符串"):
             require_provider_name(bad_value)
+
+
+# ── 配置编辑器的动态上界（读可直写字段） ──
+#
+# ``config_menu._top_k_ceiling`` / ``_multiplier_ceiling`` 读的是**另一个**规模
+# 字段来算动态上界（``min(_MAX_RETRIEVAL_TOP_K, _MAX_RETRIEVAL_CANDIDATES //
+# max(1, m))``），而那两个字段都可被直写。实测修复前「倍率被直写成 ``"abc"``、
+# 用户选『调整 Top K』」在 ``max()`` 处抛裸
+# ``TypeError: '>' not supported between instances of 'str' and 'int'``。
+#
+# 菜单在 chat 主循环的 ``try`` **之外**：内层只接 ``(KeyboardInterrupt,
+# EOFError)``、外层只有 ``finally``，因此这会以裸 traceback 终止整个会话，用户
+# 丢失对话。``retrieve`` 对同样两个字段早有 ``_coerce_scale_field``，现在判据
+# 上移为 ``require_scale_field``（``src/utils/config.py``，``_MAX_RETRIEVAL_*``
+# 的归属地），服务层与 UI 共用——UI 不反向依赖服务层私有函数。
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        pytest.param("abc", id="str"),
+        pytest.param(None, id="none"),
+        pytest.param([2], id="list"),
+        pytest.param(True, id="bool"),
+        pytest.param(_HUGE_INT, id="beyond-int-max-str-digits"),
+    ],
+)
+def test_top_k_ceiling_rejects_unusable_multiplier(bad_value):
+    """倍率字段形态不可用时，``_top_k_ceiling`` 必须报错而不是抛裸 ``TypeError``。"""
+    from src.ui.config_menu import _top_k_ceiling
+
+    with pytest.raises(ValueError, match="retrieval_candidate_multiplier"):
+        _top_k_ceiling(bad_value)
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        pytest.param("abc", id="str"),
+        pytest.param(None, id="none"),
+        pytest.param([2], id="list"),
+        pytest.param(True, id="bool"),
+    ],
+)
+def test_multiplier_ceiling_rejects_unusable_top_k(bad_value):
+    """对称方向：``top_k`` 形态不可用时 ``_multiplier_ceiling`` 同样报错。"""
+    from src.ui.config_menu import _multiplier_ceiling
+
+    with pytest.raises(ValueError, match="top_k"):
+        _multiplier_ceiling(bad_value)
+
+
+@pytest.mark.parametrize(
+    ("multiplier", "top_k"),
+    [(1, 2000), (3, 666), (20, 100), (100, 20), (2, 5)],
+)
+def test_ceilings_keep_working_for_valid_scale_fields(multiplier, top_k):
+    """收紧不能误伤：合法取值照旧算出上界。"""
+    from src.ui.config_menu import _multiplier_ceiling, _top_k_ceiling
+
+    assert _top_k_ceiling(multiplier) >= 1
+    assert _multiplier_ceiling(top_k) >= 1
+
+
+def test_edit_retrieval_params_survives_broken_scale_field():
+    """端到端：字段被直写坏掉时，菜单必须给出可读错误而不是终止会话。
+
+    这条走的是真实入口（``edit_retrieval_params`` 的选择分支），而不是只调
+    ``_top_k_ceiling``——「助手修好了但调用点没接上」是另一类漏网。
+    """
+    from unittest.mock import patch
+
+    from src.runtime.contracts import build_session_config
+    from src.ui import config_menu
+    from src.utils.config import get_settings
+
+    config = build_session_config(get_settings()).to_dict()
+    config["retrieval_candidate_multiplier"] = "abc"
+    # 第一次选目标项，第二次退出循环（否则 ``while True`` 不结束）。
+    choices = iter(["top_k", "back"])
+
+    with (
+        patch.object(config_menu.questionary, "select") as select,
+        patch.object(config_menu.questionary, "text") as text,
+    ):
+        select.return_value.ask.side_effect = lambda: next(choices, "back")
+        text.return_value.ask.return_value = None
+
+        with pytest.raises(ValueError, match="retrieval_candidate_multiplier"):
+            config_menu.edit_retrieval_params(config)
+
+
+def test_require_scale_field_matches_the_service_layer_semantics():
+    """共享助手的语义与 ``retrieve`` 的 ``max(1, ...)`` 一致。
+
+    非正数收敛成 1（读取已有状态时的容错），``bool`` 显式拒绝（它几乎必然是
+    上游把标志位写进了规模字段），超上界拒绝。
+    """
+    from src.utils.config import _MAX_RETRIEVAL_CANDIDATES, require_scale_field
+
+    assert require_scale_field(5, "top_k") == 5
+    assert require_scale_field(0, "top_k") == 1
+    assert require_scale_field(-3, "top_k") == 1
+    for bad_value in (True, False, "5", None, [5], 1.5, _HUGE_INT):
+        with pytest.raises(ValueError):
+            require_scale_field(bad_value, "top_k")
+    with pytest.raises(ValueError, match="超出合理范围"):
+        require_scale_field(_MAX_RETRIEVAL_CANDIDATES + 1, "top_k")

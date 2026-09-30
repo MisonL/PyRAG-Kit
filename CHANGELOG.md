@@ -326,7 +326,11 @@
   - **同一张表的裸 f-string 插值**：`model_name`、`active_llm_configuration`、`active_rerank_configuration` 是位数超限整数时抛 `ValueError: Exceeds the limit`。而**同一个函数**的 `top_k`／`score_threshold`／权重早已走 `_render_value`，注释还明确写着「本函数在任何提示符之前被调用，会话在启动横幅这一步就终止」——判据只做了一部分单元格。现四处统一经 `_render_value`（降级成量级描述，正常取值显示形态不变）。
   - 顺带把该函数里五处 `logger.debug(f"…{取值}")` 改成惰性 `%s` 参数：f-string 在 DEBUG 关闭时也**已经求值**，裸插值对同一取值照样抛。
 
+- **补齐配置编辑器动态上界的规模字段收敛**：`config_menu._top_k_ceiling` 与 `_multiplier_ceiling` 读取另一个可直写的规模字段来算动态上界。修复前实测「`retrieval_candidate_multiplier` 被直写成 `"abc"`、用户在菜单里选择『调整 Top K』」时，`max()` 抛裸 `TypeError: '>' not supported between instances of 'str' and 'int'`；`top_k` 被直写成 `None` 时对称复现。配置编辑器在聊天主循环的 `try` 之外，内层只接 `KeyboardInterrupt`／`EOFError`，裸 `TypeError` 会以 traceback 终止整个会话。`retrieve` 对同一字段早有收敛判据，现将它上移为 `require_scale_field`（`src/utils/config.py`），服务层与 UI 共用；UI 不反向依赖服务层私有函数。非正整数继续按既有读取语义收敛为 1，`bool`／非整数／超上界取值给出带字段名的 `ValueError`。
+
 ### 测试
+
+- 新增第十一轮的回归用例（16 个用例；回退源码后其中 11 个变红，5 个「不误伤」反向守卫保持绿）：两个动态上界助手对字符串／`None`／列表／`bool`／位数超限整数的拒绝、两种方向的合法上界照旧工作、真实 `edit_retrieval_params` 入口在坏倍率下给出可读错误而不是终止，以及 `require_scale_field` 与服务层既有的 `max(1, ...)` 读取语义对齐。
 
 - 新增第十轮的回归用例（15 个用例；回退源码后其中 9 个变红，6 个「不误伤」反向守卫保持绿）：`display_chat_config` 对四类非字符串 provider（`list`／`dict`／`None`／`int`）的拒绝、Rerank 侧同一判据、三类位数超限取值（`model_name`／两个 `active_*_configuration`）**必须可渲染**而不是终止会话、合法配置照旧渲染，以及共享助手 `require_provider_name` 接受任意字符串（含尚未支持的 provider）并拒绝其余形态。位数超限那两条特意把激活名与配置键一并设成同一取值——它们同源，只设激活名会先撞上「未找到key」那条判据，测不到渲染路径。
 

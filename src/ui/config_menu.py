@@ -12,6 +12,7 @@ from ..utils.config import (
     RetrievalMethod,
     parse_decimal_int,
     require_retrieval_method,
+    require_scale_field,
     safe_repr,
 )
 from ..utils.log_manager import get_module_logger  # 导入日志管理器
@@ -28,11 +29,19 @@ def _top_k_ceiling(multiplier: int) -> int:
     报错也不截断），因此单字段上界不够——UI 放行一个组合越界的值，会在应用
     配置时抛 ``ValueError`` 并终止会话。
     """
+    # 收敛后再算：``multiplier`` 是可直写字段，非数值在 ``max()`` 处抛裸
+    # ``TypeError``，而菜单在主循环的 ``try`` 之外——内层只接
+    # ``(KeyboardInterrupt, EOFError)``、外层只有 ``finally``，因此这会以裸
+    # traceback 终止整个会话。实测「倍率被直写成 ``"abc"``、用户选『调整
+    # Top K』」即复现。
+    multiplier = require_scale_field(multiplier, "retrieval_candidate_multiplier")
     return min(_MAX_RETRIEVAL_TOP_K, _MAX_RETRIEVAL_CANDIDATES // max(1, multiplier))
 
 
 def _multiplier_ceiling(top_k: int) -> int:
     """返回当前 ``top_k`` 下候选倍率可用的上界。"""
+    # 与 ``_top_k_ceiling`` 同因：``top_k`` 同样可直写。
+    top_k = require_scale_field(top_k, "top_k")
     return min(_MAX_RETRIEVAL_MULTIPLIER, _MAX_RETRIEVAL_CANDIDATES // max(1, top_k))
 
 

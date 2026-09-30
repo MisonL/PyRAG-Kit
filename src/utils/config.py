@@ -400,6 +400,48 @@ def require_retrieval_method(value: Any, *, label: str = "retrieval_method") -> 
     raise ValueError(f"{label} 必须是 {allowed} 之一，但得到 {safe_repr(value)}。")
 
 
+def require_scale_field(value: Any, label: str) -> int:
+    """把规模字段（``top_k``／``retrieval_candidate_multiplier``）收敛成正整数。
+
+    ``SessionConfig`` 是公开类、普通属性没有 ``__setattr__`` 守卫，嵌入方或携带
+    超大整数的 pickle 快照可以把这两个字段直写成任何形态。两个读取方此前各自
+    假设它是整数：
+
+    * ``RetrievalService.retrieve`` 直接算 ``max(1, top_k) * max(1, multiplier)``，
+      ``max()`` 对非数值抛裸 ``TypeError: '>' not supported between instances of
+      'NoneType' and 'int'``。它是**生产入口**（``Chatbot.chat_async`` 每次提问
+      都调它），契约是返回文档列表或给出可读错误。
+    * ``config_menu._top_k_ceiling`` / ``_multiplier_ceiling`` 读**另一个**字段算
+      动态上界（``min(_MAX_RETRIEVAL_TOP_K, _MAX_RETRIEVAL_CANDIDATES // max(1, m))``），
+      同样在 ``max()`` 处抛裸 ``TypeError``。菜单在主循环的 ``try`` 之外——内层
+      只接 ``(KeyboardInterrupt, EOFError)``、外层只有 ``finally``——因此这会以
+      裸 traceback 终止整个会话，用户丢失对话。实测「倍率被直写成 ``"abc"``、
+      用户选『调整 Top K』」即复现。
+
+    判据上移到这里而不是留在 ``retrieval_service``：``config_menu`` 已经依赖本
+    模块（``_MAX_RETRIEVAL_*``、``parse_decimal_int``、``safe_repr``），而反向
+    依赖（UI 去 import 服务层私有函数）会把层次关系弄反。
+
+    收敛语义与 ``retrieve`` 的 ``max(1, ...)`` 一致：非正数视为 1（「至少要取
+    一条」），这与 ``__setitem__`` 的 1 下界不冲突——那里是拒绝写入，这里是读取
+    已有状态时的容错。``bool`` 显式拒绝：``max(1, True)`` 会静默变成 1，而它几乎
+    必然是上游把标志位写进了规模字段。
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{label} 必须是整数，但得到布尔值 {safe_repr(value)}。")
+    if isinstance(value, int):
+        # 位数上界：``top_k × multiplier`` 要送进 ``faiss_index.search()``，而
+        # FAISS 既不报错也不截断，按 k 分配结果数组。``10**4301`` 这类取值在
+        # 乘积处还会撞上双精度转换，收场各不相同。
+        if value > _MAX_RETRIEVAL_CANDIDATES:
+            raise ValueError(
+                f"{label} 超出合理范围（{safe_repr(value)}），"
+                f"上界 {_MAX_RETRIEVAL_CANDIDATES}。请检查该配置项。"
+            )
+        return max(1, value)
+    raise ValueError(f"{label} 必须是整数，但得到 {safe_repr(value)}。")
+
+
 def require_provider_name(value: Any, *, label: str = "provider") -> str:
     """确认 ``provider`` 是字符串并原样返回，否则给出带字段名的 ``ValueError``。
 
