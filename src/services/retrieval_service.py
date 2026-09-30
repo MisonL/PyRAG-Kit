@@ -138,8 +138,8 @@ class HybridReranker:
             # ``nan`` 与分数阈值的比较恒为 False，整批结果被静默丢弃。
             raise ValueError(
                 "混合检索的 vector_weight 与 keyword_weight 必须是和为正的有限数值，"
-                f"但得到 vector_weight={self.vector_weight!r}、"
-                f"keyword_weight={self.keyword_weight!r}。"
+                f"但得到 vector_weight={safe_repr(self.vector_weight)}、"
+                f"keyword_weight={safe_repr(self.keyword_weight)}。"
                 " 两个权重同时为 0（或含非有限值）会让所有文档得分都是 0 或 nan，"
                 "再被分数阈值过滤，检索会静默返回空结果。"
             )

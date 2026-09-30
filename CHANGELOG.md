@@ -6,6 +6,15 @@
 
 ### 修复
 
+- **`HybridReranker._weight_tuple` 同一判据的两个分支用了两种渲染**（`src/services/retrieval_service.py`）。该函数对同一句「必须是和为正的有限数值」有两个触发点：前者是 `is_double_convertible` 判单个权重失败（用 `safe_repr`），后者是**派生值** `total` 判和溢出（用裸 `!r`）。裸 `!r` 的两条后果都实测复现：
+
+  - `HybridReranker(10**308, 10**308)`——**普通 int**，两个权重各自都在 double 范围内、只有和溢出——报错 **759 字符**，而 `safe_repr` 的截断上限是 80；这正是 `safe_repr` 的 docstring 写明的「一条校验消息不该刷屏」。
+  - `repr` 自己会抛的 `int` 子类（`is_double_convertible` 走 `isinstance` 放行后，`{v!r}` 在 f-string 插值处抛）让本方法的 `ValueError` 契约变成 `ValueError: Exceeds the limit (4300 digits)` 或裸 `RuntimeError`——与「权重配错了」毫无关系，且穿透调用方的 `except ValueError` 分类。
+
+  可达性：`HybridReranker` 是公开类，docstring 自己写明「库调用方可能绕过 `Settings` 与 `SessionConfig` 直接构造」，本方法即为此存在的最后一道兜底。两个分支现统一走 `safe_repr`。
+
+- **`src/utils/cleanup.py` 的 `/tmp` 清单项让 `bandit -ll` 不再归零**（质量门回归，由补齐系统目录清单的那一轮引入）。bandit 的 `B108 hardcoded_tmp_directory` 按 `context.string_val.startswith("/tmp")` 匹配**字符串字面量前缀**，认不出 `Path("/tmp")` 是「禁止删除的目录清单」而非「用固定路径建临时文件」——本行既不创建也不写入任何文件，语义与 CWE-377 恰好相反。它是清单里唯一以临时目录前缀开头的项。实测 `uv run bandit -r main.py src scripts -ll` 在 HEAD 上退出码为 1（CI 的 Security scan 步骤会失败），现按仓库既有的 `# nosec <规则> - 理由` 惯例标注理由，quality gate 恢复零告警、退出码 0。
+
 - **补齐分片重叠的比例上界（`kb_chunk_overlap <= kb_chunk_size / 2`）**。原先只判 `overlap < size`，而 LangChain 的 `RecursiveCharacterTextSplitter` 只在 `overlap > size` 时报错、**接近** size 时静默接受——每个分片只前进 `size - overlap` 个字符，冗余随比例急剧放大。实测一篇 15000 字符的文档在 `size=1500` 时：overlap=150（10%）产出 14 个分片（1.1x），overlap=1490（99%）产出 1651 个（137.6x），overlap=1499 产出 13751 个（**1145.9x**）——全部进入 embedding 与 FAISS 写入，是一次「配置看着正常、代价上千倍」的静默放大。50% 是主流 RAG 实践的通行上界（它同时保证每个分片至少有一半是新内容），且实测在该点上放大仅 1.9x。判据同时加在 `Settings.validate_overlap_smaller_than_size`（拦配置来源）与 `RecursiveTextSplitter._validate_parent_sizes`／`_validate_hierarchical_sizes`（拦直接构造，它是公开类）——两个入口必须一致。
 
 - **修复 anthropic 与 volcengine 渠道的 5 处边界缺陷**（第二轮对抗审查，同样逐条实测复现）：

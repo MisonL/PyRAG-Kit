@@ -101,7 +101,12 @@ def _reject_unsafe_cache_dir(
         Path("/Library"),
         Path("/Applications"),
         # 系统级目录（此前遗漏）
-        Path("/tmp"),
+        # ``nosec B108``：bandit 的 hardcoded_tmp_directory 规则按
+        # ``context.string_val.startswith("/tmp")`` 匹配字面量，认不出这是
+        # 「禁止删除的目录清单」而不是「用固定路径建临时文件」——本行既不
+        # 创建也不写入任何文件，语义与 CWE-377 恰好相反。它是清单里唯一以
+        # 临时目录前缀开头的项，因此只有这一处需要标注。
+        Path("/tmp"),  # nosec B108 - 禁止删除清单项，非临时文件用法
         Path("/Users"),
         Path("/home"),
         Path("/opt"),

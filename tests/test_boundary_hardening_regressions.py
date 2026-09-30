@@ -3575,3 +3575,50 @@ def test_ark_tokenization_data_must_be_a_list(bad_data):
         pytest.raises(RuntimeError, match="data 必须是列表"),
     ):
         provider.count_tokens("hi")
+
+
+# ── HybridReranker._weight_tuple：同一判据的两个分支必须同一种渲染 ──
+#
+# ``_weight_tuple`` 对同一句「必须是和为正的有限数值」有两个触发分支：前者是
+# ``is_double_convertible`` 判单个权重失败，后者是**派生值** ``total`` 判和溢出。
+# 两个分支此前一个用 ``safe_repr``、一个用裸 ``!r``——同一函数、同一消息模板、
+# 同一判据，渲染方式却不同。
+#
+# 裸 ``!r`` 的两条后果都实测复现：
+#   * ``HybridReranker(10**308, 10**308)``（**普通 int**，两个权重各自都在
+#     double 范围内，只有和溢出）报错 759 字符，而 ``safe_repr`` 的上限是 80——
+#     这正是 ``safe_repr`` 的 docstring 写明的「一条校验消息不该刷屏」；
+#   * ``repr`` 会抛的 ``int`` 子类（``is_double_convertible`` 走 ``isinstance``，
+#     放行后 ``{v!r}`` 在插值处抛）让本方法的 ``ValueError`` 契约变成
+#     ``ValueError: Exceeds the limit (4300 digits)`` / 裸 ``RuntimeError``——
+#     与「权重配错了」毫无关系，且穿透调用方的 ``except ValueError`` 分类。
+#
+# 可达性：``HybridReranker`` 是公开类，docstring 自己写明「库调用方可能绕过
+# ``Settings`` 与 ``SessionConfig`` 直接构造」，本方法即为此存在的最后一道兜底。
+
+
+def test_hybrid_reranker_weight_message_is_not_flooded_by_a_huge_int():
+    """普通超大整数触发的消息必须被 ``safe_repr`` 截断，而不是刷 759 字符。"""
+    from src.services.retrieval_service import HybridReranker
+
+    with pytest.raises(ValueError, match="有限数值") as excinfo:
+        HybridReranker(10**308, 10**308)._weight_tuple()
+
+    message = str(excinfo.value)
+    # ``safe_repr`` 对每个权重最多 80 字符；留足前缀与指引文案的余量。
+    assert len(message) < 400, f"消息长度 {len(message)}，疑似未走 safe_repr：{message[:120]}"
+
+
+def test_hybrid_reranker_weight_message_survives_unrepresentable_values():
+    """``repr`` 自己会抛的取值，报错仍必须是带指引的 ``ValueError``。"""
+
+    class _UnreprUnstyled(int):
+        def __repr__(self) -> str:
+            # 模拟位数超限的整数：``repr(10**4301)`` 撞
+            # ``sys.get_int_max_str_digits()``（默认 4300）。
+            return repr(10**4301)
+
+    from src.services.retrieval_service import HybridReranker
+
+    with pytest.raises(ValueError, match="有限数值"):
+        HybridReranker(_UnreprUnstyled(10**308), 10**308)._weight_tuple()
