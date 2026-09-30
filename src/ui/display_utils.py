@@ -293,10 +293,33 @@ def _require_model_detail(configurations: Any, key: Any, role_label: str) -> Any
     ``AttributeError``（不是 ``ValueError``）。取值来源与键同源，都是可直写的
     配置映射，因此在这里一并收敛。
     """
-    if not isinstance(configurations, Mapping) or key not in configurations:
-        available = (
-            ", ".join(sorted(configurations)) if isinstance(configurations, Mapping) else "无"
+    if not isinstance(configurations, Mapping):
+        raise ValueError(
+            f"在{role_label}配置中未找到key: {safe_repr(key)}。可选值: 无。"
+            " 请检查 config.toml 里的 default_*_provider 与 *_configurations 是否对应。"
         )
+    # 成员判断要接住 ``TypeError``：``key not in mapping`` 对**不可哈希**的取值抛
+    # 裸 ``TypeError: unhashable type: 'list'``，它不是 ``ValueError``。本函数在
+    # ``start_chat_session_async`` 里于任何提示符**之前**被调用，因此实测
+    # ``active_rerank_configuration = ["siliconflow"]`` 时用户看到的是裸 traceback
+    # ——刚显示完启动横幅，会话随即终止。判据与 ``ModelProviderFactory
+    # ._get_model_detail`` 的同名守卫一致（本函数的 docstring 正是以「同一个 key
+    # 走工厂得到 ``ValueError``」为理由建立契约的，两处必须同判据）。
+    #
+    # 只收不可哈希这一类，**不**要求 key 是字符串：本函数的职责是**显示**，而
+    # 可哈希的非字符串键在映射里能正常取到值（既有用例
+    # ``test_display_chat_config_renders_values_beyond_the_conversion_limit``
+    # 明确要求位数超限的整数键可渲染）。工厂侧要求字符串是因为它要拿 key 去建
+    # provider，两处的接受面本就不同；契约一致的是**异常分类**。
+    try:
+        present = key in configurations
+    except TypeError as exc:
+        raise ValueError(
+            f"{role_label}配置的 key 必须是可哈希的取值，但得到 {safe_repr(key)}。"
+            " 请检查 config.toml 里的 default_*_provider 与 *_configurations 是否对应。"
+        ) from exc
+    if not present:
+        available = ", ".join(sorted(configurations))
         raise ValueError(
             f"在{role_label}配置中未找到key: {safe_repr(key)}。可选值: {available}。"
             " 请检查 config.toml 里的 default_*_provider 与 *_configurations 是否对应。"

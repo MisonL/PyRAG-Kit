@@ -3293,3 +3293,90 @@ def test_retrieve_uses_the_coerced_top_k_even_if_it_changes_mid_flight():
 
     results = asyncio.run(run())
     assert len(results) == 3
+
+
+# ── display_utils._require_model_detail：不可哈希的 key 必须收敛 ──
+#
+# 该函数的 docstring 明确以「同一个 key 走 ModelProviderFactory._get_model_detail
+# 得到 ValueError，错误分类本就该一致」为理由建立契约，但工厂侧有一条它没有的
+# 守卫：**成员判断前先收敛键形态**。``key not in mapping`` 对**不可哈希**的取值抛
+# 裸 ``TypeError: unhashable type: 'list'``——不是 ``ValueError``，而本函数在
+# ``start_chat_session_async`` 里于任何提示符**之前**被调用，用户刚看完启动横幅
+# 就收到裸 traceback。
+#
+# 可达路径：``SessionConfig`` 是公开类、普通属性没有 ``__setattr__`` 守卫，
+# 直写 ``active_rerank_configuration = ["siliconflow"]``（``active_*`` 字段在
+# ``Settings`` 与 ``SessionConfig`` 里都没有 validator）即可。
+#
+# **收窄到不可哈希这一类，而不是「必须是字符串」**：本函数的职责是显示，而可哈希
+# 的非字符串键在映射里能正常取到值——既有用例
+# ``test_display_chat_config_renders_values_beyond_the_conversion_limit`` 明确
+# 要求位数超限的整数键可渲染（那是显示层的既有契约）。工厂侧要求字符串是因为它
+# 要拿 key 去建 provider，两处的接受面本就不同；一致的是**异常分类**。
+
+
+@pytest.mark.parametrize(
+    "written",
+    [
+        pytest.param([1], id="list"),
+        pytest.param({"a": 1}, id="dict"),
+        pytest.param({1, 2}, id="set"),
+    ],
+)
+def test_model_detail_lookup_rejects_an_unhashable_key(written):
+    """不可哈希的 key 必须收敛成 ``ValueError``，与工厂侧同判据。"""
+    from src.ui.display_utils import _require_model_detail
+
+    configurations = {"demo": SimpleNamespace(provider="p", model_name="m")}
+
+    with pytest.raises(ValueError, match="key 必须是可哈希的取值"):
+        _require_model_detail(configurations, written, "Rerank")
+
+
+def test_model_detail_lookup_matches_the_factory_for_an_unhashable_key():
+    """同一个 key 在两处必须给出同一种异常分类（docstring 的既有契约）。"""
+    from src.providers.factory import ModelProviderFactory
+    from src.ui.display_utils import _require_model_detail
+
+    configurations = {"demo": SimpleNamespace(provider="p", model_name="m")}
+
+    for written in ([1], {"a": 1}):
+        with pytest.raises(ValueError):
+            _require_model_detail(configurations, written, "Rerank")
+        with pytest.raises(ValueError):
+            ModelProviderFactory._get_model_detail(
+                written, configurations, "rerank_configurations", "Rerank"
+            )
+
+
+@pytest.mark.parametrize(
+    "written",
+    [
+        pytest.param("missing", id="str"),
+        pytest.param(5, id="int"),
+        pytest.param(None, id="none"),
+        pytest.param(_HUGE_INT, id="huge-int"),
+    ],
+)
+def test_model_detail_lookup_keeps_missing_key_semantics_for_hashable_keys(written):
+    """收紧不能误伤：**可哈希**的缺失键仍是原来的「未找到key」消息。
+
+    这些取值不会触发 ``TypeError``，因此不属于本轮的缺陷类；它们必须继续走原有
+    分支（位数超限的整数尤其要紧——显示层既有契约要求它可渲染，见上方注释）。
+    """
+    from src.ui.display_utils import _require_model_detail
+
+    configurations = {"demo": SimpleNamespace(provider="p", model_name="m")}
+
+    with pytest.raises(ValueError, match="未找到key"):
+        _require_model_detail(configurations, written, "Rerank")
+
+
+def test_model_detail_lookup_renders_a_huge_integer_key():
+    """位数超限的整数键必须仍能取到值——既有显示契约，不得被本轮收紧误伤。"""
+    from src.ui.display_utils import _require_model_detail
+
+    detail = SimpleNamespace(provider="p", model_name="m")
+    configurations = {_HUGE_INT: detail}
+
+    assert _require_model_detail(configurations, _HUGE_INT, "Rerank") is detail

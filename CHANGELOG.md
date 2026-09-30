@@ -369,7 +369,13 @@
 
   修法与同函数里 `rerank_enabled` 的既有处置一致：出口切片改用**已收敛的局部变量**；`_rerank_if_needed` 新增 `top_k` 形参，由 `retrieve` 传入收敛后的值，`None` 时自行经 `require_scale_field` 收敛（供库调用方直接调用的场景）。两处都只保留一份判据。
 
+- **补齐 `display_utils._require_model_detail` 的不可哈希键守卫**：该函数的 docstring 明确以「同一个 key 走 `ModelProviderFactory._get_model_detail` 得到 `ValueError`，错误分类本就该一致」为理由建立契约，但工厂侧有一条它没有的守卫——**成员判断前先收敛键形态**。`key not in mapping` 对**不可哈希**的取值抛裸 `TypeError: unhashable type: 'list'`，而本函数在 `start_chat_session_async` 里于任何提示符**之前**被调用：实测直写 `active_rerank_configuration = ["siliconflow"]` 时，用户刚看完启动横幅就收到裸 traceback，会话随即终止。可达路径与其它 `active_*` 字段同源（`Settings` 与 `SessionConfig` 都没有为它们登记 validator，普通属性也没有 `__setattr__` 守卫）。
+
+  守卫**只收不可哈希这一类，不要求 key 是字符串**。初版写成「必须是字符串」，被既有用例 `test_display_chat_config_renders_values_beyond_the_conversion_limit` 挡下：该用例明确要求位数超限的**整数键**可渲染（可哈希的非字符串键在映射里能正常取到值，那是显示层的既有契约）。工厂侧要求字符串是因为它要拿 key 去建 provider，两处的接受面本就不同；一致的是**异常分类**。
+
 ### 测试
+
+- 新增第十七轮的回归用例（12 个用例；回退源码后其中 4 个变红）：三类不可哈希 key（`[1]`／`{"a": 1}`／`{1, 2}`）必须收敛成带指引的 `ValueError`；同一个 key 在展示层与工厂侧必须给出同一种异常分类；以及四组「不误伤」反向守卫——可哈希的缺失键（`"missing"`／`5`／`None`／超大整数）仍是原来的「未找到key」消息、位数超限的整数键仍能取到值、既有的渲染用例保持绿。
 
 - 新增第十六轮的回归用例（5 个用例，回退源码后全部变红）：库调用方直调 `_rerank_if_needed` 时四类非法 `top_k`（`"abc"`／`None`／`[1]`／`True`）必须收敛成带指引的 `ValueError`；以及检索飞行中把 `top_k` 直写成 `"abc"` 后，出口切片仍须正常返回（用已收敛的局部变量）。
 
