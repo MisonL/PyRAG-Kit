@@ -3066,3 +3066,110 @@ def test_openai_sdk_does_not_validate_response_containers_by_default():
 
     client = OpenAI(api_key="dummy", base_url="https://example.invalid/v1")
     assert client._strict_response_validation is False
+
+
+# ── rerank_enabled：读取侧必须与写入侧同判据 ──
+#
+# ``SessionConfig._validate_rerank_enabled`` 只认 ``bool``（测试
+# ``tests/runtime/test_contracts.py`` 里就有 ``("rerank_enabled", "yes")``），
+# 但那只管**写入**侧。``SessionConfig`` 是公开类、普通属性没有 ``__setattr__``
+# 守卫，直写 ``"false"``／``"no"``／``0`` 之后，UI 的 5 个读取点走真值判断，
+# 与服务层的 ``_coerce_rerank_enabled`` 分成两套判据：
+#
+#   实测直写 ``"false"``：配置表显示 **「启用」** 并渲染 Rerank 模型段落、
+#   菜单显示「当前: 启用」、``questionary.confirm`` 的默认项是「是」；
+#   而 ``RetrievalService.retrieve`` 对同一个值直接抛
+#   ``ValueError: rerank_enabled 必须是布尔值``。
+#
+# 用户看到的是与配置意图**相反**的结论——把 rerank 写成 ``"false"`` 的人
+# 得到的是「已启用」，且界面不提示任何错误。
+
+
+@pytest.mark.parametrize(
+    "written",
+    [
+        pytest.param("false", id="str-false"),
+        pytest.param("no", id="str-no"),
+        pytest.param("true", id="str-true"),
+        pytest.param(0, id="int-0"),
+        pytest.param(1, id="int-1"),
+        pytest.param(None, id="none"),
+    ],
+)
+def test_rerank_enabled_reading_rejects_what_writing_rejects(written):
+    """直写的非布尔取值，UI 与服务层必须给出同一种收场（拒绝）。"""
+    from src.services.retrieval_service import _coerce_rerank_enabled
+    from src.utils.config import require_rerank_enabled
+
+    config = _session_config()
+    config.rerank_enabled = written  # 普通属性，无守卫
+
+    with pytest.raises(ValueError, match="rerank_enabled 必须是布尔值"):
+        require_rerank_enabled(config.rerank_enabled)
+    with pytest.raises(ValueError, match="rerank_enabled 必须是布尔值"):
+        _coerce_rerank_enabled(config.rerank_enabled)
+
+
+def test_display_does_not_report_enabled_for_a_falsy_string():
+    """配置表不得把 ``"false"`` 显示成「启用」。
+
+    这是缺陷的原始症状：真值判断让 ``"false"``（非空字符串）走「启用」分支，
+    连 Rerank 模型段落都一起渲染出来。修复后读取侧与写入侧同判据，直接拒绝。
+    """
+    from io import StringIO
+
+    from rich.console import Console
+
+    from src.ui.display_utils import display_chat_config
+
+    config = _model_config(rerank_enabled=True)
+    config.rerank_enabled = "false"
+
+    console = Console(file=StringIO(), width=200, no_color=True)
+    with pytest.raises(ValueError, match="rerank_enabled 必须是布尔值"):
+        display_chat_config(console, config)
+
+
+def test_display_keeps_working_for_a_real_boolean():
+    """收紧不能误伤：真正的布尔取值照旧渲染出对应的状态文本。"""
+    from io import StringIO
+
+    from rich.console import Console
+
+    from src.ui.display_utils import display_chat_config
+
+    for enabled, expected in ((True, "启用"), (False, "禁用")):
+        buffer = StringIO()
+        display_chat_config(
+            Console(file=buffer, width=200, no_color=True),
+            _model_config(rerank_enabled=enabled),
+        )
+        assert expected in buffer.getvalue()
+
+
+def test_config_menu_does_not_report_enabled_for_a_falsy_string():
+    """菜单项同样不得把 ``"false"`` 显示成「启用」。
+
+    菜单**不能**抛错：``edit_retrieval_params`` 由 ``launch_config_editor`` 经
+    ``asyncio.to_thread`` 调用，调用点只接 ``(KeyboardInterrupt, EOFError)``，
+    异常会终止整个会话——而菜单是用户唯一还能改配置的入口
+    （``display_chat_config`` 在上游直接拒绝）。因此非法取值降级为「未知」。
+    """
+    from src.ui.config_menu import _rerank_default, _rerank_menu_label
+
+    config = _session_config().to_dict()
+    for written in ("false", "no", 0, None):
+        config["rerank_enabled"] = written
+        assert _rerank_menu_label(config) == "未知", written
+        assert _rerank_default(config) is None, written
+
+
+def test_config_menu_keeps_working_for_a_real_boolean():
+    """收紧不能误伤：真正的布尔取值照旧显示「启用」／「禁用」。"""
+    from src.ui.config_menu import _rerank_default, _rerank_menu_label
+
+    config = _session_config().to_dict()
+    for enabled, label in ((True, "启用"), (False, "禁用")):
+        config["rerank_enabled"] = enabled
+        assert _rerank_menu_label(config) == label
+        assert _rerank_default(config) is enabled

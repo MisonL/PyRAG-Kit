@@ -11,6 +11,7 @@ from ..utils.config import (
     _MAX_RETRIEVAL_TOP_K,
     RetrievalMethod,
     parse_decimal_int,
+    require_rerank_enabled,
     require_retrieval_method,
     require_scale_field,
     safe_repr,
@@ -20,6 +21,40 @@ from .display_utils import _render_value, display_chat_config, markup_text
 
 logger = get_module_logger(__name__)  # 获取当前模块的日志器
 console = Console()
+
+
+def _rerank_menu_label(chat_config: dict[str, Any]) -> str:
+    """返回菜单里的 Rerank 状态文本；取值非法时显示「未知」。
+
+    读取必须与写入侧同判据（``_validate_rerank_enabled`` 只认 ``bool``）：真值
+    判断会把直写的 ``"false"`` 显示成「启用」，与服务层的
+    ``_coerce_rerank_enabled`` 给出相反结论。
+
+    但这里**不能**抛 ``ValueError``——``edit_retrieval_params`` 由
+    ``launch_config_editor`` 经 ``asyncio.to_thread`` 调用，调用点只接
+    ``(KeyboardInterrupt, EOFError)``，异常会终止整个会话。而菜单是用户唯一
+    还能改配置的入口（``display_chat_config`` 在上游会直接拒绝）。非法取值
+    显示「未知」，用户仍能进菜单把它改回布尔。
+    """
+    try:
+        enabled = require_rerank_enabled(chat_config["rerank_enabled"])
+    except ValueError:
+        return "未知"
+    return "启用" if enabled else "禁用"
+
+
+def _rerank_default(chat_config: dict[str, Any]) -> bool | None:
+    """读 ``rerank_enabled`` 作为 ``confirm`` 的默认项；取值非法时返回 ``None``。
+
+    ``questionary.confirm`` 在用户直接回车时把 ``default`` **原样**返回
+    （``prompt_toolkit`` 的 ``set_answer`` 分支），因此 ``default="false"`` 会让
+    回车得到字符串 ``"false"``——写回配置后服务层报错，而界面上明明显示「是」。
+    ``None`` 是 questionary 的合法默认（不预选），菜单照常可用。
+    """
+    try:
+        return require_rerank_enabled(chat_config["rerank_enabled"])
+    except ValueError:
+        return None
 
 
 def _top_k_ceiling(multiplier: int) -> int:
@@ -71,7 +106,10 @@ def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
         # ``AttributeError``，菜单渲染不出来。收敛后 ``default=`` 也拿到规范取值。
         current_method = require_retrieval_method(chat_config["retrieval_method"]).value
         current_top_k = chat_config["top_k"]
-        current_rerank = "启用" if chat_config["rerank_enabled"] else "禁用"
+        # 与 ``display_chat_config`` 同因：真值判断对可直写的取值会给出与服务层
+        # 相反的结论（``"false"`` 显示成「启用」）。菜单侧不抛错，非法取值显示
+        # 「未知」——见 ``_rerank_menu_label``。
+        current_rerank = _rerank_menu_label(chat_config)
         # 权重同样要经 ``safe_repr``：``SessionConfig`` 是公开类、普通属性没有
         # ``__setattr__`` 守卫，嵌入方或携带超大整数的 pickle 快照可以直写
         # ``cfg.vector_weight = 10**4301``，随后这里与下面三处的裸插值都会抛
@@ -155,8 +193,18 @@ def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
                 logger.info(f"Top K 已更新为: {new_top_k}")
 
         elif choice == "rerank":
+            # 同一收敛也用于 ``default=``，见 ``_rerank_default``。
+            #
+            # ``default=None`` 是 questionary 的**合法**取值，只是它的类型标注
+            # （``default: bool = True``）没写出来：``prompt_toolkit`` 的
+            # ``set_answer`` 分支是 ``if status["answer"] is None: status["answer"]
+            # = default``——``None`` 正是它内部的「尚未作答」哨兵，用户直接回车
+            # 时返回 ``None``，下面的 ``if new_rerank is not None`` 因而跳过写回。
+            # 实测 ``questionary.confirm("x", default=None)`` 正常构造。标注与行为
+            # 不符，故在此显式忽略。
             new_rerank = questionary.confirm(
-                "是否启用Rerank重排?", default=chat_config["rerank_enabled"]
+                "是否启用Rerank重排?",
+                default=_rerank_default(chat_config),  # type: ignore[arg-type]
             ).ask()
             if new_rerank is not None:
                 chat_config["rerank_enabled"] = new_rerank

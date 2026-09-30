@@ -15,6 +15,7 @@ from ..utils.config import (  # 导入 get_settings 函数
     is_double_convertible,
     require_detail_attributes,
     require_provider_name,
+    require_rerank_enabled,
     require_retrieval_method,
     safe_repr,
 )
@@ -358,13 +359,20 @@ def display_chat_config(console: Console, chat_config: dict[str, Any]):
     chat_table.add_row(
         "候选过量招募倍率:", Text(_render_value(chat_config["retrieval_candidate_multiplier"]))
     )
+    # ``rerank_enabled`` 与同一张表的 ``retrieval_method`` 同因：``SessionConfig``
+    # 是公开类、普通属性没有 ``__setattr__`` 守卫，直写 ``"false"``／``"no"``／``0``
+    # 之后真值判断会给出与服务层**相反**的结论——实测直写 ``"false"`` 时这张表显示
+    # 「启用」并渲染 Rerank 模型段落，而 ``RetrievalService._coerce_rerank_enabled``
+    # 对同一个值直接报错。写入侧（``_validate_rerank_enabled``）只认 ``bool``，
+    # 读取侧必须同判据。
+    rerank_enabled = require_rerank_enabled(chat_config["rerank_enabled"])
     chat_table.add_row(
         "Rerank重排:",
         markup_text("[bold green]启用[/bold green]")
-        if chat_config["rerank_enabled"]
+        if rerank_enabled
         else markup_text("[bold red]禁用[/bold red]"),
     )
-    if chat_config["rerank_enabled"]:
+    if rerank_enabled:
         active_rerank = chat_config["active_rerank_configuration"]
         rerank_model_details = _require_model_detail(
             chat_config["rerank_configurations"], active_rerank, "Rerank"
@@ -420,7 +428,7 @@ def display_chat_config(console: Console, chat_config: dict[str, Any]):
     api_table.add_column(style="bold white")
     # 仅显示与激活的LLM和Rerank相关的配置
     active_providers = {llm_model_details.provider}
-    if chat_config["rerank_enabled"]:
+    if rerank_enabled:
         # 与上面那处同源：这里是同一个裸索引的第二份拷贝，上面改了这里也要改，
         # 否则「rerank 配置缺失」只在表格渲染阶段被拦住、到了 API Key 段落又
         # 抛一次裸 ``KeyError``。

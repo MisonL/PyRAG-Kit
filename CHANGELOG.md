@@ -351,7 +351,18 @@
 
   因此上一轮（第十三轮）提交里的 Google 守卫**只在测试替身下可达**——那批用例打桩了 `_get_client`，恰好绕过了校验所在的那一层，而原文把 Google 与 Ark 一并称为「实测走真实入口」是不准确的。Ark 的那批是线上可达的。Google 守卫本身保留（契约一致性有价值，且它暴露了一个不真实的既有夹具），但定位已在代码注释、测试 docstring 与本条目里改正；另加两条**前提断言**（`test_google_sdk_validates_response_containers_so_the_guard_is_not_reachable_live` 与 `test_openai_sdk_does_not_validate_response_containers_by_default`）把这个差异固定在测试里——某个 SDK 版本改了构造方式就会变红。
 
+- **补齐 `rerank_enabled` 读取侧的判据（此前只有写入侧）**：`SessionConfig._validate_rerank_enabled` 只认 `bool`（`tests/runtime/test_contracts.py` 里就有 `("rerank_enabled", "yes")` 这一行），但那只管**写入**。`SessionConfig` 是公开类、普通属性没有 `__setattr__` 守卫，直写 `"false"`／`"no"`／`0` 之后，UI 的 **5 个读取点**走的是真值判断，与服务层的 `_coerce_rerank_enabled` 分成两套判据：
+
+  - `display_chat_config`（`chat_table` 的状态格、Rerank 模型段落、API Key 段落的三处分支）：实测直写 `"false"` 时配置表显示 **[bold green]「启用」** 并渲染出激活的 Rerank 模型，而 `RetrievalService.retrieve` 对同一个值直接抛 `ValueError: rerank_enabled 必须是布尔值`。把 rerank 写成 `"false"` 的人看到的是「已启用」，且界面不提示任何错误——**与配置意图相反**。
+  - `config_menu` 的菜单项与 `questionary.confirm(default=...)`：同一取值下菜单显示「当前: 启用」，且 `confirm` 在用户直接回车时把 `default` **原样**返回（`prompt_toolkit` 的 `set_answer` 分支），于是回车得到字符串 `"false"` 并被写回配置——界面显示「是」，写进去的是字符串，服务层再报错。
+
+  现新增共享助手 `require_rerank_enabled`（`src/utils/config.py`），与 `_validate_rerank_enabled`／`_coerce_rerank_enabled` 共用同一判据（只认 `bool`，**不**接受 `0`／`1`／`"yes"`——真值语义正是这条缺陷的根因）。服务层的 `_coerce_rerank_enabled` 改为复用它，两处不再各写一份消息。
+
+  **两处读取点的处置不同，这是有意的**：`display_chat_config` 与同一张表的 `retrieval_method` 一致，**直接拒绝**（它本就在启动横幅处对非法取值报错）；`config_menu` 则降级——菜单由 `launch_config_editor` 经 `asyncio.to_thread` 调用，调用点只接 `(KeyboardInterrupt, EOFError)`，抛 `ValueError` 会终止整个会话，而菜单是用户唯一还能改配置的入口（`display_chat_config` 在上游已经拒绝）。因此菜单里非法取值显示「未知」、`confirm` 的默认项传 `None`（questionary 的合法默认，不预选），用户仍能进菜单把它改回布尔。
+
 ### 测试
+
+- 新增第十五轮的回归用例（10 个用例；回退源码后其中 9 个变红，1 个「不误伤」反向守卫保持绿）：六个非布尔取值（`"false"`／`"no"`／`"true"`／`0`／`1`／`None`）下 UI 与服务层必须给出同一种收场；配置表不得把 `"false"` 显示成「启用」（原始症状）；菜单的标签与 `confirm` 默认项对非法取值降级为「未知」／`None`；以及真布尔取值照旧渲染「启用」／「禁用」的反向守卫。
 
 - 新增第十四轮的回归用例（8 个用例；回退源码后其中 5 个变红）：OpenAI 兼容渠道 Responses `output` 对三类非序列取值的拒绝、Chat `message.tool_calls` 的拒绝、流式 `delta.tool_calls` 的拒绝（走同一守卫）、正常响应（含工具调用）照旧解析；以及两条**可达性前提断言**——google-genai 在 SDK 层就拒绝畸形容器、openai 默认不校验。后两条在回退源码后仍为绿（它们断言的是 SDK 行为而非本仓行为），这正是它们的作用：把「哪个守卫线上可达」这件事从口头结论变成会随依赖升级而失效的测试。
 

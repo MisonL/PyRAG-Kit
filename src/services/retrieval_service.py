@@ -24,6 +24,7 @@ from src.utils.config import (
     parse_decimal_int,
     require_detail_attributes,
     require_provider_name,
+    require_rerank_enabled,
     require_retrieval_method,
     require_scale_field,
     safe_repr,
@@ -297,10 +298,12 @@ def _coerce_rerank_enabled(value: Any) -> bool:
     ``[]`` 静默当成「禁用」、把 ``"no"`` 当成「启用」——用户看到的是 rerank 行为
     与配置不符，而不是一条配置错误。``SessionConfig`` 的校验器要求 ``bool``，
     这里对直写路径保持同一判据。
+
+    判据与措辞都交给 ``require_rerank_enabled``：UI 的 5 个读取点此前用真值判断
+    （直写 ``"false"`` 时配置表显示「启用」），现在与这里共用同一实现，读出来的
+    收场与写进去的拒绝一致。
     """
-    if not isinstance(value, bool):
-        raise ValueError(f"rerank_enabled 必须是布尔值，但得到 {safe_repr(value)}。")
-    return value
+    return require_rerank_enabled(value)
 
 
 def _coerce_fusion_strategy(value: Any) -> str:

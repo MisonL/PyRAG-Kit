@@ -470,6 +470,29 @@ def require_provider_name(value: Any, *, label: str = "provider") -> str:
     return value
 
 
+def require_rerank_enabled(value: Any, *, label: str = "rerank_enabled") -> bool:
+    """确认 ``rerank_enabled`` 是真正的布尔值并原样返回，否则抛 ``ValueError``。
+
+    ``SessionConfig._validate_rerank_enabled`` 早已要求 ``bool``（测试
+    ``tests/runtime/test_contracts.py`` 里就有 ``("rerank_enabled", "yes")`` 这一
+    行），但那只管**写入**侧。``SessionConfig`` 是公开类、普通属性没有
+    ``__setattr__`` 守卫，直写 ``"false"``／``"no"``／``0`` 之后，读取侧此前走的是
+    真值判断，于是同一个字段分成两套判据：
+
+    * ``RetrievalService._coerce_rerank_enabled`` 明确拒绝（``ValueError``）；
+    * UI 的 5 个读取点全部用真值判断——实测直写 ``"false"`` 时配置表显示
+      **「启用」**、菜单显示「当前: 启用」、``questionary.confirm`` 的默认项是
+      「是」，而服务层对同一个值直接报错。用户看到的是与配置意图**相反**的结论。
+
+    判据与 ``_coerce_rerank_enabled``／``_validate_rerank_enabled`` 完全一致
+    （只认 ``bool``，不认 ``0``／``1``／``"yes"``）：真值语义正是这条缺陷的根因，
+    读取侧不能再用它。
+    """
+    if not isinstance(value, bool):
+        raise ValueError(f"{label} 必须是布尔值，但得到 {safe_repr(value)}。")
+    return value
+
+
 def require_chat_temperature(value: Any) -> float:
     """把 ``chat_temperature`` 收敛成非负有限浮点，非法取值给出带字段名的 ``ValueError``。
 
