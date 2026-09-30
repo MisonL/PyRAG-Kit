@@ -1644,12 +1644,40 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 chunks.append(content_to_text(text))
         if chunks:
             return "".join(chunks)
-        for item in field(response, "output", []) or []:
+        for item in cls._require_response_list(field(response, "output", []) or [], label="output"):
             for content in field(item, "content", []) or []:
                 text = field(content, "text")
                 if isinstance(text, str):
                     chunks.append(text)
         return "".join(chunks)
+
+    @staticmethod
+    def _require_response_list(value: Any, *, label: str) -> list[Any]:
+        """把响应里的容器字段收敛成列表，非法形态给出可读的 ``RuntimeError``。
+
+        与 ``_raise_for_chat_response_error`` 对 ``choices`` 的守卫同一判据
+        （「响应的 choices 必须是列表」），只是这里覆盖 ``output`` 与 ``tool_calls``：
+        本文件有 8 处直接迭代它们，此前每一处都只写 ``field(x, ..., []) or []``
+        ——那只挡住 ``None`` 与空值。
+
+        **可达性取决于 SDK 的响应构造方式**，这一点必须写清楚，否则很容易把
+        守卫加在不可达的位置上：``openai`` 与 ``volcenginesdkarkruntime`` 的
+        ``_base_client._process_response_data`` 在 ``_strict_response_validation``
+        为假（默认）时走 ``construct_type``——它**不执行 pydantic 校验**，畸形
+        容器会原样进入响应对象。实测走真实入口：
+
+        * Chat 路径 ``message.tool_calls=5`` -> 裸
+          ``TypeError: 'int' object is not iterable``；
+        * Responses 路径 ``output=5`` -> 同一个裸 ``TypeError``。
+
+        两者都不是 ``RuntimeError``，而调用方的错误分类按它写。对照：``google-genai``
+        的 ``_from_response`` 走 ``cls.model_validate(response)``——**会**校验，
+        因此那里的同类守卫只在测试替身下可达（google.py 的 ``_require_candidates``
+        即属此列，它的价值是契约一致性与不真实夹具的暴露，不是拦截线上流量）。
+        """
+        if not isinstance(value, (list, tuple)):
+            raise RuntimeError(f"响应的 {label} 必须是列表，但得到 {safe_repr(value)}。")
+        return list(value)
 
     @classmethod
     def _extract_tool_calls(cls, response: Any) -> list[dict[str, Any]]:
@@ -1657,7 +1685,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         choices = field(response, "choices", []) or []
         for choice in choices:
             message = field(choice, "message") or field(choice, "delta")
-            for call in field(message, "tool_calls", []) or []:
+            for call in cls._require_response_list(
+                field(message, "tool_calls", []) or [], label="tool_calls"
+            ):
                 function = field(call, "function")
                 calls.append(
                     {
@@ -1667,7 +1697,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                         "arguments": normalize_tool_arguments(field(function, "arguments", "")),
                     }
                 )
-        for item in field(response, "output", []) or []:
+        for item in cls._require_response_list(field(response, "output", []) or [], label="output"):
             if enum_field(item, "type") in {"function_call", "custom_tool_call"}:
                 calls.append(
                     {
@@ -1695,7 +1725,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 value = field(message, name)
                 if isinstance(value, str):
                     values.append(value)
-        for item in field(response, "output", []) or []:
+        for item in cls._require_response_list(field(response, "output", []) or [], label="output"):
             if enum_field(item, "type") in {"reasoning", "reasoning_item"}:
                 summary = field(item, "summary")
                 if isinstance(summary, str):
@@ -1723,7 +1753,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             refusal = field(message, "refusal")
             if isinstance(refusal, str) and refusal:
                 return refusal
-        for item in field(response, "output", []) or []:
+        for item in cls._require_response_list(field(response, "output", []) or [], label="output"):
             refusal = field(item, "refusal")
             if isinstance(refusal, str) and refusal:
                 return refusal
@@ -1918,7 +1948,9 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         text = content_to_text(field(delta, "content", ""))
         reasoning = field(delta, "reasoning_content") or field(delta, "reasoning") or ""
         refusal = field(delta, "refusal")
-        tool_calls = field(delta, "tool_calls", []) or []
+        tool_calls = cls._require_response_list(
+            field(delta, "tool_calls", []) or [], label="tool_calls"
+        )
         finish_reason = field(choice, "finish_reason")
         events: list[StreamEvent] = []
 

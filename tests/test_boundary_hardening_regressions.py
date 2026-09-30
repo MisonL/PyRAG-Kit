@@ -2720,8 +2720,15 @@ def _google_provider_with(response):
 def test_google_complete_rejects_unusable_candidates(bad_candidates):
     """非序列 ``candidates`` 必须收敛成 ``RuntimeError``。
 
-    走真实 ``complete`` 入口而不是直接调 ``_extract_result``：守卫加在哪个函数上
-    是一回事，真实路径是否经过它是另一回事。
+    走 ``complete`` 入口而不是直接调 ``_extract_result``：守卫加在哪个函数上是
+    一回事，路径是否经过它是另一回事。
+
+    **可达性说明**：这里打桩了 ``_get_client``，而真 SDK 的响应由
+    ``GenerateContentResponse._from_response`` 经 ``cls.model_validate(response)``
+    构造——**会**执行 pydantic 校验，畸形容器在 SDK 层就被拒。因此本条守的是
+    「替身 / 将来 SDK 改成不校验时」的契约，**不是**线上流量。同文件
+    ``test_google_sdk_validates_response_containers_so_the_guard_is_not_reachable_live``
+    把这条前提固定住。
     """
     from types import SimpleNamespace
 
@@ -2752,7 +2759,11 @@ def test_google_complete_keeps_working_for_valid_candidates():
 
 
 def test_google_stream_chunk_guard_covers_both_readers():
-    """流式两个读取点用同一守卫：``_stream_events_from_chunk`` 与终止判据。"""
+    """流式两个读取点用同一守卫：``_stream_events_from_chunk`` 与终止判据。
+
+    与上一节同一条可达性说明：google 的响应在 SDK 层已校验，本条覆盖的是契约
+    一致性与替身场景。
+    """
     from types import SimpleNamespace
 
     from src.providers.google import GoogleProvider
@@ -2798,7 +2809,12 @@ def _ark_provider(protocol: str):
     ],
 )
 def test_ark_responses_complete_rejects_unusable_output(bad_output):
-    """Responses 路径的 ``output`` 非序列时必须收敛成 ``RuntimeError``。"""
+    """Responses 路径的 ``output`` 非序列时必须收敛成 ``RuntimeError``。
+
+    与 google 那节不同，**本条线上可达**：Ark SDK 的
+    ``_base_client._process_response_data`` 走 ``construct_type``，不执行 pydantic
+    校验（对照表见「OpenAI 兼容渠道的响应容器守卫」一节的注释）。
+    """
     from types import SimpleNamespace
     from unittest.mock import MagicMock, patch
 
@@ -2884,3 +2900,169 @@ def test_ark_complete_keeps_working_for_valid_responses():
     with patch.object(provider, "_get_client", return_value=client):
         result = provider.complete(prompt="hi")
     assert result.text == "你好"
+
+
+# ── OpenAI 兼容渠道的响应容器守卫（可达性由 SDK 决定） ──
+#
+# 同一类「响应容器被迭代却没有形态守卫」，在三个 SDK 上的**可达性不同**，因为
+# 它们的响应构造方式不同：
+#
+#   * ``google-genai`` 的 ``_from_response`` 走 ``cls.model_validate(response)``
+#     ——**会**执行 pydantic 校验，畸形容器在 SDK 层就被拒（``ValidationError``）；
+#   * ``openai`` 的 ``_base_client._process_response_data`` 在
+#     ``_strict_response_validation`` 为假时走 ``construct_type``——该标志实测
+#     默认 ``False``，``construct_type`` **不校验**；
+#   * ``volcenginesdkarkruntime`` 的 ``_base_client`` 同样只有 ``construct_type``。
+#
+# 因此 openai 兼容渠道（``OpenAICompatibleProvider`` 及其 7 个薄子类：qwen /
+# siliconflow / ollama / lm-studio / deepseek / grok 等）与 Ark 的守卫是**线上
+# 可达**的，而 google 的同类守卫只在测试替身下可达。
+#
+# 本节的用例打桩 ``_get_client``：对 openai 兼容渠道而言这与真实路径等价（SDK
+# 那一层不做校验，响应对象直接来自 ``construct_type``）；对 google 而言则**不等价**
+# （见上），所以这里不重复 google 的用例，其契约由上一节覆盖。
+
+
+def _openai_compatible_provider(protocol: str):
+    """构造一个可直接调用 ``complete`` 的 OpenAICompatibleProvider 替身。"""
+    from src.providers.openai_compatible import OpenAICompatibleProvider
+
+    provider = OpenAICompatibleProvider.__new__(OpenAICompatibleProvider)
+    provider._provider = "demo"
+    provider._protocol = protocol
+    provider._model_name = "demo-model"
+    provider._client = None
+    provider._aclient = None
+    provider._options = {}
+    provider._server_verified_protocols = frozenset({"responses"})
+    return provider
+
+
+@pytest.mark.parametrize(
+    "bad_output",
+    [
+        pytest.param(5, id="int"),
+        pytest.param({"a": 1}, id="mapping"),
+        pytest.param("ab", id="str"),
+    ],
+)
+def test_openai_compatible_responses_rejects_unusable_output(bad_output):
+    """Responses 路径的 ``output`` 非序列时必须收敛成 ``RuntimeError``。"""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    provider = _openai_compatible_provider("responses")
+    response = SimpleNamespace(
+        output=bad_output, usage=None, status="completed", id="r", choices=None
+    )
+    client = MagicMock()
+    client.responses.create.return_value = response
+
+    with (
+        patch.object(provider, "_get_client", return_value=client),
+        pytest.raises(RuntimeError, match="output 必须是列表"),
+    ):
+        provider.complete(prompt="hi")
+
+
+def test_openai_compatible_chat_rejects_unusable_tool_calls():
+    """Chat 路径的 ``message.tool_calls`` 非序列时同样收敛成 ``RuntimeError``。"""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    provider = _openai_compatible_provider("chat_completions")
+    message = SimpleNamespace(content="x", tool_calls=5)
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=message, finish_reason="stop")],
+        output=[],
+        usage=None,
+        status=None,
+        id="r",
+    )
+    client = MagicMock()
+    client.chat.completions.create.return_value = response
+
+    with (
+        patch.object(provider, "_get_client", return_value=client),
+        pytest.raises(RuntimeError, match="tool_calls 必须是列表"),
+    ):
+        provider.complete(prompt="hi")
+
+
+def test_openai_compatible_stream_delta_rejects_unusable_tool_calls():
+    """流式 delta 的 ``tool_calls`` 用同一守卫。"""
+    from types import SimpleNamespace
+
+    from src.providers.openai_compatible import OpenAICompatibleProvider
+
+    chunk = SimpleNamespace(
+        choices=[
+            SimpleNamespace(delta=SimpleNamespace(content="", tool_calls=5), finish_reason=None)
+        ],
+        usage=None,
+        id="r",
+    )
+    with pytest.raises(RuntimeError, match="tool_calls 必须是列表"):
+        OpenAICompatibleProvider._chat_stream_events(chunk)
+
+
+def test_openai_compatible_complete_keeps_working_for_valid_responses():
+    """收紧不能误伤：两条协议的正常响应照旧解析。"""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    provider = _openai_compatible_provider("chat_completions")
+    message = SimpleNamespace(
+        content="你好",
+        tool_calls=[
+            SimpleNamespace(
+                id="c1", type="function", function=SimpleNamespace(name="f", arguments='{"a":1}')
+            )
+        ],
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=message, finish_reason="stop")],
+        output=[],
+        usage=None,
+        status=None,
+        id="r",
+    )
+    client = MagicMock()
+    client.chat.completions.create.return_value = response
+    with patch.object(provider, "_get_client", return_value=client):
+        result = provider.complete(prompt="hi")
+    assert result.text == "你好"
+    assert len(result.tool_calls) == 1
+
+
+def test_google_sdk_validates_response_containers_so_the_guard_is_not_reachable_live():
+    """记录可达性事实：google-genai 在 SDK 层就拒绝畸形容器。
+
+    这条不是产品行为的断言，而是**可达性前提**的断言。它把「google 的
+    ``_require_candidates`` 只在测试替身下可达」这件事固定在测试里：如果某个
+    SDK 版本改成 ``construct_type``（像 openai 那样不校验），这条会变红，提醒
+    重新评估那个守卫的定位。反过来，如果有人把守卫当成线上拦截手段来写文档或
+    发布说明，这条也会让前提显形。
+    """
+    from google.genai import types as genai_types
+    from pydantic import ValidationError
+
+    for payload in (
+        {"candidates": 5},
+        {"candidates": {"0": {}}},
+        {"candidates": [{"content": {"parts": 5}}]},
+    ):
+        with pytest.raises(ValidationError, match="candidates"):
+            genai_types.GenerateContentResponse.model_validate(payload)
+
+
+def test_openai_sdk_does_not_validate_response_containers_by_default():
+    """对称事实：openai SDK 默认走 ``construct_type``，不校验容器。
+
+    这解释了为什么 openai 兼容渠道的同类守卫是**线上可达**的，而 google 的不是。
+    两条前提断言放在一起，避免只记住一半。
+    """
+    from openai import OpenAI
+
+    client = OpenAI(api_key="dummy", base_url="https://example.invalid/v1")
+    assert client._strict_response_validation is False

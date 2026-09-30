@@ -332,16 +332,30 @@
 
   可达性说明：44 个调用点里 43 个模板是字符串字面量，剩下 1 个（`scripts/embed_knowledge_base.py` 的 `mask_api_key(api_key_value)`）两个分支都返回字面量，因此本仓自带流程走不到——修的是**公开函数**的契约一致性。
 
-- **补齐 Google 与 Ark 响应顶层容器的形态守卫**：两个 provider 的响应容器此前只写 `field(x, "candidates", []) or []` / `field(x, "output", []) or []`——那只挡住 `None` 与空值，挡不住其它形态。实测走**真实入口**（`GoogleProvider.complete` / `VolcengineProvider.complete`）：
+- **补齐 Google 与 Ark 响应顶层容器的形态守卫**：两个 provider 的响应容器此前只写 `field(x, "candidates", []) or []` / `field(x, "output", []) or []`——那只挡住 `None` 与空值，挡不住其它形态。**可达性两者不同**，取决于各 SDK 的响应构造方式（详见第十四轮条目里的对照表）：Ark 走 `construct_type`，**不执行 pydantic 校验**，因此线上可达；Google 走 `model_validate`，畸形响应在 SDK 层就被拒，因此那里的守卫只在测试替身下可达。原文把两者一并称为「实测走真实入口」是不准确的——测试打桩了 `_get_client`，恰好绕过了校验所在的那一层。
 
   - Google `candidates=5` → 裸 `TypeError: 'int' object is not iterable`；`candidates={"0": {}}` → 更晚一步，在 `candidates[0]` 处抛裸 `KeyError: 0`。本文件有 **6 处**直接迭代 `candidates`（`_response_text`、`_extract_refusal`、`_extract_result` 两处、`_stream_events_from_chunk`、`_stream_chunk_has_terminal_event`），现全部经新增的 `_require_candidates` 收敛。
   - Ark Responses `output=5` → 裸 `TypeError`；Ark Chat `message.tool_calls=5` → 同一个裸 `TypeError`。现经新增的 `_require_ark_list` 收敛（6 处调用点）。
 
   这些异常都不是 `RuntimeError`——而两个 provider 的错误分类（以及调用方的 `except`）按 `RuntimeError` 写。同一个形态在 `openai_compatible._raise_for_chat_response_error` 对 `choices` 早已有显式守卫，三个 provider 的收场必须一致。`candidates` / `output` 缺失（`None`）的既有语义保持不变：流式路径的正常中间态依赖它。
 
+- **补齐 OpenAI 兼容渠道响应容器的形态守卫，并厘清同类守卫在三个 SDK 上的可达性差异**：`OpenAICompatibleProvider` 有 **8 处**直接迭代响应容器（`output`、`message.tool_calls`、流式 `delta.tool_calls`），此前每处都只写 `field(x, ..., []) or []`——那只挡住 `None` 与空值。实测走真实入口：Chat 路径 `message.tool_calls=5` 与 Responses 路径 `output=5` 都抛裸 `TypeError: 'int' object is not iterable`，而调用方的错误分类按 `RuntimeError` 写。现新增 `_require_response_list`，判据与同文件 `_raise_for_chat_response_error` 对 `choices` 的守卫一致，8 处全部接入。这一条影响 `qwen`／`siliconflow`／`ollama`／`lm-studio`／`deepseek`／`grok` 等 7 个薄子类共用的路径。
+
+  **同时厘清一个此前被我说错的事实**：同一类守卫在三个 SDK 上**可达性不同**，因为响应构造方式不同——
+
+  | SDK | 响应构造 | 是否校验 |
+  |---|---|---|
+  | `google-genai` | `_from_response` → `cls.model_validate(response)` | **校验**，畸形容器在 SDK 层就被拒 |
+  | `openai` | `_process_response_data` → `construct_type`（`_strict_response_validation` 实测默认 `False`） | **不校验** |
+  | `volcenginesdkarkruntime` | 同样只有 `construct_type` | **不校验** |
+
+  因此上一轮（第十三轮）提交里的 Google 守卫**只在测试替身下可达**——那批用例打桩了 `_get_client`，恰好绕过了校验所在的那一层，而原文把 Google 与 Ark 一并称为「实测走真实入口」是不准确的。Ark 的那批是线上可达的。Google 守卫本身保留（契约一致性有价值，且它暴露了一个不真实的既有夹具），但定位已在代码注释、测试 docstring 与本条目里改正；另加两条**前提断言**（`test_google_sdk_validates_response_containers_so_the_guard_is_not_reachable_live` 与 `test_openai_sdk_does_not_validate_response_containers_by_default`）把这个差异固定在测试里——某个 SDK 版本改了构造方式就会变红。
+
 ### 测试
 
-- 新增第十三轮的回归用例（18 个用例；回退源码后其中 7 个变红，11 个「不误伤」反向守卫保持绿）：Google `complete` 对三类非序列 `candidates`（`int`／`mapping`／`str`）的拒绝、流式两个读取点用同一守卫、`candidates=None` 的既有语义不变、正常响应照旧解析；Ark 两条协议分别对非序列 `output` 与 `tool_calls` 的拒绝，以及正常响应（含工具调用）照旧解析。用例全部走**真实入口**而不是直接调私有解析函数——「守卫加在哪个函数上」与「真实路径是否经过它」是两回事，我最初的探针正是在这里给出过错误结论。
+- 新增第十四轮的回归用例（8 个用例；回退源码后其中 5 个变红）：OpenAI 兼容渠道 Responses `output` 对三类非序列取值的拒绝、Chat `message.tool_calls` 的拒绝、流式 `delta.tool_calls` 的拒绝（走同一守卫）、正常响应（含工具调用）照旧解析；以及两条**可达性前提断言**——google-genai 在 SDK 层就拒绝畸形容器、openai 默认不校验。后两条在回退源码后仍为绿（它们断言的是 SDK 行为而非本仓行为），这正是它们的作用：把「哪个守卫线上可达」这件事从口头结论变成会随依赖升级而失效的测试。
+
+- 新增第十三轮的回归用例（18 个用例；回退源码后其中 7 个变红，11 个「不误伤」反向守卫保持绿）：Google `complete` 对三类非序列 `candidates`（`int`／`mapping`／`str`）的拒绝、流式两个读取点用同一守卫、`candidates=None` 的既有语义不变、正常响应照旧解析；Ark 两条协议分别对非序列 `output` 与 `tool_calls` 的拒绝，以及正常响应（含工具调用）照旧解析。用例走 `complete` 入口而不是直接调私有解析函数——「守卫加在哪个函数上」与「路径是否经过它」是两回事。但要注意**可达性两半不同**：Ark 的用例线上可达，Google 的打桩了 `_get_client`、绕过了 SDK 的 `model_validate`，因此只在替身场景下成立（第十四轮已把这条前提写成断言）。
 
   同时修正 `tests/providers/test_google_genai.py` 的一处夹具：它用未指定 `candidates` 的裸 `MagicMock`，而真 SDK 的字段类型是 `list[Candidate] | None`。裸 `MagicMock` 的属性是一个可迭代的空 mock，旧代码只做 `or []` 与迭代，这种不真实形态恰好能通过；形态守卫会把它拒掉。夹具已写成真实形状（显式 `candidates = []`）。
 
