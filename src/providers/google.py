@@ -1853,7 +1853,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
     @staticmethod
     def _response_text(response: Any) -> str:
         """读取文本而不触发 Google SDK 纯工具响应的 ValueError。"""
-        candidates = field(response, "candidates", []) or []
+        candidates = GoogleProvider._require_candidates(response, source="响应")
         if candidates:
             chunks: list[str] = []
             saw_parts = False
@@ -1896,6 +1896,33 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             "MODEL_ARMOR",
         }
     )
+
+    @staticmethod
+    def _require_candidates(owner: Any, *, source: str) -> list[Any]:
+        """把响应／流块里的 ``candidates`` 收敛成列表，非法形态给出可读的 ``RuntimeError``。
+
+        ``candidates`` 是 Gemini 响应的顶层容器，本文件有 **6 处**直接迭代它
+        （``_response_text``、``_extract_refusal``、``_extract_result`` 两处、
+        ``_stream_events_from_chunk``、``_stream_chunk_has_terminal_event``）。
+        此前每一处都只写 ``field(x, "candidates", []) or []``——那只挡住 ``None``
+        与空值。实测走**真实入口**（``GoogleProvider.complete``）时：
+
+        * ``candidates`` 是整数 -> 裸 ``TypeError: 'int' object is not iterable``；
+        * 是 JSON 对象 -> 更晚一步，在 ``candidates[0]`` 处抛裸 ``KeyError: 0``。
+
+        两者都不是 ``RuntimeError``——而本 provider 的错误分类（以及调用方的
+        ``except``）按 ``RuntimeError`` 写。同一个形态在
+        ``openai_compatible._raise_for_chat_response_error`` 早已有显式守卫
+        （「响应的 choices 必须是列表」），两个 provider 的收场必须一致。
+
+        返回列表而不是原值：调用方全都只做迭代，收敛后不必再各自 ``or []``。
+        """
+        candidates = field(owner, "candidates", []) or []
+        if not isinstance(candidates, (list, tuple)):
+            raise RuntimeError(
+                f"Google {source}的 candidates 必须是列表，但得到 {safe_repr(candidates)}。"
+            )
+        return list(candidates)
 
     @classmethod
     def _candidate_refusal(cls, candidate: Any) -> str | None:
@@ -1952,7 +1979,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
     @classmethod
     def _extract_refusal(cls, response: Any) -> str | None:
         """提取 Gemini 响应中的显式拒答或安全拦截信息。"""
-        for candidate in field(response, "candidates", []) or []:
+        for candidate in cls._require_candidates(response, source="响应"):
             refusal = cls._candidate_refusal(candidate)
             if refusal:
                 return refusal
@@ -2328,7 +2355,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         usage_dict = normalize_usage(usage)
         calls = []
         reasoning: list[str] = []
-        for candidate in field(response, "candidates", []) or []:
+        for candidate in GoogleProvider._require_candidates(response, source="响应"):
             content = field(candidate, "content")
             for part in field(content, "parts", []) or []:
                 function_call = field(part, "function_call")
@@ -2348,7 +2375,10 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             tool_calls=calls,
             usage=usage_dict,
             finish_reason=GoogleProvider._normalize_finish_reason(
-                field((field(response, "candidates", []) or [None])[0], "finish_reason")
+                field(
+                    next(iter(GoogleProvider._require_candidates(response, source="响应")), None),
+                    "finish_reason",
+                )
             ),
             response_id=field(response, "response_id"),
             refusal=GoogleProvider._extract_refusal(response),
@@ -2360,7 +2390,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
     def _stream_events_from_chunk(cls, chunk: Any) -> list[StreamEvent]:
         events: list[StreamEvent] = []
         response_id = field(chunk, "response_id")
-        for candidate in field(chunk, "candidates", []) or []:
+        for candidate in cls._require_candidates(chunk, source="流块"):
             content = field(candidate, "content")
             parts = field(content, "parts", []) or []
             refusal_emitted = False
@@ -2526,7 +2556,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             return True
         return any(
             field(candidate, "finish_reason", None) is not None
-            for candidate in field(chunk, "candidates", []) or []
+            for candidate in GoogleProvider._require_candidates(chunk, source="流块")
         )
 
     def complete(self, request: CompletionRequest | None = None, **kwargs: Any) -> CompletionResult:

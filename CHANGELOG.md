@@ -332,7 +332,18 @@
 
   可达性说明：44 个调用点里 43 个模板是字符串字面量，剩下 1 个（`scripts/embed_knowledge_base.py` 的 `mask_api_key(api_key_value)`）两个分支都返回字面量，因此本仓自带流程走不到——修的是**公开函数**的契约一致性。
 
+- **补齐 Google 与 Ark 响应顶层容器的形态守卫**：两个 provider 的响应容器此前只写 `field(x, "candidates", []) or []` / `field(x, "output", []) or []`——那只挡住 `None` 与空值，挡不住其它形态。实测走**真实入口**（`GoogleProvider.complete` / `VolcengineProvider.complete`）：
+
+  - Google `candidates=5` → 裸 `TypeError: 'int' object is not iterable`；`candidates={"0": {}}` → 更晚一步，在 `candidates[0]` 处抛裸 `KeyError: 0`。本文件有 **6 处**直接迭代 `candidates`（`_response_text`、`_extract_refusal`、`_extract_result` 两处、`_stream_events_from_chunk`、`_stream_chunk_has_terminal_event`），现全部经新增的 `_require_candidates` 收敛。
+  - Ark Responses `output=5` → 裸 `TypeError`；Ark Chat `message.tool_calls=5` → 同一个裸 `TypeError`。现经新增的 `_require_ark_list` 收敛（6 处调用点）。
+
+  这些异常都不是 `RuntimeError`——而两个 provider 的错误分类（以及调用方的 `except`）按 `RuntimeError` 写。同一个形态在 `openai_compatible._raise_for_chat_response_error` 对 `choices` 早已有显式守卫，三个 provider 的收场必须一致。`candidates` / `output` 缺失（`None`）的既有语义保持不变：流式路径的正常中间态依赖它。
+
 ### 测试
+
+- 新增第十三轮的回归用例（18 个用例；回退源码后其中 7 个变红，11 个「不误伤」反向守卫保持绿）：Google `complete` 对三类非序列 `candidates`（`int`／`mapping`／`str`）的拒绝、流式两个读取点用同一守卫、`candidates=None` 的既有语义不变、正常响应照旧解析；Ark 两条协议分别对非序列 `output` 与 `tool_calls` 的拒绝，以及正常响应（含工具调用）照旧解析。用例全部走**真实入口**而不是直接调私有解析函数——「守卫加在哪个函数上」与「真实路径是否经过它」是两回事，我最初的探针正是在这里给出过错误结论。
+
+  同时修正 `tests/providers/test_google_genai.py` 的一处夹具：它用未指定 `candidates` 的裸 `MagicMock`，而真 SDK 的字段类型是 `list[Candidate] | None`。裸 `MagicMock` 的属性是一个可迭代的空 mock，旧代码只做 `or []` 与迭代，这种不真实形态恰好能通过；形态守卫会把它拒掉。夹具已写成真实形状（显式 `candidates = []`）。
 
 - 新增第十二轮的回归用例（12 个用例；回退源码后其中 7 个变红，5 个「不误伤」反向守卫保持绿）：`markup_text` 对七类非字符串模板（`int`／`None`／`list`／`tuple`／`dict`／`bytes`／位数超限整数）的拒绝、四类合法模板（含零占位符与多占位符）照旧渲染，以及「形态守卫不得盖掉既有占位符判据」——模板是合法字符串但数量不符时仍须给出原来那条消息。
 

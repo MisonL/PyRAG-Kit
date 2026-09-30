@@ -2678,3 +2678,209 @@ def test_markup_text_placeholder_errors_still_win_over_shape_guard():
         markup_text("无占位符", "多余的值")
     with pytest.raises(ValueError, match="占位符多于实参数量"):
         markup_text("{} 与 {}", "只有一个")
+
+
+# ── 响应容器的形态守卫（google / volcengine） ──
+#
+# 两个 provider 的响应顶层容器此前只有 ``field(x, "candidates", []) or []`` 这种
+# 写法——它挡住 ``None`` 与空值，挡不住其它形态。实测走**真实入口**
+# （``GoogleProvider.complete`` / ``VolcengineProvider.complete``）：
+#
+#   * Google ``candidates=5`` -> 裸 ``TypeError: 'int' object is not iterable``；
+#     ``candidates={"0": {}}`` -> 更晚一步，在 ``candidates[0]`` 处抛裸 ``KeyError: 0``。
+#   * Ark Responses ``output=5`` -> 裸 ``TypeError``；
+#     Ark Chat ``message.tool_calls=5`` -> 同一个裸 ``TypeError``。
+#
+# 这些都不是 ``RuntimeError``——而两个 provider 的错误分类（以及调用方的
+# ``except``）按 ``RuntimeError`` 写。同一个形态在
+# ``openai_compatible._raise_for_chat_response_error`` 对 ``choices`` 早已有显式
+# 守卫，三个 provider 的收场必须一致。
+
+
+def _google_provider_with(response):
+    """构造一个 ``_get_client`` 返回固定响应的 GoogleProvider。"""
+    from unittest.mock import MagicMock, patch
+
+    from src.providers.google import GoogleProvider
+
+    provider = GoogleProvider(model_name="gemini-1.5-flash")
+    client = MagicMock()
+    client.models.generate_content.return_value = response
+    return provider, patch.object(provider, "_get_client", return_value=client)
+
+
+@pytest.mark.parametrize(
+    "bad_candidates",
+    [
+        pytest.param(5, id="int"),
+        pytest.param({"0": {}}, id="mapping"),
+        pytest.param("ab", id="str"),
+    ],
+)
+def test_google_complete_rejects_unusable_candidates(bad_candidates):
+    """非序列 ``candidates`` 必须收敛成 ``RuntimeError``。
+
+    走真实 ``complete`` 入口而不是直接调 ``_extract_result``：守卫加在哪个函数上
+    是一回事，真实路径是否经过它是另一回事。
+    """
+    from types import SimpleNamespace
+
+    provider, client_patch = _google_provider_with(
+        SimpleNamespace(candidates=bad_candidates, usage_metadata=None, response_id="r")
+    )
+
+    with client_patch, pytest.raises(RuntimeError, match="candidates 必须是列表"):
+        provider.complete(prompt="hi")
+
+
+def test_google_complete_keeps_working_for_valid_candidates():
+    """收紧不能误伤：正常响应照旧解析。"""
+    from types import SimpleNamespace
+
+    candidate = SimpleNamespace(
+        finish_reason="STOP", content=SimpleNamespace(parts=[SimpleNamespace(text="你好")])
+    )
+    provider, client_patch = _google_provider_with(
+        SimpleNamespace(candidates=[candidate], usage_metadata=None, response_id="r")
+    )
+
+    with client_patch:
+        result = provider.complete(prompt="hi")
+
+    assert result.text == "你好"
+    assert result.finish_reason == "STOP"
+
+
+def test_google_stream_chunk_guard_covers_both_readers():
+    """流式两个读取点用同一守卫：``_stream_events_from_chunk`` 与终止判据。"""
+    from types import SimpleNamespace
+
+    from src.providers.google import GoogleProvider
+
+    chunk = SimpleNamespace(candidates=5, response_id="r", usage_metadata=None)
+    with pytest.raises(RuntimeError, match="candidates 必须是列表"):
+        GoogleProvider._stream_events_from_chunk(chunk)
+    with pytest.raises(RuntimeError, match="candidates 必须是列表"):
+        GoogleProvider._stream_chunk_has_terminal_event(chunk)
+
+
+def test_google_stream_guard_keeps_none_semantics():
+    """``candidates`` 缺失（``None``）仍按「无候选」放行，不得变成错误。
+
+    流式路径的正常中间态依赖这条：把它一并拒掉会让正常流失败。
+    """
+    from types import SimpleNamespace
+
+    from src.providers.google import GoogleProvider
+
+    chunk = SimpleNamespace(candidates=None, response_id="r", usage_metadata=None)
+    assert GoogleProvider._stream_events_from_chunk(chunk) == []
+    assert GoogleProvider._stream_chunk_has_terminal_event(chunk) is False
+
+
+def _ark_provider(protocol: str):
+    from src.providers.volcengine import VolcengineProvider
+
+    provider = VolcengineProvider.__new__(VolcengineProvider)
+    provider._protocol = protocol
+    provider._model_name = "demo"
+    provider._client = None
+    provider._aclient = None
+    provider._options = {"server_verified_protocols": ["responses"]}
+    return provider
+
+
+@pytest.mark.parametrize(
+    "bad_output",
+    [
+        pytest.param(5, id="int"),
+        pytest.param("ab", id="str"),
+    ],
+)
+def test_ark_responses_complete_rejects_unusable_output(bad_output):
+    """Responses 路径的 ``output`` 非序列时必须收敛成 ``RuntimeError``。"""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    provider = _ark_provider("responses")
+    response = SimpleNamespace(output=bad_output, usage=None, status="completed", id="r")
+    client = MagicMock()
+    client.responses.create.return_value = response
+
+    with (
+        patch.object(provider, "_get_client", return_value=client),
+        pytest.raises(RuntimeError, match="output 必须是列表"),
+    ):
+        provider.complete(prompt="hi")
+
+
+def test_ark_chat_complete_rejects_unusable_tool_calls():
+    """Chat 路径的 ``message.tool_calls`` 非序列时同样收敛成 ``RuntimeError``。"""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    provider = _ark_provider("chat_completions")
+    message = SimpleNamespace(content="x", tool_calls=5)
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=message, finish_reason="stop")],
+        output=[],
+        usage=None,
+        status=None,
+        id="r",
+    )
+    client = MagicMock()
+    client.chat.completions.create.return_value = response
+
+    with (
+        patch.object(provider, "_get_client", return_value=client),
+        pytest.raises(RuntimeError, match="tool_calls 必须是列表"),
+    ):
+        provider.complete(prompt="hi")
+
+
+def test_ark_complete_keeps_working_for_valid_responses():
+    """收紧不能误伤：两条协议的正常响应照旧解析。"""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    # Chat 路径：正文 + 一个工具调用
+    provider = _ark_provider("chat_completions")
+    message = SimpleNamespace(
+        content="你好",
+        tool_calls=[
+            SimpleNamespace(
+                id="c1", type="function", function=SimpleNamespace(name="f", arguments='{"a":1}')
+            )
+        ],
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=message, finish_reason="stop")],
+        output=[],
+        usage=None,
+        status=None,
+        id="r",
+    )
+    client = MagicMock()
+    client.chat.completions.create.return_value = response
+    with patch.object(provider, "_get_client", return_value=client):
+        result = provider.complete(prompt="hi")
+    assert result.text == "你好"
+    assert len(result.tool_calls) == 1
+
+    # Responses 路径：output[].content[].text
+    provider = _ark_provider("responses")
+    response = SimpleNamespace(
+        output=[
+            SimpleNamespace(
+                type="message", content=[SimpleNamespace(type="output_text", text="你好")]
+            )
+        ],
+        usage=None,
+        status="completed",
+        id="r",
+    )
+    client = MagicMock()
+    client.responses.create.return_value = response
+    with patch.object(provider, "_get_client", return_value=client):
+        result = provider.complete(prompt="hi")
+    assert result.text == "你好"

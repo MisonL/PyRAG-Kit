@@ -442,6 +442,12 @@ def test_google_provider_invoke_non_stream(mock_settings, mock_genai_client):
     with patch.object(GoogleProvider, "_get_client", return_value=mock_genai_client):
         mock_response = MagicMock()
         mock_response.text = "Hello world"
+        # ``candidates`` 必须显式给成列表：真 SDK 的字段类型是
+        # ``list[Candidate] | None``，而裸 ``MagicMock`` 的属性是一个可迭代的
+        # ``MagicMock``（``iter()`` 返回空迭代器）——旧代码只做 ``or []`` 与迭代，
+        # 这种不真实形态恰好能通过。响应容器的形态守卫（google.py 的
+        # ``_require_candidates``）会把它拒掉，因此夹具要写成真实形状。
+        mock_response.candidates = []
         mock_genai_client.models.generate_content.return_value = mock_response
 
         result = list(provider.invoke("test prompt", stream=False))

@@ -86,9 +86,30 @@ _ARK_BUILTIN_TOOL_ITEM_TYPES = frozenset(
 )
 
 
+def _require_ark_list(value: Any, *, label: str) -> list[Any]:
+    """把 Ark 响应里的容器字段收敛成列表，非法形态给出可读的 ``RuntimeError``。
+
+    两个容器此前只有 ``field(x, ..., []) or []``——那挡住 ``None`` 与空值，挡不住
+    其它形态。实测走**真实入口**（``VolcengineProvider.complete``）：
+
+    * Responses 路径 ``output=5`` -> 裸 ``TypeError: 'int' object is not iterable``；
+    * Chat 路径 ``message.tool_calls=5`` -> 同一个裸 ``TypeError``。
+
+    两者都不是 ``RuntimeError``——而本 provider 的错误分类（以及调用方的
+    ``except``）按 ``RuntimeError`` 写。同一个形态在
+    ``openai_compatible._raise_for_chat_response_error`` 对 ``choices`` 早已有
+    显式守卫，两个 provider 的收场必须一致。
+
+    返回列表而不是原值：调用方全都只做迭代，收敛后不必再各自 ``or []``。
+    """
+    if not isinstance(value, (list, tuple)):
+        raise RuntimeError(f"Ark {label} 必须是列表，但得到 {safe_repr(value)}。")
+    return list(value)
+
+
 def _ark_responses_has_builtin_tool_items(response: Any) -> bool:
     """判断响应里是否含 Ark 内置工具的调用项。"""
-    for item in field(response, "output", []) or []:
+    for item in _require_ark_list(field(response, "output", []) or [], label="响应的 output"):
         if enum_field(item, "type") in _ARK_BUILTIN_TOOL_ITEM_TYPES:
             return True
     return False
@@ -103,7 +124,7 @@ def _ark_responses_output_text(response: Any) -> str:
     混进正文。
     """
     chunks: list[str] = []
-    for item in field(response, "output", []) or []:
+    for item in _require_ark_list(field(response, "output", []) or [], label="响应的 output"):
         for content in field(item, "content", []) or []:
             if enum_field(content, "type") not in {"output_text", "text"}:
                 continue
@@ -1475,7 +1496,9 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         if choices:
             message = field(choices[0], "message")
             text = content_to_text(field(message, "content", ""))
-            for call in field(message, "tool_calls", []) or []:
+            for call in _require_ark_list(
+                field(message, "tool_calls", []) or [], label="响应的 tool_calls"
+            ):
                 fn = field(call, "function")
                 calls.append(
                     {
@@ -1499,7 +1522,7 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             # 入口都会返回空文本而不报错。仅在没有 choices 文本时启用，避免
             # 覆盖 Chat Completions 分支已经取到的内容。
             text = _ark_responses_output_text(response)
-        for item in field(response, "output", []) or []:
+        for item in _require_ark_list(field(response, "output", []) or [], label="响应的 output"):
             item_type = enum_field(item, "type")
             if item_type in {"function_call", "custom_tool_call"}:
                 calls.append(
@@ -1524,7 +1547,7 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             candidate_refusal = field(message, "refusal")
             if isinstance(candidate_refusal, str) and candidate_refusal:
                 refusal = candidate_refusal
-        for item in field(response, "output", []) or []:
+        for item in _require_ark_list(field(response, "output", []) or [], label="响应的 output"):
             if enum_field(item, "type") in {"reasoning", "reasoning_item"}:
                 summary = field(item, "summary")
                 if isinstance(summary, str):
@@ -1624,7 +1647,7 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         text = content_to_text(field(delta, "content", ""))
         reasoning = field(delta, "reasoning_content") or field(delta, "reasoning") or ""
         refusal = field(delta, "refusal")
-        calls = field(delta, "tool_calls", []) or []
+        calls = _require_ark_list(field(delta, "tool_calls", []) or [], label="流块的 tool_calls")
         finish_reason = field(choice, "finish_reason")
         events: list[StreamEvent] = []
         if isinstance(refusal, str) and refusal:
