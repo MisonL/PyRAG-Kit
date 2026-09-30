@@ -77,6 +77,20 @@ def _reject_unsafe_cache_dir(
         home = None
     if home is not None and resolved == home:
         return f"{resolved} 是当前用户的家目录"
+    # 清单原先只有 ``/etc``／``/usr``／``/bin``／``/sbin``／``/var`` 与三个
+    # macOS 目录，**漏掉了同样属于系统级、且删除后果不可逆的一批**。实测放行的
+    # 包括：
+    #
+    #   * ``/tmp``（在 macOS 上解析成 ``/private/tmp``）——整个系统临时目录；
+    #   * ``/Users``——macOS 上**全部用户家目录的父目录**，``rmtree`` 会删掉
+    #     机器上每个账户的家目录；``/home`` 在 Linux 上同理；
+    #   * ``/opt``——本文件的 docstring 自己就把「安装在 ``/opt``」列为场景，
+    #     而它的父目录同样不该被删；
+    #   * ``/dev``（设备节点）、``/proc``、``/sys``（内核虚拟文件系统）。
+    #
+    # 判据与上面几项一致：**相等**才算命中，因此 ``/Volumes/MyDrive/cache``、
+    # ``/opt/myapp/cache`` 这类正常缓存位置不受影响（本函数从不过度拦截用户
+    # 有意指定的缓存目录，见下方「目录名不是 .cache 时只警告不阻断」）。
     protected_roots = [
         Path("/etc"),
         Path("/usr"),
@@ -86,6 +100,24 @@ def _reject_unsafe_cache_dir(
         Path("/System"),
         Path("/Library"),
         Path("/Applications"),
+        # 系统级目录（此前遗漏）
+        Path("/tmp"),
+        Path("/Users"),
+        Path("/home"),
+        Path("/opt"),
+        Path("/boot"),
+        Path("/dev"),
+        Path("/proc"),
+        Path("/sys"),
+        Path("/run"),
+        Path("/srv"),
+        Path("/mnt"),
+        Path("/media"),
+        Path("/root"),
+        # macOS 的外接卷挂载点；只挡挂载点本身，卷内的目录照常可用。
+        Path("/Volumes"),
+        # macOS 上 ``/etc``／``/var``／``/tmp`` 都指向它下面，挡一层总入口。
+        Path("/private"),
     ]
     for protected in protected_roots:
         if resolved == protected.resolve():

@@ -244,3 +244,63 @@ def test_symlink_loop_does_not_break_cleanup_temp_files(tmp_path, monkeypatch):
     monkeypatch.setattr("src.utils.cleanup.get_settings", lambda: FakeSettings())
 
     cleanup_temp_files()  # 不抛即通过
+
+
+# ── 回归：系统级目录清单必须完整 ──
+#
+# 清单原先只有 ``/etc``／``/usr``／``/bin``／``/sbin``／``/var`` 与三个 macOS
+# 目录，漏掉了同样属于系统级、且 ``rmtree`` 后果不可逆的一批。实测以下路径
+# **全部被放行**，退出钩子会把它们整个删掉：
+#
+#   * ``/tmp``（macOS 上解析成 ``/private/tmp``）——整个系统临时目录；
+#   * ``/Users``——macOS 上**全部用户家目录的父目录**（``/home`` 在 Linux 上
+#     同理），删除等于抹掉机器上每个账户的家目录；
+#   * ``/opt``——本模块 docstring 自己就把「安装在 ``/opt``」列为场景；
+#   * ``/dev``／``/proc``／``/sys`` 等。
+#
+# 判据是**相等**，因此只挡挂载点与系统根本身，卷内／目录内的正常缓存位置不受
+# 影响（见下方「不误伤」用例）。
+
+
+@pytest.mark.parametrize(
+    "dangerous",
+    [
+        "/tmp",
+        "/private/tmp",
+        "/Users",
+        "/home",
+        "/opt",
+        "/dev",
+        "/proc",
+        "/sys",
+        "/boot",
+        "/run",
+        "/srv",
+        "/mnt",
+        "/media",
+        "/root",
+        "/Volumes",
+        "/private",
+    ],
+)
+def test_reject_unsafe_cache_dir_rejects_system_level_roots(dangerous):
+    """系统级目录（含用户家目录的父目录）一律拒绝。"""
+    assert _reject_unsafe_cache_dir(dangerous) is not None
+
+
+@pytest.mark.parametrize(
+    "allowed",
+    [
+        "/tmp/myapp/cache",
+        "/opt/myapp/cache",
+        "/Volumes/MyDrive/cache",
+        "/Users/someone/Library/Caches/app",
+    ],
+)
+def test_reject_unsafe_cache_dir_still_allows_paths_inside_system_roots(allowed):
+    """收紧不能误伤：系统根**内部**的缓存目录照常可用。
+
+    判据是「解析后相等」，因此 ``/tmp/myapp/cache`` 这类显式指定的缓存位置
+    必须继续放行——本函数从不过度拦截用户有意配置的缓存目录。
+    """
+    assert _reject_unsafe_cache_dir(allowed) is None

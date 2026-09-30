@@ -373,7 +373,18 @@
 
   守卫**只收不可哈希这一类，不要求 key 是字符串**。初版写成「必须是字符串」，被既有用例 `test_display_chat_config_renders_values_beyond_the_conversion_limit` 挡下：该用例明确要求位数超限的**整数键**可渲染（可哈希的非字符串键在映射里能正常取到值，那是显示层的既有契约）。工厂侧要求字符串是因为它要拿 key 去建 provider，两处的接受面本就不同；一致的是**异常分类**。
 
+- **补齐退出钩子的系统目录清单**：`cleanup_temp_files` 是 `atexit` 钩子，删除前用 `_reject_unsafe_cache_dir` 判断 `cache_path` 是否可安全 `rmtree`。清单原先只有 `/etc`／`/usr`／`/bin`／`/sbin`／`/var` 与三个 macOS 目录，**漏掉了同样属于系统级、且删除后果不可逆的一批**。实测以下路径全部被放行，退出钩子会把它们整个删掉：
+
+  - `/tmp`（在 macOS 上解析成 `/private/tmp`）——整个系统临时目录；
+  - `/Users`——macOS 上**全部用户家目录的父目录**，`rmtree` 等于抹掉机器上每个账户的家目录；`/home` 在 Linux 上同理；
+  - `/opt`——本模块自己的 docstring 就把「安装在 `/opt`」列为场景，而它的父目录同样不该被删；
+  - `/dev`（设备节点）、`/proc`、`/sys`（内核虚拟文件系统）等。
+
+  触发条件只是一个配置项：`config.toml` 里写 `cache_path = "/tmp"`（或 `/Users`／`/opt`）。判据补为**相等**，因此只挡系统根本身，卷内／目录内的正常缓存位置不受影响——`/tmp/myapp/cache`、`/opt/myapp/cache`、`/Volumes/MyDrive/cache`、`/Users/someone/Library/Caches/app` 全部继续放行（本函数从不过度拦截用户有意指定的缓存目录，见下方「目录名不是 `.cache` 时只警告不阻断」的既有取舍）。
+
 ### 测试
+
+- 新增第十八轮的回归用例（20 个用例；回退源码后其中 16 个变红）：16 个系统级根（`/tmp`／`/private/tmp`／`/Users`／`/home`／`/opt`／`/dev`／`/proc`／`/sys`／`/boot`／`/run`／`/srv`／`/mnt`／`/media`／`/root`／`/Volumes`／`/private`）必须拒绝；以及 4 个「不误伤」反向守卫——系统根**内部**的缓存目录（`/tmp/myapp/cache`／`/opt/myapp/cache`／`/Volumes/MyDrive/cache`／`/Users/someone/Library/Caches/app`）照常放行。
 
 - 新增第十七轮的回归用例（12 个用例；回退源码后其中 4 个变红）：三类不可哈希 key（`[1]`／`{"a": 1}`／`{1, 2}`）必须收敛成带指引的 `ValueError`；同一个 key 在展示层与工厂侧必须给出同一种异常分类；以及四组「不误伤」反向守卫——可哈希的缺失键（`"missing"`／`5`／`None`／超大整数）仍是原来的「未找到key」消息、位数超限的整数键仍能取到值、既有的渲染用例保持绿。
 
