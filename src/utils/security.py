@@ -355,6 +355,25 @@ _PEM_PRIVATE_KEY_RE = re.compile(
 )
 
 
+def _display_repr(value: Any) -> str:
+    """把任意取值渲染成字符串，位数超限时退回量级描述。
+
+    本模块**不能**导入 ``config.safe_repr``：``config`` 反过来从本模块导入
+    ``redact_sensitive_text`` 与 ``validate_secret_free_options``，跨模块引用会
+    形成循环导入。判据与 ``safe_repr`` 一致（位数超限时用 ``bit_length()`` 给
+    出量级），改一处时两处都要看。
+    """
+    if isinstance(value, str):
+        return value
+    try:
+        return str(value)
+    except (ValueError, RuntimeError, RecursionError):
+        if isinstance(value, int):
+            digits = value.bit_length() * 30103 // 100000 + 1  # log10(2) ≈ 0.30103
+            return f"<整数，约 {digits} 位十进制>"
+        return f"<{type(value).__name__}>"
+
+
 def redact_sensitive_text(value: Any) -> str:
     """脱敏异常、日志和请求错误中的常见凭证表示。"""
     if not isinstance(value, str):
@@ -653,6 +672,23 @@ def validate_secret_free_options(
         return {}
     if not isinstance(options, Mapping):
         raise ValueError(f"{provider} options 必须是对象。")
+    # 顶层键必须是字符串。``ModelDetail.options`` 声明为 ``dict[str, Any]``，
+    # pydantic 会强制这一形态，但 provider 是**公开类**——嵌入方可以直接
+    # ``JinaProvider("m", {1: "x"})``（本仓测试就这么构造）。非字符串键会一路
+    # 穿过这里，随后在调用方的 ``sorted(set(options).difference(_OPTION_KEYS))``
+    # 处抛裸 ``TypeError: sequence item 0: expected str instance, int found``
+    # （混合类型键则是 ``'<' not supported between instances of ...``）——不是
+    # ``ValueError``，而各 provider 的其余判据都按 ``ValueError`` 收敛。
+    #
+    # 只在**顶层**判：``options`` 的值可以是任意 JSON（``extra_body`` 里放什么
+    # 都可能），且 ``_copy_nested`` 复制的是值不是键。
+    for key in options:
+        if not isinstance(key, str):
+            raise ValueError(
+                f"{provider} options 的键必须是字符串，但得到 {_display_repr(key)}。"
+                " 请检查配置里的 options 表（TOML 表的键本就是字符串，"
+                "非字符串键通常来自直接构造 Provider 的库调用方）。"
+            )
     found = find_sensitive_option_paths(options, allowed_containers=allowed_containers)
     if found:
         raise ValueError(

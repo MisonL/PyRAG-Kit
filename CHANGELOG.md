@@ -6,6 +6,10 @@
 
 ### 修复
 
+- **provider options 的非字符串键漏成裸 `TypeError`**（`src/utils/security.py`、`src/providers/google.py`）。`ModelDetail.options` 声明为 `dict[str, Any]`，pydantic 会强制字符串键，因此**配置来源**的 options 到不了这里。但 provider 是**公开类**——嵌入方可以直接 `JinaProvider("m", {1: "x"})`（本仓测试就这么构造 provider），而共享前置校验 `validate_secret_free_options` 此前只判容器形态与敏感键名、**放行任意键类型**。非字符串键一路穿到各 provider 的 `sorted(set(options).difference(_OPTION_KEYS))`，抛裸 `TypeError: sequence item 0: expected str instance, int found`（混合类型键则是 `'<' not supported between instances of ...`）——不是 `ValueError`，而各 provider 的其余判据都按 `ValueError` 收敛。
+
+  实测受影响的构造路径：`JinaProvider`／`SiliconflowRerankProvider`／`GoogleProvider`／`AnthropicProvider`／`VolcengineProvider`。修法分两处：共享入口 `validate_secret_free_options` 加一条顶层键类型判据（覆盖除 Google 外的全部），Google 因为不走共享入口、自己调 `_validate_options`，在其内部单列同一判据。回归测试覆盖三个 provider × 三种非法键形态，另加一条「字符串键照常」的反向守卫，均在未修源码时实测变红。
+
 - **「未找到 key」消息里的可选值列表在混合类型键下抛裸 `TypeError`**（`src/ui/display_utils.py`、`src/services/embedding_service.py`）。两处在 key 未命中时都用 `sorted(configurations)` 生成「可选值」列表——直接比较**原始键**。键来自可直写映射（`SessionConfig.llm_configurations`／`rerank_configurations` 的普通属性没有 `__setattr__` 守卫，`RunConfig.embedding_configurations` 虽为 frozen dataclass 但嵌入方可自拼），混合类型键（`{1: .., "b": ..}`）在排序时抛裸 `TypeError: '<' not supported between instances of 'str' and 'int'`——不是 `ValueError`。`display_utils` 这条在 `start_chat_session_async` 里于任何提示符**之前**被调用，会话随即终止；`embedding_service` 这条在检索与建库的主路径上。
 
   讽刺的是这条消息的**用途正是**「告诉用户可选值是什么」，却在拼消息时自己崩掉。修法是先 `safe_repr` 渲染成字符串再排序（用 `safe_repr` 而非 `str`：位数超限的整数键连 `str()` 都抛）。两处各加回归测试，均先在未修源码时实测变红。同项目的工厂侧 `_get_model_detail` 不列可选值，因此不受影响。

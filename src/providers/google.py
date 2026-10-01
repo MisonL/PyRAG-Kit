@@ -384,6 +384,19 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
     def _validate_options(cls, options: Mapping[str, Any]) -> None:
         if not isinstance(options, Mapping):
             raise ValueError("Google options 必须是对象。")
+        # 键形态必须先收敛：``sorted(set(options).difference(_OPTION_KEYS))`` 对
+        # 非字符串键抛裸 ``TypeError: sequence item 0: expected str instance,
+        # int found``（混合类型键则是 ``'<' not supported between instances of
+        # ...``）。本类是公开类，嵌入方可以直接 ``GoogleProvider("m", {1: "x"})``
+        # ——本仓测试就这么构造——而本方法的其余判据都按 ``ValueError`` 收敛。
+        # 与 ``utils.security.validate_secret_free_options`` 的同名判据一致；
+        # 本类不走那个共享入口，故在此单列。
+        for key in options:
+            if not isinstance(key, str):
+                raise ValueError(
+                    f"Google options 的键必须是字符串，但得到 {safe_repr(key)}。"
+                    " 请检查配置里的 options 表。"
+                )
         unknown = sorted(set(options).difference(cls._OPTION_KEYS))
         if unknown:
             raise ValueError("Google options 包含不支持的字段: " + ", ".join(unknown))

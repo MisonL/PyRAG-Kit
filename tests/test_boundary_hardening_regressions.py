@@ -4240,3 +4240,58 @@ def test_embedding_model_detail_lists_mixed_type_keys_without_crashing():
     message = str(excinfo.value)
     assert "1" in message
     assert "b" in message
+
+
+# --- provider options 的非字符串键 -----------------------------------------
+#
+# `ModelDetail.options` 声明为 `dict[str, Any]`，pydantic 会强制字符串键，因此
+# **配置来源**的 options 到不了这里。但 provider 是**公开类**——嵌入方可以直接
+# `JinaProvider("m", {1: "x"})`（本仓测试就这么构造 provider），而
+# `validate_secret_free_options` 此前只判容器形态与敏感键名、放行任意键类型。
+# 非字符串键一路穿到调用方的
+# `sorted(set(options).difference(_OPTION_KEYS))`，抛裸
+# `TypeError: sequence item 0: expected str instance, int found`（混合类型键则是
+# `'<' not supported between instances of ...`）——不是 `ValueError`，而各
+# provider 的其余判据都按 `ValueError` 收敛。
+#
+# 修法：在共享入口 `validate_secret_free_options` 与 Google 自己的
+# `_validate_options`（不走共享入口）各加一条顶层键类型判据。
+
+
+def _options_provider_factories():
+    """返回 (名字, 构造器) 列表；构造器接受 options 参数。
+
+    与 ``_rerank_providers`` 同一惯例：局部导入，避免在模块顶层引入这些 provider
+    模块（它们各自会拉 SDK）。
+    """
+    from src.providers.google import GoogleProvider
+    from src.providers.jina import JinaProvider
+    from src.providers.siliconflow_rerank import SiliconflowRerankProvider
+
+    return [
+        ("jina", lambda opts: JinaProvider("m", opts)),
+        ("siliconflow", lambda opts: SiliconflowRerankProvider("m", opts)),
+        ("google", lambda opts: GoogleProvider("m", opts)),
+    ]
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        pytest.param({1: "x"}, id="int-key"),
+        pytest.param({"a": 1, 2: "b"}, id="mixed-keys"),
+        pytest.param({(1, 2): "x"}, id="tuple-key"),
+    ],
+)
+def test_provider_options_reject_non_string_keys(options):
+    """非字符串 options 键必须抛 `ValueError`，而不是裸 `TypeError`。"""
+    for label, factory in _options_provider_factories():
+        with pytest.raises(ValueError, match="键必须是字符串"):
+            factory(options)
+
+
+def test_provider_options_still_accept_string_keys():
+    """收紧不能误伤：字符串键的合法 options 照常构造。"""
+    from src.providers.google import GoogleProvider
+
+    GoogleProvider("m", {"max_tokens": 100})
