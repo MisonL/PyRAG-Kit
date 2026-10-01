@@ -77,8 +77,16 @@ class EmbeddingService:
         configurations = self.run_config.embedding_configurations
         key = self.embedding_provider_key
         if not isinstance(configurations, Mapping) or key not in configurations:
+            # 先渲染成字符串再排序，理由同 ``display_utils._require_model_detail``
+            # 的同名位置：``sorted(configurations)`` 直接比较**原始键**，混合类型
+            # 键抛裸 ``TypeError: '<' not supported between instances of 'str' and
+            # 'int'``，而这条消息的用途正是「告诉用户可选值是什么」。
+            # ``embedding_configurations`` 由 ``RunConfig`` 携带（frozen
+            # dataclass、字段无校验器），嵌入方可自拼 ``RunConfig`` 送入任意键。
             available = (
-                ", ".join(sorted(configurations)) if isinstance(configurations, Mapping) else "无"
+                ", ".join(sorted(safe_repr(item) for item in configurations))
+                if isinstance(configurations, Mapping)
+                else "无"
             )
             raise ValueError(
                 f"在Embedding配置中未找到key: {safe_repr(key)}。可选值: {available}。"

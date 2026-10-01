@@ -319,7 +319,16 @@ def _require_model_detail(configurations: Any, key: Any, role_label: str) -> Any
             " 请检查 config.toml 里的 default_*_provider 与 *_configurations 是否对应。"
         ) from exc
     if not present:
-        available = ", ".join(sorted(configurations))
+        # 先渲染成字符串再排序：``sorted(configurations)`` 直接比较**原始键**，
+        # 而键来自可直写的 ``llm_configurations``／``rerank_configurations``
+        # （``SessionConfig`` 普通属性没有 ``__setattr__`` 守卫，嵌入方或携带
+        # 异常取值的 pickle 快照可以放任意可哈希键）。混合类型键（``{1: ..,
+        # "b": ..}``）在排序时抛裸 ``TypeError: '<' not supported between
+        # instances of 'str' and 'int'``——而本函数在
+        # ``start_chat_session_async`` 里于任何提示符**之前**被调用，会话随即
+        # 终止。这条消息的用途正是「告诉用户可选值是什么」，不该在拼消息时崩。
+        # 渲染走 ``safe_repr``：位数超限的整数键连 ``str()`` 都抛。
+        available = ", ".join(sorted(safe_repr(item) for item in configurations))
         raise ValueError(
             f"在{role_label}配置中未找到key: {safe_repr(key)}。可选值: {available}。"
             " 请检查 config.toml 里的 default_*_provider 与 *_configurations 是否对应。"

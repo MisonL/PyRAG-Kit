@@ -4186,3 +4186,57 @@ def test_load_snapshot_rejects_symlink_loop_in_active_marker(tmp_path):
 
     with pytest.raises(ValueError, match="ACTIVE_SNAPSHOT"):
         FaissStore().load_snapshot(str(snapshot), snapshot_root=str(root))
+
+
+# --- 报错消息里的「可选值」列表：键类型混合时的排序 -------------------------
+#
+# `_require_model_detail` 与 `EmbeddingService.embedding_model_detail` 在
+# 「key 未找到」时都把可选值列出来，而列表用 `sorted(configurations)` 生成——
+# 直接比较**原始键**。键来自可直写映射（`SessionConfig.llm_configurations` /
+# `RunConfig.embedding_configurations`，前者普通属性无 `__setattr__` 守卫、
+# 后者是 frozen dataclass 但嵌入方可自拼），混合类型键（`{1: .., "b": ..}`）
+# 在排序时抛裸 `TypeError: '<' not supported between instances of 'str' and
+# 'int'`。这条消息的用途正是「告诉用户可选值是什么」，不该在拼消息时崩。
+#
+# 修法：先 `safe_repr` 渲染成字符串再排序。用 `safe_repr` 而非 `str` 是因为
+# 位数超限的整数键连 `str()` 都抛。
+
+
+def test_require_model_detail_lists_mixed_type_keys_without_crashing():
+    """`_require_model_detail` 对混合类型键的可选值列表必须能渲染出来。"""
+    from src.ui.display_utils import _require_model_detail
+
+    with pytest.raises(ValueError, match="未找到key") as excinfo:
+        _require_model_detail({1: "a", "b": "c"}, "missing", "LLM")
+
+    message = str(excinfo.value)
+    # 两个键都要出现在可选值里（顺序不限，只验证「都列出来了」）。
+    assert "1" in message
+    assert "b" in message
+
+
+def test_require_model_detail_lists_huge_integer_key_without_crashing():
+    """位数超限的整数键：列表渲染要走 `safe_repr`，不能自己抛 `ValueError`。"""
+    from src.ui.display_utils import _require_model_detail
+
+    with pytest.raises(ValueError, match="未找到key") as excinfo:
+        _require_model_detail({10**4301: "a"}, "missing", "LLM")
+
+    assert "未找到key" in str(excinfo.value)
+
+
+def test_embedding_model_detail_lists_mixed_type_keys_without_crashing():
+    """`embedding_model_detail` 对混合类型键的可选值列表必须能渲染出来。"""
+    from src.services.embedding_service import EmbeddingService
+
+    run_config = SimpleNamespace(
+        default_embedding_provider="missing",
+        embedding_configurations={1: "a", "b": "c"},
+    )
+
+    with pytest.raises(ValueError, match="未找到key") as excinfo:
+        _ = EmbeddingService(run_config).embedding_model_detail
+
+    message = str(excinfo.value)
+    assert "1" in message
+    assert "b" in message

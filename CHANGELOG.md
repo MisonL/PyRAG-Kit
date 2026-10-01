@@ -6,6 +6,10 @@
 
 ### 修复
 
+- **「未找到 key」消息里的可选值列表在混合类型键下抛裸 `TypeError`**（`src/ui/display_utils.py`、`src/services/embedding_service.py`）。两处在 key 未命中时都用 `sorted(configurations)` 生成「可选值」列表——直接比较**原始键**。键来自可直写映射（`SessionConfig.llm_configurations`／`rerank_configurations` 的普通属性没有 `__setattr__` 守卫，`RunConfig.embedding_configurations` 虽为 frozen dataclass 但嵌入方可自拼），混合类型键（`{1: .., "b": ..}`）在排序时抛裸 `TypeError: '<' not supported between instances of 'str' and 'int'`——不是 `ValueError`。`display_utils` 这条在 `start_chat_session_async` 里于任何提示符**之前**被调用，会话随即终止；`embedding_service` 这条在检索与建库的主路径上。
+
+  讽刺的是这条消息的**用途正是**「告诉用户可选值是什么」，却在拼消息时自己崩掉。修法是先 `safe_repr` 渲染成字符串再排序（用 `safe_repr` 而非 `str`：位数超限的整数键连 `str()` 都抛）。两处各加回归测试，均先在未修源码时实测变红。同项目的工厂侧 `_get_model_detail` 不列可选值，因此不受影响。
+
 - **快照标记与路径配置里的符号链接环漏成裸 `RuntimeError`**（`src/utils/config.py`、`src/retrieval/snapshot_repository.py`、`src/retrieval/vdb/faiss_store.py`）。`ACTIVE_SNAPSHOT` 是磁盘上的任意文本，其内容会被拼进路径后 `resolve()`；相对路径字段（`knowledge_base_path`／`pkl_path`／`snapshot_root`／`log_path`／`cache_path`）在 `resolve_path` 里也会被 `resolve()`。而 `Path.resolve()` 对**符号链接环**抛 `RuntimeError: Symlink loop from ...`——它不是 `ValueError`。三处都只在这条判据上漏了：
 
   | 入口 | 修复前的收场 |
