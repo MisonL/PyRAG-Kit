@@ -4094,3 +4094,71 @@ def test_config_branch_missing_update_method_raises_a_caught_type():
     assert any("ValueError" in text for text in handled), (
         f"抛出的 {raised} 未被最近的 except {handled} 接住——会穿透并终止会话"
     )
+
+
+# --- 重复装饰器（双重 @classmethod） ---------------------------------------
+#
+# `e95158d` 给 `_normalize_request_timeout` 写了**两个** `@classmethod`。当前
+# CPython 下它恰好能用：`classmethod.__get__` 对「被包装对象也是 classmethod」
+# 会委托到内层，最终绑定的仍是真实函数，且类／7 个子类／实例／`super()` 四条
+# 路径的 `cls` 都与单个装饰时一致（实测）。但这是**结构缺陷**而非风格问题：
+#
+#   * 它依赖 CPython 的委托行为，不在语言规范里；换解释器或换实现就可能变。
+#   * `_normalize_request_timeout.__func__` 的类型从 `function` 变成
+#     `classmethod`，任何按「`classmethod.__func__` 是函数」写的内省
+#     （装饰器、签名收集、`functools.wraps` 链）都会错判。
+#   * 函数体只要开始用到 `cls`（例如将来改成 `cls._SOMETHING`），语义就从
+#     「类方法」漂到别处，而当时不会有任何测试拦下。
+#
+# 判据用 AST 静态扫描而不是运行时取值：缺陷的本体是**源码里写了两个同名
+# 装饰器**，运行时的巧合可用不代表源码正确。同一个不变量适用于全仓库。
+
+
+def test_no_duplicate_decorators_in_source_tree():
+    """生产代码里任何函数都不得有重复装饰器（同名的叠两次）。
+
+    只扫 `src/`。测试目录里堆叠多个 `@pytest.mark.parametrize` 是**合法**的
+    笛卡尔积用法（同名但不同参数），因此不纳入本不变量。
+    """
+    import ast
+    from pathlib import Path
+
+    violations: list[str] = []
+    for path in sorted(Path("src").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            names: list[str] = []
+            for decorator in node.decorator_list:
+                if isinstance(decorator, ast.Name):
+                    names.append(decorator.id)
+                elif isinstance(decorator, ast.Attribute):
+                    names.append(decorator.attr)
+                elif isinstance(decorator, ast.Call):
+                    func = decorator.func
+                    names.append(
+                        func.id if isinstance(func, ast.Name) else getattr(func, "attr", "?")
+                    )
+            duplicated = sorted({name for name in names if names.count(name) > 1})
+            if duplicated:
+                violations.append(f"{path}:{node.lineno} def {node.name} 重复装饰器 {duplicated}")
+
+    assert not violations, "存在重复装饰器：\n" + "\n".join(violations)
+
+
+def test_normalize_request_timeout_is_a_plain_classmethod():
+    """`_normalize_request_timeout` 的 `__func__` 必须是函数，而不是另一个 classmethod。
+
+    这是上面那条 AST 不变量在**运行时**的对照：即使有人用非 AST 可识别的方式
+    （例如 `classmethod(classmethod(f))`）重新引入双重包装，这条也会变红。
+    """
+    import inspect
+
+    attribute = OpenAICompatibleProvider.__dict__["_normalize_request_timeout"]
+    assert isinstance(attribute, classmethod)
+    assert inspect.isfunction(attribute.__func__), (
+        f"`__func__` 应是函数；得到 {type(attribute.__func__).__name__}——说明被重复装饰了"
+    )
+    # 行为不变式：真实取值仍走校验体。
+    assert OpenAICompatibleProvider._normalize_request_timeout(30) == 30.0

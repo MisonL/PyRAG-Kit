@@ -6,6 +6,8 @@
 
 ### 修复
 
+- **`OpenAICompatibleProvider._normalize_request_timeout` 被写了两个 `@classmethod`**（`src/providers/openai_compatible.py`）。`e95158d` 引入请求级 `timeout` 校验时叠了两个同名装饰器。当前 CPython 下它**恰好能用**——`classmethod.__get__` 对「被包装对象也是 classmethod」会委托到内层，最终绑定的仍是真实函数，实测类／7 个子类（`openai`／`ollama`／`lm-studio`／`qwen`／`deepseek`／`grok`／`siliconflow`）／实例／`super()`／`inspect.signature` 五条路径的行为与单个装饰时逐字一致，因此此前没有测试拦下它。但它是**结构缺陷**而非风格问题：其一，它依赖 CPython 的委托行为、不在语言规范里；其二，`__func__` 的类型从 `function` 变成 `classmethod`，任何按「`classmethod.__func__` 是函数」写的内省（装饰器、签名收集、`functools.wraps` 链）都会错判；其三，函数体一旦开始用到 `cls`，语义就会漂移而无人察觉。现删去多余的一行，并加两条回归测试钉住：一条 AST 不变量扫描整个 `src/`（任何函数都不得有重名装饰器），一条运行时断言 `__func__` 是函数。
+
 - **`cleanup.py` 的 `/private` 挡了符号链接解析点而非其指向目标**：macOS 上 `/etc`／`/var`／`/tmp` 都是指向 `/private/*` 的符号链接，用户把 `cache_path` 配成这三个目录之一时，`Path("/etc").resolve()` 产出 `/private/etc`、与清单里的 `Path("/etc")` **不相等**（它没 resolve），放行删除。实测 `Settings(cache_path="/etc")` 通过，退出时 `rmtree("/etc")` 被执行（需 root 权限才真删成，普通用户会得到权限错误）。同理 `/private` 自己也会放行——用户配成它时与清单比对的是 `/private` resolve 后的自己。三条都是「清单里有、但比对逻辑接不住」。现把 `/private` **提前**到遍历清单之前单独判（它是 macOS 符号链接树的总入口，挡一层即覆盖其下全部），并让清单里每个路径都先 resolve 再比对——与 `protected_paths` 那一轮的逻辑对齐（那里早就 resolve 了）。(`src/utils/cleanup.py`)
 
 ### 修复

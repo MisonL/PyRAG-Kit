@@ -349,7 +349,6 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         return frozenset(normalized)
 
     @classmethod
-    @classmethod
     def _normalize_request_timeout(cls, timeout: Any) -> Any:
         """校验请求级 ``timeout``，与构造期 ``options.timeout`` 用同一判据。
 
