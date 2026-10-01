@@ -6,6 +6,18 @@
 
 ### 修复
 
+- **快照标记与路径配置里的符号链接环漏成裸 `RuntimeError`**（`src/utils/config.py`、`src/retrieval/snapshot_repository.py`、`src/retrieval/vdb/faiss_store.py`）。`ACTIVE_SNAPSHOT` 是磁盘上的任意文本，其内容会被拼进路径后 `resolve()`；相对路径字段（`knowledge_base_path`／`pkl_path`／`snapshot_root`／`log_path`／`cache_path`）在 `resolve_path` 里也会被 `resolve()`。而 `Path.resolve()` 对**符号链接环**抛 `RuntimeError: Symlink loop from ...`——它不是 `ValueError`。三处都只在这条判据上漏了：
+
+  | 入口 | 修复前的收场 |
+  |---|---|
+  | `Settings.resolve_path`（相对路径字段） | 裸 `RuntimeError`，穿透 `get_settings` 全部四个 handler |
+  | `SnapshotRepository._require_snapshot_id_within_root`（`get_active_snapshot_id` 等四个方法） | 裸 `RuntimeError` |
+  | `FaissStore.load_snapshot` 的标记解析 | 裸 `RuntimeError` |
+
+  三处都与各自的契约相反：`resolve_path` 明确拒绝非字符串与 NUL，理由都是「不能让配置错误变成裸 traceback」；`SnapshotRepository` 的其余判据（路径形态、长度、逃逸）一律抛带指引的 `ValueError`，测试注释也写明「本类的契约是带指引的 `ValueError`」；`FaissStore.load_snapshot` 的其余拒绝路径（目录未激活、不是活动快照）同样抛 `ValueError`，调用方 `VectorStoreFactory._load_existing_state` 按 `ValueError` 分类。`resolve_path` 这条尤其要紧：`get_settings()` 在 **import 期**就被调用（`log_manager.get_module_logger`），早于任何入口的 `try`，实测 `data` 是符号链接环（`data -> data`）时 `import main` 直接以裸 traceback 终止。
+
+  同项目的两个兄弟判据早已为同一情况收敛，这次让三处对齐：`utils/security.resolve_within` 明确把 `(OSError, RuntimeError)` 收成 `ValueError`（注释写明「一条『拒绝加载』的消息变成 pathlib 的内部错误」），`utils/cleanup._reject_unsafe_cache_dir` 同源。三处各加一条回归测试（另加一条「绝对路径不做 resolve，不受影响」的反向守卫），均在未修源码时实测变红。
+
 - **`OpenAICompatibleProvider._normalize_request_timeout` 被写了两个 `@classmethod`**（`src/providers/openai_compatible.py`）。`e95158d` 引入请求级 `timeout` 校验时叠了两个同名装饰器。当前 CPython 下它**恰好能用**——`classmethod.__get__` 对「被包装对象也是 classmethod」会委托到内层，最终绑定的仍是真实函数，实测类／7 个子类（`openai`／`ollama`／`lm-studio`／`qwen`／`deepseek`／`grok`／`siliconflow`）／实例／`super()`／`inspect.signature` 五条路径的行为与单个装饰时逐字一致，因此此前没有测试拦下它。但它是**结构缺陷**而非风格问题：其一，它依赖 CPython 的委托行为、不在语言规范里；其二，`__func__` 的类型从 `function` 变成 `classmethod`，任何按「`classmethod.__func__` 是函数」写的内省（装饰器、签名收集、`functools.wraps` 链）都会错判；其三，函数体一旦开始用到 `cls`，语义就会漂移而无人察觉。现删去多余的一行，并加两条回归测试钉住：一条 AST 不变量扫描整个 `src/`（任何函数都不得有重名装饰器），一条运行时断言 `__func__` 是函数。
 
 - **`cleanup.py` 的 `/private` 挡了符号链接解析点而非其指向目标**：macOS 上 `/etc`／`/var`／`/tmp` 都是指向 `/private/*` 的符号链接，用户把 `cache_path` 配成这三个目录之一时，`Path("/etc").resolve()` 产出 `/private/etc`、与清单里的 `Path("/etc")` **不相等**（它没 resolve），放行删除。实测 `Settings(cache_path="/etc")` 通过，退出时 `rmtree("/etc")` 被执行（需 root 权限才真删成，普通用户会得到权限错误）。同理 `/private` 自己也会放行——用户配成它时与清单比对的是 `/private` resolve 后的自己。三条都是「清单里有、但比对逻辑接不住」。现把 `/private` **提前**到遍历清单之前单独判（它是 macOS 符号链接树的总入口，挡一层即覆盖其下全部），并让清单里每个路径都先 resolve 再比对——与 `protected_paths` 那一轮的逻辑对齐（那里早就 resolve 了）。(`src/utils/cleanup.py`)

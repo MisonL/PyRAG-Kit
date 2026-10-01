@@ -746,7 +746,22 @@ class FaissStore(VectorStoreBase):
         if not marker.exists():
             raise ValueError(f"知识快照目录未被激活，缺少标记文件: {marker}")
         active_id = marker.read_text(encoding="utf-8").strip()
-        active_dir = (marker.parent / active_id).resolve()
+        # ``resolve()`` 对符号链接环抛 ``RuntimeError: Symlink loop from ...``，
+        # 不是 ``ValueError``——本方法的其余拒绝路径一律抛 ``ValueError``，且
+        # 调用方（``VectorStoreFactory._load_existing_state``）按 ``ValueError``
+        # 分类。标记文件是磁盘上的任意文本，用户手工摆一个环即触发，于是「标记
+        # 坏了，请重建快照」变成 pathlib 的内部错误。判据与
+        # ``SnapshotRepository._require_snapshot_id_within_root``、
+        # ``utils.security.resolve_within`` 一致：``(OSError, RuntimeError)``
+        # 统一收敛成 ``ValueError``。
+        try:
+            active_dir = (marker.parent / active_id).resolve()
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(
+                f"知识快照的 ACTIVE_SNAPSHOT 标记无法解析: {marker}"
+                f"（{type(exc).__name__}: {exc}）。"
+                " 标记内容或其路径可能包含符号链接环，请检查该文件，或重建知识快照。"
+            ) from exc
         if active_dir != snapshot_path:
             raise ValueError(
                 "知识快照目录不是当前活动快照。"

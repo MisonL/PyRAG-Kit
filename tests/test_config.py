@@ -1328,3 +1328,32 @@ def test_empty_snapshot_root_does_not_widen_the_pickle_trust_root():
     """
     with pytest.raises(ValidationError):
         Settings(snapshot_root="")
+
+
+# ── 回归：路径字段的符号链接环必须收敛成 ``ValueError`` ──
+#
+# ``resolve_path`` 里 ``(ROOT_DIR / v).resolve()`` 对**符号链接环**抛
+# ``RuntimeError: Symlink loop from ...``。它不是 ``ValueError`` 也不是
+# ``OSError``，``get_settings`` 已有的四个 handler（``ValidationError``／
+# ``SettingsError``／``TOMLDecodeError``／``RecursionError``）一个都接不住，
+# 而 ``get_settings`` 在 **import 期**就被调用（``log_manager
+# .get_module_logger``），早于任何入口的 ``try``。实测 ``data`` 是环
+# （``data -> data``）时 ``import main`` 以裸 traceback 终止。收敛判据与
+# ``utils.security.resolve_within`` 一致：``(OSError, RuntimeError)`` →
+# 带字段名的 ``ValueError``。
+
+
+def test_relative_path_symlink_loop_is_reported_as_value_error(tmp_path, monkeypatch):
+    """相对路径字段遇到符号链接环时，必须抛脱敏的 ``ValueError``。"""
+    monkeypatch.setattr("src.utils.config.ROOT_DIR", tmp_path)
+    loop = tmp_path / "data"
+    loop.symlink_to(loop)
+
+    with pytest.raises(ValueError, match="snapshot_root"):
+        Settings(snapshot_root="data/kb", _env_file=None)
+
+
+def test_absolute_path_field_is_not_resolved(tmp_path):
+    """绝对路径不做 ``resolve``，因此不受影响（收紧不能误伤）。"""
+    settings = Settings(snapshot_root=str(tmp_path / "kb"), _env_file=None)
+    assert settings.snapshot_root == str(tmp_path / "kb")

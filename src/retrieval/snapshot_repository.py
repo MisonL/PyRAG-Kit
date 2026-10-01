@@ -85,8 +85,25 @@ class SnapshotRepository:
                 f"上界 {_MAX_SNAPSHOT_ID_LENGTH}。"
                 " 请检查该值，或重建知识快照。"
             )
-        root = Path(self.root).resolve()
-        candidate = (self.root / snapshot_id).resolve()
+        # ``resolve()`` 对符号链接环抛 ``RuntimeError: Symlink loop from ...``，
+        # 它**不是** ``ValueError``，会穿透本类的契约（本类的其余判据一律抛带
+        # 指引的 ``ValueError``）。标记文件是磁盘上的任意文本，用户手工摆一个
+        # 环即触发；而 ``VectorStoreFactory._load_existing_state`` 的第一步就是
+        # ``get_active_snapshot_dir()``，于是**启动**以 pathlib 的内部错误收场。
+        # 判据与 ``utils.security.resolve_within``／``utils.cleanup
+        # ._reject_unsafe_cache_dir`` 一致：把 ``(OSError, RuntimeError)`` 统一
+        # 收敛成 ``ValueError``。``strict=False`` 不覆盖这种情况——环是**解析期**
+        # 的失败，与目标是否存在无关。
+        try:
+            root = Path(self.root).resolve()
+            candidate = (self.root / snapshot_id).resolve()
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(
+                f"快照 id 无法解析（来源: {source}，id={snapshot_id!r}）："
+                f"{type(exc).__name__}: {exc}。"
+                " 快照根目录或其下的路径可能包含符号链接环或过长的间接层，"
+                "请检查该值，或重建知识快照。"
+            ) from exc
         if candidate.parent != root:
             raise ValueError(
                 f"快照 id 不合法: {snapshot_id!r}（来源: {source}）。"

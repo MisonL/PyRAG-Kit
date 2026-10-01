@@ -988,3 +988,39 @@ def test_validate_snapshot_dir_reports_huge_integer_parent_key(tmp_path):
 
     with pytest.raises(ValueError, match="父条目"):
         repository.validate_snapshot_dir(snapshot_dir)
+
+
+# ── 回归：符号链接环必须收敛成 ``ValueError`` ──
+#
+# ``_require_snapshot_id_within_root`` 里 ``Path(self.root / snapshot_id)
+# .resolve()`` 对**符号链接环**抛 ``RuntimeError: Symlink loop from ...``。
+# 它**不是** ``ValueError``，穿透本类的契约（见上方
+# ``test_active_snapshot_id_rejects_overlong_value`` 的注释：「本类的契约是带
+# 指引的 ``ValueError``」）。同项目的两个兄弟判据早已为同一情况收敛：
+#
+#   * ``utils/security.resolve_within`` 明确把 ``(OSError, RuntimeError)``
+#     收成 ``ValueError``，注释写明「一条『拒绝加载』的消息变成 pathlib 的
+#     内部错误」；
+#   * ``utils/cleanup._reject_unsafe_cache_dir`` 同样收敛，理由同源。
+#
+# 可达性：``ACTIVE_SNAPSHOT`` 是磁盘上的任意文本，标记内容直接拼进路径。用户
+# 手工摆一个环（或外部工具写坏）即触发，而 ``VectorStoreFactory
+# ._load_existing_state`` 的第一步就是 ``get_active_snapshot_dir()``——启动
+# 会以 pathlib 的内部错误收场，而不是「标记文件坏了，请重建快照」。
+
+
+def test_active_snapshot_id_rejects_symlink_loop(tmp_path, monkeypatch):
+    """标记内容指向符号链接环时，必须抛 ``ValueError`` 而不是 ``RuntimeError``。"""
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_root.mkdir()
+    monkeypatch.setattr("src.utils.config.ROOT_DIR", tmp_path)
+    (tmp_path / "config.toml").write_text('snapshot_root = "snapshots"\n', encoding="utf-8")
+    get_settings.cache_clear()
+    repository = SnapshotRepository(build_run_config(get_settings()))
+
+    loop = repository.root / "loop"
+    loop.symlink_to(loop)
+    repository.run_config.active_snapshot_marker.write_text("loop", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        repository.get_active_snapshot_id()

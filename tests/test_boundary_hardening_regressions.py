@@ -4162,3 +4162,27 @@ def test_normalize_request_timeout_is_a_plain_classmethod():
     )
     # 行为不变式：真实取值仍走校验体。
     assert OpenAICompatibleProvider._normalize_request_timeout(30) == 30.0
+
+
+# --- ACTIVE_SNAPSHOT 标记的符号链接环 -------------------------------------
+#
+# 与 ``SnapshotRepository._require_snapshot_id_within_root`` 同一缺陷、同一
+# 判据：``load_snapshot`` 里 ``(marker.parent / active_id).resolve()`` 对符号
+# 链接环抛 ``RuntimeError: Symlink loop from ...``。它**不是** ``ValueError``，
+# 而本方法的其余拒绝路径（目录未激活、不是活动快照）一律抛 ``ValueError``，
+# 调用方 ``VectorStoreFactory._load_existing_state`` 也按 ``ValueError`` 分类。
+# 标记文件是磁盘上的任意文本，用户手工摆一个环即触发。收敛判据与
+# ``utils.security.resolve_within`` 一致：``(OSError, RuntimeError)`` → ``ValueError``。
+
+
+def test_load_snapshot_rejects_symlink_loop_in_active_marker(tmp_path):
+    """ACTIVE_SNAPSHOT 内容指向符号链接环时，必须抛 ``ValueError``。"""
+    root = tmp_path
+    snapshot = root / "kb-loop"
+    snapshot.mkdir()
+    loop = root / "loop"
+    loop.symlink_to(loop)
+    (root / "ACTIVE_SNAPSHOT").write_text("loop", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="ACTIVE_SNAPSHOT"):
+        FaissStore().load_snapshot(str(snapshot), snapshot_root=str(root))

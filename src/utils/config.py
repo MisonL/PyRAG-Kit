@@ -1184,7 +1184,21 @@ class Settings(BaseSettings):
         path = Path(v)
         if path.is_absolute():
             return str(path)
-        return str((ROOT_DIR / v).resolve())
+        # ``resolve()`` 对符号链接环抛 ``RuntimeError: Symlink loop from ...``，
+        # 它不是 ``ValueError``，也不是 ``OSError``——``get_settings`` 已有的四个
+        # handler 一个都接不住，而 ``get_settings`` 在 **import 期**就被调用
+        # （``log_manager.get_module_logger``），早于任何入口的 ``try``。实测
+        # ``data`` 是符号链接环（``data -> data``）时 ``import main`` 直接以裸
+        # traceback 终止，与同文件其它「配置写错」的脱敏收场不一致。收敛判据与
+        # ``utils.security.resolve_within``、``cleanup._reject_unsafe_cache_dir``
+        # 一致：``(OSError, RuntimeError)`` 统一成带字段名的 ``ValueError``。
+        try:
+            return str((ROOT_DIR / v).resolve())
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(
+                f"{info.field_name} 无法解析（{type(exc).__name__}: {exc}）。"
+                " 路径可能包含符号链接环或过长的间接层，请检查该配置项。"
+            ) from exc
 
     @classmethod
     def settings_customise_sources(
