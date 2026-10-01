@@ -4036,3 +4036,61 @@ def test_diagnostic_entries_still_work_for_legal_inputs():
         ]
         is True
     )
+
+
+# ── /config 分支的异常分类：抛出类型必须落在自己的 except 分类内 ──
+#
+# `start_chat_session_async` 的 `/config` 分支里有一段专门为「嵌入方传入的 bot
+# 替身缺少约定接口」写的探测：先 `getattr(bot, "apply_config_update_async", None)`，
+# 再退到同步入口，两者都不可调用时抛错。
+#
+# 该 `raise` 此前抛的是 `AttributeError`，而同一个 `try` 的
+# `except (ValueError, KeyError)` 接不住它；更内层的
+# `except (KeyboardInterrupt, EOFError)` 也接不住——实测会一路穿透到 `finally`，
+# **终止整个会话**。这与该块开头注释的意图（「配置应用失败**不能**终止整个会话…
+# 报错、保留原配置、回到提示符」）直接矛盾：同一个恢复路径对 `SessionConfig`
+# 校验失败等情形都生效，唯独这条会把用户丢出会话。
+#
+# 判据：抛出类型必须是 `ValueError`（语义上也确实是一条配置错误——嵌入方的实现
+# 缺少约定接口），从而与同一 `except` 里其它失败同收场。
+
+
+def test_config_branch_missing_update_method_raises_a_caught_type():
+    """缺配置更新方法时必须抛 `except (ValueError, KeyError)` 接得住的类型。
+
+    用 AST 精确对照「最近包裹的 ``try`` 的 ``except`` 分类」与 ``raise`` 的类型
+    ——这是「异常分类泄漏」的直接判据，比跑一遍完整会话更稳（后者会被
+    ``display_chat_config`` 等无关分支干扰）。
+    """
+    import ast
+    from pathlib import Path
+
+    tree = ast.parse(Path("src/chat/core.py").read_text(encoding="utf-8"))
+
+    raise_node = None
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Raise)
+            and isinstance(node.exc, ast.Call)
+            and "缺少配置更新方法" in ast.unparse(node)
+        ):
+            raise_node = node
+            break
+    assert raise_node is not None, "未找到该 raise（实现被移动或改写？）"
+    raised = raise_node.exc.func.id
+    assert raised == "ValueError", f"应抛 ValueError，实际 {raised}"
+
+    # 找最近包裹它的 Try,确认分类覆盖。
+    enclosing = None
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Try)
+            and node.lineno <= raise_node.lineno <= (node.end_lineno or 0)
+            and (enclosing is None or node.lineno > enclosing.lineno)
+        ):
+            enclosing = node
+    assert enclosing is not None, "该 raise 不在任何 try 内"
+    handled = [ast.unparse(handler.type) for handler in enclosing.handlers]
+    assert any("ValueError" in text for text in handled), (
+        f"抛出的 {raised} 未被最近的 except {handled} 接住——会穿透并终止会话"
+    )

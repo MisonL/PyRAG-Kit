@@ -6,6 +6,8 @@
 
 ### 修复
 
+- **修正 `/config` 分支的异常分类泄漏**：`start_chat_session_async` 的 `/config` 分支在检测到嵌入方传入的 bot 替身缺少约定接口（`apply_config_update` / `apply_config_update_async` 都不可调用）时抛出 `AttributeError`，而同一个 `try` 的 `except (ValueError, KeyError)` 接不住它，更内层的 `except (KeyboardInterrupt, EOFError)` 也接不住——实测会一路穿透到 `finally`，**终止整个会话**。这与该块开头注释的意图（「配置应用失败**不能**终止整个会话…报错、保留原配置、回到提示符」）直接矛盾：同一个恢复路径对 `SessionConfig` 校验失败等情形都生效，唯独这条会把用户丢出会话。现已改为抛出 `ValueError`（语义上也确实是一条配置错误——嵌入方的实现缺少约定接口），从而与同 `except` 里其它失败同收场。回归测试用 AST 静态对照「最近包裹的 `try` 的 `except` 分类」与 `raise` 的类型，精确验证异常分类不再泄漏。(`src/chat/core.py`)
+
 - **公开诊断入口对非法 `provider_name`／`role` 的收场与工厂其余入口不一致**（`src/providers/factory.py`）。`ModelProviderFactory` 有三个**公开**诊断入口——`capabilities`／`capability_report`／`protocol_status`，源码注释写明供「配置界面和诊断」使用——它们的入参直接来自调用方，此前完全没有形态守卫：
 
   | 入参 | 修复前的收场 |

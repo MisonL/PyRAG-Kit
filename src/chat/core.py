@@ -419,7 +419,20 @@ async def start_chat_session_async():
                             else:
                                 apply_sync = getattr(bot, "apply_config_update", None)
                                 if not callable(apply_sync):
-                                    raise AttributeError("Chatbot 缺少配置更新方法。")
+                                    # 抛 ``ValueError`` 而**不是** ``AttributeError``：
+                                    # 下面这个 ``except`` 只接 ``(ValueError, KeyError)``，
+                                    # 而 ``AttributeError`` 同样不落在更内层的
+                                    # ``except (KeyboardInterrupt, EOFError)`` 里——实测
+                                    # 会一路穿透到 ``finally``，**终止整个会话**。这与
+                                    # 本块开头那段注释的意图（「配置应用失败不能终止整个
+                                    # 会话…报错、保留原配置、回到提示符」）直接矛盾：同一
+                                    # 个恢复路径对别的失败都生效，唯独这条替身缺方法的
+                                    # 情况会把用户丢出会话。
+                                    #
+                                    # 语义上这也确实是一条配置错误（嵌入方传入的 bot
+                                    # 实现缺少约定接口），与同 ``except`` 里的
+                                    # ``SessionConfig`` 校验失败同类。
+                                    raise ValueError("Chatbot 缺少配置更新方法。")
                                 apply_sync(updated_config, llm_needs_reload)
                         except (ValueError, KeyError) as exc:
                             # 经 ``getattr`` 取 logger：``bot`` 的类型是运行时
