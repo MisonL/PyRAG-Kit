@@ -140,3 +140,38 @@ def test_build_still_accepts_utf8_knowledge_base(tmp_path, monkeypatch):
     # 空分片会被 ``_IncompleteVectorStore`` 判为不完整快照，说明文件读取这一步过了。
     with pytest.raises(FileNotFoundError, match="知识快照不完整"):
         asyncio.run(service.build("standard"))
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        pytest.param(5, id="int"),
+        pytest.param(["a"], id="list"),
+        pytest.param(None, id="none"),
+    ],
+)
+def test_build_rejects_non_path_knowledge_base_path(tmp_path, bad_path):
+    """``knowledge_base_path`` 非 ``Path`` 时必须给 ``ValueError``。
+
+    ``build`` 第一行就写 ``self.run_config.knowledge_base_path.glob("*.md")``，而
+    ``RunConfig`` 是 frozen dataclass、字段没有校验器（同仓库多处已认领这条
+    可达性）。非 ``Path`` 取值在那里抛裸
+    ``AttributeError: 'int' object has no attribute 'glob'``——不是本服务其余拒绝
+    路径承诺的带指引 ``ValueError``，而 ``build`` 由 CLI 与 ``main.py`` 的知识库
+    向量化入口直接调用。
+    """
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_root.mkdir()
+    run_config = _RunConfig(bad_path, snapshot_root)
+    service = KnowledgeBuildService(
+        run_config,
+        _IncompleteVectorStore(),
+        SimpleNamespace(
+            embedding_provider_key="local-hash",
+            embedding_model_detail=SimpleNamespace(model_name="local-hash-32"),
+        ),
+        SnapshotRepository(run_config),
+    )
+
+    with pytest.raises(ValueError, match="knowledge_base_path"):
+        asyncio.run(service.build("standard"))

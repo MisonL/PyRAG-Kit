@@ -32,11 +32,22 @@ class KnowledgeBuildService:
         self.snapshot_repository = snapshot_repository
 
     async def build(self, splitter_structure_mode: str) -> dict[str, object]:
-        markdown_files = sorted(self.run_config.knowledge_base_path.glob("*.md"))
-        if not markdown_files:
-            raise FileNotFoundError(
-                f"知识库目录 '{self.run_config.knowledge_base_path}' 中未找到 Markdown 文件。"
+        # 形态先收敛：下一行直接对 ``knowledge_base_path`` 调 ``.glob()``，非
+        # ``Path`` 取值在那里抛裸 ``AttributeError: 'int' object has no attribute
+        # 'glob'``——不是本服务其余拒绝路径承诺的带指引 ``ValueError``。
+        # ``RunConfig`` 是 frozen dataclass、字段没有校验器，嵌入方可以自拼
+        # ``knowledge_base_path=5`` 的配置。只接受 ``Path``（``RunConfig`` 的标注
+        # 就是它），不做静默强转。
+        knowledge_base_path = self.run_config.knowledge_base_path
+        if not isinstance(knowledge_base_path, Path):
+            raise ValueError(
+                "knowledge_base_path 必须是 Path，"
+                f"但得到 {type(knowledge_base_path).__name__}。"
+                " 请检查 config.toml 里的 knowledge_base_path 配置项。"
             )
+        markdown_files = sorted(knowledge_base_path.glob("*.md"))
+        if not markdown_files:
+            raise FileNotFoundError(f"知识库目录 '{knowledge_base_path}' 中未找到 Markdown 文件。")
 
         snapshot_id = self.snapshot_repository.generate_snapshot_id()
         temp_dir = self.snapshot_repository.create_temp_snapshot_dir(snapshot_id)

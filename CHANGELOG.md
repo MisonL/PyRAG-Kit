@@ -6,6 +6,8 @@
 
 ### 修复
 
+- **`KnowledgeBuildService.build` 对非 `Path` 的 `knowledge_base_path` 抛裸 `AttributeError`**（`src/services/knowledge_build_service.py`）。`build` 第一件事就是 `self.run_config.knowledge_base_path.glob("*.md")`，而 `RunConfig` 是 frozen dataclass、字段没有校验器（同仓库多处已认领这条可达性），嵌入方可以自拼 `knowledge_base_path=5` 的配置。实测抛裸 `AttributeError: 'int' object has no attribute 'glob'`——不是本服务其余拒绝路径（空目录给 `FileNotFoundError`、非 UTF-8 文件给带文件名的 `ValueError`）承诺的带指引消息，而 `build` 由 CLI 与 `main.py` 的知识库向量化入口直接调用。修法：读取路径之后先判形态，只接受 `Path`（`RunConfig` 的标注就是它），不做静默强转。回归测试 3 条（`int`／`list`／`None`），全部在未修源码时实测变红。
+
 - **`SnapshotRepository.__init__` 对非 `Path` 的 `snapshot_root` 抛裸 `AttributeError`**（`src/retrieval/snapshot_repository.py`）。构造器直接对 `run_config.snapshot_root` 调 `.mkdir()`，而 `RunConfig` 是 frozen dataclass、字段没有校验器（同仓库多处已认领这条可达性），嵌入方可以自拼 `snapshot_root=5` 的配置。实测抛裸 `AttributeError: 'int' object has no attribute 'mkdir'`——不是本类其余拒绝路径承诺的带指引 `ValueError`。修法：构造期判形态，只接受 `Path`（`RunConfig` 的标注就是它），不做静默强转。回归测试 3 条（`int`／`list`／`None`），全部在未修源码时实测变红。
 
 - **`_load_existing_state` 的 legacy 分支对非路径的 `legacy_pkl_path` 抛裸 `TypeError`**（`src/retrieval/vdb/factory.py`）。该方法第一件事就是 `Path(run_config.legacy_pkl_path)`，而 `RunConfig` 是 frozen dataclass、字段没有校验器。非路径取值在那里抛裸 `TypeError: expected str, bytes or os.PathLike object, not ...`，位数超限的整数抛 `ValueError: Exceeds the limit`——两条都不在本模块其余拒绝路径承诺的带指引 `ValueError` 契约内，而调用方（`get_default_vector_store` 在 `Chatbot` 初始化时调用）按它分类。修法：构造 `Path` 之前先判形态，与 `FaissStore.load`／`resolve_within` 同判据。回归测试 3 条（`int`／`list`／位数超限整数），全部在未修源码时实测变红。
