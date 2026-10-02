@@ -414,6 +414,39 @@ def test_finalize_snapshot_does_not_delete_outside_the_root(run_config, tmp_path
     assert (victim / "important.txt").is_file()
 
 
+@pytest.mark.parametrize(
+    "hostile_id",
+    [
+        pytest.param(5, id="int"),
+        pytest.param(["a"], id="list"),
+        pytest.param(10**4301, id="beyond-int-str-digits"),
+        pytest.param(b"abc", id="bytes"),
+    ],
+)
+def test_snapshot_id_guard_rejects_non_path_forms(run_config, hostile_id):
+    """非路径形态的 ``snapshot_id`` 必须收敛成 ``ValueError``，不是裸 ``TypeError``。
+
+    ``_require_snapshot_id_within_root`` 第一行就写 ``Path(snapshot_id)``，而
+    ``Path(5)``／``Path(["a"])`` 抛裸 ``TypeError: expected str, bytes or
+    os.PathLike object, not ...``——不是本类承诺的带指引 ``ValueError``，也没有
+    「快照 id 不合法」的语义。位数超限的整数更隐蔽：``Path(10**4301)`` 抛的是
+    ``ValueError: Exceeds the limit``，类型对、内容却与快照 id 无关。
+
+    三个 ``*_temp_snapshot_dir``／``finalize_snapshot`` 方法都对拼出的路径做
+    ``rmtree``，而快照 id 的来源之一是磁盘上的标记文件；形态判据必须与同仓库的
+    ``resolve_within``／``ensure_trusted_source`` 一致（构造 ``Path`` 之前先判
+    形态）。
+    """
+    repository = SnapshotRepository(run_config)
+
+    with pytest.raises(ValueError, match="快照 id"):
+        repository.create_temp_snapshot_dir(hostile_id)
+    with pytest.raises(ValueError, match="快照 id"):
+        repository.cleanup_temp_snapshot_dir(hostile_id)
+    with pytest.raises(ValueError, match="快照 id"):
+        repository.finalize_snapshot(run_config.snapshot_root / ".tmp-x", hostile_id)
+
+
 def test_snapshot_id_guard_does_not_break_the_normal_flow(run_config):
     """收紧不能误伤：生成 id 的完整流程必须照常走通。"""
     repository = SnapshotRepository(run_config)

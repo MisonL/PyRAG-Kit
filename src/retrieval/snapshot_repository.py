@@ -61,6 +61,22 @@ class SnapshotRepository:
         # 快照 id 由本项目的 ``generate_snapshot_id()`` 产出（``<prefix>-<12 hex>``），
         # 或来自标记文件，两者都不含分隔符，因此「单分量」不会误伤合法值。
         # 判定放在 ``root`` 解析之前，对 ``Path`` 的规范化行为不敏感。
+        # 形态先收敛：下面第一行就对 ``snapshot_id`` 构造 ``Path``，而
+        # ``Path(5)``／``Path(["a"])``／``Path(b"abc")`` 抛裸 ``TypeError:
+        # expected str, bytes or os.PathLike object, not ...``——不是本类承诺的
+        # 带指引 ``ValueError``。位数超限的整数更隐蔽：``Path(10**4301)`` 抛
+        # ``ValueError: Exceeds the limit``，类型对、内容却与快照 id 无关。
+        # 快照 id 的来源之一是磁盘上的标记文件（``get_active_snapshot_id``），
+        # 而三个 ``*_temp_snapshot_dir``／``finalize_snapshot`` 都对拼出的路径做
+        # ``rmtree``，形态判据必须与 ``resolve_within``／``ensure_trusted_source``
+        # 一致：构造 ``Path`` 之前先判形态。``str`` 之外的 ``bytes`` 也不接受
+        # ——本项目所有快照路径都是文本路径，``os.fspath`` 对 ``bytes`` 会给出
+        # 另一种报错，与其下游行为不一致。
+        if not isinstance(snapshot_id, str):
+            raise ValueError(
+                f"快照 id 不合法: {safe_repr(snapshot_id)}（来源: {source}）。"
+                " 它必须是字符串形式的单一目录名。请检查该值，或重建知识快照。"
+            )
         if (
             not snapshot_id
             or Path(snapshot_id).is_absolute()
