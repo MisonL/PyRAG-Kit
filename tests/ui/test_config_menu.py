@@ -9,6 +9,7 @@ UI 的校验器如果只按单字段上界放行，用户设一个「字段合�
 from __future__ import annotations
 
 import pytest
+import questionary
 
 from src.runtime.contracts import SessionConfig, build_session_config
 from src.ui.config_menu import _bounded_int_validator, _multiplier_ceiling, _top_k_ceiling
@@ -363,3 +364,86 @@ def test_edit_model_params_lists_unusable_details_without_reading_them(monkeypat
 
     assert config_menu.edit_model_params(chat_config) is False
     assert chat_config["active_llm_configuration"] == "broken"
+
+
+# ── 回归：模型菜单的候选项必须能交给 questionary ──
+#
+# `edit_model_params` 把 `_configuration_keys` 返回的**原始键**直接当候选传给
+# `questionary.select`。`SessionConfig` 的 `_VALIDATORS` 明确不登记
+# `*_configurations`（「按原样写入，由使用方负责其内部结构」），嵌入方或携带
+# 异常取值的 pickle 快照可以放进任意可哈希键。questionary 对每个候选调
+# `choice.get(...)`（`Choice` 对象才有该方法），非字符串键——`int`、`tuple`、
+# 乃至 `None`——一律抛裸 `AttributeError: 'int' object has no attribute 'get'`，
+# 菜单根本显示不出来。位数超限的整数则更早在渲染候选标题时抛
+# `ValueError: Exceeds the limit`。
+#
+# 同一处还有第二条：`default=current_llm` 传的是**原始**激活键，而候选若被
+# 渲染成字符串标题，questionary 会拿它去候选集合里找，找不到就抛
+# `ValueError: Invalid 'default' value passed`——激活项被删掉、或它本身是位数
+# 超限的整数时都会命中。
+#
+# 修法：候选一律包成 `questionary.Choice(title=_render_value(key), value=key)`，
+# `default` 传原始键（`Choice.value` 就是原始键，能对上），并把不在候选集合里的
+# `default` 收敛成 `None`（questionary 的「未作答」哨兵，合法）。
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        pytest.param(1, id="int"),
+        pytest.param((1, 2), id="tuple"),
+        pytest.param(10**4301, id="huge-int"),
+    ],
+)
+def test_edit_model_params_selects_over_non_string_configuration_keys(monkeypatch, key):
+    """非字符串的配置键必须能进候选，而不是让 questionary 抛裸 ``AttributeError``。"""
+    from src.ui import config_menu
+
+    seen: list[list] = []
+    answers = iter(["llm", None, "back"])
+
+    def select(prompt, choices=None, **_kwargs):
+        if prompt == "选择新的LLM配置:":
+            # 真实 questionary 走 ``Choice.build``：``Choice`` 原样返回、``str``
+            # 包成 ``Choice(c, c)``，**其余类型**才落到 ``c.get(...)`` 上抛裸
+            # ``AttributeError``。替身按同一契约校验。
+            seen.append(list(choices))
+            for choice in choices:
+                assert isinstance(choice, (str, questionary.Choice)), (
+                    f"候选不是 questionary 能接受的形态: {choice!r}"
+                )
+        return _Choice(next(answers))
+
+    monkeypatch.setattr(config_menu.questionary, "select", select)
+    chat_config = {
+        "llm_configurations": {key: None},
+        "active_llm_configuration": key,
+        "active_rerank_configuration": "",
+    }
+
+    assert config_menu.edit_model_params(chat_config) is False
+    assert seen, "菜单必须真的构造过候选"
+
+
+def test_edit_model_params_survives_stale_active_configuration(monkeypatch):
+    """激活项不在候选集合里时，``default`` 不得让 questionary 抛 ``ValueError``。"""
+    from src.ui import config_menu
+
+    answers = iter(["llm", None, "back"])
+
+    def select(prompt, choices=None, default=None, **_kwargs):
+        if prompt == "选择新的LLM配置:":
+            # 收敛后 default 要么是候选里的原始键，要么是 ``None``（未作答哨兵）
+            values = [c.value for c in choices]
+            assert default is None or default in values, (default, values)
+        return _Choice(next(answers))
+
+    monkeypatch.setattr(config_menu.questionary, "select", select)
+    chat_config = {
+        "llm_configurations": {"a": None, "b": None},
+        # 激活项已被删掉：不在候选里
+        "active_llm_configuration": "removed",
+        "active_rerank_configuration": "",
+    }
+
+    assert config_menu.edit_model_params(chat_config) is False

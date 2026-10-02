@@ -6,6 +6,12 @@
 
 ### 修复
 
+- **模型配置菜单把原始键直接交给 questionary，非字符串键让菜单崩掉**（`src/ui/config_menu.py`）。`edit_model_params` 把 `_configuration_keys` 返回的**原始键**当候选传给 `questionary.select`。`SessionConfig` 的 `_VALIDATORS` 明确不登记 `*_configurations`（「按原样写入，由使用方负责其内部结构」），嵌入方或携带异常取值的 pickle 快照可以放进任意可哈希键；questionary 的 `Choice.build` 只对 `str` 有特例，其余类型落到 `c.get(...)`，实测 `int`／`tuple`／`None` 键一律抛裸 `AttributeError: 'int' object has no attribute 'get'`，位数超限的整数键更早在渲染标题时抛 `ValueError: Exceeds the limit`——菜单根本显示不出来，而它正是用户唯一还能改配置的入口。
+
+  同一处还有第二条：`default=` 传的是**原始**激活键，而候选若被渲染成字符串标题，questionary 会拿它去候选集合里找，找不到就抛 `ValueError: Invalid 'default' value passed`——激活项被删掉、或它本身是位数超限的整数时都会命中。另外 `new_llm != current_llm` 拿渲染后的字符串比较，非字符串键永不等于自身，会让「选中同一个配置」被误判成切换、白白触发一次 LLM 重载。
+
+  修法：新增 `_configuration_choices`（候选一律包成 `questionary.Choice(title=_render_value(key), value=key)`，`value` 保留原始键）与 `_choice_default`（`default` 不在候选集合里时退回 `None`——questionary 的「未作答」哨兵，合法），切换判据改与**原始**键比较。回归测试 4 条（三种非字符串键 + 一条陈旧激活项），均在未修源码时实测变红；修后另用**真实** questionary 复核五种键形态与陈旧 `default` 全部可构造。
+
 - **非字符串键的判据只加在顶层，嵌套层级与四个兄弟校验器仍漏**（`src/utils/security.py`、`src/providers/google.py`）。上一条修的是 `validate_secret_free_options` 的**顶层**循环，注释还专门写了「只在顶层判」。但共享递归扫描器 `find_sensitive_option_paths` 对**每一层**映射都做 `str(key)` 建路径，`normalize_option_key`／`_is_credential_key` 也各自 `str(key)`；同一判据在嵌套层级和四个兄弟校验器（`validate_secret_free_payload`／`validate_secret_free_request_overrides`／`validate_secret_free_resource_kwargs`／`validate_secret_free_resource_args`）上都没有，而它们共用同一个扫描器。
 
   两种收场都不在契约内：`{10**4301: "x"}` 抛 `ValueError: Exceeds the limit`——类型对、内容与字段无关；`{1: "x"}` 则**静默通过**，随后在调用方的 `", ".join(sorted(...))` 处抛裸 `TypeError: sequence item 0: expected str instance, int found`（实测 `GoogleProvider("m", {"extra_body": {1: "x"}})` 构造成功，首次请求合并 `extra_body` 时才崩）。Google 自己的 `_validate_http_options` 递归与 `_coerce_debug_config` 也各有一处 `str(key)`／`sorted(...)`。

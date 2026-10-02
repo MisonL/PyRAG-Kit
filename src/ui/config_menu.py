@@ -316,6 +316,46 @@ def _configuration_keys(configurations: Any, role_label: str) -> list[Any]:
     return list(configurations.keys())
 
 
+def _configuration_choices(configurations: Any, role_label: str) -> list[questionary.Choice]:
+    """把配置映射的键列表包成 questionary 候选。
+
+    与 ``_configuration_keys`` 同一处取值、同一取舍（只判容器、不判取值），
+    但**必须**包成 ``Choice``：``questionary.select`` 对每个候选调
+    ``choice.get(...)``，只有 ``Choice`` 对象有该方法，原始字符串之所以能工作
+    是因为 questionary 内部对 ``str`` 有特例——非字符串键（``int``／``tuple``／
+    ``None``）一律抛裸 ``AttributeError: 'int' object has no attribute 'get'``。
+    而 ``SessionConfig._VALIDATORS`` 明确不登记 ``*_configurations``，嵌入方或
+    携带异常取值的 pickle 快照可以放进任意可哈希键。
+
+    标题走 ``_render_value``：位数超限的整数键连 ``str()`` 都抛
+    ``ValueError: Exceeds the limit``，菜单根本渲染不出来。``value`` 保留**原始
+    键**——切换时写回的必须是它，``default=`` 也要拿原始键去候选集合里对。
+
+    候选为空时 questionary 自己抛 ``ValueError: A list of choices needs to be
+    provided.``——那是「配置里一个模型都没有」的真实情况，交给它报出比在这里
+    编一个假选项更诚实。
+    """
+    return [
+        questionary.Choice(title=_render_value(key), value=key)
+        for key in _configuration_keys(configurations, role_label)
+    ]
+
+
+def _choice_default(choices: list[questionary.Choice], active: Any) -> Any:
+    """返回可交给 ``questionary.select(default=...)`` 的取值。
+
+    ``default`` 必须**存在于候选集合里**，否则 questionary 抛
+    ``ValueError: Invalid `default` value passed``——激活项被删掉、或它本身是
+    位数超限的整数时都会命中，而菜单是用户唯一还能改配置的入口。不在候选里就
+    退回 ``None``：那是 questionary 内部的「尚未作答」哨兵（见
+    ``edit_retrieval_params`` 里 ``default=None`` 的说明），合法且不抛。
+    """
+    for choice in choices:
+        if choice.value == active:
+            return active
+    return None
+
+
 def edit_model_params(chat_config: dict[str, Any]) -> bool:
     """编辑模型相关参数。"""
     logger.info("进入模型参数编辑菜单。")
@@ -323,8 +363,10 @@ def edit_model_params(chat_config: dict[str, Any]) -> bool:
     while True:
         # 与 ``edit_retrieval_params`` 同因：``active_*_configuration`` 可被直写，
         # 裸插值对位数超限的整数抛 ``ValueError: Exceeds the limit``，菜单渲染不出来。
-        current_llm = _render_value(chat_config["active_llm_configuration"])
-        current_rerank = _render_value(chat_config["active_rerank_configuration"])
+        active_llm = chat_config["active_llm_configuration"]
+        active_rerank = chat_config["active_rerank_configuration"]
+        current_llm = _render_value(active_llm)
+        current_rerank = _render_value(active_rerank)
 
         choice = questionary.select(
             "选择要切换的模型:",
@@ -344,11 +386,16 @@ def edit_model_params(chat_config: dict[str, Any]) -> bool:
             break
 
         if choice == "llm":
-            llm_options = _configuration_keys(chat_config["llm_configurations"], "LLM")
+            llm_options = _configuration_choices(chat_config["llm_configurations"], "LLM")
             new_llm = questionary.select(
-                "选择新的LLM配置:", choices=llm_options, default=current_llm
+                "选择新的LLM配置:",
+                choices=llm_options,
+                default=_choice_default(llm_options, active_llm),
             ).ask()
-            if new_llm and new_llm != current_llm:
+            # 与**原始**键比较，不与渲染后的 ``current_llm`` 比较：非字符串键
+            # （或位数超限的整数键）渲染成量级描述后永不等于自身，会让「选中
+            # 同一个配置」被误判成切换、白白触发一次 LLM 重载。
+            if new_llm is not None and new_llm != active_llm:
                 chat_config["active_llm_configuration"] = new_llm
                 console.print(markup_text("[green]LLM配置已切换为: {}[/green]", new_llm))
                 logger.info("LLM配置已切换为: %s", new_llm)
@@ -356,11 +403,13 @@ def edit_model_params(chat_config: dict[str, Any]) -> bool:
             continue
 
         if choice == "rerank":
-            rerank_options = _configuration_keys(chat_config["rerank_configurations"], "Rerank")
+            rerank_options = _configuration_choices(chat_config["rerank_configurations"], "Rerank")
             new_rerank = questionary.select(
-                "选择新的Rerank配置:", choices=rerank_options, default=current_rerank
+                "选择新的Rerank配置:",
+                choices=rerank_options,
+                default=_choice_default(rerank_options, active_rerank),
             ).ask()
-            if new_rerank:
+            if new_rerank is not None:
                 chat_config["active_rerank_configuration"] = new_rerank
                 console.print(markup_text("[green]Rerank已切换为: {}[/green]", new_rerank))
                 logger.info("Rerank已切换为: %s", new_rerank)
