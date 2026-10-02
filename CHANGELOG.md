@@ -6,6 +6,10 @@
 
 ### 修复
 
+- **`split_hierarchical` 绕过尺寸守卫，与 `split` 判据不一致**（`src/etl/splitters/recursive_text_splitter.py`）。`split` 在层级分支里会调 `_validate_hierarchical_sizes()`（子分片 `overlap < size`、比例上界、`child_size < parent_size`），但 `split_hierarchical` 是**公开方法**（同 `_require_documents` 认领的那条理由：「只守卫 `split` 会留下直接调 `split_hierarchical` 的口子」），直接调它时这些判据全部被绕过。实测 `child_overlap == child_size` 时 `split` 抛带指引的 `ValueError`，而 `split_hierarchical` 照常返回——1000 字符的文档产出 694 个分片（子分片器几乎不前进），全部进入 embedding 与 FAISS 写入且无任何提示；`child_size >= parent_size` 则让层级结构静默退化为一层。上一条同类修复只钉了「documents 形态」那一半，尺寸这一半漏了。
+
+  修法：把 `_validate_hierarchical_sizes()` 一并移进 `split_hierarchical`（`_require_documents` 已在那里），两条入口同判据。回归测试 2 条，均在未修源码时实测变红（`DID NOT RAISE`）。
+
 - **legacy 导入分支缺 embedding 配置时抛裸 `KeyError`，与活动快照分支判据不一致**（`src/retrieval/vdb/factory.py`）。`_load_existing_state` 的两条分支都要按 `default_embedding_provider` 从 `embedding_configurations` 取 `model_name` 去构造 manifest，但判据不一致：活动快照分支显式判过「键不在映射里」，给出带字段名与指引的 `ValueError`；legacy 分支直接下标 `run_config.embedding_configurations[...]`。配置里把 provider 名打错（或漏写整段 `embedding_configurations`）时，用户拿到的是裸 `KeyError: 'local-hash-typo'`——没有字段名、没有可选值，也不是调用方按 `ValueError` 建立的错误分类。同一个「embedding 配置缺失」的错误，收场不该取决于磁盘上恰好有没有活动快照。
 
   修法是抽出 `_require_embedding_detail` 供两条分支共用：既判「键不在映射里」，也判取值可用性（`{"k": None}` 的键在、值却读不出 `model_name`，原抛裸 `AttributeError`）与容器形态（`RunConfig` 是 frozen dataclass、字段无校验器，嵌入方可自拼非映射的配置），判据与 `EmbeddingService.embedding_model_detail` 一致。回归测试 2 条，均在未修源码时实测变红（`KeyError: 'local-hash-typo'` 与 `AttributeError: 'NoneType' object has no attribute 'model_name'`）。

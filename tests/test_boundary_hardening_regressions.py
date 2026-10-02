@@ -4737,3 +4737,48 @@ def test_ark_chat_stream_keeps_string_tool_arguments_verbatim():
 
     deltas = [event.tool_call for event in events if event.type == "tool_call_delta"]
     assert deltas[0]["arguments"] == '{"a":1}'
+
+
+def test_split_hierarchical_applies_the_same_size_guard_as_split():
+    """``split_hierarchical`` 必须与 ``split`` 同判据，连**尺寸**守卫一起。
+
+    上一条只钉了「documents 形态」那一半。``split`` 在层级分支里还会调
+    ``_validate_hierarchical_sizes()``（子分片 ``overlap < size``、比例上界、
+    ``child_size < parent_size``），而 ``split_hierarchical`` 是**公开方法**，
+    直接调它时这些判据全部被绕过。实测 ``child_overlap == child_size`` 时
+    ``split`` 抛带指引的 ``ValueError``，而 ``split_hierarchical`` 照常返回
+    ——1000 字符的文档产出 694 个分片（分片器几乎不前进），全部进入 embedding
+    与 FAISS 写入，且没有任何提示。这与 ``split`` 的收场直接矛盾。
+    """
+    from src.etl.splitters.recursive_text_splitter import RecursiveTextSplitter
+    from src.models.document import Document
+
+    splitter = RecursiveTextSplitter(
+        structure_mode="hierarchical",
+        parent_chunk_size=300,
+        parent_chunk_overlap=30,
+        child_chunk_size=100,
+        child_chunk_overlap=100,  # == child_size：子分片器无法推进
+    )
+    document = Document(content="a" * 1000, metadata={"source": "x.md"})
+
+    with pytest.raises(ValueError, match="kb_child_chunk_overlap 必须小于 kb_child_chunk_size"):
+        splitter.split_hierarchical([document])
+
+
+def test_split_hierarchical_rejects_child_larger_than_parent():
+    """``child_size >= parent_size`` 同样必须在 ``split_hierarchical`` 上生效。"""
+    from src.etl.splitters.recursive_text_splitter import RecursiveTextSplitter
+    from src.models.document import Document
+
+    splitter = RecursiveTextSplitter(
+        structure_mode="hierarchical",
+        parent_chunk_size=300,
+        parent_chunk_overlap=30,
+        child_chunk_size=1500,  # >= parent_size：层级结构静默退化为一层
+        child_chunk_overlap=30,
+    )
+    document = Document(content="a" * 2000, metadata={"source": "x.md"})
+
+    with pytest.raises(ValueError, match="kb_child_chunk_size 必须小于 kb_chunk_size"):
+        splitter.split_hierarchical([document])

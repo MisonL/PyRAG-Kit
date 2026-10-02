@@ -395,7 +395,16 @@ class RecursiveTextSplitter(BaseSplitter):
 
     def split_hierarchical(self, documents: list[Document]) -> list[Document]:
         """层级分片：先切父块，再切子块。"""
+        # 两个守卫都必须在这里，不能只挂在 ``split`` 的层级分支上：
+        # ``split_hierarchical`` 是**公开方法**（同 ``_require_documents`` 的
+        # 理由），直接调它时 ``split`` 的校验全部被绕过。实测
+        # ``child_overlap == child_size`` 时 ``split`` 抛带指引的 ``ValueError``，
+        # 而这里照常返回——1000 字符的文档产出 694 个分片（子分片器几乎不前进），
+        # 全部进入 embedding 与 FAISS 写入且无任何提示；``child_size >=
+        # parent_size`` 则让层级结构静默退化为一层。同一个非法配置在两条入口上
+        # 的收场必须一致。
         self._require_documents(documents)
+        self._validate_hierarchical_sizes()
         all_chunks: list[Document] = []
         child_splitter = self._build_child_splitter()
         self.parent_documents = {}
