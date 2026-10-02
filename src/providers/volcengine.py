@@ -1693,7 +1693,16 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
                             "index": field(call, "index", position),
                             "type": field(call, "type", "function"),
                             "name": field(function, "name"),
-                            "arguments": field(function, "arguments", ""),
+                            # 与另两条路径同判据（非流式 ``_extract_result`` 与
+                            # OpenAI 兼容的 ``_chat_stream_events`` 都走
+                            # ``normalize_tool_arguments``）。网关可以把
+                            # ``arguments`` 写成对象／数组／整数（``construct_type``
+                            # 不做校验），原样透传会让**同一个输入在 Ark 的两条
+                            # 路径上给出不同类型**——调用方按字符串 ``json.loads``
+                            # 时拿到 dict 并抛裸 ``TypeError``；位数超限的整数则让
+                            # 拼接／``json.dumps`` 抛 ``ValueError: Exceeds the
+                            # limit``。字符串片段原样透传，拼接语义不变。
+                            "arguments": normalize_tool_arguments(field(function, "arguments", "")),
                         },
                         response_id=response_id,
                         raw=chunk,

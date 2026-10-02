@@ -6,6 +6,8 @@
 
 ### 修复
 
+- **Ark Chat Completions 流式工具参数未收敛，与另两条路径判据不一致**（`src/providers/volcengine.py`）。同一个 `arguments` 字段在三条路径上的判据必须一致：非流式 `_extract_result` 走 `normalize_tool_arguments`、OpenAI 兼容的 `_chat_stream_events` 也走它，而 **Ark 的** `_chat_stream_events` 原样透传 `field(function, "arguments", "")`。网关可以把 `arguments` 写成对象／数组／整数（`construct_type` 不做校验），于是同一个输入在 Ark 的两条路径上给出不同类型——调用方按字符串 `json.loads` 时拿到 dict 并抛裸 `TypeError`；位数超限的整数则让拼接／`json.dumps` 抛 `ValueError: Exceeds the limit`。修法是让 Ark 的流式路径也走 `normalize_tool_arguments`，与另两条对齐。回归测试 4 条（对象／整数参数必须收敛成字符串、超大整数得到可读的「必须可序列化为 JSON」、一条「字符串片段原样透传」的反向守卫），其中 3 条在未修源码时实测变红。
+
 - **Anthropic 流式增量的文本字段原样透传非字符串，打破 `Generator[str]` 契约**（`src/providers/anthropic.py`）。`_stream_event` 的 `text_delta`／`thinking_delta` 用 `field(delta, "text", "") or ""` 取值——`or ""` 只挡住 `None` 与空串，**真值非字符串**（`5`／`{"a": 1}`）原样进 `StreamEvent.text`／`.reasoning`，而这两个字段声明为 `str`。消费方 `_iter_invoke_stream_text` 直接 `yield converted.text`，`Generator[str]` 的契约因此被打破：实测调用方 `"".join`／`+=` 抛 `TypeError: can only concatenate str (not "int") to str`，位数超限的整数更在更早的拼接处抛 `ValueError: Exceeds the limit`。同一 `tool_use` 块的标量 `input` 走裸 `str()`（`initial_arguments`），超大整数同样抛 `ValueError`。
 
   修法沿用上一条抽出的 `_block_text`：`text`／`reasoning`／`input_json_delta` 的 `partial_json`／`tool_use` 的标量 `input` 四处改用它。回归测试 9 条（正文与思考增量 × 三种非字符串取值、`tool_use` 标量 `input` × 两种取值、一条「正常字符串照旧保留」的反向守卫），其中 7 条在未修源码时实测变红。

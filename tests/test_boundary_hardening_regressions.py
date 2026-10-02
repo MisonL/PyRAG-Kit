@@ -4632,3 +4632,108 @@ def test_anthropic_stream_tool_use_initial_arguments_survives_non_mapping(value)
 
     assert converted is not None and converted.type == "tool_call_delta"
     assert isinstance(converted.tool_call["arguments"], str)
+
+
+# --- Ark Chat Completions 流式工具参数的收敛 ---------------------------------
+#
+# 同一个 ``arguments`` 字段在三条路径上的判据必须一致：
+#   * 非流式 ``_extract_result`` -> ``normalize_tool_arguments``（JSON 字符串）；
+#   * OpenAI 兼容的 ``_chat_stream_events`` -> ``normalize_tool_arguments``；
+#   * **Ark 的** ``_chat_stream_events`` -> 原样透传 ``field(function, "arguments", "")``。
+#
+# 第三条漏了：网关可以把 ``arguments`` 写成对象／数组／整数（``construct_type``
+# 不做校验），于是同一个输入在 Ark 的两条路径上给出不同类型——调用方按字符串
+# ``json.loads`` 时拿到 dict 并抛裸 ``TypeError``；位数超限的整数更直接让
+# ``json.dumps``／拼接抛 ``ValueError: Exceeds the limit``。
+#
+# 修法与 OpenAI 兼容路径对齐：统一走 ``normalize_tool_arguments``。
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        pytest.param({"order_id": "A-1"}, id="dict"),
+        pytest.param(5, id="int"),
+    ],
+)
+def test_ark_chat_stream_normalizes_non_string_tool_arguments(arguments):
+    """Ark 流式工具参数必须收敛成 JSON 字符串，与另两条路径同判据。"""
+    from src.providers.volcengine import VolcengineProvider
+
+    events = VolcengineProvider._chat_stream_events(
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "t1",
+                                "function": {"name": "f", "arguments": arguments},
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+    )
+
+    deltas = [event.tool_call for event in events if event.type == "tool_call_delta"]
+    assert deltas, "应产出工具调用增量"
+    assert isinstance(deltas[0]["arguments"], str)
+
+
+def test_ark_chat_stream_rejects_unserializable_tool_arguments_readably():
+    """位数超限的整数与 OpenAI 兼容路径同收场：可读的 ``ValueError``。
+
+    ``json.dumps(10**4301)`` 撞上 CPython 的整数位数上限，``normalize_tool_arguments``
+    把它收敛成「工具调用 arguments 必须可序列化为 JSON」——与
+    ``OpenAICompatibleProvider._chat_stream_events`` 对同一取值的行为一致，
+    而不是裸 ``ValueError: Exceeds the limit``。
+    """
+    from src.providers.volcengine import VolcengineProvider
+
+    with pytest.raises(ValueError, match="必须可序列化为 JSON"):
+        VolcengineProvider._chat_stream_events(
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "t1",
+                                    "function": {"name": "f", "arguments": _HUGE_INT},
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        )
+
+
+def test_ark_chat_stream_keeps_string_tool_arguments_verbatim():
+    """收紧不能误伤：字符串片段原样透传，拼接语义不变。"""
+    from src.providers.volcengine import VolcengineProvider
+
+    events = VolcengineProvider._chat_stream_events(
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "t1",
+                                "function": {"name": "f", "arguments": '{"a":1}'},
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+    )
+
+    deltas = [event.tool_call for event in events if event.type == "tool_call_delta"]
+    assert deltas[0]["arguments"] == '{"a":1}'
