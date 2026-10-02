@@ -419,3 +419,94 @@ def test_get_llm_provider_still_accepts_a_plain_dict():
     provider = ModelProviderFactory.get_llm_provider("k", configurations)
 
     assert provider.model_name == "m"
+
+
+# ── 回归：provider 配置**取值内部字段**的形态校验 ──
+#
+# `_get_model_detail` 只做键/容器/取值形态的校验，取值的**内部字段**
+# （`provider`／`model_name`）原样交给 `_create_provider`。而 `_create_provider`
+# 会把 `provider_name` 拿去 `_role_aliases.get(...)`／`_provider_map.get(...)`
+# 做字典查找、`_get_provider_class` 做成员判定、并在「不支持的模型提供商」消息里
+# f-string 插值；`model_name` 则原样透传给 provider 构造器（`local-hash` 直接
+# `.rsplit()`）。
+#
+# 判据只做了一半：`832abf0` 给**诊断**入口 `_provider_info_for_role` 加了
+# `provider_name` 形态守卫，展示层 `display_chat_config` 与
+# `RetrievalService._get_rerank_provider` 也各自用 `require_provider_name` 收敛，
+# 唯独**真正建 provider** 的 `_create_provider` 与三个 getter 漏了。同一个
+# `provider=["a"]`：走诊断入口得到带指引的 `ValueError`，走 getter 得到裸
+# `TypeError: unhashable type: 'list'`。
+#
+# 可达路径：`SessionConfig` 是公开类、普通属性没有 `__setattr__` 守卫，
+# `llm_configurations`／`embedding_configurations`／`rerank_configurations`
+# 的 `_VALIDATORS` 明确不登记（「按原样写入，由使用方负责其内部结构」），嵌入方
+# 可以往映射里放任意取值的 detail；`Chatbot.reload_llm` 把它原样传到这里。
+# `ModelDetail` 本身会拒绝非字符串 `provider`，但属性赋值没有 `__setattr__` 守卫
+# （实测 `detail.provider = ["a"]` 直接成功），且 `SimpleNamespace` 替身同样能提供
+# 这些属性（`require_detail_attributes` 只要求属性**存在**）。
+
+
+def _detail_with(**overrides: Any) -> ModelDetail:
+    """构造一个 `ModelDetail` 再直写字段，绕过 pydantic 的构造期校验。"""
+    detail = ModelDetail(provider="mock_llm", model_name="m")
+    for field, value in overrides.items():
+        setattr(detail, field, value)
+    return detail
+
+
+@pytest.mark.parametrize(
+    "bad_provider",
+    [["a"], {"k": 1}, 10**4301],
+    ids=["list", "dict", "huge-int"],
+)
+def test_get_llm_provider_rejects_malformed_provider_field_readably(bad_provider):
+    """`detail.provider` 形态非法时必须给 ``ValueError``，不是裸 ``TypeError``／整数转换错。"""
+    configurations = {"k": _detail_with(provider=bad_provider)}
+
+    with pytest.raises(ValueError) as excinfo:
+        ModelProviderFactory.get_llm_provider("k", configurations)
+
+    message = str(excinfo.value)
+    assert "Exceeds the limit" not in message, message
+    assert "provider" in message
+
+
+def test_embedding_and_rerank_getters_share_the_provider_field_guard():
+    """Embedding／Rerank 走同一 helper，判据必须一致。"""
+    for getter, field in (
+        (ModelProviderFactory.get_embedding_provider, "embedding_configurations"),
+        (ModelProviderFactory.get_rerank_provider, "rerank_configurations"),
+    ):
+        with pytest.raises(ValueError, match="provider"):
+            getter("k", {"k": _detail_with(provider=["a"])})
+
+
+@pytest.mark.parametrize(
+    "bad_model_name",
+    [["m"], {"m": 1}, None, 5, 10**4301],
+    ids=["list", "dict", "none", "int", "huge-int"],
+)
+def test_get_embedding_provider_rejects_malformed_model_name_readably(bad_model_name):
+    """`detail.model_name` 形态非法时必须给 ``ValueError``，不是裸 ``AttributeError``。
+
+    `model_name` 全程没有形态校验：`local-hash` 的 `_parse_dimension` 直接
+    `.rsplit()`（非字符串抛裸 `AttributeError`），其它 provider 把它交给 SDK。
+    位数超限的整数还会在日志 f-string 与错误消息里抛 `ValueError: Exceeds the limit`。
+    """
+    configurations = {"k": _detail_with(provider="local-hash", model_name=bad_model_name)}
+
+    with pytest.raises(ValueError) as excinfo:
+        ModelProviderFactory.get_embedding_provider("k", configurations)
+
+    message = str(excinfo.value)
+    assert "Exceeds the limit" not in message, message
+    assert "model_name" in message
+
+
+def test_getters_still_accept_valid_details():
+    """收紧不能误伤：合法的 provider／model_name 照常建出实例。"""
+    provider = ModelProviderFactory.get_llm_provider(
+        "k", {"k": ModelDetail(provider="mock_llm", model_name="m")}
+    )
+
+    assert provider.model_name == "m"

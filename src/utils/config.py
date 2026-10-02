@@ -442,12 +442,19 @@ def require_scale_field(value: Any, label: str) -> int:
     raise ValueError(f"{label} 必须是整数，但得到 {safe_repr(value)}。")
 
 
+def _require_text(value: Any, label: str) -> str:
+    """确认取值是字符串并原样返回，否则给出带字段名的 ``ValueError``。"""
+    if not isinstance(value, str):
+        raise ValueError(f"{label} 必须是字符串，但得到 {safe_repr(value)}。")
+    return value
+
+
 def require_provider_name(value: Any, *, label: str = "provider") -> str:
     """确认 ``provider`` 是字符串并原样返回，否则给出带字段名的 ``ValueError``。
 
     ``ModelDetail.provider`` 声明为 ``str``，但 ``SessionConfig.llm_configurations``
     ／``rerank_configurations`` 的 ``_VALIDATORS`` 明确不登记（「按原样写入，由
-    使用方负责其内部结构」），嵌入方可以往映射里放任意取值。两个使用方此前各自
+    使用方负责其内部结构」），嵌入方可以往映射里放任意取值。三个使用方此前各自
     假设它是字符串：
 
     * ``display_chat_config`` 拿它拼 ``f"{provider.lower()}_api_key"`` —— 实测
@@ -459,15 +466,32 @@ def require_provider_name(value: Any, *, label: str = "provider") -> str:
       这一步就终止。
     * ``RetrievalService._get_rerank_provider`` 已经内联了同一判据（provider 进
       ``cache_key`` 元组），这里抽成共享实现，两处不再各写一份。
+    * ``ModelProviderFactory._get_model_detail`` 把取值原样交给三个 getter，而
+      getter 的 ``logger.info(f"...{provider_name}...")`` 对位数超限的整数抛
+      ``ValueError: Exceeds the limit``，``_create_provider`` 的字典查找对不可哈希
+      取值抛裸 ``TypeError``——诊断入口（``_provider_info_for_role``）早已按本判据
+      收敛，建 provider 这条路径此前漏了。
 
     判据只要求「是字符串」，不查 ``_provider_map`` 白名单：白名单是**工厂**的
     职责（``_get_provider_class`` 会给「不支持的模型提供商」），而展示层与缓存键
     只需要一个可哈希、可拼串的取值。在展示层提前套白名单会让「配置里有个尚未
     支持的 provider」从「启动时列出配置」变成「启动时崩溃」——那是更差的收场。
     """
-    if not isinstance(value, str):
-        raise ValueError(f"{label} 必须是字符串，但得到 {safe_repr(value)}。")
-    return value
+    return _require_text(value, label)
+
+
+def require_model_name(value: Any, *, label: str = "model_name") -> str:
+    """确认 ``model_name`` 是字符串并原样返回，否则给出带字段名的 ``ValueError``。
+
+    ``ModelDetail.model_name`` 声明为 ``str``，但取值来源与 ``provider`` 同源
+    （``_VALIDATORS`` 不登记 ``*_configurations``，属性赋值也没有 ``__setattr__``
+    守卫，实测 ``detail.model_name = ["m"]`` 直接成功），而它全程没有形态校验：
+    ``local-hash`` 的 ``_parse_dimension`` 直接 ``.rsplit()``（非字符串抛裸
+    ``AttributeError``），其它 provider 把它透传给 SDK；三个 getter 的
+    ``logger.info(f"...模型: {model_name}")`` 对位数超限的整数抛
+    ``ValueError: Exceeds the limit``。判据与 ``require_provider_name`` 一致。
+    """
+    return _require_text(value, label)
 
 
 def require_rerank_enabled(value: Any, *, label: str = "rerank_enabled") -> bool:

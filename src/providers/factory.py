@@ -16,6 +16,8 @@ from src.utils.config import (  # 导入 get_settings 函数
     ModelProtocol,
     get_settings,
     require_detail_attributes,
+    require_model_name,
+    require_provider_name,
     safe_repr,
 )
 from src.utils.log_manager import get_module_logger  # 导入日志管理器
@@ -287,6 +289,21 @@ class ModelProviderFactory:
         protocol: ModelProtocol | str | None = None,
         options: Mapping[str, Any] | None = None,
     ) -> Any:
+        # 形态先收敛：本方法把 ``provider_name`` 拿去 ``_role_aliases.get(...)``／
+        # ``_provider_map.get(...)`` 做字典查找、``_get_provider_class`` 做成员判定，
+        # 并在「不支持的模型提供商」消息里 f-string 插值——不可哈希取值抛裸
+        # ``TypeError: unhashable type: 'list'``、位数超限的整数抛
+        # ``ValueError: Exceeds the limit``，都不是本模块其余拒绝路径承诺的带指引
+        # ``ValueError``。``model_name`` 原样透传给 provider 构造器（``local-hash``
+        # 直接 ``.rsplit()``，非字符串抛裸 ``AttributeError``）。
+        #
+        # 判据只做了一半：诊断入口 ``_provider_info_for_role``（``832abf0``）与
+        # 展示层／``RetrievalService`` 都已用 ``require_provider_name`` 收敛，
+        # 唯独**真正建 provider** 的这里漏了。三个 getter 走 ``_get_model_detail``
+        # 也会到达本方法，因此这一处同时覆盖「getter 路径」与「直接调
+        # ``_create_provider`` 的嵌入方／测试」。
+        provider_name = require_provider_name(provider_name, label="provider 名称")
+        model_name = require_model_name(model_name)
         # ``ModelDetail`` normally normalizes protocol values before they reach
         # the factory, but this internal helper is also used directly by
         # integrations and tests. Normalize again at the boundary so a plain
@@ -613,6 +630,18 @@ class ModelProviderFactory:
             field=settings_field,
             key=provider_key,
             role_label=role_label,
+        )
+        # 属性**存在**不代表取值可用：``ModelDetail`` 的构造器会拒绝非字符串
+        # ``provider``／``model_name``，但属性赋值没有 ``__setattr__`` 守卫（实测
+        # ``detail.provider = ["a"]`` 直接成功），``SimpleNamespace`` 替身同样能提供
+        # 这些属性。三个 getter 紧接着读 ``config.provider``／``config.model_name``
+        # 并写进 ``logger.info`` 的 f-string，随后交给 ``_create_provider``——前者对
+        # 位数超限的整数抛 ``ValueError: Exceeds the limit``，后者对不可哈希取值抛
+        # 裸 ``TypeError``。诊断入口 ``_provider_info_for_role`` 早已按同一判据收敛，
+        # 这里对齐（``_create_provider`` 也各自判一次，覆盖直接调用它的嵌入方）。
+        require_provider_name(detail.provider, label=f"{role_label}配置 {provider_key} 的 provider")
+        require_model_name(
+            detail.model_name, label=f"{role_label}配置 {provider_key} 的 model_name"
         )
         return detail
 
