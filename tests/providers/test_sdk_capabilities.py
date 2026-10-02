@@ -8168,3 +8168,69 @@ def test_responses_provider_variant_falls_back_instead_of_raising():
     assert _responses_provider_variant("volcengine") == "ark"
     assert _responses_provider_variant("  ARK  ") == "ark"
     assert _responses_provider_variant("openai") == "openai"
+
+
+# ── 回归：``normalize_messages`` 的 prompt / system_prompt 形态 ──
+#
+# 本函数是四个 provider 公共 ``invoke`` 的**统一请求边界**（``google.py:1497``、
+# ``anthropic.py:834/1746/…``、``openai_compatible.py:1024``、``volcengine.py:1001``
+# 都调它）。``messages`` 那条分支有完整判据（非序列、非 Mapping 条目都给
+# ``ValueError``），而 ``prompt``／``system_prompt`` 这一半**完全没有**：
+#
+#   * ``prompt=5``／``["a"]`` 静默生成 ``{"role": "user", "content": 5}``，非字符串
+#     字面量被当成真实用户输入发给模型（与 ``ChatService._build_prompt`` 钉住的
+#     ``用户问题: None`` 是同一形态）；
+#   * ``prompt=10**4301`` 在 ``str(prompt).strip()`` 处抛 ``ValueError: Exceeds the
+#     limit``——消息与「请求内容写错了」无关，而 provider 的错误分类按
+#     ``ValueError``／``RuntimeError`` 写；
+#   * ``system_prompt`` 同理：非字符串直接进 ``content``，位数超限的整数在
+#     ``normalize_responses_input`` 的日志插值处炸。
+#
+# 可达路径：``invoke``／``ainvoke`` 是公开方法，参数一路透传到 ``normalize_messages``；
+# 本仓测试就有 ``ainvoke("hello", system_prompt=None, stream=False)`` 这类直调。
+
+
+@pytest.mark.parametrize(
+    "hostile_prompt",
+    [
+        pytest.param(10**4301, id="huge-int"),
+        pytest.param(5, id="int"),
+        pytest.param(["a"], id="list"),
+    ],
+)
+def test_normalize_messages_rejects_non_string_prompt_readably(hostile_prompt):
+    """非字符串 ``prompt`` 必须给带指引的 ``ValueError``，不是静默进 content 或裸整数转换错。"""
+    with pytest.raises(ValueError) as excinfo:
+        normalize_messages(hostile_prompt, None, None)
+
+    message = str(excinfo.value)
+    assert "Exceeds the limit" not in message, message
+    assert "prompt" in message
+
+
+@pytest.mark.parametrize(
+    "hostile_system",
+    [
+        pytest.param(10**4301, id="huge-int"),
+        pytest.param(5, id="int"),
+        pytest.param(["a"], id="list"),
+    ],
+)
+def test_normalize_messages_rejects_non_string_system_prompt_readably(hostile_system):
+    """非字符串 ``system_prompt`` 同样必须被拒绝，而不是进 ``content``。"""
+    with pytest.raises(ValueError) as excinfo:
+        normalize_messages("hi", hostile_system, None)
+
+    message = str(excinfo.value)
+    assert "Exceeds the limit" not in message, message
+    assert "system_prompt" in message
+
+
+def test_normalize_messages_still_accepts_string_prompt_and_system_prompt():
+    """收紧不能误伤：字符串 prompt／system_prompt 照常构造消息。"""
+    normalized = normalize_messages("北京天气", "你是助手", None)
+
+    assert normalized == [
+        {"role": "system", "content": "你是助手"},
+        {"role": "user", "content": "北京天气"},
+    ]

@@ -489,7 +489,27 @@ def normalize_messages(
 
     ``require_tool_call_ids`` 只应由确实要求 assistant 历史工具调用带 ``id``
     的协议（Chat Completions）开启；其它协议继续接受 Gemini 这类无 id 的历史。
+
+    ``prompt`` 与 ``system_prompt`` 的形态必须在这里收敛，且必须与 ``messages``
+    分支同判据：本函数是四个 provider 公共 ``invoke`` 的**统一请求边界**
+    （``google.py``／``anthropic.py``／``openai_compatible.py``／``volcengine.py``
+    都调它），而 ``messages`` 那条分支对非序列、非 ``Mapping`` 条目都给
+    ``ValueError``，``prompt``／``system_prompt`` 这一半此前**完全没有**判据：
+
+    * ``prompt=5``／``["a"]`` 静默生成 ``{"role": "user", "content": 5}``——非字符串
+      字面量被当成真实用户输入发给模型（与 ``ChatService._build_prompt`` 钉住的
+      ``用户问题: None`` 是同一形态）；
+    * ``prompt=10**4301`` 在 ``str(prompt).strip()`` 处抛 ``ValueError: Exceeds
+      the limit``，消息与「请求内容写错了」无关；
+    * ``system_prompt`` 同理：真值非字符串直接进 ``content``。
+
+    ``None`` 是合法取值（``prompt=None`` 走「必须提供 prompt 或 messages」分支，
+    ``system_prompt=None`` 表示不带系统提示），只拒绝非字符串的**真值**形态。
     """
+    if prompt is not None and not isinstance(prompt, str):
+        raise ValueError(f"prompt 必须是字符串，但得到 {safe_repr(prompt)}。")
+    if system_prompt is not None and not isinstance(system_prompt, str):
+        raise ValueError(f"system_prompt 必须是字符串，但得到 {safe_repr(system_prompt)}。")
     if messages is not None:
         if isinstance(messages, (str, bytes, bytearray)) or not isinstance(messages, Sequence):
             raise ValueError("messages 必须是消息对象序列。")
