@@ -296,6 +296,21 @@ class ExcelLogger:
         # 找不到）。在取值处降级成 ``safe_repr`` 的量级描述，保住整批记录。
         query = self._cell_value(query)
 
+        # ``results`` 的形态同样要判。本方法签名声明 ``list[dict]``，但它是**公开
+        # 方法**，而两种非列表取值都不在契约内：
+        #   * ``"abc"`` 是合法可迭代对象，下面的 ``enumerate`` 逐**字符**迭代，
+        #     每个字符经 ``document_*`` 助手收敛成占位符，于是写出 3 条内容与来源
+        #     都是占位符的伪结果行——用户看到日志写着 3 条命中，而实际返回的是
+        #     字符串；
+        #   * ``5``／``True``／``1.5`` 抛裸 ``TypeError: 'int' object is not
+        #     iterable``，而本方法的调用点位于 ``try`` **之外**（见
+        #     ``_append_text_row`` 的说明），异常直接冒到召回测试主循环的
+        #     ``except Exception``——一次**成功**的召回被显示成「召回测试出错」。
+        # 按「非列表一律视为无结果」收敛：写一行「无结果」比写三条占位垃圾诚实，
+        # 与 ``if not results`` 的既有分支同一条出口。
+        if not isinstance(results, list):
+            results = []
+
         row: list[Any]
         if not results:
             # 如果没有结果，也记录一条信息

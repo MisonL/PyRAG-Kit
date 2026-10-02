@@ -689,3 +689,68 @@ def test_excel_log_keeps_string_query_verbatim(tmp_path):
 
     worksheet = load_workbook(logger.filepath).active
     assert worksheet.cell(row=2, column=2).value == "如何清除浏览器缓存？"
+
+
+# ── 回归：log_results 对非列表的 results 静默写出垃圾行 ──
+#
+# ``log_results(query, results)`` 声明 ``results: list[dict]``，但它是**公开
+# 方法**，且本模块的既有契约是「日志是旁路、失败不该丢记录」（见 ``_cell_value``
+# 与 ``query`` 的收敛说明）。实测非列表取值有两种收场，都不在契约内：
+#
+#   * ``results = "abc"`` —— 字符串是合法可迭代对象，``for i, doc in
+#     enumerate(results)`` 逐**字符**迭代，每个字符经
+#     ``document_*`` 助手收敛成默认值，于是写出 3 条内容与来源都是占位符的
+#     「结果」行。用户看到日志里写着 3 条命中，而实际一次检索返回的是字符串。
+#   * ``results = 5`` / ``True`` / ``1.5`` —— 抛裸 ``TypeError: 'int' object is
+#     not iterable``，而 ``log_results`` 的调用点位于 ``try`` **之外**
+#     （见 ``_append_text_row`` 的说明），异常直接冒到
+#     ``run_retrieval_test_async`` 的 ``except Exception``，一次**成功**的召回被
+#    显示成「召回测试出错」。
+#
+# 形态判据与 ``display_results`` 一致（那里 ``if not documents`` 后直接迭代）
+# ——但那里只判空、不判类型，因此这里按「非列表一律视为无结果」收敛：写入一行
+# 「无结果」比写出三条占位垃圾诚实。
+
+
+@pytest.mark.parametrize(
+    "results",
+    [
+        pytest.param("abc", id="str"),
+        pytest.param(5, id="int"),
+        pytest.param(True, id="bool"),
+        pytest.param(1.5, id="float"),
+    ],
+)
+def test_excel_logger_treats_non_list_results_as_empty(tmp_path, results):
+    """非列表 ``results`` 不得逐字符迭代出垃圾行，也不得抛裸 ``TypeError``。"""
+    from openpyxl import load_workbook
+
+    from src.retrieval_test.excel_logger import ExcelLogger
+
+    logger = ExcelLogger(log_dir=str(tmp_path))
+    logger.log_results("查询", results)
+
+    rows = list(load_workbook(logger.filepath).active.iter_rows(values_only=True))
+    # 表头 + 一行「无结果」，不得出现逐字符生成的伪结果行。
+    assert len(rows) == 2, rows
+    assert rows[1][4] == "无结果"
+
+
+def test_excel_logger_still_logs_real_result_lists(tmp_path):
+    """收紧不能误伤：正常的文档列表照常逐条落盘。"""
+    from openpyxl import load_workbook
+
+    from src.retrieval_test.excel_logger import ExcelLogger
+
+    logger = ExcelLogger(log_dir=str(tmp_path))
+    logger.log_results(
+        "查询",
+        [
+            {"page_content": "第一条", "metadata": {"source": "a.md"}, "score": 0.5},
+            {"page_content": "第二条", "metadata": {"source": "b.md"}, "score": 0.6},
+        ],
+    )
+
+    rows = list(load_workbook(logger.filepath).active.iter_rows(values_only=True))
+    assert len(rows) == 3
+    assert {row[6] for row in rows[1:]} == {"第一条", "第二条"}
