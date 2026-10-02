@@ -1727,7 +1727,15 @@ def raise_for_stream_error_event(event: Any, provider: str) -> None:
         if not message:
             pending.extend(value for value in values if value is not None)
     if not message:
-        message = field(error, "code") or f"{provider} 流返回错误"
+        # ``code`` 来自网关 JSON，形态不受控：位数超限的整数让 f-string 抛
+        # ``ValueError: Exceeds the limit``，正要报出流错误的那一步变成整数转换
+        # 错误，而调用方按 ``StreamEventError`` 分类。判据与上面提取 ``message``
+        # 的路径一致（字符串原样，其余走 ``safe_repr``）。
+        code = field(error, "code")
+        if code:
+            message = code if isinstance(code, str) else safe_repr(code)
+        else:
+            message = f"{provider} 流返回错误"
     status: int | None = None
     for value in (
         field(error, "status_code"),

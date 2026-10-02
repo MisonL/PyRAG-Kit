@@ -800,3 +800,34 @@ def test_ark_responses_failed_still_reports_string_error():
     """收紧不能误伤：字符串 ``error`` 仍原样出现在消息里。"""
     with pytest.raises(RuntimeError, match="boom"):
         VolcengineProvider._raise_for_response_error({"status": "failed", "error": "boom"})
+
+
+# ── 回归：流错误事件兜底用裸 ``code`` 插值 ──
+#
+# ``raise_for_stream_error_event`` 在 message 提取失败后回落到
+# ``field(error, "code") or f"{provider} 流返回错误"``。``code`` 来自网关 JSON，
+# 形态不受控：位数超限的整数让 f-string 抛 ``ValueError: Exceeds the limit``——
+# 正要报出流错误的那一步变成整数转换错误，而调用方按 ``StreamEventError`` 分类。
+# 同函数提取 ``message`` 的那条路径只收字符串，这一支漏了。
+
+
+@pytest.mark.parametrize(
+    "code",
+    [pytest.param(10**4301, id="huge-int"), pytest.param(["a"], id="list")],
+)
+def test_stream_error_event_reports_malformed_code_readably(code):
+    """非字符串 ``code`` 不得让「报告流错误」自己抛裸异常。"""
+    event = {"type": "error", "error": {"code": code}}
+
+    with pytest.raises(StreamEventError) as excinfo:
+        raise_for_stream_error_event(event, "Test")
+
+    assert "Exceeds the limit" not in str(excinfo.value)
+
+
+def test_stream_error_event_still_reports_string_code():
+    """收紧不能误伤：字符串 ``code`` 仍原样出现在消息里。"""
+    event = {"type": "error", "error": {"code": "invalid_api_key"}}
+
+    with pytest.raises(StreamEventError, match="invalid_api_key"):
+        raise_for_stream_error_event(event, "Test")

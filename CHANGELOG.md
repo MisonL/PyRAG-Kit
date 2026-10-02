@@ -6,6 +6,8 @@
 
 ### 修复
 
+- **流错误事件的兜底文案原样插值网关 `code`，位数超限时抛裸 `ValueError`**（`src/providers/__base__/model_provider.py`）。`raise_for_stream_error_event` 在 `message` 提取失败后回落到 `field(error, "code") or f"{provider} 流返回错误"`。`code` 来自网关 JSON、形态不受控：位数超限的整数让 f-string 抛 `ValueError: Exceeds the limit`——**正要报出流错误**的那一步变成整数转换错误，而调用方按 `StreamEventError` 分类；非字符串取值（`["a"]`）则把 Python 字面量当成错误码渲染。判据只做了一半：同函数提取 `message` 的路径只收字符串，这一支漏了。修法：字符串原样，其余走 `safe_repr`，与 `message` 分支同口径。回归测试 3 条（`code` 为位数超限整数／列表 + 一条「字符串 `code` 照常出现在消息里」的反向守卫），其中 1 条在未修源码时实测变红。
+
 - **Ark Responses 的 `failed` 分支原样 `str()` 网关 `error`，位数超限时抛裸 `ValueError`**（`src/providers/volcengine.py`）。`_raise_for_response_error` 的 `status == "failed"` 分支把 `error`（或它的 `message` 字段）写进 `RuntimeError(str(message))`。`message` 来自网关 JSON、形态不受控：`error = {"message": 10**4301}` 让裸 `str()` 抛 `ValueError: Exceeds the limit`——**正要报告网关错误**的那一步变成整数转换错误，而调用方按 `RuntimeError` 分类；非字符串取值（`error = ["a"]`）则把 Python 字面量 `['a']` 当成错误文案渲染出去。判据只做了一半：同函数的 `incomplete` 分支已按 `safe_repr(reason)` 收敛，`openai_compatible._error_message` 也是同一口径，唯独这一支漏了。修法：与两处对齐——字符串原样，其余降级成 `safe_repr` 的量级描述。回归测试 3 条（`error` 为位数超限整数／其 `message` 为位数超限整数 + 一条「字符串 `error` 照常出现在消息里」的反向守卫），其中 1 条在未修源码时实测变红。
 
 - **Responses background 轮询的超时消息原样插值网关 `id`，位数超限时抛裸 `ValueError`**（`src/providers/openai_compatible.py`）。`_poll_background_response` 与 `_poll_background_response_async` 在超时分支里用裸 f-string 插值 `response_id`（`f"...响应 {response_id} 在 {timeout:g}s 内未完成。"`）。`response_id` 来自网关 JSON 的 `id` 字段，形态不受控：`10**4301` 让 f-string 抛 `ValueError: Exceeds the limit`——**正要报告超时**的那一步变成整数转换错误，而调用方按 `TimeoutError` 分类。判据与同文件 `_error_message`／`_extract_refusal` 一致（字符串原样，其余走 `safe_repr`）；`retrieve` 调用本身仍用原始取值。回归测试 5 条（同步／异步 × 位数超限整数 + 非字符串 + 一条「字符串 id 照常出现在消息里」的反向守卫），其中 2 条在未修源码时实测变红。
