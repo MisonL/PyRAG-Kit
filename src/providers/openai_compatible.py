@@ -1805,7 +1805,15 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             return False
         if isinstance(status, int):
             return status >= 400
-        normalized = str(status).strip().lower()
+        # 只有**字符串**才谈得上「是不是某个错误状态名」。此前对非 ``int`` 的
+        # 取值一律 ``str(status).strip().lower()``，而 ``str([10**4301])`` 自己
+        # 抛 ``ValueError: Exceeds the limit``——本方法 docstring 承诺的
+        # 「形态奇怪的 status 不能打断错误分类」只做了一半：位数超限的**数字串**
+        # 挡住了，装在容器里的位数超限整数没有。``status`` 来自网关 JSON，形态
+        # 不受控；非字符串一律判为「不是错误状态」，与它落在集合外的原语义一致。
+        if not isinstance(status, str):
+            return False
+        normalized = status.strip().lower()
         if not normalized:
             return False
         # 解析走 ``parse_decimal_int``：这个方法在**解析网关响应**的路径上，

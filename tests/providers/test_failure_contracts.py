@@ -831,3 +831,35 @@ def test_stream_error_event_still_reports_string_code():
 
     with pytest.raises(StreamEventError, match="invalid_api_key"):
         raise_for_stream_error_event(event, "Test")
+
+
+# ── 回归：错误分类不得被「形态奇怪的 status」打断（容器持大整数）──
+#
+# ``_chat_status_is_error`` 的 docstring 明确承诺「一个形态奇怪的 status 值不能
+# 让错误分类本身崩掉」，它也确实挡住了「字符串形态但位数超限」的取值。但收敛
+# 只做了一半：非 ``int`` 的非字符串走 ``str(status).strip().lower()``，而
+# ``str([10**4301])`` 自己抛 ``ValueError: Exceeds the limit``——于是
+# 「网关在响应体里返回了业务错误」变成一条整数转换错误，调用方的错误分类与日志
+# 脱敏都接不住。``status`` 来自网关 JSON，形态不受控。
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        pytest.param([10**4301], id="list-with-huge-int"),
+        pytest.param({"code": 10**4301}, id="dict-with-huge-int"),
+    ],
+)
+def test_chat_status_is_error_survives_container_with_huge_int(status):
+    """容器里含位数超限整数时，错误分类必须照常给出布尔判断。"""
+    assert OpenAICompatibleProvider._chat_status_is_error(status) is False
+
+
+def test_chat_response_error_reports_container_status_readably():
+    """从 ``_raise_for_chat_response_error`` 进入时同样不抛整数转换错误。"""
+    response = {"status": [10**4301], "choices": None}
+
+    with pytest.raises(RuntimeError) as excinfo:
+        OpenAICompatibleProvider._raise_for_chat_response_error(response)
+
+    assert "Exceeds the limit" not in str(excinfo.value)
