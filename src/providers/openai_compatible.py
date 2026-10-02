@@ -571,6 +571,12 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         response_id = field(response, "id")
         if not response_id:
             raise RuntimeError("Responses background 响应缺少 id，无法轮询。")
+        # 收敛成字符串供消息插值：``response_id`` 来自网关 JSON 的 ``id`` 字段，
+        # 形态不受控——位数超限的整数让下面 f-string 抛 ``ValueError: Exceeds the
+        # limit``，于是**正要报告超时**的那一步变成整数转换错误，而调用方按
+        # ``TimeoutError`` 分类。判据与同文件 ``_error_message`` 一致（字符串原样，
+        # 其余走 ``safe_repr``）。``retrieve`` 调用本身仍用原始取值。
+        response_id_text = response_id if isinstance(response_id, str) else safe_repr(response_id)
         interval, timeout = self._background_poll_config()
         deadline = time.monotonic() + timeout
         retrieve_kwargs = self._response_retrieve_kwargs(params)
@@ -578,7 +584,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(
-                    f"Responses background 响应 {response_id} 在 {timeout:g}s 内未完成。"
+                    f"Responses background 响应 {response_id_text} 在 {timeout:g}s 内未完成。"
                 )
             if interval:
                 time.sleep(min(interval, remaining))
@@ -597,6 +603,8 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         response_id = field(response, "id")
         if not response_id:
             raise RuntimeError("Responses background 响应缺少 id，无法轮询。")
+        # 与同步分支同判据（见 ``_poll_background_response`` 的说明）。
+        response_id_text = response_id if isinstance(response_id, str) else safe_repr(response_id)
         interval, timeout = self._background_poll_config()
         deadline = time.monotonic() + timeout
         retrieve_kwargs = self._response_retrieve_kwargs(params)
@@ -604,7 +612,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(
-                    f"Responses background 响应 {response_id} 在 {timeout:g}s 内未完成。"
+                    f"Responses background 响应 {response_id_text} 在 {timeout:g}s 内未完成。"
                 )
             if interval:
                 await asyncio.sleep(min(interval, remaining))

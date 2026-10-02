@@ -8234,3 +8234,64 @@ def test_normalize_messages_still_accepts_string_prompt_and_system_prompt():
         {"role": "system", "content": "你是助手"},
         {"role": "user", "content": "北京天气"},
     ]
+
+
+# ── 回归：Responses background 轮询超时消息的 id 形态 ──
+#
+# ``_poll_background_response``／``_poll_background_response_async`` 在超时分支
+# 里用裸 f-string 插值 ``response_id``（``f"...响应 {response_id} 在 {timeout:g}s
+# 内未完成。"``）。``response_id`` 来自网关 JSON 的 ``id`` 字段，形态不受控：
+# ``10**4301`` 让 f-string 抛 ``ValueError: Exceeds the limit``——**正要报告超时**
+# 的那一步变成整数转换错误，而调用方按 ``TimeoutError``／``RuntimeError`` 分类。
+# 判据与同文件 ``_error_message``／``_extract_refusal`` 一致（字符串原样，其余走
+# ``safe_repr``）。
+
+
+def _background_poll_provider():
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._provider = "demo"
+    provider._options = {}
+    provider._background_poll_config = lambda: (0.0, 0.0)
+    provider._response_retrieve_kwargs = lambda params: {}
+    return provider
+
+
+@pytest.mark.parametrize(
+    "hostile_id",
+    [pytest.param(10**4301, id="huge-int"), pytest.param(["a"], id="list")],
+)
+def test_responses_background_timeout_reports_malformed_id_readably(hostile_id):
+    """超时消息不得因非字符串 ``id`` 抛裸异常。"""
+    provider = _background_poll_provider()
+    response = {"status": "queued", "id": hostile_id}
+
+    with pytest.raises(TimeoutError) as excinfo:
+        provider._poll_background_response(response, {})
+
+    assert "Exceeds the limit" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "hostile_id",
+    [pytest.param(10**4301, id="huge-int"), pytest.param(["a"], id="list")],
+)
+def test_responses_background_timeout_reports_malformed_id_readably_async(hostile_id):
+    """异步分支同判据。"""
+    provider = _background_poll_provider()
+    response = {"status": "queued", "id": hostile_id}
+
+    with pytest.raises(TimeoutError) as excinfo:
+        asyncio.run(provider._poll_background_response_async(response, {}))
+
+    assert "Exceeds the limit" not in str(excinfo.value)
+
+
+def test_responses_background_timeout_still_reports_string_id():
+    """收紧不能误伤：字符串 id 仍原样出现在消息里。"""
+    provider = _background_poll_provider()
+    response = {"status": "queued", "id": "resp_abc"}
+
+    with pytest.raises(TimeoutError) as excinfo:
+        provider._poll_background_response(response, {})
+
+    assert "resp_abc" in str(excinfo.value)
