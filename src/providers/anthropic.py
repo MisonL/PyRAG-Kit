@@ -1296,7 +1296,11 @@ class AnthropicProvider(LargeLanguageModel):
                         else ""
                     )
                 else:
-                    initial_arguments = str(initial_input) if initial_input else ""
+                    # 非映射的 ``input`` 走 ``_block_text`` 而不是裸 ``str()``：
+                    # 位数超限的整数让 ``str()`` 抛 ``ValueError: Exceeds the
+                    # limit``，而 ``arguments`` 的契约是字符串（非流式路径经
+                    # ``normalize_tool_arguments`` 收敛）。
+                    initial_arguments = cls._block_text(initial_input)
                 return StreamEvent(
                     type="tool_call_delta",
                     tool_call={
@@ -1323,14 +1327,19 @@ class AnthropicProvider(LargeLanguageModel):
             if delta_type == "text_delta":
                 return StreamEvent(
                     type="text_delta",
-                    text=field(delta, "text", "") or "",
+                    # ``or ""`` 只挡住 ``None`` 与空串；真值非字符串（``5``／
+                    # ``{"a": 1}``）原样进 ``StreamEvent.text``（声明为 ``str``），
+                    # 而消费方 ``_iter_invoke_stream_text`` 直接 ``yield`` 它——
+                    # ``Generator[str]`` 的契约被打破，调用方拼接时抛裸
+                    # ``TypeError``。走 ``_block_text``（与 ``_refusal_text`` 同判据）。
+                    text=cls._block_text(field(delta, "text", "")),
                     response_id=response_id,
                     raw=event,
                 )
             if delta_type == "thinking_delta":
                 return StreamEvent(
                     type="reasoning_delta",
-                    reasoning=field(delta, "thinking", "") or "",
+                    reasoning=cls._block_text(field(delta, "thinking", "")),
                     response_id=response_id,
                     raw=event,
                 )
@@ -1347,7 +1356,10 @@ class AnthropicProvider(LargeLanguageModel):
                     type="tool_call_delta",
                     tool_call={
                         "index": field(event, "index"),
-                        "arguments": field(delta, "partial_json", "") or "",
+                        # 同上：``arguments`` 的契约是字符串（非流式路径经
+                        # ``normalize_tool_arguments`` 收敛），非字符串原样透传会让
+                        # 两条路径给出不同类型。字符串片段原样透传，拼接语义不变。
+                        "arguments": cls._block_text(field(delta, "partial_json", "")),
                     },
                     response_id=response_id,
                     raw=event,

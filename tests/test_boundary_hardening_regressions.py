@@ -4551,3 +4551,84 @@ def test_anthropic_extract_result_keeps_real_block_text():
 
     assert result.text == "正文"
     assert result.reasoning == "推理"
+
+
+# --- Anthropic 流式增量的文本字段 -------------------------------------------
+#
+# ``_stream_event`` 的 ``text_delta``／``thinking_delta`` 用
+# ``field(delta, "text", "") or ""`` 取值——``or ""`` 只挡住 ``None`` 与空串，
+# **真值非字符串**（``5``／``{"a": 1}``）原样进 ``StreamEvent.text``／``.reasoning``，
+# 而这两个字段声明为 ``str``。消费方 ``_iter_invoke_stream_text`` 直接
+# ``yield converted.text``，``Generator[str]`` 的契约因此被打破：实测调用方
+# ``"".join``／``+=`` 抛 ``TypeError: can only concatenate str (not "int") to str``。
+# 位数超限的整数则让 ``str()`` 在更早的 ``print``／拼接处抛
+# ``ValueError: Exceeds the limit``。
+#
+# 判据与 ``_extract_result``／``_refusal_text`` 同源：非字符串走 ``safe_repr``
+# 的可读描述，而不是原样透传。
+
+
+@pytest.mark.parametrize(
+    ("delta_type", "field_name", "event_type"),
+    [
+        pytest.param("text_delta", "text", "text_delta", id="text"),
+        pytest.param("thinking_delta", "thinking", "reasoning_delta", id="thinking"),
+    ],
+)
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(5, id="int"),
+        pytest.param(_HUGE_INT, id="huge-int"),
+        pytest.param({"a": 1}, id="dict"),
+    ],
+)
+def test_anthropic_stream_delta_coerces_non_string_text(delta_type, field_name, event_type, value):
+    """流式增量的文本字段必须收敛成 ``str``，不能原样透传非字符串。"""
+    from src.providers.anthropic import AnthropicProvider
+
+    event = {
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": delta_type, field_name: value},
+    }
+
+    converted = AnthropicProvider._stream_event(event)
+
+    assert converted is not None and converted.type == event_type
+    payload = converted.text if event_type == "text_delta" else converted.reasoning
+    assert isinstance(payload, str), f"流式增量透传了非字符串: {payload!r}"
+
+
+def test_anthropic_stream_text_delta_keeps_real_text():
+    """收紧不能误伤：正常的字符串增量原样保留。"""
+    from src.providers.anthropic import AnthropicProvider
+
+    converted = AnthropicProvider._stream_event(
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "你好"}}
+    )
+
+    assert converted is not None and converted.text == "你好"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(5, id="int"),
+        pytest.param(_HUGE_INT, id="huge-int"),
+    ],
+)
+def test_anthropic_stream_tool_use_initial_arguments_survives_non_mapping(value):
+    """``tool_use`` 块的标量 ``input`` 不得让 ``arguments`` 抛整数转换错误。"""
+    from src.providers.anthropic import AnthropicProvider
+
+    converted = AnthropicProvider._stream_event(
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": "t1", "name": "f", "input": value},
+        }
+    )
+
+    assert converted is not None and converted.type == "tool_call_delta"
+    assert isinstance(converted.tool_call["arguments"], str)

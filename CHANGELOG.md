@@ -6,6 +6,10 @@
 
 ### 修复
 
+- **Anthropic 流式增量的文本字段原样透传非字符串，打破 `Generator[str]` 契约**（`src/providers/anthropic.py`）。`_stream_event` 的 `text_delta`／`thinking_delta` 用 `field(delta, "text", "") or ""` 取值——`or ""` 只挡住 `None` 与空串，**真值非字符串**（`5`／`{"a": 1}`）原样进 `StreamEvent.text`／`.reasoning`，而这两个字段声明为 `str`。消费方 `_iter_invoke_stream_text` 直接 `yield converted.text`，`Generator[str]` 的契约因此被打破：实测调用方 `"".join`／`+=` 抛 `TypeError: can only concatenate str (not "int") to str`，位数超限的整数更在更早的拼接处抛 `ValueError: Exceeds the limit`。同一 `tool_use` 块的标量 `input` 走裸 `str()`（`initial_arguments`），超大整数同样抛 `ValueError`。
+
+  修法沿用上一条抽出的 `_block_text`：`text`／`reasoning`／`input_json_delta` 的 `partial_json`／`tool_use` 的标量 `input` 四处改用它。回归测试 9 条（正文与思考增量 × 三种非字符串取值、`tool_use` 标量 `input` × 两种取值、一条「正常字符串照旧保留」的反向守卫），其中 7 条在未修源码时实测变红。
+
 - **Anthropic 响应文本块的拼接对真值非字符串抛裸 `TypeError`**（`src/providers/anthropic.py`）。`_extract_result` 用 `"".join(field(block, "text", "") or "" ...)` 拼正文与思考，而 `or ""` 只挡住 `None` 与空串——**真值非字符串**（`5`／`{"a": 1}`／`10**4301`）原样进 `join`，抛裸 `TypeError: sequence item 0: expected str instance, int found`。本 provider 的错误分类按 `RuntimeError` 写（同文件对拒答用的就是它），且 SDK 在 `_strict_response_validation=False` 时走 `construct_type`、不执行 pydantic 校验，因此块字段形态不受本地控制。
 
   同一文件的 `_refusal_text` 早已认领同一判据（非字符串走 `safe_repr`，「非字符串一律给可读描述而不是空串」），而正文／思考块这一半漏了。修法是抽出 `_block_text` 供两处共用（`_refusal_text` 委托给它），并在 `text`／`reasoning` 两处改用它。回归测试 7 条（正文与思考块 × 三种非字符串取值 + 一条「正常字符串照旧保留」的反向守卫），其中 6 条在未修源码时实测变红。
