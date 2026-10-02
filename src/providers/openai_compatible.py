@@ -2682,6 +2682,15 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 event_type = enum_field(event, "type")
                 if event_type == "response.refusal.delta":
                     refusal = field(event, "delta")
+                    # ``delta`` 来自网关 JSON，形态不受控。同一次循环里正文分支
+                    # （``_stream_delta``）与非流式的 ``_extract_refusal`` 都做了
+                    # 形态收敛，唯独这条拒答分支直接插值：位数超限的整数让
+                    # f-string 在**求值期**抛裸 ``ValueError: Exceeds the limit``
+                    # ——正要报出拒答的那一步变成整数转换错误，而本 provider 的
+                    # 错误分类按 ``RuntimeError`` 写。收敛口径与 google 的拒答
+                    # 消息一致：字符串原样，其余降级成 ``safe_repr`` 的量级描述。
+                    if not isinstance(refusal, str):
+                        refusal = safe_repr(refusal) if refusal else ""
                     if refusal:
                         raise RuntimeError(f"{self._provider} Responses 返回拒答: {refusal}")
                 delta = self._stream_delta(event)
@@ -2713,6 +2722,15 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
                 event_type = enum_field(event, "type")
                 if event_type == "response.refusal.delta":
                     refusal = field(event, "delta")
+                    # ``delta`` 来自网关 JSON，形态不受控。同一次循环里正文分支
+                    # （``_stream_delta``）与非流式的 ``_extract_refusal`` 都做了
+                    # 形态收敛，唯独这条拒答分支直接插值：位数超限的整数让
+                    # f-string 在**求值期**抛裸 ``ValueError: Exceeds the limit``
+                    # ——正要报出拒答的那一步变成整数转换错误，而本 provider 的
+                    # 错误分类按 ``RuntimeError`` 写。收敛口径与 google 的拒答
+                    # 消息一致：字符串原样，其余降级成 ``safe_repr`` 的量级描述。
+                    if not isinstance(refusal, str):
+                        refusal = safe_repr(refusal) if refusal else ""
                     if refusal:
                         raise RuntimeError(f"{self._provider} Responses 返回拒答: {refusal}")
                 delta = self._stream_delta(event)

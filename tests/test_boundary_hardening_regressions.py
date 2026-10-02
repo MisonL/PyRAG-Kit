@@ -5,6 +5,7 @@
 类别排查同类问题。
 """
 
+import asyncio
 import pickle
 from pathlib import Path
 from types import SimpleNamespace
@@ -3584,6 +3585,90 @@ def test_openai_responses_complete_never_raises_bare_type_error_on_bad_choices(b
 
     with pytest.raises(RuntimeError, match="choices 必须是列表"):
         provider.complete(prompt="hi", stream=False)
+
+
+@pytest.mark.parametrize(
+    "bad_delta",
+    [
+        pytest.param(5, id="int"),
+        pytest.param({"a": 1}, id="mapping"),
+        pytest.param(10**4301, id="beyond-int-str-digits"),
+    ],
+)
+def test_openai_responses_streaming_refusal_delta_is_coerced(bad_delta):
+    """流式拒答的 ``delta`` 必须收敛，且收场是 ``RuntimeError``。
+
+    同一份事件里 ``_stream_delta``（正文分支）与 ``_extract_refusal``（非流式
+    拒答）都对取值做过形态收敛，而**流式拒答分支**直接把 ``delta`` 插进
+    f-string：位数超限的整数让 f-string 在**求值期**抛裸
+    ``ValueError: Exceeds the limit``——正要报出拒答的那一步变成整数转换错误，
+    而本 provider 的错误分类按 ``RuntimeError`` 写。
+    """
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._provider = "openai"
+
+    class Responses:
+        def create(self, **_kwargs):
+            return iter(
+                [
+                    SimpleNamespace(type="response.refusal.delta", delta=bad_delta),
+                    SimpleNamespace(type="response.completed"),
+                ]
+            )
+
+    provider._get_client = lambda: SimpleNamespace(responses=Responses())
+
+    with pytest.raises(RuntimeError, match="拒答") as excinfo:
+        list(provider._invoke_responses({"model": "m", "input": "hi", "stream": True}))
+    assert "Exceeds the limit" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "bad_delta",
+    [
+        pytest.param(5, id="int"),
+        pytest.param({"a": 1}, id="mapping"),
+        pytest.param(10**4301, id="beyond-int-str-digits"),
+    ],
+)
+def test_openai_responses_async_streaming_refusal_delta_is_coerced(bad_delta):
+    """异步 Responses 流的拒答分支与同步版同判据。"""
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._provider = "openai"
+
+    class AsyncEvents:
+        def __aiter__(self):
+            self._items = iter(
+                [
+                    SimpleNamespace(type="response.refusal.delta", delta=bad_delta),
+                    SimpleNamespace(type="response.completed"),
+                ]
+            )
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._items)
+            except StopIteration:
+                raise StopAsyncIteration from None
+
+    class Responses:
+        def create(self, **_kwargs):
+            return AsyncEvents()
+
+    provider._get_aclient = lambda: SimpleNamespace(responses=Responses())
+
+    async def collect():
+        return [
+            chunk
+            async for chunk in provider._ainvoke_responses(
+                {"model": "m", "input": "hi", "stream": True}
+            )
+        ]
+
+    with pytest.raises(RuntimeError, match="拒答") as excinfo:
+        asyncio.run(collect())
+    assert "Exceeds the limit" not in str(excinfo.value)
 
 
 @pytest.mark.parametrize(
