@@ -1051,12 +1051,16 @@ class AnthropicProvider(LargeLanguageModel):
         blocks = list(blocks)
         # ``field`` 只在键不存在时返回默认值；键存在而值为 None 时仍返回 None，
         # 而 SDK 的部分块（如 thinking / redacted_thinking）确实会给出 None。
-        # 直接 join 会抛 ``TypeError: expected str instance, NoneType found``。
+        # 直接 join 会抛 ``TypeError: expected str instance, NoneType found``；
+        # **真值非字符串**（``5``／``10**4301``）同样会抛——``or ""`` 只挡住
+        # ``None`` 与空串。统一走 ``_block_text``（与 ``_refusal_text`` 同判据）。
         text = "".join(
-            field(block, "text", "") or "" for block in blocks if field(block, "type") == "text"
+            cls._block_text(field(block, "text", ""))
+            for block in blocks
+            if field(block, "type") == "text"
         )
         reasoning = "".join(
-            field(block, "thinking", "") or ""
+            cls._block_text(field(block, "thinking", ""))
             for block in blocks
             if enum_field(block, "type") in {"thinking", "redacted_thinking"}
         )
@@ -1225,6 +1229,26 @@ class AnthropicProvider(LargeLanguageModel):
         return safe_repr(value)
 
     @staticmethod
+    def _block_text(value: Any) -> str:
+        """把响应块里的文本字段（``text``／``thinking``／``refusal``）收敛成字符串。
+
+        这些字段都来自服务端 JSON，形态不受本地控制（SDK 在
+        ``_strict_response_validation=False`` 时走 ``construct_type``，不执行
+        pydantic 校验）。裸 ``"".join(... or "")`` 只挡住 ``None`` 与空串——
+        **真值非字符串**（``5``／``{"a": 1}``／``10**4301``）原样进 ``join``，抛裸
+        ``TypeError: sequence item 0: expected str instance, int found``，而本
+        provider 的错误分类按 ``RuntimeError`` 写。
+
+        非字符串给 ``safe_repr`` 的可读描述而不是空串：空串会让调用方以为「这块
+        没有内容」。判据与 ``_refusal_text`` 逐字相同，两者共用本实现。
+        """
+        if isinstance(value, str):
+            return value
+        if value is None:
+            return ""
+        return safe_repr(value)
+
+    @staticmethod
     def _refusal_text(value: Any) -> str:
         """把服务端返回的拒答取值收敛成字符串。
 
@@ -1240,12 +1264,9 @@ class AnthropicProvider(LargeLanguageModel):
         只有位数超限的那一个炸——收场方式取决于取值的**大小**而不是形态。
 
         非字符串一律给可读描述而不是空串：空串会让调用方以为「没有拒答」。
+        收敛判据与 ``_block_text`` 相同，委托给它。
         """
-        if isinstance(value, str):
-            return value
-        if value is None:
-            return ""
-        return safe_repr(value)
+        return AnthropicProvider._block_text(value)
 
     @classmethod
     def _stream_event(cls, event: Any, response_id: str | None = None) -> StreamEvent | None:

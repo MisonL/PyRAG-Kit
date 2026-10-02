@@ -4489,3 +4489,65 @@ def test_google_contents_keep_small_scalar_content_verbatim():
     contents = GoogleProvider._contents([{"role": "user", "content": 5}], None, None)
 
     assert contents[0].parts[0].text == "5"
+
+
+# --- Anthropic 响应文本块的拼接 ---------------------------------------------
+#
+# ``AnthropicProvider._extract_result`` 用 ``"".join(field(block, "text", "") or ""
+# ...)`` 拼正文与思考。``or ""`` 只挡住 ``None`` 与空串——**真值非字符串**
+# （``5``／``{"a": 1}``／``10**4301``）原样进 ``join``，抛裸
+# ``TypeError: sequence item 0: expected str instance, int found``。而本 provider
+# 的错误分类按 ``RuntimeError`` 写（同文件对拒答用的就是它），且 SDK 在
+# ``_strict_response_validation=False`` 时走 ``construct_type``，不执行 pydantic
+# 校验，因此块字段形态不受本地控制。
+#
+# 同一文件的 ``_refusal_text`` 早已认领同一判据（非字符串走 ``safe_repr``，
+# 「非字符串一律给可读描述而不是空串」），这里对齐。
+
+
+@pytest.mark.parametrize(
+    ("block_type", "field_name"),
+    [
+        pytest.param("text", "text", id="text"),
+        pytest.param("thinking", "thinking", id="thinking"),
+    ],
+)
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(5, id="int"),
+        pytest.param(_HUGE_INT, id="huge-int"),
+        pytest.param({"a": 1}, id="dict"),
+    ],
+)
+def test_anthropic_extract_result_survives_non_string_block_text(block_type, field_name, value):
+    """正文／思考块的非字符串取值不得让 ``_extract_result`` 抛裸 ``TypeError``。"""
+    from src.providers.anthropic import AnthropicProvider
+
+    response = SimpleNamespace(
+        content=[SimpleNamespace(type=block_type, **{field_name: value})],
+        usage=None,
+    )
+
+    result = AnthropicProvider._extract_result(response)
+
+    assert isinstance(result.text, str)
+    assert isinstance(result.reasoning, str)
+
+
+def test_anthropic_extract_result_keeps_real_block_text():
+    """收紧不能误伤：正常的字符串正文与思考照旧原样保留。"""
+    from src.providers.anthropic import AnthropicProvider
+
+    response = SimpleNamespace(
+        content=[
+            SimpleNamespace(type="thinking", thinking="推理"),
+            SimpleNamespace(type="text", text="正文"),
+        ],
+        usage=None,
+    )
+
+    result = AnthropicProvider._extract_result(response)
+
+    assert result.text == "正文"
+    assert result.reasoning == "推理"

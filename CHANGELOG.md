@@ -6,6 +6,10 @@
 
 ### 修复
 
+- **Anthropic 响应文本块的拼接对真值非字符串抛裸 `TypeError`**（`src/providers/anthropic.py`）。`_extract_result` 用 `"".join(field(block, "text", "") or "" ...)` 拼正文与思考，而 `or ""` 只挡住 `None` 与空串——**真值非字符串**（`5`／`{"a": 1}`／`10**4301`）原样进 `join`，抛裸 `TypeError: sequence item 0: expected str instance, int found`。本 provider 的错误分类按 `RuntimeError` 写（同文件对拒答用的就是它），且 SDK 在 `_strict_response_validation=False` 时走 `construct_type`、不执行 pydantic 校验，因此块字段形态不受本地控制。
+
+  同一文件的 `_refusal_text` 早已认领同一判据（非字符串走 `safe_repr`，「非字符串一律给可读描述而不是空串」），而正文／思考块这一半漏了。修法是抽出 `_block_text` 供两处共用（`_refusal_text` 委托给它），并在 `text`／`reasoning` 两处改用它。回归测试 7 条（正文与思考块 × 三种非字符串取值 + 一条「正常字符串照旧保留」的反向守卫），其中 6 条在未修源码时实测变红。
+
 - **Google 消息 content 的标量回退用裸 `str()`，超大整数让 `_contents` 崩掉**（`src/providers/google.py`）。`_contents` 对既不是 `str` 也不是 `list` 的 `content` 走 `str(raw_content)` 兜底，而 `normalize_messages` 只校验 `messages` 是「对象序列」、**不校验 content 的形态**（实测 `{"role": "user", "content": 10**4301}` 原样通过），因此这是标量 content 的唯一收口。位数超限的整数让 `str()` 抛 `ValueError: Exceeds the limit`——类型对、内容却与「消息内容写错了」无关，且异常发生在 `complete`／`invoke` 的 `try` 之外（`_contents` 在调用 SDK 之前求值），用户拿到的是整数转换错误。
 
   同一文件的 `_normalize_finish_reason` 早已认领同一判据（非字符串走 `safe_repr` 而不是裸 `str()`），这里对齐。回归测试两条（超大整数 content 必须保住、普通标量渲染形态不变），前者在未修源码时实测变红。
