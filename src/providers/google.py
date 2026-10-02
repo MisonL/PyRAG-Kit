@@ -50,6 +50,7 @@ from src.utils.config import (
     get_settings,
     is_double_convertible,
     parse_decimal_int,
+    require_model_name,
     safe_repr,
 )
 from src.utils.log_manager import get_module_logger
@@ -229,7 +230,11 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
     )
 
     def __init__(self, model_name: str, options: dict[str, Any] | None = None):
-        self._model_name = model_name
+        # ``GoogleProvider`` 是公开类，嵌入方可以绕过工厂直接构造。工厂路径已用
+        # ``require_model_name`` 收敛（``cc10585``），这里同样要判：非字符串取值
+        # 会在下面的 ``logger.info`` 插值处抛裸 ``ValueError: Exceeds the limit``
+        # （位数超限的整数），或静默原样发给 SDK（列表／``None``）。
+        self._model_name = require_model_name(model_name)
         if options is not None and not isinstance(options, Mapping):
             raise ValueError("Google options 必须是对象。")
         self._options = dict(options or {})

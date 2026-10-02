@@ -6,7 +6,11 @@ import re
 import jieba  # type: ignore[import-untyped]
 
 from src.providers.__base__.model_provider import TextEmbeddingModel, require_text_list
-from src.utils.config import _MAX_EMBEDDING_DIMENSION, parse_decimal_int, safe_repr
+from src.utils.config import (
+    _MAX_EMBEDDING_DIMENSION,
+    parse_decimal_int,
+    require_model_name,
+)
 
 DEFAULT_DIMENSION = 256
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]")
@@ -26,10 +30,9 @@ def _parse_dimension(model_name: str) -> int:
     # ``AttributeError: 'int' object has no attribute 'rsplit'``——不是本模块其余
     # 拒绝路径承诺的 ``ValueError``（维度超上界给的是带指引的 ``ValueError``）。
     # ``LocalHashEmbeddingProvider`` 是公开类，嵌入方可以绕过工厂直接构造；工厂
-    # 路径已用 ``require_model_name`` 收敛，这条路径同样要有判据。判据与
-    # ``require_model_name`` 一致：只接受字符串。
-    if not isinstance(model_name, str):
-        raise ValueError(f"local-hash 的 model_name 必须是字符串，但得到 {safe_repr(model_name)}。")
+    # 路径已用 ``require_model_name`` 收敛，这条路径同样要有判据，且与其它六个
+    # provider 构造器共用同一 helper。
+    model_name = require_model_name(model_name, label="local-hash 的 model_name")
     suffix = model_name.rsplit("-", maxsplit=1)[-1]
     # 解析走 ``parse_decimal_int``：它同时挡住「``isdigit()`` 为真但 ``int()``
     # 抛错」（``²`` ``①`` ``፩`` …）与「位数超过 ``sys.get_int_max_str_digits()``」

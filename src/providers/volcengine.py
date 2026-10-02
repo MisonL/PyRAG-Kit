@@ -39,7 +39,7 @@ from src.providers.__base__.model_provider import (
 )
 from src.providers.openai_compatible import OpenAICompatibleProvider
 from src.providers.resources import ArkResources, AsyncArkResources
-from src.utils.config import get_settings, is_double_convertible, safe_repr
+from src.utils.config import get_settings, is_double_convertible, require_model_name, safe_repr
 from src.utils.log_manager import get_module_logger
 from src.utils.security import validate_secret_free_payload
 
@@ -556,7 +556,11 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             self._protocol = "responses"
         else:
             raise ValueError("Volcengine 仅支持 ark/chat_completions 或 responses 协议。")
-        self._model_name = model_name
+        # ``VolcengineProvider`` 是公开类，嵌入方可以绕过工厂直接构造。工厂路径
+        # 已用 ``require_model_name`` 收敛，这里同样要判：非字符串取值此前**全程
+        # 静默接受**（没有日志插值兜底），原样进 ``"model": self._model_name``
+        # 发给服务端。
+        self._model_name = require_model_name(model_name)
         self._options = validate_secret_free_options(options, "Volcengine")
         self._options = self._normalize_client_options(self._options)
         self._server_verified_protocols = self._normalize_verified_protocols(

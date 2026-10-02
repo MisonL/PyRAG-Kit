@@ -863,3 +863,86 @@ def test_chat_response_error_reports_container_status_readably():
         OpenAICompatibleProvider._raise_for_chat_response_error(response)
 
     assert "Exceeds the limit" not in str(excinfo.value)
+
+
+# ── 回归：provider 构造器对非字符串 model_name 无形态守卫 ──
+#
+# 六个 provider 的 ``__init__`` 都把 ``model_name`` 原样存下、不做形态判据：
+#   * google / anthropic / jina / siliconflow_rerank / openai_compatible 在
+#     ``logger.info(f"...模型: {model_name}")`` 处抛裸
+#     ``ValueError: Exceeds the limit``（位数超限的整数），而该消息与「模型名
+#     写错了」无关；列表/``None`` 则静默通过，原样发给 SDK；
+#   * volcengine 连日志都没有，非字符串全程静默接受。
+#
+# 这些类都是**公开类**，嵌入方可以绕过工厂直接构造（本仓测试大量这么用），而
+# 工厂路径已用 ``require_model_name`` 收敛（``cc10585``）。同一个 ``model_name``
+# 走工厂得到带指引的 ``ValueError``，直接构造却得到整数转换错误或静默接受——
+# 判据只做了一半。
+
+
+def _model_name_settings():
+    return SimpleNamespace(
+        openai_api_key="k",
+        openai_api_base="https://api.openai.com/v1",
+        anthropic_api_key="k",
+        google_api_key="k",
+        jina_api_key="k",
+        siliconflow_api_key="k",
+        siliconflow_base_url="https://api.siliconflow.cn/v1",
+        ark_api_key="k",
+        volc_access_key="ak",
+        volc_secret_key="sk",
+        volc_base_url="https://ark.cn-beijing.volces.com/api/v3",
+    )
+
+
+def _constructible_providers(monkeypatch):
+    """构造六个 provider 的工厂，各自用最小的合法凭证设置。
+
+    provider **类**必须从本次新导入的模块取（而不是文件顶部的导入）：
+    ``tests/providers/test_factory.py`` 会把 ``src.providers.*`` 从 ``sys.modules``
+    里删掉再重新导入，于是文件顶部那个类属于**旧**模块对象，而
+    ``__init__`` 仍从旧模块字典取 ``get_settings``——patch 落在新模块上，类却读
+    旧模块，全量运行时读到真实配置（无 key）后抛 ``API_KEY is required``。单独跑
+    本文件不触发，只有全量运行才暴露。
+    """
+    settings = _model_name_settings()
+    cases = [
+        ("google", "GoogleProvider", lambda cls, v: cls(v)),
+        ("anthropic", "AnthropicProvider", lambda cls, v: cls(v)),
+        ("jina", "JinaProvider", lambda cls, v: cls(v)),
+        ("siliconflow_rerank", "SiliconflowRerankProvider", lambda cls, v: cls(v)),
+        ("volcengine", "VolcengineProvider", lambda cls, v: cls(v)),
+        (
+            "openai_compatible",
+            "OpenAICompatibleProvider",
+            lambda cls, v: cls(v, "openai", settings=settings),
+        ),
+    ]
+    factories = []
+    for module_name, class_name, build in cases:
+        module = importlib.import_module(f"src.providers.{module_name}")
+        monkeypatch.setitem(module.__dict__, "get_settings", lambda: settings)
+        provider_class = getattr(module, class_name)
+        factories.append((class_name, lambda v, build=build, cls=provider_class: build(cls, v)))
+    return factories
+
+
+@pytest.mark.parametrize(
+    "bad_name",
+    [pytest.param(10**4301, id="huge-int"), pytest.param(["m"], id="list")],
+)
+def test_provider_constructors_reject_non_string_model_name_readably(monkeypatch, bad_name):
+    """非字符串 model_name 必须给出带字段名的 ``ValueError``，不得静默接受。"""
+    for label, build in _constructible_providers(monkeypatch):
+        with pytest.raises(ValueError) as excinfo:
+            build(bad_name)
+        message = str(excinfo.value)
+        assert "Exceeds the limit" not in message, f"{label}: {message}"
+        assert "model_name" in message, f"{label}: {message}"
+
+
+def test_provider_constructors_still_accept_string_model_names(monkeypatch):
+    """收紧不能误伤：字符串 model_name 照常构造。"""
+    for label, build in _constructible_providers(monkeypatch):
+        build("demo-model")

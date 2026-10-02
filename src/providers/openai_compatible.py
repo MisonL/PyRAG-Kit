@@ -51,6 +51,7 @@ from src.utils.config import (
     get_settings,
     is_double_convertible,
     parse_decimal_int,
+    require_model_name,
     safe_repr,
 )
 from src.utils.log_manager import get_module_logger
@@ -242,7 +243,12 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         protocol: str = "chat_completions",
         options: dict[str, Any] | None = None,
     ):
-        self._model_name = model_name
+        # ``OpenAICompatibleProvider`` 是公开类，嵌入方可以绕过工厂直接构造。
+        # 工厂路径已用 ``require_model_name`` 收敛（``cc10585``），这里同样要判：
+        # 非字符串取值会在下面的 ``logger.info`` 插值处抛裸
+        # ``ValueError: Exceeds the limit``（位数超限的整数），或静默原样发给
+        # SDK（列表／``None``）。
+        self._model_name = require_model_name(model_name)
         self._provider = provider
         self._protocol = self._normalize_protocol(protocol)
         self._options = validate_secret_free_options(options, provider)

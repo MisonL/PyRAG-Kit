@@ -6,6 +6,8 @@
 
 ### 修复
 
+- **另外六个 provider 构造器同样漏了 `model_name` 形态判据**（`src/providers/google.py`、`anthropic.py`、`jina.py`、`siliconflow_rerank.py`、`openai_compatible.py`、`volcengine.py`）。与上一条 `local-hash` 同一类：这些 `__init__` 都把 `model_name` 原样存下、不做形态判据，而它们都是**公开类**，嵌入方可以绕过工厂直接构造（本仓测试大量这么用）。实测 `10**4301`／`["m"]`／`None`：google／anthropic／jina／siliconflow_rerank／openai_compatible 在 `logger.info(f"...模型: {model_name}")` 处抛裸 `ValueError: Exceeds the limit`（消息与「模型名写错了」无关），列表／`None` 则静默通过、原样发给 SDK；`volcengine` 连日志都没有，非字符串全程静默接受，原样进 `"model": self._model_name`。判据只做了一半：工厂路径已用 `require_model_name` 收敛（`cc10585`），直接构造这条路径漏了。修法：六处构造器统一调 `require_model_name`，与工厂同判据。回归测试 3 条（六个构造器各覆盖位数超限整数与列表两类形态，外加一条「字符串照常构造」的反向守卫），在未修源码时实测变红。
+
 - **`local-hash` 的 `model_name` 无形态守卫，非字符串在构造期抛裸 `AttributeError`**（`src/providers/local_hash.py`）。`_parse_dimension` 第一行就是 `model_name.rsplit("-", maxsplit=1)`，而 `LocalHashEmbeddingProvider` 是**公开类**，嵌入方可以绕过工厂直接构造（本仓测试就是这么用的）。实测 `10**4301`／`["m"]`／`None`／`5` 全部抛裸 `AttributeError: 'int' object has no attribute 'rsplit'`——不在本模块其余拒绝路径承诺的 `ValueError` 契约内（维度超上界给的是带指引的 `ValueError`）。`local-hash` 是默认 Embedding provider，工厂路径已用 `require_model_name` 收敛，直接构造这条路径漏了。修法：构造期先判字符串形态，与 `require_model_name` 同判据。回归测试 5 条（四类非字符串形态 + 一条「字符串照常解析」的反向守卫），其中 4 条在未修源码时实测变红。
 
 - **`_chat_status_is_error` 对容器形态的 `status` 抛裸 `ValueError`，错误分类被大整数打断**（`src/providers/openai_compatible.py`）。本方法的 docstring 明确承诺「一个形态奇怪的 `status` 值不能让错误分类本身崩掉」，它也确实挡住了「字符串形态但位数超限」的取值（上一条回归钉住）。但收敛只做了一半：非 `int` 的非字符串走 `str(status).strip().lower()`，而 `str([10**4301])` 自己抛 `ValueError: Exceeds the limit`——于是「网关在响应体里返回了业务错误」变成一条整数转换错误，调用方的错误分类与日志脱敏都接不住。`status` 来自网关 JSON，形态不受控。修法：只有字符串才谈得上「是不是某个错误状态名」，非字符串一律判为「不是错误状态」，与它落在集合外的原语义一致。回归测试 3 条（列表／映射各持大整数 + 一条从 `_raise_for_chat_response_error` 进入的用例），全部在未修源码时实测变红。

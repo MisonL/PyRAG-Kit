@@ -11,7 +11,7 @@ from src.providers.__base__.model_provider import (
     normalize_client_timeout,
     validate_secret_free_options,
 )
-from src.utils.config import get_settings, is_double_convertible, safe_repr
+from src.utils.config import get_settings, is_double_convertible, require_model_name, safe_repr
 from src.utils.log_manager import get_module_logger
 from src.utils.security import safe_exception_text, validate_secret_free_payload
 
@@ -40,7 +40,11 @@ class SiliconflowRerankProvider(RerankModel):
     _OPTION_KEYS = frozenset({"return_documents", "truncate", "extra_body", "timeout"})
 
     def __init__(self, model_name: str, options: dict[str, Any] | None = None):
-        self._model_name = model_name
+        # ``SiliconflowRerankProvider`` 是公开类，嵌入方可以绕过工厂直接构造。
+        # 工厂路径已用 ``require_model_name`` 收敛，这里同样要判：非字符串取值
+        # 会在下面的 ``logger.info`` 插值处抛裸 ``ValueError: Exceeds the limit``
+        # （位数超限的整数），或静默原样发给 SDK（列表／``None``）。
+        self._model_name = require_model_name(model_name)
         self._options = validate_secret_free_options(options, "SiliconFlow Rerank")
         unknown = sorted(set(self._options).difference(self._OPTION_KEYS))
         if unknown:

@@ -38,7 +38,13 @@ from src.providers.__base__.model_provider import (
     validate_secret_free_request_overrides,
 )
 from src.providers.resources import AnthropicResources, AsyncAnthropicResources
-from src.utils.config import get_settings, is_double_convertible, safe_repr, to_finite_float
+from src.utils.config import (
+    get_settings,
+    is_double_convertible,
+    require_model_name,
+    safe_repr,
+    to_finite_float,
+)
 from src.utils.log_manager import get_module_logger
 from src.utils.security import (
     redact_sensitive_text,
@@ -166,7 +172,11 @@ class AnthropicProvider(LargeLanguageModel):
     )
 
     def __init__(self, model_name: str, options: dict[str, Any] | None = None):
-        self._model_name = model_name
+        # ``AnthropicProvider`` 是公开类，嵌入方可以绕过工厂直接构造。工厂路径已用
+        # ``require_model_name`` 收敛（``cc10585``），这里同样要判：非字符串取值
+        # 会在下面的 ``logger.info`` 插值处抛裸 ``ValueError: Exceeds the limit``
+        # （位数超限的整数），或静默原样发给 SDK（列表／``None``）。
+        self._model_name = require_model_name(model_name)
         self._options = validate_secret_free_options(options, "Anthropic")
         # 客户端构造参数在配置边界就校验。``timeout``／``max_retries`` 会被原样
         # 透传给 ``anthropic.Anthropic(...)``，而 SDK 不校验：实测
