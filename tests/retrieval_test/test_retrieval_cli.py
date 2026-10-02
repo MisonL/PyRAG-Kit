@@ -637,3 +637,55 @@ def test_excel_log_still_records_good_rows_next_to_malformed_ones(tmp_path):
     ]
     assert "第一条" in stored
     assert "第三条" in stored
+
+
+# ── 回归：``log_results`` 的 ``query`` 列必须与其余列同判据 ──
+#
+# ``query`` 是 ``log_results`` 里唯一没走收敛的列：其余列分别经
+# ``document_*``／``_cell_value``／``_json_safe``，而 ``query`` 直接进 ``row``。
+# 实测 ``query=10**4301``（位数超限的整数）时 ``openpyxl`` 在 ``save()`` 期对
+# 每个数值调 ``safe_string`` -> ``isnan(value)``，抛
+# ``OverflowError: int too large to convert to float``。后果正是 ``_cell_value``
+# 的 docstring 描述的那一种：``save`` 外的 ``except Exception`` 把它吞成一行
+# 日志，整个工作簿**一个字都没落盘**——同一次查询里完全正常的结果一并丢失，
+# 用户看到「召回测试完成」而日志文件是坏的。
+
+
+def test_excel_log_survives_huge_integer_query(tmp_path):
+    """``query`` 是位数超限的整数时，整批结果仍必须落盘。"""
+    from openpyxl import load_workbook
+
+    from src.retrieval_test.excel_logger import ExcelLogger
+
+    logger = ExcelLogger(log_dir=str(tmp_path))
+    logger.log_results(
+        10**4301,
+        [
+            {"page_content": "正文1", "metadata": {"source": "s1"}, "score": 0.9},
+            {"page_content": "正文2", "metadata": {"source": "s2"}, "score": 0.8},
+            {"page_content": "正文3", "metadata": {"source": "s3"}, "score": 0.7},
+        ],
+    )
+
+    worksheet = load_workbook(logger.filepath).active
+    # 表头 + 3 条结果。修复前 save 中途失败，文件连 [Content_Types].xml 都没有，
+    # load_workbook 会直接抛 KeyError。
+    assert worksheet.max_row == 4, f"期望表头 + 3 条结果，实际 {worksheet.max_row} 行"
+    # query 列降级成量级描述，而不是抛异常。
+    assert worksheet.cell(row=2, column=2).value
+
+
+def test_excel_log_keeps_string_query_verbatim(tmp_path):
+    """收紧不能误伤：正常字符串 query 逐字落盘。"""
+    from openpyxl import load_workbook
+
+    from src.retrieval_test.excel_logger import ExcelLogger
+
+    logger = ExcelLogger(log_dir=str(tmp_path))
+    logger.log_results(
+        "如何清除浏览器缓存？",
+        [{"page_content": "正文", "metadata": {"source": "s"}, "score": 0.5}],
+    )
+
+    worksheet = load_workbook(logger.filepath).active
+    assert worksheet.cell(row=2, column=2).value == "如何清除浏览器缓存？"

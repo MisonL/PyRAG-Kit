@@ -6,6 +6,10 @@
 
 ### 修复
 
+- **`ExcelLogger.log_results` 的 `query` 列未收敛，超大整数会丢掉整批记录**（`src/retrieval_test/excel_logger.py`）。`query` 是该方法的行里**唯一**没走收敛的列：其余列分别经 `document_*`／`_cell_value`／`_json_safe`，而 `query` 直接进 `row`。签名声明 `query: str`，但它是**公开方法**，且这里正是「日志是旁路、失败不该丢记录」这条契约的入口。
+
+  实测 `query=10**4301`（位数超限的整数）时 `openpyxl` 在 `save()` 期对每个数值调 `safe_string` → `isnan(value)`，抛 `OverflowError: int too large to convert to float`。后果正是 `_cell_value` 的 docstring 已经写明要防的那一种：`save` 外的 `except Exception` 把它吞成一行日志，整个工作簿**一个字都没落盘**——同一次查询里 3 条完全正常的结果一并丢失，用户看到「召回测试完成」而日志文件是坏的（`load_workbook` 连 `[Content_Types].xml` 都找不到）。修法是让 `query` 与其余列同判据，过一遍 `_cell_value`。回归测试两条（超大整数 query 必须保住整批、字符串 query 逐字落盘），前者在未修源码时实测变红。
+
 - **provider options 的非字符串键漏成裸 `TypeError`**（`src/utils/security.py`、`src/providers/google.py`）。`ModelDetail.options` 声明为 `dict[str, Any]`，pydantic 会强制字符串键，因此**配置来源**的 options 到不了这里。但 provider 是**公开类**——嵌入方可以直接 `JinaProvider("m", {1: "x"})`（本仓测试就这么构造 provider），而共享前置校验 `validate_secret_free_options` 此前只判容器形态与敏感键名、**放行任意键类型**。非字符串键一路穿到各 provider 的 `sorted(set(options).difference(_OPTION_KEYS))`，抛裸 `TypeError: sequence item 0: expected str instance, int found`（混合类型键则是 `'<' not supported between instances of ...`）——不是 `ValueError`，而各 provider 的其余判据都按 `ValueError` 收敛。
 
   实测受影响的构造路径：`JinaProvider`／`SiliconflowRerankProvider`／`GoogleProvider`／`AnthropicProvider`／`VolcengineProvider`。修法分两处：共享入口 `validate_secret_free_options` 加一条顶层键类型判据（覆盖除 Google 外的全部），Google 因为不走共享入口、自己调 `_validate_options`，在其内部单列同一判据。回归测试覆盖三个 provider × 三种非法键形态，另加一条「字符串键照常」的反向守卫，均在未修源码时实测变红。

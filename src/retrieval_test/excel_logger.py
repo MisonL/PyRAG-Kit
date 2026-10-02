@@ -281,6 +281,21 @@ class ExcelLogger:
         """
         timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
+        # ``query`` 也要过 ``_cell_value``。它是本方法里唯一没走收敛的列：
+        # 其余列分别经 ``document_*``／``_cell_value``／``_json_safe``，而
+        # ``query`` 直接进 ``row``。本方法签名声明 ``query: str``，但它是**公开
+        # 方法**，且这里是「日志是旁路、失败不该丢记录」这条契约的入口。
+        #
+        # 实测 ``query=10**4301``（位数超限的整数）时 ``openpyxl`` 在
+        # ``save()`` 期对每个数值调 ``safe_string`` -> ``isnan(value)``，抛
+        # ``OverflowError: int too large to convert to float``。后果正是
+        # ``_cell_value`` 的 docstring 描述的那一种：``save`` 外的
+        # ``except Exception`` 把它吞成一行日志，整个工作簿**一个字都没落盘**
+        # ——同一次查询里 3 条完全正常的结果一并丢失，用户看到「召回测试完成」
+        # 而日志文件是坏的（``load_workbook`` 连 ``[Content_Types].xml`` 都
+        # 找不到）。在取值处降级成 ``safe_repr`` 的量级描述，保住整批记录。
+        query = self._cell_value(query)
+
         row: list[Any]
         if not results:
             # 如果没有结果，也记录一条信息
