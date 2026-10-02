@@ -946,3 +946,41 @@ def test_provider_constructors_still_accept_string_model_names(monkeypatch):
     """收紧不能误伤：字符串 model_name 照常构造。"""
     for label, build in _constructible_providers(monkeypatch):
         build("demo-model")
+
+
+# ── 回归：OpenAI 兼容构造器的 ``provider`` 参数无形态守卫 ──
+#
+# 与 ``model_name`` 同一处、同一类：``__init__`` 里 ``provider.lower()`` 直接调用，
+# 非字符串抛裸 ``AttributeError: 'list' object has no attribute 'lower'``。而
+# ``provider`` 随后要拼出 ``{provider}_api_key`` 字段名——本类的其余拒绝路径
+# （缺 key／缺 base_url／协议非法）都给带指引的 ``ValueError``。工厂路径已用
+# ``require_provider_name`` 收敛，直接构造这条路径漏了。
+
+
+@pytest.mark.parametrize(
+    "provider",
+    [
+        pytest.param(10**4301, id="huge-int"),
+        pytest.param(["openai"], id="list"),
+        pytest.param(None, id="none"),
+    ],
+)
+def test_openai_compatible_rejects_non_string_provider_readably(provider):
+    """非字符串 provider 必须给出带字段名的 ``ValueError``。"""
+    settings = _model_name_settings()
+
+    with pytest.raises(ValueError) as excinfo:
+        OpenAICompatibleProvider("demo", provider, settings=settings)
+
+    message = str(excinfo.value)
+    assert "Exceeds the limit" not in message, message
+    assert "provider" in message, message
+
+
+def test_openai_compatible_still_accepts_string_provider():
+    """收紧不能误伤：字符串 provider 照常构造。"""
+    settings = _model_name_settings()
+
+    provider = OpenAICompatibleProvider("demo", "openai", settings=settings)
+
+    assert provider._provider == "openai"

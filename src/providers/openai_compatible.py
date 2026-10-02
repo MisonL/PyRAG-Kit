@@ -52,6 +52,7 @@ from src.utils.config import (
     is_double_convertible,
     parse_decimal_int,
     require_model_name,
+    require_provider_name,
     safe_repr,
 )
 from src.utils.log_manager import get_module_logger
@@ -249,7 +250,12 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         # ``ValueError: Exceeds the limit``（位数超限的整数），或静默原样发给
         # SDK（列表／``None``）。
         self._model_name = require_model_name(model_name)
-        self._provider = provider
+        # ``provider`` 同处、同类：下面 ``provider.lower()`` 直接调用，非字符串抛裸
+        # ``AttributeError: 'list' object has no attribute 'lower'``，而它随后要拼出
+        # ``{provider}_api_key`` 字段名——本类其余拒绝路径都给带指引的
+        # ``ValueError``。工厂路径已用 ``require_provider_name`` 收敛，直接构造这条
+        # 路径漏了。
+        self._provider = require_provider_name(provider)
         self._protocol = self._normalize_protocol(protocol)
         self._options = validate_secret_free_options(options, provider)
         # 客户端构造参数在配置边界就校验：非法取值不能拖到首次发请求时才暴露，
