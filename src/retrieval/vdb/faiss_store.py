@@ -746,9 +746,13 @@ class FaissStore(VectorStoreBase):
                 " 快照目录内的文件是 pickle，必须由调用方声明信任根（"
                 "RunConfig.snapshot_root 或 SnapshotRepository.root）。"
             )
-        snapshot_path = resolve_within(
-            Path(snapshot_dir), Path(snapshot_root), label="知识快照目录"
-        )
+        # 直接把**原始取值**交给 ``resolve_within``，不要先包一层 ``Path``：
+        # ``Path(5)``／``Path(["a"])`` 抛裸 ``TypeError: expected str, bytes or
+        # os.PathLike object, not ...``，位数超限的整数抛 ``ValueError: Exceeds
+        # the limit``——两条都发生在 ``resolve_within`` 的形态判据**之前**，于是
+        # 本方法其余拒绝路径承诺的带指引 ``ValueError`` 收场被绕过。``load``
+        # （legacy 入口）早已按同一判据修过，这一半此前漏了。
+        snapshot_path = resolve_within(snapshot_dir, snapshot_root, label="知识快照目录")
         if not snapshot_path.is_dir():
             raise FileNotFoundError(f"知识快照目录不存在: {snapshot_path}")
         marker = snapshot_path.parent / "ACTIVE_SNAPSHOT"

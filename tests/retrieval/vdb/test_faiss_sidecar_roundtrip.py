@@ -539,6 +539,35 @@ def test_load_snapshot_requires_trust_root(tmp_path):
         FaissStore(file_path=None).load_snapshot(str(snapshot_dir))
 
 
+@pytest.mark.parametrize(
+    "bad_argument",
+    [
+        pytest.param(5, id="int"),
+        pytest.param(["a"], id="list"),
+        pytest.param(10**4301, id="beyond-int-str-digits"),
+    ],
+)
+@pytest.mark.parametrize("which", ["snapshot_dir", "snapshot_root"])
+def test_load_snapshot_rejects_non_path_arguments(tmp_path, which, bad_argument):
+    """``load_snapshot`` 的非路径入参必须收敛成 ``ValueError``，不是裸 ``TypeError``。
+
+    ``load``（legacy 入口）早已按同一判据修过，而 ``load_snapshot`` 这一半漏了：
+    它在调 ``resolve_within`` **之前**先写 ``Path(snapshot_dir)`` / ``Path(snapshot_root)``，
+    非路径取值在那里抛裸 ``TypeError: expected str, bytes or os.PathLike object,
+    not ...``；位数超限的整数抛 ``ValueError: Exceeds the limit``——类型对、内容
+    却与快照路径无关。两条都不在本方法其余拒绝路径的 ``ValueError`` 契约内，
+    调用方 ``VectorStoreFactory._load_existing_state`` 按它分类。
+    """
+    snapshot_dir = _make_valid_snapshot(tmp_path / "snapshots")
+    kwargs = {"snapshot_dir": str(snapshot_dir), "snapshot_root": str(tmp_path)}
+    kwargs[which] = bad_argument
+
+    with pytest.raises(ValueError, match="必须是字符串或路径"):
+        FaissStore(file_path=None).load_snapshot(
+            kwargs["snapshot_dir"], snapshot_root=kwargs["snapshot_root"]
+        )
+
+
 def test_load_snapshot_rejects_directory_outside_trust_root(tmp_path):
     """信任根之外的目录必须拒绝，即使目录结构看起来完全合法。"""
     outside = tmp_path / "outside"

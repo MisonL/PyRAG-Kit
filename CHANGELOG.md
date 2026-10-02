@@ -6,6 +6,8 @@
 
 ### 修复
 
+- **`FaissStore.load_snapshot` 对非路径入参抛裸 `TypeError`，与 `load` 判据不一致**（`src/retrieval/vdb/faiss_store.py`）。`load`（legacy 入口）此前已按同一判据修过，而 `load_snapshot` 这一半漏了：它在调 `resolve_within` **之前**先写 `Path(snapshot_dir)`／`Path(snapshot_root)`，非路径取值在那里抛裸 `TypeError: expected str, bytes or os.PathLike object, not ...`；位数超限的整数抛 `ValueError: Exceeds the limit`——类型对、内容却与快照路径无关。两条都不在本方法其余拒绝路径承诺的带指引 `ValueError` 契约内，而调用方 `VectorStoreFactory._load_existing_state` 按它分类。修法：把原始取值直接交给 `resolve_within`（它先判形态再解析），不再预先包 `Path`。回归测试 6 条（`snapshot_dir`／`snapshot_root` × `int`／`list`／位数超限整数），全部在未修源码时实测变红。
+
 - **`_require_snapshot_id_within_root` 对非路径形态的快照 id 抛裸 `TypeError`**（`src/retrieval/snapshot_repository.py`）。该方法第一行就写 `Path(snapshot_id)`，而 `Path(5)`／`Path(["a"])`／`Path(b"abc")` 抛裸 `TypeError: expected str, bytes or os.PathLike object, not ...`——不是本类承诺的带指引 `ValueError`，也没有「快照 id 不合法」的语义。位数超限的整数更隐蔽：`Path(10**4301)` 抛 `ValueError: Exceeds the limit`，类型对、内容却与快照 id 无关。快照 id 的来源之一是磁盘上的标记文件（`get_active_snapshot_id`），而三个 `*_temp_snapshot_dir`／`finalize_snapshot` 都对拼出的路径做 `rmtree`。修法：构造 `Path` 之前先判形态，与同仓库的 `resolve_within`／`ensure_trusted_source` 同判据。回归测试 4 条（`int`／`list`／位数超限整数／`bytes`），全部在未修源码时实测变红。
 
 - **Responses 流式拒答的 `delta` 原样插值，位数超限时抛裸 `ValueError`**（`src/providers/openai_compatible.py`）。`_invoke_responses`／`_ainvoke_responses` 的流式循环里，正文分支走 `_stream_delta`（对 `delta` 判过 `isinstance(..., str)`），非流式拒答走 `_extract_refusal`（同样只认字符串），唯独**流式拒答分支**把 `field(event, "delta")` 直接插进 f-string。`delta` 来自网关 JSON、形态不受控：位数超限的整数让 f-string 在**求值期**抛裸 `ValueError: Exceeds the limit`——正要报出拒答的那一步变成整数转换错误，而本 provider 的错误分类按 `RuntimeError` 写；非字符串取值还会把 `{'a': 1}` 这类字面量当成拒答文本渲染出去。修法：与 google 的拒答消息同口径——字符串原样，其余降级成 `safe_repr` 的量级描述。回归测试 6 条（同步／异步 × 三种取值），位数超限那两条在未修源码时实测变红。
