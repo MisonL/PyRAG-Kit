@@ -1337,3 +1337,48 @@ def test_resolve_within_rejects_non_path_arguments_readably(tmp_path):
         resolve_within(None, tmp_path, label="知识快照目录")
     with pytest.raises(ValueError, match="受信根必须是字符串或路径"):
         resolve_within(tmp_path, 5, label="知识快照目录")
+
+
+# ── 回归：upsert_embeddings 的 documents 顶层容器缺形态判据 ──
+#
+# 上面那一组参数化覆盖的是**条目**形态（``_validate_document_shape`` 逐条判），
+# 顶层容器这一半漏了：``upsert_embeddings`` 的第一行就是 ``if not documents:
+# return``，随后 ``len(documents)``。实测：
+#   * ``documents=5``  -> 裸 ``TypeError: object of type 'int' has no len()``，
+#     不是本方法其余拒绝路径承诺的 ``ValueError``（载入侧
+#     ``_normalize_documents`` 对同一形态给的是带指引的 ``ValueError``）；
+#   * ``documents=None`` -> **静默返回**，调用方以为写入成功，而 store 一个字
+#     都没变——写入路径上的静默无操作比报错更难查。
+# 判据与载入侧 ``_normalize_documents`` 的同名守卫一致（拒绝 str／bytes／映射，
+# 要求有 ``__len__``）。
+
+
+@pytest.mark.parametrize(
+    "documents",
+    [
+        pytest.param(5, id="int"),
+        pytest.param(None, id="none"),
+        pytest.param("abc", id="str"),
+        pytest.param({"a": 1}, id="dict"),
+    ],
+)
+def test_upsert_embeddings_rejects_non_sequence_documents(documents):
+    """非序列的 ``documents`` 必须给出带指引的 ``ValueError``，不得静默返回。"""
+    store = FaissStore(file_path=None)
+
+    with pytest.raises(ValueError, match="文档列表"):
+        store.upsert_embeddings(documents, np.zeros((1, 4), np.float32))
+
+    assert store.documents == []
+
+
+def test_upsert_embeddings_still_accepts_document_sequences():
+    """收紧不能误伤：正常文档列表照常写入。"""
+    store = FaissStore(file_path=None)
+
+    store.upsert_embeddings(
+        [{"page_content": "good", "metadata": {"source": "a"}}], np.zeros((1, 4), np.float32)
+    )
+
+    assert len(store.documents) == 1
+    assert store.faiss_index.ntotal == 1

@@ -426,6 +426,17 @@ class FaissStore(VectorStoreBase):
         return content if isinstance(content, str) and content else None
 
     def upsert_embeddings(self, documents: list[dict[str, Any]], embeddings: Any):
+        # 顶层容器形态先判：下一行 ``if not documents`` 之后就是 ``len(documents)``。
+        # 实测 ``documents=5`` 抛裸 ``TypeError: object of type 'int' has no len()``
+        # ——不是本方法其余拒绝路径承诺的 ``ValueError``；``documents=None`` 更糟，
+        # 它被 ``if not documents`` 当成「无写入」**静默返回**，调用方以为写入成功
+        # 而 store 一个字都没变。判据与载入侧 ``_normalize_documents`` 的同名守卫
+        # 一致（拒绝 ``str``／``bytes``／映射，要求有 ``__len__``）。
+        if isinstance(documents, (str, bytes, Mapping)) or not hasattr(documents, "__len__"):
+            raise ValueError(
+                "待写入的 documents 必须是文档列表，但得到 "
+                f"{type(documents).__name__}，无法作为文档列表使用。"
+            )
         if not documents:
             return
 
