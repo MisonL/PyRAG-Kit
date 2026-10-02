@@ -6,6 +6,10 @@
 
 ### 修复
 
+- **`chat_async` 内联分支自造 prompt，绕开 `ChatService._build_prompt` 的字段收敛**（`src/chat/core.py`）。`chat_async` 有两条生成路径：`chat_service` 存在时走 `ChatService.generate_reply`（内部调 `_build_prompt`，逐字段用 `display_utils` 助手收敛），而 `chat_service` 缺失、`llm_model` 仍在时走内联分支，它把整份 `retrieved_docs` 直接 f-string 进 prompt。两个后果都实测复现：`page_content=None` 生成 `知识: [{'page_content': None, ...}]`，模型把字面量 `None` 当成一条真实知识；`score=10**4301` 抛裸 `ValueError: Exceeds the limit`，`chat_async` 捕获后只回一句「抱歉，处理请求时遇到错误」——用户看到莫名其妙的失败，而不是那条知识被正常跳过。检索结果可以来自任何 `VectorStoreBase` 实现，第三方 store 不做载入期归一化。`_build_prompt` 的 docstring 本就声明「两个调用点是 `generate_reply` 与 `chat_async` 的内联分支」，但内联分支从未真正调用它——这条声明此前是错的。
+
+  修法：内联分支改调 `ChatService._build_prompt(user_input, intent, retrieved_docs)`，与 `generate_reply` 共用同一份模板，不再维护第二份。回归测试 2 条（`page_content=None` 不得进 prompt、位数超限的 `score` 不得让整次问答失败），均在未修源码时实测变红。
+
 - **Anthropic `text_stream` 兜底分支原样透传非字符串，打破 `Generator[str]` 契约**（`src/providers/anthropic.py`）。`_iter_invoke_stream_text`／`_aiter_invoke_stream_text` 各有三条取文本的路径：主路径（`__iter__`／`__aiter__` 事件）走 `_stream_event`，那里的 `text_delta` 已按 `_block_text` 收敛（此前同类修复）；而两条 `text_stream` 兜底分支直接 `yield text`，非字符串原样进入声明为 `Generator[str]` 的生成器。消费方 `"".join`／`+=` 抛裸 `TypeError`，位数超限的整数更早抛 `ValueError: Exceeds the limit`。真实 SDK 的 `MessageStream` 只提供 `__iter__` 与 `current_message_snapshot`（实测无 `text_stream`），但本仓测试正是用只带 `text_stream` 的替身构造这条路径，因此它是被支持、被测试的输入形态——契约与主路径必须一致。
 
   修法：两处兜底分支改走 `_block_text`（与 `_stream_event` 同一收敛）。回归测试 3 条（同步／异步的「非字符串必须收敛」+ 一条「字符串分片原样透传」的反向守卫），其中 2 条在未修源码时实测变红。

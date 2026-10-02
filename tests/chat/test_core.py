@@ -630,6 +630,81 @@ def test_chat_async_survives_markup_like_intent(monkeypatch):
     assert "斜杠 [/] 的用法" in buffer.getvalue()
 
 
+def _inline_branch_bot(documents, captured):
+    """构造走 ``chat_async`` 内联分支（``chat_service=None``）的 bot。
+
+    该分支只在 ``chat_service`` 缺失而 ``llm_model`` 仍在时进入——例如
+    ``reload_llm`` 之外的库调用方手工装配，或依赖被替换后的降级路径。它不是
+    死代码：``test_chat_async_survives_markup_like_intent`` 同样走这一支。
+    """
+    from io import StringIO
+
+    bot = _silent_bot(StringIO())
+
+    class Model:
+        async def ainvoke(self, **kwargs):
+            captured["prompt"] = kwargs.get("prompt")
+            yield "回答"
+
+    async def fake_identify(query):
+        return query
+
+    async def fake_retrieve(_query):
+        return documents
+
+    bot.llm_model = Model()
+    bot.chat_service = None
+    bot._identify_intent_async = fake_identify
+    bot._retrieve_knowledge_async = fake_retrieve
+    return bot
+
+
+def test_chat_async_inline_branch_does_not_feed_malformed_content_to_the_model():
+    """内联分支必须与 ``ChatService._build_prompt`` 收敛同一条判据。
+
+    ``_build_prompt`` 对检索结果里的文档字段已经收敛（``page_content=None``
+    时整条跳过，绝不把字面量 ``内容: None`` 喂给模型），而 ``chat_async`` 的
+    内联分支把整份 ``retrieved_docs`` 直接 f-string 进 prompt——实测
+    ``page_content=None`` 生成
+    ``知识: [{'page_content': None, ...}]``，模型会把字面量 ``None`` 当成
+    一条真实知识。检索结果可以来自任何 ``VectorStoreBase`` 实现，第三方 store
+    不会做载入期归一化。
+    """
+    captured = {}
+    bot = _inline_branch_bot([{"page_content": None, "metadata": {"source": "a.md"}}], captured)
+
+    async def consume():
+        return [chunk async for chunk in bot.chat_async("问题")]
+
+    chunks = asyncio.run(consume())
+
+    assert chunks == ["回答"]
+    assert "None" not in captured["prompt"]
+
+
+def test_chat_async_inline_branch_survives_oversized_score():
+    """位数超限的分数字段不得让整次问答失败。
+
+    内联分支 f-string 整个 ``retrieved_docs``；文档里的 ``score=10**4301``
+    会抛裸 ``ValueError: Exceeds the limit``，``chat_async`` 捕获后只回一句
+    「抱歉，处理请求时遇到错误」——用户看到的是莫名其妙的失败，而不是那条
+    知识被正常跳过。
+    """
+    captured = {}
+    bot = _inline_branch_bot(
+        [{"page_content": "正文", "metadata": {"source": "a.md"}, "score": 10**4301}],
+        captured,
+    )
+
+    async def consume():
+        return [chunk async for chunk in bot.chat_async("问题")]
+
+    chunks = asyncio.run(consume())
+
+    assert chunks == ["回答"]
+    assert "正文" in captured["prompt"]
+
+
 def test_chat_async_error_path_survives_markup_like_exception(monkeypatch):
     """异常消息含标记形态时，错误提示必须能打出来（级联失效的回归）。"""
     from io import StringIO

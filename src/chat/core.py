@@ -309,11 +309,14 @@ class Chatbot:
                     full_response += chunk
                     yield chunk
             elif (llm_model := getattr(self, "llm_model", None)) is not None:
-                prompt = (
-                    f"你是一个智能客服。用户问题: {user_input}\n"
-                    f"意图: {intent}\n"
-                    f"知识: {retrieved_docs}\n回答要简洁。"
-                )
+                # 与 ``ChatService.generate_reply`` 走**同一条** prompt 构造：
+                # 这里原先自己 f-string 整份 ``retrieved_docs``，于是
+                # ``page_content=None`` 会把字面量 ``None`` 当成一条真实知识喂给
+                # 模型，``score=10**4301`` 则抛裸 ``ValueError: Exceeds the
+                # limit`` 让整次问答失败。``_build_prompt`` 已经用
+                # ``display_utils`` 的助手把每个字段收敛好（第三方 store 不做
+                # 载入期归一化），复用它即可，不必再维护第二份模板。
+                prompt = ChatService._build_prompt(user_input, intent, retrieved_docs)
                 invoke_kwargs: dict[str, Any] = {"prompt": prompt, "stream": True}
                 supports_sampling = getattr(llm_model, "supports_sampling_option", None)
                 if callable(supports_sampling) and supports_sampling("temperature"):
