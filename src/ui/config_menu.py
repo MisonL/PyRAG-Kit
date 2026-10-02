@@ -262,7 +262,7 @@ def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
                     questionary.Choice("RRF (倒数排名融合)", value="rrf"),
                     questionary.Choice("Weighted (分值加权)", value="weighted"),
                 ],
-                default=chat_config["hybrid_fusion_strategy"],
+                default=_normalized_fusion_default(chat_config["hybrid_fusion_strategy"]),
             ).ask()
             if new_strategy:
                 chat_config["hybrid_fusion_strategy"] = new_strategy
@@ -354,6 +354,30 @@ def _choice_default(choices: list[questionary.Choice], active: Any) -> Any:
         if choice.value == active:
             return active
     return None
+
+
+def _normalized_fusion_default(value: Any) -> str | None:
+    """把融合策略收敛成候选集合里的字面量，收敛不了时返回 ``None``。
+
+    候选只有 ``"rrf"``／``"weighted"`` 两个字面量，而 ``default=`` 拿的是
+    ``chat_config["hybrid_fusion_strategy"]`` 的**原始**取值——``SessionConfig``
+    的普通属性没有 ``__setattr__`` 守卫，嵌入方或携带异常取值的 pickle 快照可以
+    直写该字段。实测三种收场都不在契约内：``"RRF"``／``" rrf "``（大小写／空白
+    未归一）与 ``1`` 让 questionary 抛 ``ValueError: Invalid 'default' value
+    passed``，位数超限的整数则抛 ``ValueError: Exceeds the limit``。
+
+    归一化口径必须与运行期一致，取 ``_coerce_fusion_strategy``（它同时服务
+    ``RetrievalService`` 的读取路径，把 ``"RRF"``／``" rrf "`` 都收敛成
+    ``"rrf"``）。收敛后仍不在候选集合里（例如 ``"bogus"``）就退回 ``None``：
+    questionary 的「未作答」哨兵，合法且不抛，用户仍能选一个合法值。
+    """
+    from ..services.retrieval_service import _coerce_fusion_strategy
+
+    try:
+        normalized = _coerce_fusion_strategy(value)
+    except ValueError:
+        return None
+    return normalized if normalized in {"rrf", "weighted"} else None
 
 
 def edit_model_params(chat_config: dict[str, Any]) -> bool:

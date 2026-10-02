@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 import questionary
 
-from src.runtime.contracts import SessionConfig, build_session_config
+from src.runtime.contracts import RetrievalMethod, SessionConfig, build_session_config
 from src.ui.config_menu import _bounded_int_validator, _multiplier_ceiling, _top_k_ceiling
 from src.utils.config import (
     _MAX_RETRIEVAL_CANDIDATES,
@@ -447,3 +447,92 @@ def test_edit_model_params_survives_stale_active_configuration(monkeypatch):
     }
 
     assert config_menu.edit_model_params(chat_config) is False
+
+
+# ── 回归：融合策略的 ``default=`` 必须落在候选集合里 ──
+#
+# `edit_retrieval_params` 的融合策略分支把 `chat_config["hybrid_fusion_strategy"]`
+# **原始**取值当 `questionary.select(default=...)`。候选只有 `"rrf"`／`"weighted"`
+# 两个字面量，而 `SessionConfig` 的普通属性没有 `__setattr__` 守卫，嵌入方或携带
+# 异常取值的 pickle 快照可以直写该字段。实测三种收场都不在契约内：
+#
+#   `"RRF"`／`" rrf "`（大小写／空白未归一） -> questionary 拿它去候选集合里
+#     找不到，抛 `ValueError: Invalid 'default' value passed`；
+#   位数超限的整数 -> 抛 `ValueError: Exceeds the limit`；
+#   非字符串（`1`／`None`／`["RRF"]`） -> 同样落到 `Invalid 'default'`。
+#
+# 菜单是用户唯一还能改配置的入口（`display_chat_config` 在上游读值时会直接拒绝），
+# 而异常落在 `edit_retrieval_params` 内、由 `launch_config_editor` 经
+# `asyncio.to_thread` 调用——调用点只接 `(KeyboardInterrupt, EOFError)`，会终止
+# 整个会话。
+#
+# 修法：`default=` 走与 `_choice_default` 同一判据——取值经 `_coerce_fusion_strategy`
+# 归一后若在候选集合里就用它，否则退回 `None`（questionary 的「未作答」哨兵）。
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("RRF", id="uppercase"),
+        pytest.param(" rrf ", id="padded"),
+        pytest.param(1, id="int"),
+        pytest.param(10**4301, id="huge-int"),
+        pytest.param(None, id="none"),
+    ],
+)
+def test_fusion_default_survives_unnormalized_or_non_string_values(monkeypatch, value):
+    """融合策略的 ``default=`` 必须是候选集合里的取值或 ``None``。"""
+    from src.ui import config_menu
+
+    seen: list = []
+    answers = iter(["fusion", None, "back"])
+
+    def select(prompt, choices=None, default=None, **_kwargs):
+        if prompt == "选择新的混合融合策略:":
+            values = [c.value for c in choices]
+            seen.append(default)
+            assert default is None or default in values, (default, values)
+        return _Choice(next(answers))
+
+    monkeypatch.setattr(config_menu.questionary, "select", select)
+    chat_config = {
+        "retrieval_method": RetrievalMethod.HYBRID_SEARCH,
+        "hybrid_fusion_strategy": value,
+        "retrieval_candidate_multiplier": 3,
+        "top_k": 5,
+        "vector_weight": 0.5,
+        "keyword_weight": 0.5,
+        "rerank_enabled": False,
+    }
+
+    config_menu.edit_retrieval_params(chat_config)
+
+    assert seen, "菜单必须真的构造过融合策略候选"
+
+
+def test_fusion_default_keeps_normalized_value(monkeypatch):
+    """收紧不能误伤：规范的 ``"rrf"`` 照旧作为默认项选中。"""
+    from src.ui import config_menu
+
+    seen: list = []
+    answers = iter(["fusion", None, "back"])
+
+    def select(prompt, choices=None, default=None, **_kwargs):
+        if prompt == "选择新的混合融合策略:":
+            seen.append(default)
+        return _Choice(next(answers))
+
+    monkeypatch.setattr(config_menu.questionary, "select", select)
+    chat_config = {
+        "retrieval_method": RetrievalMethod.HYBRID_SEARCH,
+        "hybrid_fusion_strategy": "rrf",
+        "retrieval_candidate_multiplier": 3,
+        "top_k": 5,
+        "vector_weight": 0.5,
+        "keyword_weight": 0.5,
+        "rerank_enabled": False,
+    }
+
+    config_menu.edit_retrieval_params(chat_config)
+
+    assert seen == ["rrf"]

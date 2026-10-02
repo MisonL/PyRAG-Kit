@@ -6,6 +6,10 @@
 
 ### 修复
 
+- **检索参数菜单的融合策略 `default=` 未归一，未归一取值让菜单崩掉**（`src/ui/config_menu.py`）。`edit_retrieval_params` 的融合策略分支把 `chat_config["hybrid_fusion_strategy"]` 的**原始**取值当 `questionary.select(default=...)`，而候选只有 `"rrf"`／`"weighted"` 两个字面量。`SessionConfig` 的普通属性没有 `__setattr__` 守卫，嵌入方或携带异常取值的 pickle 快照可以直写该字段。实测三种收场都不在契约内：`"RRF"`／`" rrf "`（大小写／空白未归一）与 `1` 让 questionary 抛 `ValueError: Invalid 'default' value passed`，位数超限的整数抛 `ValueError: Exceeds the limit`。异常落在 `edit_retrieval_params` 内、由 `launch_config_editor` 经 `asyncio.to_thread` 调用——调用点只接 `(KeyboardInterrupt, EOFError)`，会终止整个会话，而菜单是用户唯一还能改配置的入口。
+
+  同一函数里 `current_fusion_strategy` 的**标签**早已走 `_render_value`（上一条同类修复），`default=` 这一半却漏了——判据只做了一半。修法是新增 `_normalized_fusion_default`：复用运行期的 `_coerce_fusion_strategy` 归一（口径与 `RetrievalService` 读取路径一致，`"RRF"`／`" rrf "` 都收敛成 `"rrf"`），归一后不在候选集合里（`"bogus"`／非字符串／超限整数）退回 `None`——questionary 的「未作答」哨兵。回归测试 6 条（五种异常取值 + 一条「规范值照旧选中」的反向守卫），其中 4 条在未修源码时实测变红；修后另用**真实** questionary 复核全部形态可构造。
+
 - **模型配置菜单把原始键直接交给 questionary，非字符串键让菜单崩掉**（`src/ui/config_menu.py`）。`edit_model_params` 把 `_configuration_keys` 返回的**原始键**当候选传给 `questionary.select`。`SessionConfig` 的 `_VALIDATORS` 明确不登记 `*_configurations`（「按原样写入，由使用方负责其内部结构」），嵌入方或携带异常取值的 pickle 快照可以放进任意可哈希键；questionary 的 `Choice.build` 只对 `str` 有特例，其余类型落到 `c.get(...)`，实测 `int`／`tuple`／`None` 键一律抛裸 `AttributeError: 'int' object has no attribute 'get'`，位数超限的整数键更早在渲染标题时抛 `ValueError: Exceeds the limit`——菜单根本显示不出来，而它正是用户唯一还能改配置的入口。
 
   同一处还有第二条：`default=` 传的是**原始**激活键，而候选若被渲染成字符串标题，questionary 会拿它去候选集合里找，找不到就抛 `ValueError: Invalid 'default' value passed`——激活项被删掉、或它本身是位数超限的整数时都会命中。另外 `new_llm != current_llm` 拿渲染后的字符串比较，非字符串键永不等于自身，会让「选中同一个配置」被误判成切换、白白触发一次 LLM 重载。
