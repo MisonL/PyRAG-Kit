@@ -45,7 +45,14 @@ class KnowledgeBuildService:
                 f"但得到 {type(knowledge_base_path).__name__}。"
                 " 请检查 config.toml 里的 knowledge_base_path 配置项。"
             )
-        markdown_files = sorted(knowledge_base_path.glob("*.md"))
+        # ``glob("*.md")`` 只按**名字**匹配，不看类型：一个名为 ``notes.md`` 的
+        # 目录、FIFO 或符号链接都会被当成知识库文件。它们没有可读正文，
+        # ``_process_file`` 的 ``read_text`` 会抛 ``IsADirectoryError`` 等
+        # ``OSError``——不是本服务其余拒绝路径承诺的带指引消息，而 ``build`` 由
+        # CLI 与 ``main.py`` 的知识库向量化入口直接调用。这里只收**普通文件**：
+        # 跳过非文件条目，让其余正常文档照常构建（知识库目录里混入同名目录是
+        # 导出工具与手工整理都会留下的常见形态）。
+        markdown_files = sorted(path for path in knowledge_base_path.glob("*.md") if path.is_file())
         if not markdown_files:
             raise FileNotFoundError(f"知识库目录 '{knowledge_base_path}' 中未找到 Markdown 文件。")
 
@@ -129,12 +136,22 @@ class KnowledgeBuildService:
         # decode byte 0xff in position 0``），不说是哪个文件——用户拿到的是
         # 「程序运行期间发生错误」加一串偏移量，无从下手。实测 39 个文件的
         # 知识库里混入一个非 UTF-8 文件即是这种收场。
+        #
+        # ``OSError`` 一并接住并带上文件名：权限不足（``PermissionError``）、
+        # 读到一半被删除（``FileNotFoundError``）、条目其实是特殊文件
+        # （``IsADirectoryError``）都会让 ``read_text`` 抛它，而裸 ``OSError``
+        # 的消息虽有系统错误码，却没有「知识库目录里的哪个文件」这一层定位。
         try:
             content = file_path.read_text(encoding="utf-8")
         except UnicodeDecodeError as exc:
             raise ValueError(
                 f"知识库文件不是 UTF-8 编码，无法读取: {file_path}。"
                 f" 请把该文件转为 UTF-8 后重试（{type(exc).__name__}: {exc}）。"
+            ) from exc
+        except OSError as exc:
+            raise ValueError(
+                f"知识库文件无法读取: {file_path}。"
+                f" 请检查该文件的权限与类型（{type(exc).__name__}: {exc}）。"
             ) from exc
         document = Document(content=content, metadata={"source": str(file_path)})
         chunks = pipeline.process(document)
