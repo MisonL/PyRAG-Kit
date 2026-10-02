@@ -540,7 +540,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         found: list[str] = []
 
         def normalized_key(key: Any) -> str:
-            return "".join(char for char in str(key).lower() if char.isalnum())
+            return "".join(char for char in safe_repr(key).lower() if char.isalnum())
 
         def is_sensitive_key(key: Any) -> bool:
             normalized = normalized_key(key)
@@ -576,7 +576,12 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         def visit(item: Any, path: str = "") -> None:
             if isinstance(item, Mapping):
                 for key, nested in item.items():
-                    current = f"{path}.{key}" if path else str(key)
+                    if not isinstance(key, str):
+                        raise ValueError(
+                            "Google options.http_options 的键必须是字符串，"
+                            f"但得到 {safe_repr(key)}。"
+                        )
+                    current = f"{path}.{key}" if path else key
                     if nested is None:
                         continue
                     if is_sensitive_key(key):
@@ -634,7 +639,10 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         def visit(value: Any) -> None:
             if isinstance(value, Mapping):
                 for key, nested in value.items():
-                    normalized = "".join(char for char in str(key).lower() if char.isalnum())
+                    # ``safe_repr`` 而非裸 ``str``：这个递归是**发现** ``http_options``
+                    # 用的，非字符串键只需不崩即可（它也不会等于 ``httpoptions``）。
+                    # ``str(10**4301)`` 会抛 ``ValueError: Exceeds the limit``。
+                    normalized = "".join(char for char in safe_repr(key).lower() if char.isalnum())
                     if normalized == "httpoptions":
                         cls._validate_http_options(nested)
                         continue
@@ -654,6 +662,14 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         """将配置文件中的 DebugConfig 表转换为 SDK 对象。"""
         if value is None or not isinstance(value, Mapping):
             return value
+        # 键形态先收敛：``sorted(set(value).difference(allowed))`` 对非字符串键抛
+        # 裸 ``TypeError: sequence item 0: expected str instance, int found``
+        # （混合类型键则是 ``'<' not supported between instances of ...``）。
+        # 与 ``_validate_options``／``utils.security.validate_secret_free_options``
+        # 同一判据、同一理由。
+        for key in value:
+            if not isinstance(key, str):
+                raise ValueError(f"Google debug_config 的键必须是字符串，但得到 {safe_repr(key)}。")
         allowed = {"client_mode", "replays_directory", "replay_id"}
         unknown = sorted(set(value).difference(allowed))
         if unknown:

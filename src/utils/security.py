@@ -374,6 +374,30 @@ def _display_repr(value: Any) -> str:
         return f"<{type(value).__name__}>"
 
 
+def _require_string_keys(mapping: Mapping[Any, Any], label: str) -> None:
+    """校验映射的**顶层**键都是字符串。
+
+    非字符串键本身不是凭证，但它会让下游的 ``str(key)`` 与 ``sorted(...)`` 崩在
+    与字段无关的地方：``str(10**4301)`` 抛
+    ``ValueError: Exceeds the limit``（类型对、内容错），``", ".join(sorted(...))``
+    对普通整数键抛裸 ``TypeError: sequence item 0: expected str instance``。
+    ``ModelDetail.options`` 声明为 ``dict[str, Any]``，pydantic 会强制这一形态，
+    因此**配置来源**到不了这里；但 provider 是**公开类**——嵌入方可以直接
+    ``JinaProvider("m", {1: "x"})``（本仓测试就这么构造）。各校验器的其余判据都
+    按 ``ValueError`` 收敛，这里必须对齐。
+
+    嵌套层级的同类判据在 ``find_sensitive_option_paths`` 的递归里，两处共用
+    ``_display_repr`` 渲染越界整数。
+    """
+    for key in mapping:
+        if not isinstance(key, str):
+            raise ValueError(
+                f"{label} 的键必须是字符串，但得到 {_display_repr(key)}。"
+                " 请检查配置里的 options 表（TOML 表的键本就是字符串，"
+                "非字符串键通常来自直接构造 Provider 的库调用方）。"
+            )
+
+
 def redact_sensitive_text(value: Any) -> str:
     """脱敏异常、日志和请求错误中的常见凭证表示。"""
     if not isinstance(value, str):
@@ -518,8 +542,16 @@ def _model_dump_mapping(value: Any) -> Mapping[str, Any] | None:
 
 
 def normalize_option_key(key: Any) -> str:
-    """将配置键规范化为大小写无关、分隔符无关的形式。"""
-    return "".join(char for char in str(key).lower() if char.isalnum())
+    """将配置键规范化为大小写无关、分隔符无关的形式。
+
+    非字符串键走 ``_display_repr``：``str(10**4301)`` 撞上 CPython 的整数位数
+    上限抛 ``ValueError: Exceeds the limit``。本函数在配置边界的**每一层**键上
+    调用（``find_sensitive_option_paths`` 的递归、``_is_credential_key``），
+    也在文本脱敏的正则回调里调用，因此对不可 ``str()`` 的键必须降级而不是崩。
+    归一化结果对非字符串键没有语义（调用方另有 ``_require_string_keys`` 判据），
+    只要不抛即可。
+    """
+    return "".join(char for char in _display_repr(key).lower() if char.isalnum())
 
 
 def _is_credential_key(key: Any) -> bool:
@@ -539,7 +571,7 @@ def _is_credential_key(key: Any) -> bool:
         part.lower()
         for part in re.split(
             r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])",
-            str(key),
+            _display_repr(key),
         )
         if part
     ]
@@ -626,17 +658,26 @@ def find_sensitive_option_paths(
     options: Mapping[str, Any],
     *,
     allowed_containers: Collection[str] = (),
+    label: str = "Provider options",
 ) -> list[str]:
     """递归查找凭证、连接覆盖和 URL 中的凭证路径。
 
     ``allowed_containers`` 只用于供应商明确支持的安全容器（例如 Google
     ``http_options.headers``）；容器内的键和值仍会继续递归检查。
+
+    每一层的键都必须是字符串：本函数是**唯一的**递归点，四个兄弟校验器都经由
+    它扫描，因此判据放在这里才能覆盖嵌套层级。此前判据只在
+    ``validate_secret_free_options`` 的顶层循环里，嵌套的 ``{10**4301: "x"}``
+    会在这里的 ``str(key)`` 上抛 ``ValueError: Exceeds the limit``（类型对、内容
+    与字段无关），而普通的 ``{1: "x"}`` 则静默通过、随后在调用方的
+    ``", ".join(sorted(...))`` 处抛裸 ``TypeError``。
     """
     found: list[str] = []
     allowed = {normalize_option_key(value) for value in allowed_containers}
 
     def visit(value: Any, path: str = "") -> None:
         if isinstance(value, Mapping):
+            _require_string_keys(value, label if not path else f"{label} 的 {path}")
             for key, nested in value.items():
                 current = f"{path}.{key}" if path else str(key)
                 if is_sensitive_option_key(key) and normalize_option_key(key) not in allowed:
@@ -672,24 +713,13 @@ def validate_secret_free_options(
         return {}
     if not isinstance(options, Mapping):
         raise ValueError(f"{provider} options 必须是对象。")
-    # 顶层键必须是字符串。``ModelDetail.options`` 声明为 ``dict[str, Any]``，
-    # pydantic 会强制这一形态，但 provider 是**公开类**——嵌入方可以直接
-    # ``JinaProvider("m", {1: "x"})``（本仓测试就这么构造）。非字符串键会一路
-    # 穿过这里，随后在调用方的 ``sorted(set(options).difference(_OPTION_KEYS))``
-    # 处抛裸 ``TypeError: sequence item 0: expected str instance, int found``
-    # （混合类型键则是 ``'<' not supported between instances of ...``）——不是
-    # ``ValueError``，而各 provider 的其余判据都按 ``ValueError`` 收敛。
-    #
-    # 只在**顶层**判：``options`` 的值可以是任意 JSON（``extra_body`` 里放什么
-    # 都可能），且 ``_copy_nested`` 复制的是值不是键。
-    for key in options:
-        if not isinstance(key, str):
-            raise ValueError(
-                f"{provider} options 的键必须是字符串，但得到 {_display_repr(key)}。"
-                " 请检查配置里的 options 表（TOML 表的键本就是字符串，"
-                "非字符串键通常来自直接构造 Provider 的库调用方）。"
-            )
-    found = find_sensitive_option_paths(options, allowed_containers=allowed_containers)
+    # 键形态判据（顶层与嵌套）统一由 ``find_sensitive_option_paths`` 承担：
+    # 它是四个校验器共用的递归点，判据放在那里才覆盖每一层。
+    found = find_sensitive_option_paths(
+        options,
+        allowed_containers=allowed_containers,
+        label=f"{provider} options",
+    )
     if found:
         raise ValueError(
             f"{provider} options 不允许包含凭证或请求头/query 配置: " + ", ".join(found)
@@ -722,7 +752,7 @@ def validate_secret_free_request_overrides(
             continue
         if not isinstance(value, Mapping):
             raise ValueError(f"{provider} {field_name} 必须是对象。")
-        found = find_sensitive_option_paths(value)
+        found = find_sensitive_option_paths(value, label=f"{provider} {field_name}")
         if found:
             raise ValueError(
                 f"{provider} 请求头/query 不允许包含凭证: {field_name}." + ", ".join(found)
@@ -742,7 +772,7 @@ def validate_secret_free_payload(
         return {}
     if not isinstance(value, Mapping):
         raise ValueError(f"{provider} {field_name} 必须是对象。")
-    found = find_sensitive_option_paths(value)
+    found = find_sensitive_option_paths(value, label=f"{provider} {field_name}")
     if found:
         raise ValueError(f"{provider} {field_name} 不允许包含凭证或连接字段: " + ", ".join(found))
     return _copy_nested(dict(value))
@@ -762,6 +792,9 @@ def validate_secret_free_resource_kwargs(
         return {}
     if not isinstance(kwargs, Mapping):
         raise ValueError(f"{provider} 资源参数必须是对象。")
+    # 顶层键单独判：下面的扫描器只收到 ``generic_kwargs``（已按扩展键名过滤），
+    # 非字符串键若恰好归一化成扩展键名就会绕过那一层的判据。
+    _require_string_keys(kwargs, f"{provider} 资源参数")
     sanitized = _copy_nested(dict(kwargs))
 
     # SDK client/resource methods also expose client-level overrides such as
@@ -776,6 +809,7 @@ def validate_secret_free_resource_kwargs(
     found = find_sensitive_option_paths(
         generic_kwargs,
         allowed_containers=_SAFE_RESOURCE_PARAMETER_CONTAINERS,
+        label=f"{provider} 资源参数",
     )
     if found:
         raise ValueError(
@@ -842,6 +876,7 @@ def validate_secret_free_resource_args(
             find_sensitive_option_paths(
                 {f"args[{index}]": value},
                 allowed_containers=_SAFE_RESOURCE_PARAMETER_CONTAINERS,
+                label=f"{provider} 资源位置参数",
             )
         )
     if found:

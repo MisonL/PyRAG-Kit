@@ -4297,6 +4297,116 @@ def test_provider_options_still_accept_string_keys():
     GoogleProvider("m", {"max_tokens": 100})
 
 
+# --- 非字符串键的**嵌套**层级与四个兄弟校验器 ------------------------------
+#
+# 上面那条判据只加在 `validate_secret_free_options` 的**顶层**循环里，注释还专门
+# 写了「只在顶层判」。但共享递归扫描器 `find_sensitive_option_paths` 对每一层映射
+# 都做 `str(key)` 建路径，`normalize_option_key`／`_is_credential_key` 也各自
+# `str(key)`——同一个判据在**嵌套**层级与四个兄弟校验器（payload、
+# request_overrides、resource_kwargs、resource_args）上都没有，而它们共用同一个
+# 扫描器。
+#
+# 两种收场都不在契约内：
+#   `{10**4301: "x"}` 抛 `ValueError: Exceeds the limit`——类型对，内容与字段无关；
+#   `{1: "x"}` 静默通过，随后在调用方的 `", ".join(sorted(...))` 处抛裸
+#   `TypeError: sequence item 0: expected str instance, int found`（实测
+#   `GoogleProvider("m", {"extra_body": {1: "x"}})` 构造成功，首次请求合并
+#   extra_body 时崩）。
+#
+# 修法：把判据收敛到共享递归点 `find_sensitive_option_paths`，并让
+# `normalize_option_key`／`_is_credential_key` 对不可 `str()` 的键退化成量级描述。
+
+
+def _security_validators():
+    """返回 (名字, 校验器) 列表，校验器都接受一个映射并返回结果。"""
+    from src.utils.security import (
+        validate_secret_free_options,
+        validate_secret_free_payload,
+        validate_secret_free_request_overrides,
+        validate_secret_free_resource_args,
+        validate_secret_free_resource_kwargs,
+    )
+
+    return [
+        ("options", lambda value: validate_secret_free_options(value, "P")),
+        ("payload", lambda value: validate_secret_free_payload(value, "P", "extra_body")),
+        ("request_overrides", lambda value: validate_secret_free_request_overrides(value)),
+        ("resource_kwargs", lambda value: validate_secret_free_resource_kwargs(value, "P")),
+        ("resource_args", lambda value: validate_secret_free_resource_args((value,), "P")),
+    ]
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        pytest.param(1, id="int"),
+        pytest.param(_HUGE_INT, id="huge-int"),
+        pytest.param((1, 2), id="tuple"),
+    ],
+)
+def test_security_validators_reject_nested_non_string_keys(key):
+    """嵌套的非字符串键必须抛 ``ValueError``，而不是崩溃或静默通过。"""
+    for label, validate in _security_validators():
+        with pytest.raises(ValueError, match="键必须是字符串"):
+            validate({"extra_body": {key: "x"}})
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        pytest.param(1, id="int"),
+        pytest.param(_HUGE_INT, id="huge-int"),
+    ],
+)
+def test_security_validators_reject_top_level_non_string_keys(key):
+    """四个兄弟校验器的**顶层**键也要收敛（此前只有 options 有这条判据）。"""
+    for label, validate in _security_validators():
+        with pytest.raises(ValueError, match="键必须是字符串"):
+            validate({key: "x"})
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        pytest.param(1, id="int"),
+        pytest.param(_HUGE_INT, id="huge-int"),
+    ],
+)
+def test_provider_options_reject_nested_non_string_keys(key):
+    """provider 的嵌套 options 键（extra_body）同样要收敛。"""
+    for label, factory in _options_provider_factories():
+        with pytest.raises(ValueError, match="键必须是字符串"):
+            factory({"extra_body": {key: "x"}})
+
+
+def test_google_http_options_reject_nested_non_string_key():
+    """Google 自己的 ``http_options`` 递归校验不能漏掉嵌套键。"""
+    with pytest.raises(ValueError, match="键必须是字符串"):
+        GoogleProvider("m", {"http_options": {"headers": {1: "x"}}})
+
+
+def test_google_debug_config_rejects_non_string_key():
+    """``debug_config`` 的非字符串键必须收敛，而不是裸 ``TypeError``。"""
+    with pytest.raises(ValueError, match="键必须是字符串"):
+        GoogleProvider._coerce_debug_config({1: "x"})
+
+
+def test_normalize_option_key_survives_oversized_integer():
+    """``normalize_option_key`` 对位数超限的键不得抛 ``ValueError``。"""
+    from src.utils.security import normalize_option_key
+
+    assert isinstance(normalize_option_key(_HUGE_INT), str)
+
+
+def test_security_validators_still_accept_nested_string_keys():
+    """收紧不能误伤：合法嵌套字符串键照常通过。"""
+    from src.utils.security import validate_secret_free_options
+
+    assert validate_secret_free_options({"extra_body": {"routing": {"tenant": "demo"}}}, "P") == {
+        "extra_body": {"routing": {"tenant": "demo"}}
+    }
+
+
 # --- 拒答消息的非字符串取值 ------------------------------------------------
 #
 # `field()` 明确支持**字典形态**的响应（docstring：「兼容 Pydantic SDK 对象和

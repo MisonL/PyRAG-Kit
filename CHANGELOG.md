@@ -6,6 +6,12 @@
 
 ### 修复
 
+- **非字符串键的判据只加在顶层，嵌套层级与四个兄弟校验器仍漏**（`src/utils/security.py`、`src/providers/google.py`）。上一条修的是 `validate_secret_free_options` 的**顶层**循环，注释还专门写了「只在顶层判」。但共享递归扫描器 `find_sensitive_option_paths` 对**每一层**映射都做 `str(key)` 建路径，`normalize_option_key`／`_is_credential_key` 也各自 `str(key)`；同一判据在嵌套层级和四个兄弟校验器（`validate_secret_free_payload`／`validate_secret_free_request_overrides`／`validate_secret_free_resource_kwargs`／`validate_secret_free_resource_args`）上都没有，而它们共用同一个扫描器。
+
+  两种收场都不在契约内：`{10**4301: "x"}` 抛 `ValueError: Exceeds the limit`——类型对、内容与字段无关；`{1: "x"}` 则**静默通过**，随后在调用方的 `", ".join(sorted(...))` 处抛裸 `TypeError: sequence item 0: expected str instance, int found`（实测 `GoogleProvider("m", {"extra_body": {1: "x"}})` 构造成功，首次请求合并 `extra_body` 时才崩）。Google 自己的 `_validate_http_options` 递归与 `_coerce_debug_config` 也各有一处 `str(key)`／`sorted(...)`。
+
+  修法：把判据收敛到唯一的递归点 `find_sensitive_option_paths`（新增 `label` 参数，错误消息带上具体路径），让 `normalize_option_key`／`_is_credential_key` 对不可 `str()` 的键走 `_display_repr` 降级，并在 `_coerce_debug_config` 与 `_validate_http_options` 各补一条同判据。回归测试 11 条（五类校验器 × 嵌套/顶层非字符串键、三个 provider 的嵌套键、Google 的 `http_options` 与 `debug_config`、`normalize_option_key` 的降级、以及一条「合法嵌套字符串键照常」的反向守卫），其中 10 条在未修源码时实测变红。
+
 - **Google 拒答消息在非字符串取值下抛裸 `ValueError`**（`src/providers/google.py`）。两处 `str(message or ...)`（`_extract_refusal` 与 `_stream_events_from_chunk`）对位数超限的整数抛 `ValueError: Exceeds the limit`。`field()` 明确支持**字典形态**的响应（docstring：「兼容 Pydantic SDK 对象和字典响应」），而字典里的 `prompt_feedback.message` 不受 SDK `Optional[str]` 约束，因此该形态在文档化的输入契约内可达。
 
   这两处的职责恰恰是**报告拒答**：在正要报出「提示被安全策略拦截」的原因时自己崩掉，用户拿到的是与该语义毫无关联的整数转换错误，而本 provider 的错误分类按 `RuntimeError` 写（`ValueError` 不在调用方的 `except` 里）。修法是字符串原样、非字符串才降级成量级描述——与 `_render_value`／`_path_text` 同一取舍（直接 `safe_repr` 会给正常字符串加引号，改掉显示形态）。同文件的 `_candidate_refusal` 用 `isinstance(value, str)` 守卫，本就安全。回归测试三条（两处崩溃各一条 + 一条「字符串原样」的反向守卫），前两条在未修源码时实测变红。
