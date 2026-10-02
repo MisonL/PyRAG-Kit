@@ -93,6 +93,15 @@ class ChatService:
         for label, value in (("用户输入", user_input), ("意图", intent)):
             if not isinstance(value, str):
                 raise ValueError(f"{label}必须是字符串，但得到 {safe_repr(value)}。")
+        # ``documents`` 的容器形态同判据。上面两个标量参数有守卫而这一半此前
+        # 漏了，实测两种收场都不在契约内：``5``／``None`` 抛裸
+        # ``TypeError: 'int' object is not iterable``（不是 ``ValueError``，两个
+        # 调用点的错误分类接不住）；``"abc"`` 更隐蔽——字符串是合法可迭代对象，
+        # 逐**字符**迭代后每个字符都被下面的「内容为空则跳过」滤掉，于是**静默
+        # 退化成「没有找到相关知识」**，一次带着知识调用的请求被无声降级，模型
+        # 据此回答「我不知道」。
+        if not isinstance(documents, list):
+            raise ValueError(f"documents 必须是文档列表，但得到 {safe_repr(documents)}。")
         # 字段形态统一由 display_utils 的助手收敛。检索结果可以来自任何
         # ``VectorStoreBase`` 实现——``FaissStore`` 会在载入期校验并归一化，
         # 第三方 store 不会。两处后果：``metadata`` 非映射时抛

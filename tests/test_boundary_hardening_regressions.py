@@ -5046,3 +5046,43 @@ def test_anthropic_async_text_stream_fallback_coerces_non_string_chunks():
 
     assert all(isinstance(item, str) for item in yielded), yielded
     assert "正常" in yielded
+
+
+# ── ChatService._build_prompt 的第三个入参同样缺形态判据 ──
+#
+# 上面那一组给 `user_input`／`intent` 补了判据（判据只做了一半的典型：同一次
+# 调用的两个标量参数修了，`documents` 这一半漏了）。实测：
+#   documents=5／None -> 裸 TypeError: 'int' object is not iterable
+#   documents="abc"    -> 字符串是合法可迭代对象，逐**字符**迭代，每个字符经
+#                         document_* 助手收敛成默认值后整条跳过（`content` 为
+#                         空即 `continue`），于是**静默退化成「没有找到相关
+#                         知识」**——一次带着知识调用的请求被无声地降级成
+#                         「无知识」prompt，模型据此回答「我不知道」。
+# `_build_prompt` 的调用点（`generate_reply` 与 `chat_async` 的内联分支）都
+# 在按 `ValueError` 分类的边界内，而 `TypeError` 不是。
+
+
+@pytest.mark.parametrize(
+    "documents",
+    [
+        pytest.param(5, id="int"),
+        pytest.param(None, id="none"),
+        pytest.param({"a": 1}, id="dict"),
+        pytest.param("abc", id="str"),
+    ],
+)
+def test_build_prompt_rejects_non_list_documents(documents):
+    """非列表的 ``documents`` 不得抛裸 ``TypeError``，也不得静默降级成无知识。"""
+    from src.services.chat_service import ChatService
+
+    with pytest.raises(ValueError, match="documents"):
+        ChatService._build_prompt("问题", "意图", documents)
+
+
+def test_build_prompt_still_accepts_document_lists():
+    """收紧不能误伤：正常的文档列表照常产出带知识的 prompt。"""
+    from src.services.chat_service import ChatService
+
+    prompt = ChatService._build_prompt("问题", "意图", [{"page_content": "正文"}])
+
+    assert "正文" in prompt

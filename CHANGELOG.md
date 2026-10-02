@@ -6,6 +6,8 @@
 
 ### 修复
 
+- **`ChatService._build_prompt` 的第三个入参 `documents` 缺形态判据**（`src/services/chat_service.py`）。上一轮给同一次调用的两个标量参数 `user_input`／`intent` 补了判据，`documents` 这一半漏了。实测两种收场都不在契约内：`5`／`None` 抛裸 `TypeError: 'int' object is not iterable`（不是 `ValueError`，两个调用点的错误分类接不住）；`"abc"` 更隐蔽——字符串是合法可迭代对象，逐**字符**迭代后每个字符都被「内容为空则跳过」滤掉，于是**静默退化成「没有找到相关知识」**，一次带着知识调用的请求被无声降级，模型据此回答「我不知道」。修法：容器形态判据与两个标量参数同处、同措辞。回归测试 5 条（`int`／`None`／`dict`／`str` + 一条「正常文档列表照常产出带知识的 prompt」的反向守卫），其中 4 条在未修源码时实测变红。
+
 - **`ExcelLogger.log_results` 对非列表的 `results` 静默写出垃圾行**（`src/retrieval_test/excel_logger.py`）。方法签名声明 `list[dict]`，但它是**公开方法**，两种非列表取值都不在契约内：`"abc"` 是合法可迭代对象，`enumerate` 逐**字符**迭代，每个字符经 `document_*` 助手收敛成占位符——实测写出 3 条内容与来源都是占位符的伪结果行，用户看到日志写着 3 条命中，而实际返回的是字符串；`5`／`True`／`1.5` 抛裸 `TypeError: 'int' object is not iterable`，而本方法的调用点位于 `try` **之外**（与 `_append_text_row` 同因），异常直接冒到召回测试主循环的 `except Exception`——一次**成功**的召回被显示成「召回测试出错」。修法：按「非列表一律视为无结果」收敛，与既有的 `if not results` 分支共用同一条出口。回归测试 5 条（`str`／`int`／`bool`／`float` + 一条「正常文档列表照常逐条落盘」的反向守卫），其中 4 条在未修源码时实测变红。
 
 - **OpenAI 兼容构造器的 `provider` 参数无形态守卫**（`src/providers/openai_compatible.py`）。与上一条 `model_name` 同一处、同一类：`__init__` 里 `provider.lower()` 直接调用，非字符串抛裸 `AttributeError: 'list' object has no attribute 'lower'`。而 `provider` 随后要拼出 `{provider}_api_key` 字段名，本类的其余拒绝路径（缺 key／缺 base_url／协议非法）都给带指引的 `ValueError`。工厂路径已用 `require_provider_name` 收敛，直接构造这条路径漏了。修法：构造期先判形态，与 `require_provider_name` 同判据。回归测试 4 条（三类非字符串形态 + 一条「字符串照常构造」的反向守卫），其中 3 条在未修源码时实测变红。
