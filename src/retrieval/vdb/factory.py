@@ -2,6 +2,7 @@
 # 原始来源: https://github.com/langgenius/dify
 # 遵循修改后的 Apache License 2.0 许可证。详情请参阅项目根目录下的 DIFY_LICENSE 文件。
 
+import os
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -107,7 +108,21 @@ class VectorStoreFactory:
             store.load_snapshot(str(active_snapshot_dir), snapshot_root=run_config.snapshot_root)
             return
 
-        legacy_path = Path(run_config.legacy_pkl_path)
+        # 形态先收敛：``Path(5)``／``Path(["a"])`` 抛裸 ``TypeError: expected str,
+        # bytes or os.PathLike object, not ...``，位数超限的整数抛 ``ValueError:
+        # Exceeds the limit``——两条都不是本模块其余拒绝路径承诺的带指引
+        # ``ValueError``。``RunConfig`` 是 frozen dataclass、字段没有校验器（同文件
+        # ``_require_embedding_detail`` 已认领这条可达性），而本方法由
+        # ``get_default_vector_store`` 在 ``Chatbot`` 初始化时调用。判据与
+        # ``FaissStore.load``／``resolve_within`` 的同类守卫一致。
+        legacy_value = run_config.legacy_pkl_path
+        if not isinstance(legacy_value, (str, os.PathLike)):
+            raise ValueError(
+                "legacy_pkl_path 必须是字符串或路径，"
+                f"但得到 {type(legacy_value).__name__}。"
+                " 请检查 config.toml 里的 pkl_path 配置项。"
+            )
+        legacy_path = Path(legacy_value)
         if not legacy_path.exists():
             return
 

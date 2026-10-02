@@ -22,7 +22,18 @@ _MAX_SNAPSHOT_ID_LENGTH = 64
 class SnapshotRepository:
     def __init__(self, run_config: RunConfig):
         self.run_config = run_config
-        self.root = run_config.snapshot_root
+        root = run_config.snapshot_root
+        # 形态先收敛：下一行直接对 ``root`` 调 ``.mkdir()``，非 ``Path`` 取值在那里
+        # 抛裸 ``AttributeError: 'int' object has no attribute 'mkdir'``——不是本类
+        # 其余拒绝路径承诺的带指引 ``ValueError``。``RunConfig`` 是 frozen
+        # dataclass、字段没有校验器，嵌入方可以自拼 ``snapshot_root=5`` 的配置。
+        # 只接受 ``Path``（``RunConfig`` 的标注就是它），不做静默强转。
+        if not isinstance(root, Path):
+            raise ValueError(
+                f"snapshot_root 必须是 Path，但得到 {type(root).__name__}。"
+                " 请检查 config.toml 里的 snapshot_root 配置项。"
+            )
+        self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
 
     def get_active_snapshot_id(self) -> str | None:

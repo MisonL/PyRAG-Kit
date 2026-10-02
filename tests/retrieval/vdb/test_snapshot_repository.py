@@ -341,6 +341,30 @@ def run_config(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "bad_root",
+    [
+        pytest.param(5, id="int"),
+        pytest.param(["a"], id="list"),
+        pytest.param(None, id="none"),
+    ],
+)
+def test_snapshot_repository_rejects_non_path_snapshot_root(run_config, bad_root):
+    """``snapshot_root`` 非 ``Path`` 时必须给 ``ValueError``，不是裸 ``AttributeError``。
+
+    ``SnapshotRepository.__init__`` 直接对 ``run_config.snapshot_root`` 调
+    ``.mkdir()``，而 ``RunConfig`` 是 frozen dataclass、字段没有校验器（同仓库多处
+    已认领这条可达性），嵌入方可以自拼一个 ``snapshot_root=5`` 的配置。实测抛裸
+    ``AttributeError: 'int' object has no attribute 'mkdir'``——不是本类其余拒绝
+    路径承诺的带指引 ``ValueError``。``Path`` 之外的形态一律拒绝，不做静默强转：
+    ``snapshot_root`` 的契约就是 ``Path``（``RunConfig`` 的标注）。
+    """
+    from dataclasses import replace
+
+    with pytest.raises(ValueError, match="snapshot_root"):
+        SnapshotRepository(replace(run_config, snapshot_root=bad_root))
+
+
+@pytest.mark.parametrize(
     "payload",
     [
         "../../../tmp/elsewhere",  # 相对逃逸

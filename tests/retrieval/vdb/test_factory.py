@@ -413,3 +413,44 @@ def test_legacy_import_rejects_unusable_embedding_detail_readably(tmp_path):
 
     with pytest.raises(ValueError, match="取值必须是提供"):
         RealFactory._load_existing_state(_StubStore(), run_config)
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        pytest.param(5, id="int"),
+        pytest.param(["a"], id="list"),
+        pytest.param(10**4301, id="beyond-int-str-digits"),
+    ],
+)
+def test_legacy_import_rejects_non_path_legacy_pkl_path(tmp_path, bad_path):
+    """legacy 分支对非路径的 ``legacy_pkl_path`` 必须给 ``ValueError``。
+
+    ``_load_existing_state`` 第一件事就是 ``Path(run_config.legacy_pkl_path)``，而
+    ``RunConfig`` 是 frozen dataclass、字段没有校验器（同文件
+    ``_require_embedding_detail`` 的 docstring 已认领这条可达性）。非路径取值在那里
+    抛裸 ``TypeError: expected str, bytes or os.PathLike object, not ...``，位数超限
+    的整数抛 ``ValueError: Exceeds the limit``——两条都不在本类其余拒绝路径承诺的
+    带指引 ``ValueError`` 契约内，而调用方（``get_default_vector_store`` 在
+    ``Chatbot`` 初始化时调用）按它分类。
+    """
+    from src.retrieval.vdb.factory import VectorStoreFactory as RealFactory
+    from src.runtime.contracts import build_run_config
+    from src.utils.config import get_settings
+
+    settings = get_settings()
+    run_config = build_run_config(settings)
+    run_config = replace(run_config, legacy_pkl_path=bad_path)
+
+    class _StubStore:
+        def __init__(self):
+            self.documents: list = []
+
+        def load(self, path, *, trusted_paths=None):
+            return
+
+        def save_snapshot(self, snapshot_dir):
+            return
+
+    with pytest.raises(ValueError, match="legacy"):
+        RealFactory._load_existing_state(_StubStore(), run_config)
