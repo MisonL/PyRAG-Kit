@@ -1509,7 +1509,15 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
 
     @staticmethod
     def _extract_result(response: Any) -> CompletionResult:
-        choices = field(response, "choices", []) or []
+        # ``choices`` 的形态守卫不能只靠 Chat 路径：``complete``／``acomplete`` 在
+        # Responses 分支走的是 ``_raise_for_response_error``，它只查 ``error`` 与
+        # ``status``，**不碰 choices**（对照 ``openai_compatible`` 的同名方法：
+        # 那边三个提取器也是这个形状）。此前这里直接 ``field(response, "choices",
+        # []) or []``，Responses 响应带 ``choices=5`` 时下面 ``choices[0]`` 抛裸
+        # ``TypeError: 'int' object is not subscriptable``——本 provider 的错误分类
+        # 按 ``RuntimeError`` 写。与 ``output``／``tool_calls`` 同判据走
+        # ``_require_ark_list``。
+        choices = _require_ark_list(field(response, "choices", []) or [], label="响应的 choices")
         text = ""
         calls: list[dict[str, Any]] = []
         if choices:

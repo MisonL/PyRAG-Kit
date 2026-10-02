@@ -3479,6 +3479,32 @@ def test_ark_nested_output_content_keeps_working_for_a_valid_response():
         pytest.param("ab", id="str"),
     ],
 )
+def test_ark_responses_path_guards_choices(bad_choices):
+    """Ark 的 Responses 路径下 ``choices`` 非列表必须收敛成 ``RuntimeError``。
+
+    Ark 的 ``_extract_result`` 被 Chat 与 Responses 两条路径共用，但只有 Chat
+    分支在它之前调了 ``_raise_for_chat_response_error``（含 choices 守卫）；
+    Responses 分支走 ``_raise_for_response_error``，它只查 ``error`` 与
+    ``status``。实测 Responses 响应带 ``choices=5`` 时 ``complete()`` 在
+    ``choices[0]`` 抛裸 ``TypeError: 'int' object is not subscriptable``。
+    """
+    from src.providers.volcengine import VolcengineProvider
+
+    response = SimpleNamespace(
+        choices=bad_choices, output=[], status="completed", id="r", usage=None
+    )
+    with pytest.raises(RuntimeError, match="choices 必须是列表"):
+        VolcengineProvider._extract_result(response)
+
+
+@pytest.mark.parametrize(
+    "bad_choices",
+    [
+        pytest.param(5, id="int"),
+        pytest.param({"0": {}}, id="mapping"),
+        pytest.param("ab", id="str"),
+    ],
+)
 def test_openai_responses_path_guards_choices(bad_choices):
     """Responses 路径下 ``choices`` 非列表必须收敛成 ``RuntimeError``。
 
@@ -3491,6 +3517,73 @@ def test_openai_responses_path_guards_choices(bad_choices):
     )
     with pytest.raises(RuntimeError, match="choices 必须是列表"):
         OpenAICompatibleProvider._extract_response_text(response)
+
+
+@pytest.mark.parametrize(
+    "bad_choices",
+    [
+        pytest.param(5, id="int"),
+        pytest.param({"0": {}}, id="mapping"),
+        pytest.param("ab", id="str"),
+    ],
+)
+@pytest.mark.parametrize(
+    "extractor", ["_extract_tool_calls", "_extract_reasoning", "_extract_refusal"]
+)
+def test_openai_responses_path_guards_choices_in_every_extractor(extractor, bad_choices):
+    """``choices`` 的形态守卫必须覆盖**每一个**读它的提取器。
+
+    ``complete()``／``acomplete()`` 用同一份响应依次调三个提取器
+    （``_extract_response_text``／``_extract_tool_calls``／``_extract_reasoning``），
+    但此前只有 ``_extract_response_text`` 把 ``choices`` 过了
+    ``_require_response_list``，另两个直接 ``for choice in choices``。而
+    ``_extract_response_text`` 在 Responses 路径下**提前返回**——``output_text``
+    是字符串时（正常形态）它根本不碰 ``choices``，于是畸形取值留给另外两个
+    提取器，在 ``for`` 上抛裸 ``TypeError: 'int' object is not iterable``——
+    与同一次调用里 ``_extract_response_text`` 给出的 ``RuntimeError`` 收场不同，
+    而调用方的错误分类按 ``RuntimeError`` 写。
+    """
+    response = SimpleNamespace(output_text="hello", choices=bad_choices, output=[], usage=None)
+    with pytest.raises(RuntimeError, match="choices 必须是列表"):
+        getattr(OpenAICompatibleProvider, extractor)(response)
+
+
+@pytest.mark.parametrize(
+    "bad_choices",
+    [
+        pytest.param(5, id="int"),
+        pytest.param({"0": {}}, id="mapping"),
+        pytest.param("ab", id="str"),
+    ],
+)
+def test_openai_responses_complete_never_raises_bare_type_error_on_bad_choices(bad_choices):
+    """整条 ``complete()`` 路径的收场必须是 ``RuntimeError``，不是裸 ``TypeError``。
+
+    直接调单个提取器只证明「它自己收敛」；这里从 ``complete()`` 入口走一遍，
+    确认三个提取器**串联**之后不再有任何一个把裸异常漏出去。
+    """
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._protocol = "responses"
+    provider._provider = "openai"
+    provider._require_responses_resource = lambda _operation: None
+    provider._build_responses_request = lambda **_kwargs: {}
+    provider._poll_background_response = lambda response, _params: response
+
+    class _Responses:
+        def create(self, **_kwargs):
+            return SimpleNamespace(
+                output_text="hello",
+                choices=bad_choices,
+                output=[],
+                status="completed",
+                id="r",
+                usage=None,
+            )
+
+    provider._get_client = lambda: SimpleNamespace(responses=_Responses())
+
+    with pytest.raises(RuntimeError, match="choices 必须是列表"):
+        provider.complete(prompt="hi", stream=False)
 
 
 @pytest.mark.parametrize(

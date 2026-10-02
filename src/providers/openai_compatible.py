@@ -1689,7 +1689,14 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     @classmethod
     def _extract_tool_calls(cls, response: Any) -> list[dict[str, Any]]:
         calls: list[dict[str, Any]] = []
-        choices = field(response, "choices", []) or []
+        # ``choices`` 的形态守卫必须与 ``_extract_response_text`` 同判据：三者在
+        # 同一次 ``complete()``／``acomplete()`` 里被依次调用，而
+        # ``_extract_response_text`` 在 Responses 路径下会**提前返回**（``output_text``
+        # 是字符串时根本不碰 ``choices``），畸形取值于是留给本函数与
+        # ``_extract_reasoning``，在裸 ``for`` 上抛 ``TypeError: 'int' object is
+        # not iterable``——与同一次调用里另一个提取器给出的 ``RuntimeError`` 收场
+        # 不同，而调用方的错误分类按 ``RuntimeError`` 写。
+        choices = cls._require_response_list(field(response, "choices", []) or [], label="choices")
         for choice in choices:
             message = field(choice, "message") or field(choice, "delta")
             for call in cls._require_response_list(
@@ -1725,7 +1732,10 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     @classmethod
     def _extract_reasoning(cls, response: Any) -> str:
         values: list[str] = []
-        choices = field(response, "choices", []) or []
+        # 与 ``_extract_tool_calls`` 同一处、同一判据：本函数在同一次
+        # ``complete()`` 里紧随 ``_extract_response_text`` 之后运行，而后者在
+        # Responses 路径下提前返回，``choices`` 的形态守卫覆盖不到这里。
+        choices = cls._require_response_list(field(response, "choices", []) or [], label="choices")
         for choice in choices:
             message = field(choice, "message") or field(choice, "delta")
             for name in ("reasoning_content", "reasoning"):
@@ -1756,7 +1766,11 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
     @classmethod
     def _extract_refusal(cls, response: Any) -> str | None:
         """提取 Chat Completions 与 Responses 的统一拒答文本。"""
-        choices = field(response, "choices", []) or []
+        # 与 ``_extract_tool_calls``／``_extract_reasoning`` 同一处、同一判据：
+        # 三者在同一次 ``complete()`` 里被依次调用，而 Responses 路径下
+        # ``_extract_response_text`` 提前返回、``_raise_for_response_error`` 也不碰
+        # ``choices``，畸形取值只能在这里收敛。
+        choices = cls._require_response_list(field(response, "choices", []) or [], label="choices")
         for choice in choices:
             message = field(choice, "message") or field(choice, "delta")
             refusal = field(message, "refusal")
