@@ -33,6 +33,14 @@ logger = get_module_logger(__name__)
 
 
 def display_results(query: str, documents: list[dict]):
+    # 形态先收敛，与同一主循环里的 ``ExcelLogger.log_results`` 同判据（两者拿的是
+    # 同一个 ``documents``）。实测非列表取值两种收场都不在契约内：
+    # ``"abc"`` 是合法可迭代对象，逐**字符**迭代后每个字符经 ``document_*`` 助手
+    # 收敛成占位符，渲染出 3 行内容与来源都是 ``N/A`` 的伪结果表格（用户看到
+    # 「召回了 3 条」，而实际返回的是字符串）；``5`` 抛裸
+    # ``TypeError: 'int' object is not iterable``。按「非列表视为无结果」收敛。
+    if not isinstance(documents, list):
+        documents = []
     if not documents:
         console.print(
             Panel(

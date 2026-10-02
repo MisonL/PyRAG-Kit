@@ -6,6 +6,10 @@
 
 ### 修复
 
+- **`display_results` 对非列表 `documents` 静默渲染伪结果**（`src/retrieval_test/core.py`）。与同一次提交里修的 `ExcelLogger.log_results` 同处、同类——两者在召回测试主循环里拿的是同一个 `documents`。实测 `documents="abc"` 是合法可迭代对象，逐**字符**迭代后每个字符经 `document_*` 助手收敛成占位符，渲染出 3 行内容与来源都是 `N/A` 的伪结果表格（用户看到「召回了 3 条」，而实际返回的是字符串）；`5` 抛裸 `TypeError: 'int' object is not iterable`。修法：按「非列表视为无结果」收敛，与 `log_results` 同判据。回归测试 4 条（`str`／`int`／`bool` + 一条「正常文档列表照常逐条渲染」的反向守卫），其中 3 条在未修源码时实测变红。
+
+  （同一次改动把 `_UNTRUSTED_FREE_ARGUMENTS` 里两条按行号登记的条目从 `60`／`61` 同步到 `68`／`69`——该清单按 `文件:行号` 索引，新增守卫行会让旧行号失效。）
+
 - **`FaissStore.upsert_embeddings` 的 `documents` 顶层容器缺形态判据**（`src/retrieval/vdb/faiss_store.py`）。条目形态早已由 `_validate_document_shape` 逐条判，顶层容器这一半漏了：`upsert_embeddings` 第一行就是 `if not documents: return`，随后 `len(documents)`。实测 `documents=5` 抛裸 `TypeError: object of type 'int' has no len()`，不是本方法其余拒绝路径承诺的 `ValueError`（载入侧 `_normalize_documents` 对同一形态给的是带指引的 `ValueError`）；`documents=None` 更糟——它被 `if not documents` 当成「无写入」**静默返回**，调用方以为写入成功而 store 一个字都没变，写入路径上的静默无操作比报错更难查。修法：判据与载入侧同名守卫一致（拒绝 `str`／`bytes`／映射，要求有 `__len__`）。回归测试 5 条（`int`／`None`／`str`／`dict` + 一条「正常文档列表照常写入」的反向守卫），其中 4 条在未修源码时实测变红。
 
 - **`ChatService._build_prompt` 的第三个入参 `documents` 缺形态判据**（`src/services/chat_service.py`）。上一轮给同一次调用的两个标量参数 `user_input`／`intent` 补了判据，`documents` 这一半漏了。实测两种收场都不在契约内：`5`／`None` 抛裸 `TypeError: 'int' object is not iterable`（不是 `ValueError`，两个调用点的错误分类接不住）；`"abc"` 更隐蔽——字符串是合法可迭代对象，逐**字符**迭代后每个字符都被「内容为空则跳过」滤掉，于是**静默退化成「没有找到相关知识」**，一次带着知识调用的请求被无声降级，模型据此回答「我不知道」。修法：容器形态判据与两个标量参数同处、同措辞。回归测试 5 条（`int`／`None`／`dict`／`str` + 一条「正常文档列表照常产出带知识的 prompt」的反向守卫），其中 4 条在未修源码时实测变红。

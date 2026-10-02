@@ -754,3 +754,50 @@ def test_excel_logger_still_logs_real_result_lists(tmp_path):
     rows = list(load_workbook(logger.filepath).active.iter_rows(values_only=True))
     assert len(rows) == 3
     assert {row[6] for row in rows[1:]} == {"第一条", "第二条"}
+
+
+# ── 回归：display_results 对非列表 documents 静默渲染伪结果 ──
+#
+# ``display_results`` 与 ``ExcelLogger.log_results`` 同处、同类（两者都在召回
+# 测试主循环里被同一个 ``documents`` 调用，且本文件已给后者补了判据）。实测：
+#   * ``documents="abc"`` —— 字符串是合法可迭代对象，逐**字符**迭代后每个字符
+#     经 ``document_*`` 助手收敛成占位符，于是渲染出 3 行内容与来源都是 ``N/A``
+#     的伪结果表格。用户看到「召回了 3 条」，而实际返回的是字符串。
+#   * ``documents=5`` —— 抛裸 ``TypeError: 'int' object is not iterable``。
+
+
+@pytest.mark.parametrize(
+    "documents",
+    [
+        pytest.param("abc", id="str"),
+        pytest.param(5, id="int"),
+        pytest.param(True, id="bool"),
+    ],
+)
+def test_display_results_treats_non_list_documents_as_empty(monkeypatch, documents):
+    """非列表 ``documents`` 必须走「无结果」分支，不得逐字符渲染伪结果。"""
+    from src.retrieval_test.core import display_results
+
+    buffer = _console_buffer(monkeypatch)
+
+    display_results("查询", documents)
+
+    rendered = buffer.getvalue()
+    assert "无结果" in rendered, rendered
+    assert "N/A" not in rendered, rendered
+
+
+def test_display_results_still_renders_real_document_lists(monkeypatch):
+    """收紧不能误伤：正常的文档列表照常逐条渲染。"""
+    from src.retrieval_test.core import display_results
+
+    buffer = _console_buffer(monkeypatch)
+
+    display_results(
+        "查询",
+        [{"page_content": "第一条", "metadata": {"source": "a.md"}, "score": 0.9}],
+    )
+
+    rendered = buffer.getvalue()
+    assert "第一条" in rendered
+    assert "无结果" not in rendered
