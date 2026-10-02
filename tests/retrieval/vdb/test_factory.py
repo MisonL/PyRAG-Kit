@@ -1,5 +1,6 @@
 import json
 import sys
+from dataclasses import replace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -297,3 +298,118 @@ def test_legacy_import_cleans_temp_dir_on_failure(tmp_path):
     )
     assert (snapshot_root / "ACTIVE_SNAPSHOT").read_text(encoding="utf-8") == "previous"
     assert (previous / "keep.txt").read_text(encoding="utf-8") == "保留"
+
+
+# ── 回归：legacy 分支缺 embedding 配置时给出与活动快照分支同类的错误 ──
+
+
+def test_legacy_import_reports_missing_embedding_provider_readably(tmp_path):
+    """legacy 分支读不到活动 embedding 配置时，不能抛裸 ``KeyError``。
+
+    ``_load_existing_state`` 的两条分支都要按 ``default_embedding_provider``
+    去 ``embedding_configurations`` 里取 ``model_name``：活动快照分支显式判过
+    「键不在映射里」，给出带字段名与可选值指引的 ``ValueError``；legacy 分支
+    却直接下标取值。配置里把 provider 名打错（或漏写整段
+    ``embedding_configurations``）时，用户拿到的是裸 ``KeyError: 'local-hash-typo'``
+    —— 没有字段名、没有可选值，也不是调用方按 ``ValueError`` 建立的错误分类。
+    同一个「embedding 配置缺失」的错误，收场不该取决于磁盘上恰好有没有活动快照。
+    """
+    import pickle
+    from pathlib import Path
+
+    import numpy as np
+
+    from src.retrieval.vdb.factory import VectorStoreFactory as RealFactory
+    from src.runtime.contracts import build_run_config
+    from src.utils.config import get_settings
+
+    settings = get_settings()
+    snapshot_root = Path(settings.snapshot_root)
+    snapshot_root.mkdir(parents=True, exist_ok=True)
+
+    # 没有活动快照，但有 legacy pkl —— 走到 legacy 分支。
+    legacy_path = Path(settings.pkl_path)
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    with legacy_path.open("wb") as file:
+        pickle.dump(
+            {
+                "documents": [{"page_content": "旧数据", "metadata": {"source": "old.md"}}],
+                "embeddings": np.zeros((1, 4), dtype=np.float32),
+                "parent_documents": {},
+            },
+            file,
+        )
+
+    run_config = build_run_config(settings)
+    # 模拟「配置里把 provider 名打错」：活动 provider 不在映射里。
+    run_config = replace(run_config, default_embedding_provider="local-hash-typo")
+
+    # 走到 manifest 构造那一步之前不需要真实落盘：缺配置的错误早于
+    # ``validate_snapshot_dir``。用一个只满足 ``load``／``save_snapshot`` 契约的
+    # 替身，让失败点落在被考察的取值上。
+    class _StubStore:
+        def __init__(self):
+            self.documents: list = []
+
+        def load(self, path, *, trusted_paths=None):
+            return
+
+        def save_snapshot(self, snapshot_dir):
+            return
+
+    with pytest.raises(ValueError, match="embedding"):
+        RealFactory._load_existing_state(_StubStore(), run_config)
+
+
+def test_legacy_import_rejects_unusable_embedding_detail_readably(tmp_path):
+    """embedding 配置的**取值**不可用时，legacy 分支也要给 ``ValueError``。
+
+    「键在」不证明「值可用」：``{"local-hash": None}`` 的键确实存在，于是不会走
+    「缺少活动提供商」的分支，而紧接着读 ``.model_name`` 时抛裸
+    ``AttributeError``。同一形态在 ``EmbeddingService.embedding_model_detail``
+    早已收敛成带字段名与 key 的 ``ValueError``，两条路径必须同判据。
+    """
+    import pickle
+    from pathlib import Path
+
+    import numpy as np
+
+    from src.retrieval.vdb.factory import VectorStoreFactory as RealFactory
+    from src.runtime.contracts import build_run_config
+    from src.utils.config import get_settings
+
+    settings = get_settings()
+    snapshot_root = Path(settings.snapshot_root)
+    snapshot_root.mkdir(parents=True, exist_ok=True)
+
+    legacy_path = Path(settings.pkl_path)
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    with legacy_path.open("wb") as file:
+        pickle.dump(
+            {
+                "documents": [{"page_content": "旧数据", "metadata": {"source": "old.md"}}],
+                "embeddings": np.zeros((1, 4), dtype=np.float32),
+                "parent_documents": {},
+            },
+            file,
+        )
+
+    run_config = build_run_config(settings)
+    # 键在、取值不可用（None 没有 provider／model_name 属性）。
+    run_config = replace(
+        run_config,
+        embedding_configurations={settings.default_embedding_provider: None},
+    )
+
+    class _StubStore:
+        def __init__(self):
+            self.documents: list = []
+
+        def load(self, path, *, trusted_paths=None):
+            return
+
+        def save_snapshot(self, snapshot_dir):
+            return
+
+    with pytest.raises(ValueError, match="取值必须是提供"):
+        RealFactory._load_existing_state(_StubStore(), run_config)

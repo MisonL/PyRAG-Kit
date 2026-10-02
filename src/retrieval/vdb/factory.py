@@ -2,12 +2,13 @@
 # 原始来源: https://github.com/langgenius/dify
 # 遵循修改后的 Apache License 2.0 许可证。详情请参阅项目根目录下的 DIFY_LICENSE 文件。
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
+from typing import Any
 
 from ...runtime.contracts import KnowledgeSnapshotManifest, build_run_config
 from ...ui.display_utils import document_source
-from ...utils.config import get_settings, safe_repr
+from ...utils.config import get_settings, require_detail_attributes, safe_repr
 from ...utils.log_manager import get_module_logger
 from ..snapshot_repository import SnapshotRepository
 from .base import VectorStoreBase
@@ -45,19 +46,54 @@ class VectorStoreFactory:
         return store
 
     @staticmethod
+    def _require_embedding_detail(run_config) -> Any:
+        """按 ``default_embedding_provider`` 取活动 embedding 配置详情。
+
+        ``_load_existing_state`` 的两条分支（活动快照与 legacy 导入）都要用同一
+        份配置去构造 manifest。此前两条分支的判据不一致：活动快照分支显式判过
+        「键不在映射里」，给出带字段名与指引的 ``ValueError``；legacy 分支直接
+        下标取值，配置里把 provider 名打错（或漏写整段
+        ``embedding_configurations``）时抛的是裸 ``KeyError: 'local-hash-typo'``
+        ——没有字段名、没有可选值，也不是调用方按 ``ValueError`` 建立的错误
+        分类。同一个「embedding 配置缺失」的错误，收场不该取决于磁盘上恰好有
+        没有活动快照。
+
+        容器形态也要判：``RunConfig`` 是 frozen dataclass、字段无校验器，嵌入方
+        可以自拼一个 ``embedding_configurations`` 非映射的配置送进来，那时
+        ``.get`` 抛裸 ``AttributeError``。判据与
+        ``EmbeddingService.embedding_model_detail`` 一致（同一字段、同一来源）。
+
+        键在**不**代表值可用（同 ``EmbeddingService.embedding_model_detail``）：
+        ``{"local-hash": None}`` 的键确实存在，于是不会走「缺少活动提供商」的
+        分支，而调用方紧接着读 ``.model_name``——抛的是裸 ``AttributeError``，
+        穿透调用方按 ``ValueError`` 建立的错误分类。这里一并收敛。
+        """
+        configurations = run_config.embedding_configurations
+        key = run_config.default_embedding_provider
+        if not isinstance(configurations, Mapping) or key not in configurations:
+            raise ValueError(
+                f"当前 embedding 配置缺少活动提供商: {safe_repr(key)}。"
+                " 请检查 config.toml 里的 default_embedding_provider 与"
+                " embedding_configurations 是否对应。"
+            )
+        detail = configurations[key]
+        require_detail_attributes(
+            detail,
+            ("provider", "model_name"),
+            field="embedding_configurations",
+            key=key,
+            role_label="Embedding",
+        )
+        return detail
+
+    @staticmethod
     def _load_existing_state(store: VectorStoreBase, run_config) -> None:
         snapshot_repository = SnapshotRepository(run_config)
         active_snapshot_dir = snapshot_repository.get_active_snapshot_dir()
         if active_snapshot_dir is not None:
             snapshot_repository.validate_snapshot_dir(active_snapshot_dir)
             manifest = snapshot_repository.load_manifest(active_snapshot_dir)
-            embedding_detail = run_config.embedding_configurations.get(
-                run_config.default_embedding_provider
-            )
-            if embedding_detail is None:
-                raise ValueError(
-                    f"当前 embedding 配置缺少活动提供商: {run_config.default_embedding_provider}"
-                )
+            embedding_detail = VectorStoreFactory._require_embedding_detail(run_config)
             if (
                 manifest.embedding_provider != run_config.default_embedding_provider
                 or manifest.embedding_model != embedding_detail.model_name
@@ -83,13 +119,14 @@ class VectorStoreFactory:
         finalized = False
         try:
             store.save_snapshot(str(temp_dir))
+            # 与活动快照分支同一处取值、同一判据（见 ``_require_embedding_detail``）：
+            # 此前这里直接下标，缺配置时抛裸 ``KeyError``。
+            embedding_detail = VectorStoreFactory._require_embedding_detail(run_config)
             manifest = KnowledgeSnapshotManifest.create(
                 snapshot_id=snapshot_id,
                 store_type=run_config.default_vector_store,
                 embedding_provider=run_config.default_embedding_provider,
-                embedding_model=run_config.embedding_configurations[
-                    run_config.default_embedding_provider
-                ].model_name,
+                embedding_model=embedding_detail.model_name,
                 chunk_mode="legacy-import",
                 source_digest="legacy-import",
                 # ``metadata`` 的形态由助手收敛：``FaissStore`` 会在载入期归一化，
