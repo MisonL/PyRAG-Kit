@@ -6,6 +6,10 @@
 
 ### 修复
 
+- **`ensure_trusted_source` 的字符串信任根被逐字符拆开，信任边界静默失效**（`src/utils/security.py`）。`trusted_roots` 是**可迭代**，而 `str`／`bytes`／`bytearray` 也是合法的可迭代：直接 `for root in trusted_roots` 会把一个字符串信任根拆成单字符根。实测 `trusted_paths="/etc"` 拆出 `"/"`（解析为文件系统根），于是**任意绝对路径都被接受**——`/anywhere/evil.pkl` 也返回成功，正好绕开 `AGENTS.md` 那条「不导入不可信来源的 `.pkl`」的边界。同一模块对 `Sequence` 参数的判据早已显式排除 `str`／`bytes`／`bytearray`（`normalize_messages`／`_require_documents`），这里必须对齐。另外每个根还要能构成 `Path`：`Path(None)`／`Path(5)`／`Path([...])` 抛裸 `TypeError: expected str, bytes or os.PathLike object, not ...`——不是 `ValueError`，穿透 `load` 调用方按 `ValueError` 建立的错误分类，且消息里没有字段名；同模块的 `resolve_within` 对**候选路径**的同类形态给的是带 label 的 `ValueError`，两条判据必须一致。
+
+  修法：`trusted_roots` 若是 `str`／`bytes`／`bytearray` 直接拒绝；逐根构造 `Path` 时把 `TypeError` 收敛成带 label 的 `ValueError`。回归测试 2 条，均在未修源码时实测变红（一条 `DID NOT RAISE`——字符串根静默放行；一条抛裸 `TypeError`）。
+
 - **`split_hierarchical` 绕过尺寸守卫，与 `split` 判据不一致**（`src/etl/splitters/recursive_text_splitter.py`）。`split` 在层级分支里会调 `_validate_hierarchical_sizes()`（子分片 `overlap < size`、比例上界、`child_size < parent_size`），但 `split_hierarchical` 是**公开方法**（同 `_require_documents` 认领的那条理由：「只守卫 `split` 会留下直接调 `split_hierarchical` 的口子」），直接调它时这些判据全部被绕过。实测 `child_overlap == child_size` 时 `split` 抛带指引的 `ValueError`，而 `split_hierarchical` 照常返回——1000 字符的文档产出 694 个分片（子分片器几乎不前进），全部进入 embedding 与 FAISS 写入且无任何提示；`child_size >= parent_size` 则让层级结构静默退化为一层。上一条同类修复只钉了「documents 形态」那一半，尺寸这一半漏了。
 
   修法：把 `_validate_hierarchical_sizes()` 一并移进 `split_hierarchical`（`_require_documents` 已在那里），两条入口同判据。回归测试 2 条，均在未修源码时实测变红（`DID NOT RAISE`）。

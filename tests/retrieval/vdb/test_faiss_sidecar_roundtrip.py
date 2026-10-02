@@ -1202,3 +1202,49 @@ def test_register_parent_documents_still_accepts_a_mapping():
 
     assert set(store.parent_documents) == {"p-ok"}
     assert store.resolve_parent_content("p-ok") == "父块正文"
+
+
+# ── 回归：trusted_paths 传成字符串会被逐字符拆开，边界静默失效 ──
+
+
+def test_load_rejects_string_trusted_paths_instead_of_splitting_it(tmp_path):
+    """``trusted_paths`` 是**可迭代**，传裸字符串会被逐字符拆成信任根。
+
+    ``ensure_trusted_source`` 对 ``trusted_roots`` 直接 ``for root in ...``，
+    而 ``str`` 是合法的可迭代——实测 ``trusted_paths="/tmp/trusted"`` 会拆成
+    ``"/"``、``"t"``、``"m"``… 一堆单字符根，其中 ``"/"`` 解析为文件系统根，
+    于是**任意绝对路径都被接受**：``/anywhere/evil.pkl`` 在 ``trusted_paths=
+    "/etc"`` 下也返回成功。这正是「不导入不可信来源的 .pkl」那条边界要挡的形态，
+    却因为参数写错而静默失效。同一文件对 ``Sequence`` 参数的判据早已显式排除
+    ``str``／``bytes``／``bytearray``（见 ``_require_documents``／
+    ``normalize_messages``），这里必须对齐。
+    """
+    import pickle
+
+    legacy = tmp_path / "legacy.pkl"
+    with legacy.open("wb") as file:
+        pickle.dump({"documents": [], "embeddings": None}, file)
+
+    with pytest.raises(ValueError, match="受信"):
+        FaissStore(file_path=None).load(str(legacy), trusted_paths=str(tmp_path))
+
+
+def test_load_rejects_non_path_trusted_roots_readably(tmp_path):
+    """信任根不是路径时给可读的 ``ValueError``，而不是裸 ``TypeError``。
+
+    ``Path(root)`` 对 ``None``／``int``／``list`` 抛的是裸
+    ``TypeError: expected str, bytes or os.PathLike object, not ...``——它不是
+    ``ValueError``，穿透 ``load`` 调用方按 ``ValueError`` 建立的错误分类，且
+    消息里没有任何字段名。同一模块的 ``resolve_within`` 对**候选路径**的同类
+    形态给出的是带 label 的 ``ValueError``，两条判据必须一致。
+    """
+    import pickle
+
+    legacy = tmp_path / "legacy.pkl"
+    with legacy.open("wb") as file:
+        pickle.dump({"documents": [], "embeddings": None}, file)
+
+    with pytest.raises(ValueError, match="受信"):
+        FaissStore(file_path=None).load(str(legacy), trusted_paths=[None])
+    with pytest.raises(ValueError, match="受信"):
+        FaissStore(file_path=None).load(str(legacy), trusted_paths=[5])

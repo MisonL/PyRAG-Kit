@@ -935,8 +935,38 @@ def ensure_trusted_source(
 
     ``trusted_roots`` 为 ``None`` 或空集合时一律拒绝——调用方没有声明任何
     信任来源时，不能退化成「任意路径都可加载」，否则这个边界等于不存在。
+
+    ``trusted_roots`` 是**可迭代**，而 ``str``／``bytes``／``bytearray`` 也是
+    合法的可迭代：直接 ``for root in trusted_roots`` 会把一个字符串信任根拆成
+    单字符根。实测 ``trusted_roots="/etc"`` 拆出 ``"/"``（解析为文件系统根），
+    于是**任意绝对路径都被接受**——``/anywhere/evil.pkl`` 也返回成功，正好绕开
+    「不导入不可信来源的 .pkl」这条边界。这与同模块对 ``Sequence`` 参数的既有
+    判据一致（``normalize_messages``／``_require_documents`` 都显式排除
+    ``str``／``bytes``／``bytearray``），必须同样拦下。
+
+    每个根还要能构成 ``Path``：``Path(None)``／``Path(5)``／``Path([...])`` 抛
+    裸 ``TypeError: expected str, bytes or os.PathLike object, not ...``——它
+    不是 ``ValueError``，会穿透 ``load`` 调用方按 ``ValueError`` 建立的错误
+    分类，消息里也没有字段名。收敛成带 label 的 ``ValueError``，与
+    ``resolve_within`` 对候选路径的同类形态同判据。
     """
-    roots = [Path(root) for root in trusted_roots] if trusted_roots else []
+    if isinstance(trusted_roots, (str, bytes, bytearray)):
+        raise ValueError(
+            f"{label} 的受信来源必须是路径序列，但得到 {type(trusted_roots).__name__}。"
+            " 字符串会被逐字符拆成信任根（其中 ``/`` 会放行任意绝对路径），"
+            "请传入路径列表，例如 [snapshot_root]。"
+        )
+    roots: list[Path] = []
+    if trusted_roots is not None:
+        for root in trusted_roots:
+            try:
+                roots.append(Path(root))
+            except TypeError as exc:
+                raise ValueError(
+                    f"{label} 的受信来源必须是路径，但得到 {type(root).__name__}。"
+                    " 请传入路径列表（通常来自 RunConfig 的 snapshot_root 或"
+                    " legacy_pkl_path）。"
+                ) from exc
     if not roots:
         raise ValueError(
             f"缺少 {label} 的受信来源声明，已拒绝加载。"
