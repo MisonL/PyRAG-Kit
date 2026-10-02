@@ -6,6 +6,8 @@
 
 ### 修复
 
+- **`local-hash` 的 `model_name` 无形态守卫，非字符串在构造期抛裸 `AttributeError`**（`src/providers/local_hash.py`）。`_parse_dimension` 第一行就是 `model_name.rsplit("-", maxsplit=1)`，而 `LocalHashEmbeddingProvider` 是**公开类**，嵌入方可以绕过工厂直接构造（本仓测试就是这么用的）。实测 `10**4301`／`["m"]`／`None`／`5` 全部抛裸 `AttributeError: 'int' object has no attribute 'rsplit'`——不在本模块其余拒绝路径承诺的 `ValueError` 契约内（维度超上界给的是带指引的 `ValueError`）。`local-hash` 是默认 Embedding provider，工厂路径已用 `require_model_name` 收敛，直接构造这条路径漏了。修法：构造期先判字符串形态，与 `require_model_name` 同判据。回归测试 5 条（四类非字符串形态 + 一条「字符串照常解析」的反向守卫），其中 4 条在未修源码时实测变红。
+
 - **`_chat_status_is_error` 对容器形态的 `status` 抛裸 `ValueError`，错误分类被大整数打断**（`src/providers/openai_compatible.py`）。本方法的 docstring 明确承诺「一个形态奇怪的 `status` 值不能让错误分类本身崩掉」，它也确实挡住了「字符串形态但位数超限」的取值（上一条回归钉住）。但收敛只做了一半：非 `int` 的非字符串走 `str(status).strip().lower()`，而 `str([10**4301])` 自己抛 `ValueError: Exceeds the limit`——于是「网关在响应体里返回了业务错误」变成一条整数转换错误，调用方的错误分类与日志脱敏都接不住。`status` 来自网关 JSON，形态不受控。修法：只有字符串才谈得上「是不是某个错误状态名」，非字符串一律判为「不是错误状态」，与它落在集合外的原语义一致。回归测试 3 条（列表／映射各持大整数 + 一条从 `_raise_for_chat_response_error` 进入的用例），全部在未修源码时实测变红。
 
 - **Google `partial_args` 的 `json_path` 拒绝消息自身用 `!r` 插值，位数超限时抛裸 `ValueError`**（`src/providers/google.py`）。`_partial_arg_tokens` 的两条拒绝分支写 `f"...: {json_path!r}"`。判据是 `isinstance(json_path, str)`，因此**非字符串**取值会走到第一条分支——而 `repr(10**4301)` 自己抛 `ValueError: Exceeds the limit`：**正要报出「json_path 无效」**的那一步变成整数转换错误。`json_path` 来自模型的流式 function call 分片（`partial_args`），形态不受控；上一条回归只覆盖了「字符串形态、索引位数超限」，这条覆盖「取值本身是位数超限的整数」。修法：两处改用 `safe_repr`（对字符串取值与 `!r` 等价，正常路径显示形态不变）。回归测试 3 条（位数超限整数／列表 + 一条从公开入口 `_partial_args_to_mapping` 进入的用例），其中 2 条在未修源码时实测变红。

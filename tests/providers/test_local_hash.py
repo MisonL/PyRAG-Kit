@@ -113,3 +113,38 @@ def test_local_hash_falls_back_to_default_for_digit_strings_beyond_the_limit():
     provider = LocalHashEmbeddingProvider(f"local-hash-{suffix}")
 
     assert len(provider.embed_documents(["文本"])[0]) == 256
+
+
+# ── 回归：非字符串 model_name 在构造期抛裸 AttributeError ──
+#
+# ``_parse_dimension`` 第一行就是 ``model_name.rsplit("-", maxsplit=1)``，而
+# ``LocalHashEmbeddingProvider`` 是**公开类**，嵌入方可以直接构造（本仓测试
+# 就是这么用 ``LocalHashEmbeddingProvider("local-hash-32")`` 的）。实测
+# ``10**4301``／``["m"]``／``None``／``5`` 全部抛裸
+# ``AttributeError: 'int' object has no attribute 'rsplit'``——不在本模块其余
+# 拒绝路径承诺的 ``ValueError`` 契约内（维度超上界给的是带指引的 ``ValueError``）。
+# ``model_name`` 的来源与 ``config.toml`` 的 ``model_name`` 同源；工厂路径已用
+# ``require_model_name`` 收敛，但直接构造这条路径漏了。
+
+
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        pytest.param(10**4301, id="huge-int"),
+        pytest.param(["m"], id="list"),
+        pytest.param(None, id="none"),
+        pytest.param(5, id="int"),
+    ],
+)
+def test_local_hash_rejects_non_string_model_name_readably(model_name):
+    """非字符串 ``model_name`` 必须给出带字段名的 ``ValueError``。"""
+    with pytest.raises(ValueError) as excinfo:
+        LocalHashEmbeddingProvider(model_name)
+
+    assert "model_name" in str(excinfo.value)
+
+
+def test_local_hash_still_accepts_string_model_names():
+    """收紧不能误伤：字符串形态照常解析。"""
+    assert len(LocalHashEmbeddingProvider("local-hash-32").embed_documents(["文本"])[0]) == 32
+    assert len(LocalHashEmbeddingProvider("local-hash").embed_documents(["文本"])[0]) == 256
