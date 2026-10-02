@@ -1,3 +1,4 @@
+import faiss
 import numpy as np
 import pytest
 
@@ -11,6 +12,34 @@ def test_faiss_store_rejects_snapshot_without_embeddings_before_writing_npy(tmp_
         store.save_snapshot(str(tmp_path / "snapshot"))
 
     assert not (tmp_path / "snapshot" / "embeddings.npy").exists()
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        pytest.param(5, id="int"),
+        pytest.param(["a"], id="list"),
+        pytest.param(10**4301, id="beyond-int-str-digits"),
+    ],
+)
+@pytest.mark.parametrize("method", ["save", "save_snapshot"])
+def test_faiss_store_write_entries_reject_non_path_arguments(bad_path, method):
+    """写入侧入口的非路径入参必须收敛成 ``ValueError``，不是裸 ``TypeError``。
+
+    ``save``／``save_snapshot`` 是 ``load``／``load_snapshot`` 的写入侧兄弟
+    （``VectorStoreBase`` 的契约方法，同一份公开接口），读取侧早已按同一判据
+    校验入参形态，写入侧这一半漏了：``Path(5)``／``Path(["a"])`` 抛裸
+    ``TypeError: expected str, bytes or os.PathLike object, not ...``，位数超限
+    的整数抛 ``ValueError: Exceeds the limit``——类型对、内容却与目标路径无关。
+    两条都不在本类其余拒绝路径承诺的带指引 ``ValueError`` 契约内。
+    """
+    store = FaissStore(file_path=None)
+    store.documents = []
+    store.embeddings = np.zeros((1, 4), dtype=np.float32)
+    store.faiss_index = faiss.IndexFlatL2(4)
+
+    with pytest.raises(ValueError, match="必须是字符串或路径"):
+        getattr(store, method)(bad_path)
 
 
 def _activate_snapshot(snapshot_root, snapshot_id: str) -> None:

@@ -622,6 +622,17 @@ class FaissStore(VectorStoreBase):
         )
 
     def save(self, path: str):
+        # 形态守卫与读取侧 ``load``／``load_snapshot`` 同判据：``open()`` 对**整数**
+        # 入参不报错，而是把它当成**文件描述符**——``save(5)`` 会把 pickle 字节写进
+        # fd 5（实测复现），既没落到预期路径，也可能覆盖进程里恰好占着该 fd 的
+        # 文件；对 ``list`` 抛裸 ``TypeError: expected str, bytes or os.PathLike
+        # object, not ...``，位数超限的整数抛 ``ValueError: Exceeds the limit``。
+        # 三条都不是本类其余拒绝路径承诺的带指引 ``ValueError``。
+        if not isinstance(path, (str, os.PathLike)):
+            raise ValueError(
+                f"向量存储文件路径必须是字符串或路径，但得到 {type(path).__name__}。"
+                " 请检查该路径来源（通常来自 RunConfig 或 SnapshotRepository）。"
+            )
         with open(path, "wb") as file:
             pickle.dump(
                 {
@@ -686,6 +697,14 @@ class FaissStore(VectorStoreBase):
     def save_snapshot(self, snapshot_dir: str):
         if self.faiss_index is None or self.embeddings is None:
             raise RuntimeError("当前语义索引为空，无法保存快照。")
+        # 与 ``save`` 同一处、同一判据（详见那里的说明）：``Path(5)`` 抛裸
+        # ``TypeError``、位数超限的整数抛 ``ValueError: Exceeds the limit``，都绕开
+        # 本类的 ``ValueError`` 契约。写入侧入口的形态判据与读取侧对齐。
+        if not isinstance(snapshot_dir, (str, os.PathLike)):
+            raise ValueError(
+                f"快照目录必须是字符串或路径，但得到 {type(snapshot_dir).__name__}。"
+                " 请检查该路径来源（通常来自 RunConfig 或 SnapshotRepository）。"
+            )
         snapshot_path = Path(snapshot_dir)
         snapshot_path.mkdir(parents=True, exist_ok=True)
         with (snapshot_path / "chunks.pkl").open("wb") as file:

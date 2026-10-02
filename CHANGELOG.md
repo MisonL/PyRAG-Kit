@@ -6,6 +6,8 @@
 
 ### 修复
 
+- **`FaissStore.save`／`save_snapshot` 对非路径入参无形态守卫，整数会被当成文件描述符**（`src/retrieval/vdb/faiss_store.py`）。两个写入侧入口是 `load`／`load_snapshot` 的契约兄弟（`VectorStoreBase` 的公开方法），读取侧早已按同一判据校验入参形态，写入侧这一半漏了。后果比 `TypeError` 更重：`open()` 对**整数**入参不报错，而是把它当成**文件描述符**——`save(5)` 会把 pickle 字节写进 fd 5（实测复现），既没落到预期路径，也可能覆盖进程里恰好占着该 fd 的文件；`save(['a'])` 抛裸 `TypeError: expected str, bytes or os.PathLike object, not ...`，位数超限的整数抛 `ValueError: Exceeds the limit`。三条都不在本类承诺的带指引 `ValueError` 契约内。修法：两个入口在第一次使用路径之前判形态。回归测试 6 条（`save`／`save_snapshot` × `int`／`list`／位数超限整数），全部在未修源码时实测变红。
+
 - **`FaissStore.load_snapshot` 对非路径入参抛裸 `TypeError`，与 `load` 判据不一致**（`src/retrieval/vdb/faiss_store.py`）。`load`（legacy 入口）此前已按同一判据修过，而 `load_snapshot` 这一半漏了：它在调 `resolve_within` **之前**先写 `Path(snapshot_dir)`／`Path(snapshot_root)`，非路径取值在那里抛裸 `TypeError: expected str, bytes or os.PathLike object, not ...`；位数超限的整数抛 `ValueError: Exceeds the limit`——类型对、内容却与快照路径无关。两条都不在本方法其余拒绝路径承诺的带指引 `ValueError` 契约内，而调用方 `VectorStoreFactory._load_existing_state` 按它分类。修法：把原始取值直接交给 `resolve_within`（它先判形态再解析），不再预先包 `Path`。回归测试 6 条（`snapshot_dir`／`snapshot_root` × `int`／`list`／位数超限整数），全部在未修源码时实测变红。
 
 - **`_require_snapshot_id_within_root` 对非路径形态的快照 id 抛裸 `TypeError`**（`src/retrieval/snapshot_repository.py`）。该方法第一行就写 `Path(snapshot_id)`，而 `Path(5)`／`Path(["a"])`／`Path(b"abc")` 抛裸 `TypeError: expected str, bytes or os.PathLike object, not ...`——不是本类承诺的带指引 `ValueError`，也没有「快照 id 不合法」的语义。位数超限的整数更隐蔽：`Path(10**4301)` 抛 `ValueError: Exceeds the limit`，类型对、内容却与快照 id 无关。快照 id 的来源之一是磁盘上的标记文件（`get_active_snapshot_id`），而三个 `*_temp_snapshot_dir`／`finalize_snapshot` 都对拼出的路径做 `rmtree`。修法：构造 `Path` 之前先判形态，与同仓库的 `resolve_within`／`ensure_trusted_source` 同判据。回归测试 4 条（`int`／`list`／位数超限整数／`bytes`），全部在未修源码时实测变红。
