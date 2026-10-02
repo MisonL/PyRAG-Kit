@@ -4782,3 +4782,39 @@ def test_split_hierarchical_rejects_child_larger_than_parent():
 
     with pytest.raises(ValueError, match="kb_child_chunk_size 必须小于 kb_chunk_size"):
         splitter.split_hierarchical([document])
+
+
+def test_stream_events_survive_huge_integer_block_reason():
+    """流式拒答的**兜底文案**里插值的 ``block_reason`` 也要收敛。
+
+    上一条钉的是 ``message`` 那一半，而 ``refusal = message or f"...: {block_reason}"``
+    的兜底分支同样把服务端取值插进 f-string。``field`` 支持字典形态的响应，
+    ``block_reason`` 不受 SDK 枚举约束——位数超限的整数让裸插值抛
+    ``ValueError: Exceeds the limit``，于是**正要报出安全拦截**的那一步变成
+    整数转换错误。非流式的 ``_extract_refusal`` 早已把 ``block_reason`` 收敛成
+    ``block_reason_text``（枚举取 name、字符串取 strip、其余空串），流式这一半
+    漏了——同一份响应在两条路径上的收场必须一致。
+    """
+    chunk = {
+        "candidates": [],
+        "prompt_feedback": {"block_reason": 10**4301},
+    }
+
+    events = GoogleProvider._stream_events_from_chunk(chunk)
+
+    refusals = [event.refusal for event in events if event.type == "refusal_delta"]
+    assert refusals, "应产出拒答事件"
+    assert "Exceeds the limit" not in refusals[0]
+
+
+def test_stream_events_keep_string_block_reason_verbatim():
+    """收紧不能误伤：字符串 block_reason 照旧进兜底文案。"""
+    chunk = {
+        "candidates": [],
+        "prompt_feedback": {"block_reason": "SAFETY"},
+    }
+
+    events = GoogleProvider._stream_events_from_chunk(chunk)
+
+    refusals = [event.refusal for event in events if event.type == "refusal_delta"]
+    assert refusals == ["Google 提示被安全策略拦截: SAFETY"]

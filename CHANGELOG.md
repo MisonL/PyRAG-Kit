@@ -6,6 +6,10 @@
 
 ### 修复
 
+- **Google 流式拒答的兜底文案未收敛 `block_reason`，与 `_extract_refusal` 判据不一致**（`src/providers/google.py`）。流式路径的 `refusal = message or f"Google 提示被安全策略拦截: {block_reason}"` 里，`message` 那一半早已收敛（上一条同类修复），而 `block_reason` 直接插值。`field` 支持字典形态的响应，`block_reason` 不受 SDK 枚举约束——位数超限的整数让裸插值抛 `ValueError: Exceeds the limit`，于是**正要报出安全拦截**的那一步变成整数转换错误；而且 f-string 在**求值期**就拼好，即使 `message` 非空、兜底文案根本不会被用到，这条路径仍会崩。非流式的 `_extract_refusal` 早已把 `block_reason` 收敛成 `block_reason_text`（枚举取 name、字符串取 strip、其余空串），流式这一半漏了——同一份响应在两条路径上的收场必须一致。
+
+  修法：把 `_extract_refusal` 的归一化逐字搬进流式分支。回归测试 2 条，其中「位数超限的整数 `block_reason`」在未修源码时实测变红。
+
 - **路径形态判据只做了一半：`resolve_within` 与 `FaissStore.load` 对非路径取值抛裸 `TypeError`**（`src/utils/security.py`、`src/retrieval/vdb/faiss_store.py`）。上一条修的是**受信根**列表里的元素，候选路径与根本身这一半漏了：`resolve_within` 把 `candidate`／`root` 直接交给 `Path(...)`，而 `Path(None)`／`Path(5)`／`Path([...])` 抛裸 `TypeError: expected str, bytes or os.PathLike object, not ...`——不是 `ValueError`，消息里也没有字段名，而两个调用方（`ensure_trusted_source` 与 `FaissStore.load_snapshot`）都按 `ValueError` 分类。`FaissStore.load` 更早一步：第一行的 `os.path.exists(path)` 就对非路径抛同一个 `TypeError`。`ensure_trusted_source` 还有第三条：它的逐根试探用 `except ValueError: continue` 吞掉 `resolve_within` 的守卫，最后落到兜底消息里的 `Path(candidate)`，在那里再抛一次 `TypeError`。
 
   修法：`resolve_within` 在构造 `Path` 之前判 `candidate`／`root` 形态（消息带上是哪个参数错了）；`ensure_trusted_source` 在兜底消息之前判 `candidate`；`FaissStore.load` 在第一次使用路径之前判。回归测试 2 条，均在未修源码时实测变红（裸 `TypeError`）。

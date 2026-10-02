@@ -2600,7 +2600,19 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             # 整数转换错误。字符串原样，非字符串降级成量级描述。
             if not isinstance(message, str):
                 message = safe_repr(message) if message else ""
-            refusal = message or f"Google 提示被安全策略拦截: {block_reason}"
+            # 兜底文案里插值的 ``block_reason`` 同样要收敛，判据与非流式的
+            # ``_extract_refusal`` 逐字一致（枚举取 name、字符串取 strip、其余
+            # 空串）：它同样来自字典形态的响应、不受 SDK 枚举约束，位数超限的
+            # 整数让裸插值抛 ``ValueError: Exceeds the limit``。``message`` 非空
+            # 时兜底文案不会被用到，但 f-string 在**求值期**就拼好——不收敛的话
+            # 这条路径仍会崩。
+            if isinstance(block_reason, Enum):
+                block_reason_text = block_reason.name or str(block_reason)
+            elif isinstance(block_reason, str):
+                block_reason_text = block_reason.strip()
+            else:
+                block_reason_text = ""
+            refusal = message or f"Google 提示被安全策略拦截: {block_reason_text}"
             if not any(event.type == "refusal_delta" for event in events):
                 events.append(
                     StreamEvent(
