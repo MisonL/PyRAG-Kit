@@ -2097,8 +2097,15 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
     @staticmethod
     def _partial_arg_tokens(json_path: str) -> list[str | int]:
         """解析 Vertex PartialArg 使用的常见 JSONPath 子集。"""
+        # ``json_path`` 来自模型的流式 function call 分片，形态不受控。两条拒绝
+        # 消息都用 ``safe_repr`` 而不是 ``!r``：``repr(10**4301)`` 自己抛
+        # ``ValueError: Exceeds the limit``——正要报出「json_path 无效」的那一步
+        # 变成整数转换错误。对字符串取值两者等价（``safe_repr`` 也加引号），
+        # 因此正常路径的显示形态不变。
         if not isinstance(json_path, str) or not json_path.startswith("$"):
-            raise ValueError(f"Google FunctionCall.partial_args 的 json_path 无效: {json_path!r}")
+            raise ValueError(
+                f"Google FunctionCall.partial_args 的 json_path 无效: {safe_repr(json_path)}"
+            )
         if json_path in {"", "$"}:
             return []
         rest = json_path[1:]
@@ -2138,7 +2145,9 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                 tokens.append(quoted.group(1))
                 rest = rest[quoted.end() :]
                 continue
-            raise ValueError(f"Google FunctionCall.partial_args 不支持的 json_path: {json_path!r}")
+            raise ValueError(
+                f"Google FunctionCall.partial_args 不支持的 json_path: {safe_repr(json_path)}"
+            )
         return tokens
 
     @classmethod

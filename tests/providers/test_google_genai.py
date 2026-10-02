@@ -620,3 +620,37 @@ def test_google_embed_query_returns_the_first_vector():
             return [[0.5, 1.5]]
 
     assert _One().embed_query("查询文本") == [0.5, 1.5]
+
+
+# ── 回归：json_path 的拒绝消息自身用 ``!r`` 插值 ──
+#
+# ``_partial_arg_tokens`` 的两条拒绝分支写 ``f"...: {json_path!r}"``。判据是
+# ``isinstance(json_path, str)``，因此**非字符串**取值会走到第一条分支——而
+# ``repr(10**4301)`` 自己抛 ``ValueError: Exceeds the limit``：正要报出
+# 「json_path 无效」的那一步变成整数转换错误。上一条回归只覆盖了「字符串形态、
+# 索引位数超限」，这条覆盖「取值本身是位数超限的整数」。
+#
+# 可达路径：``_partial_args_to_mapping`` 读模型流式分片的 ``json_path`` 字段，
+# 形态不受控。
+
+
+@pytest.mark.parametrize(
+    "json_path",
+    [pytest.param(10**4301, id="huge-int"), pytest.param(["$"], id="list")],
+)
+def test_google_partial_args_rejects_malformed_json_path_readably(json_path):
+    """非字符串 ``json_path`` 不得让「报告无效路径」自己抛裸异常。"""
+    with pytest.raises(ValueError) as excinfo:
+        GoogleProvider._partial_arg_tokens(json_path)
+
+    message = str(excinfo.value)
+    assert "Exceeds the limit" not in message, message
+    assert "json_path" in message
+
+
+def test_google_partial_args_mapping_surfaces_malformed_json_path_readably():
+    """从公开入口进入时同样给出可读消息。"""
+    with pytest.raises(ValueError) as excinfo:
+        GoogleProvider._partial_args_to_mapping([{"json_path": 10**4301, "number_value": 1}])
+
+    assert "Exceeds the limit" not in str(excinfo.value)
