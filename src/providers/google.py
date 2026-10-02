@@ -1844,7 +1844,14 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                     else:
                         raise ValueError(f"Google 不支持的消息内容块类型: {part_type!r}。")
             else:
-                parts = [types.Part(text=str(raw_content))]
+                # 标量 content 的渲染走 ``safe_repr`` 而不是裸 ``str()``：
+                # ``normalize_messages`` 只校验 ``messages`` 是「对象序列」，不校验
+                # content 的形态（实测 ``{"role": "user", "content": 10**4301}``
+                # 原样通过），因此这里是标量 content 的唯一收口。``str(10**4301)``
+                # 抛 ``ValueError: Exceeds the limit``——类型对、内容却与「消息
+                # 内容写错了」无关。判据与同文件的 ``_normalize_finish_reason`` 一致
+                # （非字符串走 ``safe_repr``）。
+                parts = [types.Part(text=safe_repr(raw_content))]
             for index, call in enumerate(message.get("tool_calls", []) or []):
                 if not isinstance(call, Mapping):
                     raise ValueError(f"Google assistant tool_calls[{index}] 必须是对象。")

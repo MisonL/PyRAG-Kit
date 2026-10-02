@@ -6,6 +6,10 @@
 
 ### 修复
 
+- **Google 消息 content 的标量回退用裸 `str()`，超大整数让 `_contents` 崩掉**（`src/providers/google.py`）。`_contents` 对既不是 `str` 也不是 `list` 的 `content` 走 `str(raw_content)` 兜底，而 `normalize_messages` 只校验 `messages` 是「对象序列」、**不校验 content 的形态**（实测 `{"role": "user", "content": 10**4301}` 原样通过），因此这是标量 content 的唯一收口。位数超限的整数让 `str()` 抛 `ValueError: Exceeds the limit`——类型对、内容却与「消息内容写错了」无关，且异常发生在 `complete`／`invoke` 的 `try` 之外（`_contents` 在调用 SDK 之前求值），用户拿到的是整数转换错误。
+
+  同一文件的 `_normalize_finish_reason` 早已认领同一判据（非字符串走 `safe_repr` 而不是裸 `str()`），这里对齐。回归测试两条（超大整数 content 必须保住、普通标量渲染形态不变），前者在未修源码时实测变红。
+
 - **检索参数菜单的融合策略 `default=` 未归一，未归一取值让菜单崩掉**（`src/ui/config_menu.py`）。`edit_retrieval_params` 的融合策略分支把 `chat_config["hybrid_fusion_strategy"]` 的**原始**取值当 `questionary.select(default=...)`，而候选只有 `"rrf"`／`"weighted"` 两个字面量。`SessionConfig` 的普通属性没有 `__setattr__` 守卫，嵌入方或携带异常取值的 pickle 快照可以直写该字段。实测三种收场都不在契约内：`"RRF"`／`" rrf "`（大小写／空白未归一）与 `1` 让 questionary 抛 `ValueError: Invalid 'default' value passed`，位数超限的整数抛 `ValueError: Exceeds the limit`。异常落在 `edit_retrieval_params` 内、由 `launch_config_editor` 经 `asyncio.to_thread` 调用——调用点只接 `(KeyboardInterrupt, EOFError)`，会终止整个会话，而菜单是用户唯一还能改配置的入口。
 
   同一函数里 `current_fusion_strategy` 的**标签**早已走 `_render_value`（上一条同类修复），`default=` 这一半却漏了——判据只做了一半。修法是新增 `_normalized_fusion_default`：复用运行期的 `_coerce_fusion_strategy` 归一（口径与 `RetrievalService` 读取路径一致，`"RRF"`／`" rrf "` 都收敛成 `"rrf"`），归一后不在候选集合里（`"bogus"`／非字符串／超限整数）退回 `None`——questionary 的「未作答」哨兵。回归测试 6 条（五种异常取值 + 一条「规范值照旧选中」的反向守卫），其中 4 条在未修源码时实测变红；修后另用**真实** questionary 复核全部形态可构造。

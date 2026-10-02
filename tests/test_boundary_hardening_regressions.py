@@ -4455,3 +4455,37 @@ def test_stream_events_survive_huge_integer_refusal_message():
     refusals = [event.refusal for event in events if event.type == "refusal_delta"]
     assert refusals, "应产出拒答事件"
     assert "Exceeds the limit" not in refusals[0]
+
+
+# --- 消息 content 的标量回退 ----------------------------------------------
+#
+# ``GoogleProvider._contents`` 对既不是 ``str`` 也不是 ``list`` 的 ``content``
+# 走 ``str(raw_content)`` 兜底。``normalize_messages`` 只校验 ``messages`` 是
+# 「对象序列」，**不校验 content 的形态**（实测 ``{"role":"user","content":huge}``
+# 原样通过），因此这个兜底是标量 content 的唯一收口。位数超限的整数让
+# ``str()`` 抛 ``ValueError: Exceeds the limit``——本 provider 的错误分类按
+# ``ValueError`` 写，类型对、内容却与「消息内容写错了」毫无关系。
+#
+# 同一文件的 ``_normalize_finish_reason`` 早已认领同一判据（非字符串走
+# ``safe_repr`` 而不是裸 ``str()``），这里对齐。
+
+
+def test_google_contents_survive_huge_integer_scalar_content():
+    """标量 content 是位数超限的整数时，``_contents`` 不得抛整数转换错误。"""
+    contents = GoogleProvider._contents(
+        [{"role": "user", "content": _HUGE_INT}],
+        None,
+        None,
+    )
+
+    assert contents, "应产出一条内容"
+    text = contents[0].parts[0].text
+    assert "Exceeds the limit" not in text
+    assert "位十进制" in text
+
+
+def test_google_contents_keep_small_scalar_content_verbatim():
+    """收紧不能误伤：普通标量 content 的渲染形态不变（``5`` 不是 ``'5'``）。"""
+    contents = GoogleProvider._contents([{"role": "user", "content": 5}], None, None)
+
+    assert contents[0].parts[0].text == "5"
