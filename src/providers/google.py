@@ -2045,7 +2045,19 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             message = field(feedback, "block_reason_message")
             if not isinstance(message, str) or not message.strip():
                 message = field(feedback, "message")
-            return str(message or f"Google 提示被安全策略拦截: {block_reason_text}")
+            # 非字符串的 ``message`` 也要能渲染：``field`` 明确支持**字典形态**
+            # 的响应（见其 docstring「兼容 Pydantic SDK 对象和字典响应」），而
+            # 字典里的 ``message`` 不受 SDK 的 ``Optional[str]`` 约束。位数超限的
+            # 整数让裸 ``str()`` 抛 ``ValueError: Exceeds the limit``——本方法的
+            # 职责是**报告拒答**，在正要报出拦截原因时自己崩掉，用户拿到的是与
+            # 「提示被安全策略拦截」毫无关联的整数转换错误，而本 provider 的错误
+            # 分类按 ``RuntimeError`` 写。
+            #
+            # 字符串走原样（``safe_repr`` 会加引号，改掉正常取值的显示形态），
+            # 非字符串才降级——与 ``_render_value``／``_path_text`` 同一取舍。
+            if not isinstance(message, str):
+                message = safe_repr(message) if message else ""
+            return message or f"Google 提示被安全策略拦截: {block_reason_text}"
         return None
 
     @staticmethod
@@ -2558,7 +2570,14 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         block_reason = field(feedback, "block_reason")
         if block_reason:
             message = field(feedback, "block_reason_message") or field(feedback, "message")
-            refusal = str(message or f"Google 提示被安全策略拦截: {block_reason}")
+            # 与 ``_extract_refusal`` 同判据、同理由：``field`` 支持字典形态的
+            # 响应，那里的 ``message`` 不受 SDK 的 ``Optional[str]`` 约束，位数
+            # 超限的整数让裸 ``str()`` 抛 ``ValueError: Exceeds the limit``——而
+            # 这段代码正在**构造拒答事件**，崩掉会让一次真实的安全拦截表现为
+            # 整数转换错误。字符串原样，非字符串降级成量级描述。
+            if not isinstance(message, str):
+                message = safe_repr(message) if message else ""
+            refusal = message or f"Google 提示被安全策略拦截: {block_reason}"
             if not any(event.type == "refusal_delta" for event in events):
                 events.append(
                     StreamEvent(

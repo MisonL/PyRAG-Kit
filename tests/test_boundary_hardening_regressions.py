@@ -4295,3 +4295,53 @@ def test_provider_options_still_accept_string_keys():
     from src.providers.google import GoogleProvider
 
     GoogleProvider("m", {"max_tokens": 100})
+
+
+# --- 拒答消息的非字符串取值 ------------------------------------------------
+#
+# `field()` 明确支持**字典形态**的响应（docstring：「兼容 Pydantic SDK 对象和
+# 字典响应」），而字典里的 `prompt_feedback.message` 不受 SDK 的
+# `Optional[str]` 约束。两处 `str(message or ...)` 对位数超限的整数抛
+# `ValueError: Exceeds the limit`——而这两处的职责正是**报告拒答**：在正要报出
+# 拦截原因时自己崩掉，用户拿到的是与「提示被安全策略拦截」毫无关联的整数转换
+# 错误，且本 provider 的错误分类按 `RuntimeError` 写。
+#
+# 修法：字符串原样（`safe_repr` 会加引号，改掉正常取值的显示形态），非字符串才
+# 降级成量级描述——与 `_render_value`／`_path_text` 同一取舍。
+
+
+def test_extract_refusal_survives_huge_integer_message():
+    """`message` 是位数超限的整数时，拒答仍必须能报出来。"""
+    response = {
+        "candidates": [],
+        "prompt_feedback": {"block_reason": "SAFETY", "message": 10**4301},
+    }
+
+    refusal = GoogleProvider._extract_refusal(response)
+
+    assert refusal, "拒答消息不应为空"
+    assert "Exceeds the limit" not in refusal
+
+
+def test_extract_refusal_keeps_string_message_verbatim():
+    """收紧不能误伤：字符串 message 原样返回（不加引号）。"""
+    response = {
+        "candidates": [],
+        "prompt_feedback": {"block_reason": "SAFETY", "message": "被拦截了"},
+    }
+
+    assert GoogleProvider._extract_refusal(response) == "被拦截了"
+
+
+def test_stream_events_survive_huge_integer_refusal_message():
+    """流式路径的拒答事件同样不能因非字符串 message 而崩。"""
+    chunk = {
+        "candidates": [],
+        "prompt_feedback": {"block_reason": "SAFETY", "message": 10**4301},
+    }
+
+    events = GoogleProvider._stream_events_from_chunk(chunk)
+
+    refusals = [event.refusal for event in events if event.type == "refusal_delta"]
+    assert refusals, "应产出拒答事件"
+    assert "Exceeds the limit" not in refusals[0]

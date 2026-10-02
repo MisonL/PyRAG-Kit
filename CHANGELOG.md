@@ -6,6 +6,10 @@
 
 ### 修复
 
+- **Google 拒答消息在非字符串取值下抛裸 `ValueError`**（`src/providers/google.py`）。两处 `str(message or ...)`（`_extract_refusal` 与 `_stream_events_from_chunk`）对位数超限的整数抛 `ValueError: Exceeds the limit`。`field()` 明确支持**字典形态**的响应（docstring：「兼容 Pydantic SDK 对象和字典响应」），而字典里的 `prompt_feedback.message` 不受 SDK `Optional[str]` 约束，因此该形态在文档化的输入契约内可达。
+
+  这两处的职责恰恰是**报告拒答**：在正要报出「提示被安全策略拦截」的原因时自己崩掉，用户拿到的是与该语义毫无关联的整数转换错误，而本 provider 的错误分类按 `RuntimeError` 写（`ValueError` 不在调用方的 `except` 里）。修法是字符串原样、非字符串才降级成量级描述——与 `_render_value`／`_path_text` 同一取舍（直接 `safe_repr` 会给正常字符串加引号，改掉显示形态）。同文件的 `_candidate_refusal` 用 `isinstance(value, str)` 守卫，本就安全。回归测试三条（两处崩溃各一条 + 一条「字符串原样」的反向守卫），前两条在未修源码时实测变红。
+
 - **`ExcelLogger.log_results` 的 `query` 列未收敛，超大整数会丢掉整批记录**（`src/retrieval_test/excel_logger.py`）。`query` 是该方法的行里**唯一**没走收敛的列：其余列分别经 `document_*`／`_cell_value`／`_json_safe`，而 `query` 直接进 `row`。签名声明 `query: str`，但它是**公开方法**，且这里正是「日志是旁路、失败不该丢记录」这条契约的入口。
 
   实测 `query=10**4301`（位数超限的整数）时 `openpyxl` 在 `save()` 期对每个数值调 `safe_string` → `isnan(value)`，抛 `OverflowError: int too large to convert to float`。后果正是 `_cell_value` 的 docstring 已经写明要防的那一种：`save` 外的 `except Exception` 把它吞成一行日志，整个工作簿**一个字都没落盘**——同一次查询里 3 条完全正常的结果一并丢失，用户看到「召回测试完成」而日志文件是坏的（`load_workbook` 连 `[Content_Types].xml` 都找不到）。修法是让 `query` 与其余列同判据，过一遍 `_cell_value`。回归测试两条（超大整数 query 必须保住整批、字符串 query 逐字落盘），前者在未修源码时实测变红。
