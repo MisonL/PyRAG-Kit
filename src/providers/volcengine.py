@@ -1646,7 +1646,10 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
                 if isinstance(error, str)
                 else field(error, "message", "Ark Responses 请求失败")
             )
-            raise RuntimeError(str(message))
+            # ``message`` 来自网关 JSON，形态不受控：位数超限的整数让裸 ``str()``
+            # 抛 ``ValueError: Exceeds the limit``，正要报告网关错误的那一步变成
+            # 整数转换错误，而调用方按 ``RuntimeError`` 分类。
+            raise RuntimeError(message if isinstance(message, str) else safe_repr(message))
         if status == "incomplete":
             details = field(response, "incomplete_details")
             reason = field(details, "reason", "unknown")

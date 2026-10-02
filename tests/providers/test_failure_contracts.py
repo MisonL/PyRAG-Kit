@@ -769,3 +769,34 @@ def test_responses_video_fps_beyond_double_range_is_explicit(value):
             "params",
             provider="ark",
         )
+
+
+# ── 回归：Ark Responses 失败出口的 message 形态 ──
+#
+# ``VolcengineProvider._raise_for_response_error`` 的 ``status == "failed"``
+# 分支写 ``raise RuntimeError(str(message))``，``message`` 是网关 JSON 的
+# ``error``（或它的 ``message`` 字段）。位数超限的整数让裸 ``str()`` 抛
+# ``ValueError: Exceeds the limit``——**正要报告网关错误**的那一步变成整数转换
+# 错误，而调用方按 ``RuntimeError`` 分类。同函数的 ``incomplete`` 分支与
+# ``openai_compatible._error_message`` 都已按 ``safe_repr`` 收敛，这一支漏了。
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        pytest.param({"status": "failed", "error": 10**4301}, id="huge-int"),
+        pytest.param({"status": "failed", "error": {"message": 10**4301}}, id="huge-int-message"),
+    ],
+)
+def test_ark_responses_failed_reports_malformed_error_readably(response):
+    """非字符串 ``error`` 不得让「报告网关错误」自己抛裸异常。"""
+    with pytest.raises(RuntimeError) as excinfo:
+        VolcengineProvider._raise_for_response_error(response)
+
+    assert "Exceeds the limit" not in str(excinfo.value)
+
+
+def test_ark_responses_failed_still_reports_string_error():
+    """收紧不能误伤：字符串 ``error`` 仍原样出现在消息里。"""
+    with pytest.raises(RuntimeError, match="boom"):
+        VolcengineProvider._raise_for_response_error({"status": "failed", "error": "boom"})
