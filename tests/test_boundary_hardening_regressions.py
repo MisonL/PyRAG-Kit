@@ -4818,3 +4818,53 @@ def test_stream_events_keep_string_block_reason_verbatim():
 
     refusals = [event.refusal for event in events if event.type == "refusal_delta"]
     assert refusals == ["Google 提示被安全策略拦截: SAFETY"]
+
+
+def test_anthropic_text_stream_fallback_coerces_non_string_chunks():
+    """``text_stream`` 兜底分支同样要收敛成 ``str``，与 ``_stream_event`` 同判据。
+
+    ``_iter_invoke_stream_text`` 有三条取文本的路径：主路径（``__iter__`` 事件）
+    走 ``_stream_event``，那里的 ``text_delta`` 已按 ``_block_text`` 收敛（上一条
+    同类修复）；而两条 ``text_stream`` 兜底分支直接 ``yield text``，非字符串原样
+    进入 ``Generator[str]``。契约声明是 ``Generator[str]``，消费方 ``"".join``／
+    ``+=`` 会抛裸 ``TypeError``，位数超限的整数更早抛 ``ValueError``。本仓测试
+    用简单替身构造 ``text_stream``（真实 SDK 只提供 ``__iter__`` 与
+    ``current_message_snapshot``），因此这是被支持、被测试的输入形态。
+    """
+    from src.providers.anthropic import AnthropicProvider
+
+    class StubStream:
+        text_stream = iter([5, "正常", 10**4301])
+
+    yielded = list(AnthropicProvider._iter_invoke_stream_text(StubStream()))
+
+    assert all(isinstance(item, str) for item in yielded), yielded
+    assert "正常" in yielded
+
+
+def test_anthropic_text_stream_fallback_keeps_string_chunks_verbatim():
+    """收紧不能误伤：字符串分片原样透传。"""
+    from src.providers.anthropic import AnthropicProvider
+
+    class StubStream:
+        text_stream = iter(["甲", "乙"])
+
+    assert list(AnthropicProvider._iter_invoke_stream_text(StubStream())) == ["甲", "乙"]
+
+
+def test_anthropic_async_text_stream_fallback_coerces_non_string_chunks():
+    """异步兜底分支与同步同判据：``text_stream`` 的分片同样收敛成 ``str``。"""
+    import asyncio
+
+    from src.providers.anthropic import AnthropicProvider
+
+    class StubStream:
+        text_stream = iter([5, "正常", 10**4301])
+
+    async def collect():
+        return [item async for item in AnthropicProvider._aiter_invoke_stream_text(StubStream())]
+
+    yielded = asyncio.run(collect())
+
+    assert all(isinstance(item, str) for item in yielded), yielded
+    assert "正常" in yielded

@@ -6,6 +6,10 @@
 
 ### 修复
 
+- **Anthropic `text_stream` 兜底分支原样透传非字符串，打破 `Generator[str]` 契约**（`src/providers/anthropic.py`）。`_iter_invoke_stream_text`／`_aiter_invoke_stream_text` 各有三条取文本的路径：主路径（`__iter__`／`__aiter__` 事件）走 `_stream_event`，那里的 `text_delta` 已按 `_block_text` 收敛（此前同类修复）；而两条 `text_stream` 兜底分支直接 `yield text`，非字符串原样进入声明为 `Generator[str]` 的生成器。消费方 `"".join`／`+=` 抛裸 `TypeError`，位数超限的整数更早抛 `ValueError: Exceeds the limit`。真实 SDK 的 `MessageStream` 只提供 `__iter__` 与 `current_message_snapshot`（实测无 `text_stream`），但本仓测试正是用只带 `text_stream` 的替身构造这条路径，因此它是被支持、被测试的输入形态——契约与主路径必须一致。
+
+  修法：两处兜底分支改走 `_block_text`（与 `_stream_event` 同一收敛）。回归测试 3 条（同步／异步的「非字符串必须收敛」+ 一条「字符串分片原样透传」的反向守卫），其中 2 条在未修源码时实测变红。
+
 - **Google 流式拒答的兜底文案未收敛 `block_reason`，与 `_extract_refusal` 判据不一致**（`src/providers/google.py`）。流式路径的 `refusal = message or f"Google 提示被安全策略拦截: {block_reason}"` 里，`message` 那一半早已收敛（上一条同类修复），而 `block_reason` 直接插值。`field` 支持字典形态的响应，`block_reason` 不受 SDK 枚举约束——位数超限的整数让裸插值抛 `ValueError: Exceeds the limit`，于是**正要报出安全拦截**的那一步变成整数转换错误；而且 f-string 在**求值期**就拼好，即使 `message` 非空、兜底文案根本不会被用到，这条路径仍会崩。非流式的 `_extract_refusal` 早已把 `block_reason` 收敛成 `block_reason_text`（枚举取 name、字符串取 strip、其余空串），流式这一半漏了——同一份响应在两条路径上的收场必须一致。
 
   修法：把 `_extract_refusal` 的归一化逐字搬进流式分支。回归测试 2 条，其中「位数超限的整数 `block_reason`」在未修源码时实测变红。

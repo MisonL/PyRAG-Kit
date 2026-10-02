@@ -1170,13 +1170,13 @@ class AnthropicProvider(LargeLanguageModel):
             for text in response.text_stream:
                 cls._raise_for_stream_snapshot_refusal(response)
                 if text:
-                    yield text
+                    yield cls._block_text(text)
             cls._raise_for_stream_snapshot_refusal(response)
             return
 
         for text in response.text_stream:
             if text:
-                yield text
+                yield cls._block_text(text)
 
     @classmethod
     async def _aiter_invoke_stream_text(cls, response: Any) -> AsyncGenerator[str, None]:
@@ -1205,13 +1205,13 @@ class AnthropicProvider(LargeLanguageModel):
             async for text in iterate_async(response.text_stream):
                 cls._raise_for_stream_snapshot_refusal(response)
                 if text:
-                    yield text
+                    yield cls._block_text(text)
             cls._raise_for_stream_snapshot_refusal(response)
             return
 
         async for text in iterate_async(response.text_stream):
             if text:
-                yield text
+                yield cls._block_text(text)
 
     @staticmethod
     def _refusal_detail(value: Any) -> str:
