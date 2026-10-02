@@ -6,6 +6,10 @@
 
 ### 修复
 
+- **路径形态判据只做了一半：`resolve_within` 与 `FaissStore.load` 对非路径取值抛裸 `TypeError`**（`src/utils/security.py`、`src/retrieval/vdb/faiss_store.py`）。上一条修的是**受信根**列表里的元素，候选路径与根本身这一半漏了：`resolve_within` 把 `candidate`／`root` 直接交给 `Path(...)`，而 `Path(None)`／`Path(5)`／`Path([...])` 抛裸 `TypeError: expected str, bytes or os.PathLike object, not ...`——不是 `ValueError`，消息里也没有字段名，而两个调用方（`ensure_trusted_source` 与 `FaissStore.load_snapshot`）都按 `ValueError` 分类。`FaissStore.load` 更早一步：第一行的 `os.path.exists(path)` 就对非路径抛同一个 `TypeError`。`ensure_trusted_source` 还有第三条：它的逐根试探用 `except ValueError: continue` 吞掉 `resolve_within` 的守卫，最后落到兜底消息里的 `Path(candidate)`，在那里再抛一次 `TypeError`。
+
+  修法：`resolve_within` 在构造 `Path` 之前判 `candidate`／`root` 形态（消息带上是哪个参数错了）；`ensure_trusted_source` 在兜底消息之前判 `candidate`；`FaissStore.load` 在第一次使用路径之前判。回归测试 2 条，均在未修源码时实测变红（裸 `TypeError`）。
+
 - **`ensure_trusted_source` 的字符串信任根被逐字符拆开，信任边界静默失效**（`src/utils/security.py`）。`trusted_roots` 是**可迭代**，而 `str`／`bytes`／`bytearray` 也是合法的可迭代：直接 `for root in trusted_roots` 会把一个字符串信任根拆成单字符根。实测 `trusted_paths="/etc"` 拆出 `"/"`（解析为文件系统根），于是**任意绝对路径都被接受**——`/anywhere/evil.pkl` 也返回成功，正好绕开 `AGENTS.md` 那条「不导入不可信来源的 `.pkl`」的边界。同一模块对 `Sequence` 参数的判据早已显式排除 `str`／`bytes`／`bytearray`（`normalize_messages`／`_require_documents`），这里必须对齐。另外每个根还要能构成 `Path`：`Path(None)`／`Path(5)`／`Path([...])` 抛裸 `TypeError: expected str, bytes or os.PathLike object, not ...`——不是 `ValueError`，穿透 `load` 调用方按 `ValueError` 建立的错误分类，且消息里没有字段名；同模块的 `resolve_within` 对**候选路径**的同类形态给的是带 label 的 `ValueError`，两条判据必须一致。
 
   修法：`trusted_roots` 若是 `str`／`bytes`／`bytearray` 直接拒绝；逐根构造 `Path` 时把 `TypeError` 收敛成带 label 的 `ValueError`。回归测试 2 条，均在未修源码时实测变红（一条 `DID NOT RAISE`——字符串根静默放行；一条抛裸 `TypeError`）。

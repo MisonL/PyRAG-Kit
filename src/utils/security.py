@@ -908,6 +908,18 @@ def resolve_within(
     # ——``ensure_trusted_source`` 只接 ``ValueError``，于是一条「拒绝加载」的消息
     # 变成 pathlib 的内部错误。``strict=False`` 不覆盖这种情况：环是**解析期**的
     # 失败，与目标是否存在无关。这里统一收敛成 ``ValueError``。
+    #
+    # ``Path(...)`` 对非路径取值抛的 ``TypeError``（``None``／``int``／``list``：
+    # ``expected str, bytes or os.PathLike object, not ...``）同样要收敛：它不是
+    # ``ValueError``，且消息里没有字段名，而本函数的两个调用方
+    # （``ensure_trusted_source`` 与 ``FaissStore.load_snapshot``）都按
+    # ``ValueError`` 分类。形态判据放在构造之前，让消息带上是哪一个参数错了。
+    for role, value in (("路径", candidate), ("受信根", root)):
+        if not isinstance(value, (str, os.PathLike)):
+            raise ValueError(
+                f"{label} 的{role}必须是字符串或路径，但得到 {type(value).__name__}。"
+                " 请检查该路径来源（通常来自 RunConfig 的路径字段）。"
+            )
     try:
         resolved_root = Path(root).resolve()
         resolved_candidate = Path(candidate).resolve()
@@ -981,6 +993,16 @@ def ensure_trusted_source(
             # 的消息只提一个根，而这里的结论是「一个都没命中」，把根列表完整
             # 列出来更有用。收集各条子消息再拼进去会让消息变长却不增加信息量。
             continue
+    # ``candidate`` 的形态先在这里判一次，不能只依赖 ``resolve_within``：后者对
+    # 非路径取值抛的 ``ValueError`` 会被上面的 ``except ValueError: continue``
+    # 吞掉，于是全部根都「没命中」，最后落到下面那条消息里的 ``Path(candidate)``
+    # ——那里对 ``None``／``int``／``list`` 抛的是裸 ``TypeError``。本函数的契约
+    # 是带 label 的 ``ValueError``（调用方 ``FaissStore.load`` 按它分类）。
+    if not isinstance(candidate, (str, os.PathLike)):
+        raise ValueError(
+            f"{label} 的路径必须是字符串或路径，但得到 {type(candidate).__name__}。"
+            " 请检查该路径来源（通常来自 RunConfig 的 legacy_pkl_path）。"
+        )
     raise ValueError(
         f"{label} 不在任何受信路径内。路径={Path(candidate)}。"
         f" 受信路径={[str(root) for root in roots]}。"

@@ -644,6 +644,15 @@ class FaissStore(VectorStoreBase):
         ``RunConfig.legacy_pkl_path`` 的所在目录）。为 ``None`` 或空时拒绝加载：
         pickle 会执行任意代码，而「路径看起来像本项目的文件」不构成来源证明。
         """
+        # ``os.path.exists`` 对非路径取值抛裸 ``TypeError``（``expected str,
+        # bytes or os.PathLike object, not ...``），早于下面的来源校验——而本
+        # 方法（及其调用方 ``VectorStoreFactory``）按 ``ValueError`` 分类。判据与
+        # ``resolve_within`` 的同类守卫一致，形态判在第一次使用之前。
+        if not isinstance(path, (str, os.PathLike)):
+            raise ValueError(
+                f"legacy 向量存储文件路径必须是字符串或路径，但得到 {type(path).__name__}。"
+                " 请检查该路径来源（通常来自 RunConfig 的 legacy_pkl_path）。"
+            )
         if not os.path.exists(path):
             raise FileNotFoundError(f"向量存储文件未找到: {path}")
         ensure_trusted_source(path, trusted_paths, label="legacy 向量存储文件")

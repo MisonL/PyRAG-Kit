@@ -1248,3 +1248,34 @@ def test_load_rejects_non_path_trusted_roots_readably(tmp_path):
         FaissStore(file_path=None).load(str(legacy), trusted_paths=[None])
     with pytest.raises(ValueError, match="受信"):
         FaissStore(file_path=None).load(str(legacy), trusted_paths=[5])
+
+
+def test_load_rejects_non_path_candidate_readably(tmp_path):
+    """候选路径不是路径时给可读的 ``ValueError``，而不是裸 ``TypeError``。
+
+    ``FaissStore.load`` 把路径交给 ``ensure_trusted_source``。候选路径形态非法
+    时，``resolve_within`` 的守卫抛 ``ValueError``，但 ``ensure_trusted_source``
+    的逐根试探会把它吞掉（``except ValueError: continue``），最后落到兜底消息里
+    的 ``Path(candidate)``——那里对 ``None``／``int``／``list`` 抛裸
+    ``TypeError``。本函数的契约是带 label 的 ``ValueError``。
+    """
+    with pytest.raises(ValueError, match="路径必须是字符串或路径"):
+        FaissStore(file_path=None).load(None, trusted_paths=[tmp_path])
+    with pytest.raises(ValueError, match="路径必须是字符串或路径"):
+        FaissStore(file_path=None).load(5, trusted_paths=[tmp_path])
+
+
+def test_resolve_within_rejects_non_path_arguments_readably(tmp_path):
+    """``resolve_within`` 对非路径的候选／根给带 label 的 ``ValueError``。
+
+    同模块的 ``(OSError, RuntimeError)`` 收敛判据早已认领「pathlib 的内部错误
+    不该穿透 ``ValueError`` 契约」，``Path(...)`` 对非路径取值抛的 ``TypeError``
+    是同一类：不是 ``ValueError``、消息里没有字段名，而两个调用方都按
+    ``ValueError`` 分类。
+    """
+    from src.utils.security import resolve_within
+
+    with pytest.raises(ValueError, match="路径必须是字符串或路径"):
+        resolve_within(None, tmp_path, label="知识快照目录")
+    with pytest.raises(ValueError, match="受信根必须是字符串或路径"):
+        resolve_within(tmp_path, 5, label="知识快照目录")
