@@ -1081,3 +1081,86 @@ def test_active_snapshot_id_rejects_symlink_loop(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError):
         repository.get_active_snapshot_id()
+
+
+def test_active_snapshot_id_rejects_a_directory_marker(tmp_path, monkeypatch):
+    """标记路径是**目录**时必须给 ``ValueError``，不是裸 ``IsADirectoryError``。
+
+    ``get_active_snapshot_id`` 只判 ``marker.exists()``（目录也为真）就直接
+    ``read_text``，``IsADirectoryError``（``OSError`` 子类）原样冒到调用方。
+    本类的契约是带指引的 ``ValueError``，而 ``VectorStoreFactory
+    ._load_existing_state`` 的第一步就是本方法——启动会以裸 ``OSError`` 收场。
+    """
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_root.mkdir()
+    monkeypatch.setattr("src.utils.config.ROOT_DIR", tmp_path)
+    (tmp_path / "config.toml").write_text('snapshot_root = "snapshots"\n', encoding="utf-8")
+    get_settings.cache_clear()
+    repository = SnapshotRepository(build_run_config(get_settings()))
+    repository.run_config.active_snapshot_marker.mkdir()
+
+    with pytest.raises(ValueError):
+        repository.get_active_snapshot_id()
+
+
+def test_active_snapshot_id_rejects_a_non_utf8_marker(tmp_path, monkeypatch):
+    """标记文件不是 UTF-8 时必须给 ``ValueError``，不是裸 ``UnicodeDecodeError``。
+
+    ``UnicodeDecodeError`` 继承 ``ValueError``，但它**不是**本类其余拒绝路径
+    给出的那种带重建指引的消息；调用方按消息内容分类/展示时接不住。标记文件
+    是磁盘上的任意字节，外部工具写坏即触发。
+    """
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_root.mkdir()
+    monkeypatch.setattr("src.utils.config.ROOT_DIR", tmp_path)
+    (tmp_path / "config.toml").write_text('snapshot_root = "snapshots"\n', encoding="utf-8")
+    get_settings.cache_clear()
+    repository = SnapshotRepository(build_run_config(get_settings()))
+    repository.run_config.active_snapshot_marker.write_bytes(b"\xff\xfe bad")
+
+    with pytest.raises(ValueError) as excinfo:
+        repository.get_active_snapshot_id()
+
+    message = str(excinfo.value)
+    assert "ACTIVE_SNAPSHOT" in message or "标记" in message, message
+
+
+def test_load_snapshot_rejects_a_directory_marker(tmp_path):
+    """``FaissStore.load_snapshot`` 对目录形态的标记文件给 ``ValueError``。
+
+    与 ``SnapshotRepository.get_active_snapshot_id`` 同一处、同一判据：两者都
+    在 ``VectorStoreFactory._load_existing_state`` 的启动路径上，标记路径是目录
+    时 ``read_text`` 抛裸 ``IsADirectoryError``。
+    """
+    from src.retrieval.vdb.faiss_store import FaissStore
+
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_root.mkdir()
+    snapshot = snapshot_root / "kb-x"
+    snapshot.mkdir()
+    (snapshot_root / "ACTIVE_SNAPSHOT").mkdir()
+
+    store = FaissStore()
+    with pytest.raises(ValueError) as excinfo:
+        store.load_snapshot(str(snapshot), snapshot_root=snapshot_root)
+
+    message = str(excinfo.value)
+    assert "ACTIVE_SNAPSHOT" in message, message
+
+
+def test_load_snapshot_rejects_a_non_utf8_marker(tmp_path):
+    """标记文件不是 UTF-8 时 ``FaissStore.load_snapshot`` 给 ``ValueError``。"""
+    from src.retrieval.vdb.faiss_store import FaissStore
+
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_root.mkdir()
+    snapshot = snapshot_root / "kb-x"
+    snapshot.mkdir()
+    (snapshot_root / "ACTIVE_SNAPSHOT").write_bytes(b"\xff\xfe bad")
+
+    store = FaissStore()
+    with pytest.raises(ValueError) as excinfo:
+        store.load_snapshot(str(snapshot), snapshot_root=snapshot_root)
+
+    message = str(excinfo.value)
+    assert "ACTIVE_SNAPSHOT" in message, message

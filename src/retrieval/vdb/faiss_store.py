@@ -777,7 +777,21 @@ class FaissStore(VectorStoreBase):
         marker = snapshot_path.parent / "ACTIVE_SNAPSHOT"
         if not marker.exists():
             raise ValueError(f"知识快照目录未被激活，缺少标记文件: {marker}")
-        active_id = marker.read_text(encoding="utf-8").strip()
+        # 读取本身要收敛：``exists()`` 对**目录**也为真，``read_text`` 于是抛
+        # ``IsADirectoryError``；标记文件不是 UTF-8 时抛 ``UnicodeDecodeError``。
+        # 两者都不是本方法的 ``ValueError`` 契约，而调用方
+        # （``VectorStoreFactory._load_existing_state``）按它分类——启动会以裸
+        # ``OSError`` 收场。判据与下面 ``resolve()`` 的 ``(OSError, RuntimeError)``
+        # 收敛一致。
+        try:
+            active_id = marker.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ValueError(
+                f"知识快照的 ACTIVE_SNAPSHOT 标记无法读取: {marker}"
+                f"（{type(exc).__name__}: {exc}）。"
+                " 该路径可能是一个目录，或文件内容不是 UTF-8；"
+                "请检查该文件，或重建知识快照。"
+            ) from exc
         # ``resolve()`` 对符号链接环抛 ``RuntimeError: Symlink loop from ...``，
         # 不是 ``ValueError``——本方法的其余拒绝路径一律抛 ``ValueError``，且
         # 调用方（``VectorStoreFactory._load_existing_state``）按 ``ValueError``

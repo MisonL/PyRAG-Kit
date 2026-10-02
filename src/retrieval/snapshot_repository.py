@@ -40,7 +40,21 @@ class SnapshotRepository:
         marker = self.run_config.active_snapshot_marker
         if not marker.exists():
             return None
-        snapshot_id = marker.read_text(encoding="utf-8").strip()
+        # 读取本身要收敛：``exists()`` 对**目录**也为真，``read_text`` 于是抛
+        # ``IsADirectoryError``；标记文件不是 UTF-8 时抛 ``UnicodeDecodeError``。
+        # 两者都不是本类其余拒绝路径承诺的带指引 ``ValueError``，而
+        # ``VectorStoreFactory._load_existing_state`` 的第一步就是本方法——
+        # 启动会以裸 ``OSError``／``UnicodeDecodeError`` 收场。标记文件是磁盘上的
+        # 任意字节，外部工具写坏即触发。
+        try:
+            snapshot_id = marker.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ValueError(
+                f"知识快照的 ACTIVE_SNAPSHOT 标记无法读取: {marker}"
+                f"（{type(exc).__name__}: {exc}）。"
+                " 该路径可能是一个目录，或文件内容不是 UTF-8；"
+                "请检查该文件，或重建知识快照。"
+            ) from exc
         if not snapshot_id:
             return None
         self._require_snapshot_id_within_root(snapshot_id, source=str(marker))
