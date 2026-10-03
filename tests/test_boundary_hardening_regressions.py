@@ -3207,12 +3207,16 @@ class _TopKStore:
 
 
 class _RerankStub:
-    """返回「全部保留、分数相同」的 rerank 替身。"""
+    """返回「全部保留、分数相同」的 rerank 替身。
+
+    返回值必须是 ``(索引列表, 分数列表)`` 二元组——``_unpack_rerank_result``
+    只接受这一形态。此前这里返回一个不存在的 ``RerankResult``（``import`` 在
+    调用期才失败），旧用例因 ``top_k`` 校验先抛而从未走到这里；一旦入参合法，
+    这个替身自己就会以 ``ImportError`` 收场。
+    """
 
     async def arerank(self, query, documents, top_n=None):
-        from src.providers.__base__.model_provider import RerankResult
-
-        return RerankResult(indices=list(range(len(documents))), scores=[0.5] * len(documents))
+        return list(range(len(documents))), [0.5] * len(documents)
 
 
 @pytest.mark.parametrize(
@@ -3250,6 +3254,68 @@ def test_rerank_if_needed_rejects_a_directly_written_top_k(written):
                 "q", [{"page_content": "d", "metadata": {}, "score": 0.9}], config
             )
         )
+
+
+# ── `_rerank_if_needed` 的 `ranked_results` 也要判形态 ──
+#
+# 该方法的 docstring 明确「供库调用方直接调本方法」，因此对 `top_k`／
+# `rerank_enabled` 都做了收敛（见上一条用例）。但**同一个方法的第一个入参**
+# `ranked_results` 这一半漏了，而它的契约正是 `_require_document_list` 覆盖的
+# 「文档映射的列表」。实测非列表取值的收场都不在契约内：
+#   * `"abc"` -> `TypeError: 'str' object does not support item assignment`
+#     （字符串是合法可迭代对象，逐字符进入循环后 `document["score"] = ...` 抛）；
+#   * `5` / `10**4301` / `object()` -> 裸 `TypeError: ... is not iterable`；
+#   * `{"a": 1}` -> `KeyError: 0`（字典迭代出的是键，`ranked_results[index]` 取不到）。
+# 三种都不是 `ValueError`，穿透调用方按 `ValueError` 建立的分类；而
+# `retrieve` 内部调用本方法时，入参已经过 `_require_document_list`，因此库调用方
+# 直接调用的这条路径与生产路径的判据不一致。
+
+
+@pytest.mark.parametrize(
+    "ranked_results",
+    [
+        pytest.param("abc", id="str"),
+        pytest.param(5, id="int"),
+        pytest.param({"a": 1}, id="dict"),
+        pytest.param(object(), id="object"),
+        pytest.param(10**4301, id="beyond-int-str-digits"),
+    ],
+)
+def test_rerank_if_needed_rejects_non_document_list(ranked_results):
+    """库调用方直调 ``_rerank_if_needed`` 时，非文档列表必须收敛成可读异常。"""
+    import asyncio
+
+    from src.services.retrieval_service import RetrievalService
+
+    detail = SimpleNamespace(provider="siliconflow", model_name="m")
+    config = _session_config(rerank_enabled=True, rerank_configurations={"y": detail})
+
+    service = RetrievalService(vector_store=object(), embedding_service=object())
+    service._get_rerank_provider = lambda *args, **kwargs: _RerankStub()
+
+    with pytest.raises((TypeError, ValueError), match="文档列表"):
+        asyncio.run(service._rerank_if_needed("q", ranked_results, config))
+
+
+def test_rerank_if_needed_still_accepts_a_document_list():
+    """收紧不能误伤：合法文档列表照常重排。"""
+    import asyncio
+
+    from src.services.retrieval_service import RetrievalService
+
+    detail = SimpleNamespace(provider="siliconflow", model_name="m")
+    config = _session_config(rerank_enabled=True, rerank_configurations={"y": detail})
+
+    service = RetrievalService(vector_store=object(), embedding_service=object())
+    service._get_rerank_provider = lambda *args, **kwargs: _RerankStub()
+
+    result = asyncio.run(
+        service._rerank_if_needed(
+            "q", [{"page_content": "d", "metadata": {}, "score": 0.9}], config
+        )
+    )
+
+    assert len(result) == 1
 
 
 def test_retrieve_uses_the_coerced_top_k_even_if_it_changes_mid_flight():

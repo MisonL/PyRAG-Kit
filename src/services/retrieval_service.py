@@ -868,6 +868,17 @@ class RetrievalService:
         if not enabled or not ranked_results:
             return ranked_results
 
+        # 与 ``top_k``／``rerank_enabled`` 同一处置：本方法的 docstring 明确
+        # 「供库调用方直接调本方法」，而库调用方不经过 ``retrieve`` 里那道
+        # ``_require_document_list``。入参形态不受控，实测非列表取值的收场都不在
+        # 契约内：``"abc"`` 是合法可迭代对象，逐**字符**进入下面的
+        # ``document["score"] = ...`` 后抛 ``TypeError: 'str' object does not
+        # support item assignment``；``5``／``10**4301``／``object()`` 抛裸
+        # ``TypeError: ... is not iterable``；``{"a": 1}`` 抛 ``KeyError: 0``
+        # （字典迭代出的是键）。三种都不是 ``ValueError``，穿透调用方按
+        # ``ValueError`` 建立的分类。判据与生产路径共用 ``_require_document_list``。
+        ranked_results = _require_document_list(ranked_results, "重排")
+
         rerank_provider = self._get_rerank_provider(
             session_config.active_rerank_configuration,
             session_config.rerank_configurations,
