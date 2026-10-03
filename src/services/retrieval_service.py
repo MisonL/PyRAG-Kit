@@ -482,6 +482,16 @@ def _document_key(document: dict[str, Any]) -> str:
 def _merge_hybrid_results(
     semantic_results: list[dict[str, Any]], keyword_results: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
+    # 两个入参的形态判据与生产路径共用 ``_require_document_list``：本函数经
+    # ``src/retrieval/retriever.py`` 的 ``__all__`` 对外导出，是公开边界。
+    # ``retrieve`` 内部调用它之前已校验过两路结果，但库调用方直接调用这条路径
+    # 没有——函数体第一件事就是 ``for rank, document in enumerate(...)`` 再对
+    # ``document.get(...)`` 取值，非列表取值的收场不在契约内：``5``／``None``／
+    # ``object()`` 抛裸 ``TypeError: ... is not iterable``；``"abc"``／
+    # ``{"a": 1}`` 抛 ``AttributeError: 'str' object has no attribute 'get'``
+    # （逐字符／逐键迭代）。两者都不是 ``ValueError``。
+    semantic_results = _require_document_list(semantic_results, "语义检索")
+    keyword_results = _require_document_list(keyword_results, "关键词检索")
     merged: dict[str, dict[str, Any]] = {}
     for rank, document in enumerate(semantic_results, start=1):
         merged_doc = copy.deepcopy(document)

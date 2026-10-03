@@ -593,3 +593,44 @@ def test_promote_parent_context_leaves_content_alone_when_nothing_to_promote(emp
 
     assert promoted["page_content"] == "子块正文"
     assert "matched_chunk_content" not in promoted["metadata"]
+
+
+# ── 回归：``_merge_hybrid_results`` 的两个入参也要判形态 ──
+#
+# 本函数经 ``src/retrieval/retriever.py`` 的 ``__all__`` 对外导出，是公开边界
+# （与 ``HybridReranker`` 同一处置）。``retrieve`` 内部调用它之前已经用
+# ``_require_document_list`` 校验过两路结果，但**库调用方直接调用**这条路径没有
+# ——函数体第一件事就是 ``for rank, document in enumerate(semantic_results)`` 再
+# 对 ``document.get(...)`` 取值。实测非列表取值的收场都不在契约内：
+#   * ``5``／``None``／``object()`` 抛裸 ``TypeError: ... is not iterable``；
+#   * ``"abc"``／``{"a": 1}`` 抛 ``AttributeError: 'str' object has no attribute
+#     'get'``（逐字符／逐键迭代）。
+# 两者都不是 ``ValueError``，穿透调用方按 ``ValueError`` 建立的分类。
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        pytest.param(5, id="int"),
+        pytest.param(None, id="none"),
+        pytest.param("abc", id="str"),
+        pytest.param({"a": 1}, id="dict"),
+        pytest.param(object(), id="object"),
+    ],
+)
+def test_merge_hybrid_results_rejects_non_document_lists(bad_value):
+    """任一路结果不是文档列表时，必须给可读异常，不得裸抛。"""
+    with pytest.raises((TypeError, ValueError), match="文档列表"):
+        _merge_hybrid_results(bad_value, [])
+    with pytest.raises((TypeError, ValueError), match="文档列表"):
+        _merge_hybrid_results([], bad_value)
+
+
+def test_merge_hybrid_results_still_accepts_document_lists():
+    """收紧不能误伤：两路合法文档列表照常合并。"""
+    semantic = [{"page_content": "s", "metadata": {"chunk_id": "a"}, "score": 0.9}]
+    keyword = [{"page_content": "k", "metadata": {"chunk_id": "b"}, "score": 0.5}]
+
+    merged = _merge_hybrid_results(semantic, keyword)
+
+    assert len(merged) == 2
