@@ -1289,6 +1289,51 @@ def test_load_rejects_string_trusted_paths_instead_of_splitting_it(tmp_path):
         FaissStore(file_path=None).load(str(legacy), trusted_paths=str(tmp_path))
 
 
+# ── 回归：``ensure_trusted_source`` 的 ``trusted_roots`` 非可迭代时要给可读异常 ──
+#
+# 该函数已显式排除 ``str``／``bytes``／``bytearray``（它们是可迭代但会被逐字符
+# 拆开），却漏了**其它不可迭代**的形态：``for root in trusted_roots`` 对
+# ``5``／``True``／``object()`` 抛裸 ``TypeError: 'int' object is not iterable``
+# ——不是本函数承诺的带 label 的 ``ValueError``，而调用方 ``FaissStore.load``
+# 按 ``ValueError`` 分类。可达路径：``load`` 是 ``VectorStoreBase`` 的契约方法，
+# 嵌入方直接调用时把 ``trusted_paths`` 写错形态即命中。
+
+
+@pytest.mark.parametrize(
+    "trusted_paths",
+    [
+        pytest.param(5, id="int"),
+        pytest.param(True, id="bool"),
+        pytest.param(object(), id="object"),
+        pytest.param(10**4301, id="beyond-int-str-digits"),
+    ],
+)
+def test_load_rejects_non_iterable_trusted_paths_readably(tmp_path, trusted_paths):
+    """``trusted_paths`` 不可迭代时必须给带指引的 ``ValueError``，不得裸抛。"""
+    import pickle
+
+    legacy = tmp_path / "legacy.pkl"
+    with legacy.open("wb") as file:
+        pickle.dump({"documents": [], "embeddings": None}, file)
+
+    with pytest.raises(ValueError, match="受信"):
+        FaissStore(file_path=None).load(str(legacy), trusted_paths=trusted_paths)
+
+
+def test_load_still_accepts_a_path_list_as_trusted_paths(tmp_path):
+    """收紧不能误伤：合法的路径列表照常加载。"""
+    import pickle
+
+    legacy = tmp_path / "legacy.pkl"
+    with legacy.open("wb") as file:
+        pickle.dump({"documents": [], "embeddings": None}, file)
+
+    store = FaissStore(file_path=None)
+    store.load(str(legacy), trusted_paths=[tmp_path])
+
+    assert store.documents == []
+
+
 def test_load_rejects_non_path_trusted_roots_readably(tmp_path):
     """信任根不是路径时给可读的 ``ValueError``，而不是裸 ``TypeError``。
 

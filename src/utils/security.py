@@ -968,6 +968,18 @@ def ensure_trusted_source(
             " 字符串会被逐字符拆成信任根（其中 ``/`` 会放行任意绝对路径），"
             "请传入路径列表，例如 [snapshot_root]。"
         )
+    # 非可迭代的形态也要在这里拦下：下面直接 ``for root in trusted_roots``，对
+    # ``5``／``True``／``object()`` 抛裸 ``TypeError: 'int' object is not
+    # iterable``——不是本函数承诺的带 label 的 ``ValueError``，而调用方
+    # ``FaissStore.load`` 按 ``ValueError`` 分类。``str``／``bytes`` 已在上一条
+    # 显式拦下（它们**是**可迭代，但会被逐字符拆开，是另一种失败），这里补的是
+    # 「根本不是序列」这一类。可达路径：``load`` 是 ``VectorStoreBase`` 的契约
+    # 方法，嵌入方直接调用时把 ``trusted_paths`` 写错形态即命中。
+    if trusted_roots is not None and not isinstance(trusted_roots, Iterable):
+        raise ValueError(
+            f"{label} 的受信来源必须是路径序列，但得到 {type(trusted_roots).__name__}。"
+            " 请传入路径列表，例如 [snapshot_root]。"
+        )
     roots: list[Path] = []
     if trusted_roots is not None:
         for root in trusted_roots:
