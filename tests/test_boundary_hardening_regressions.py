@@ -3318,6 +3318,126 @@ def test_rerank_if_needed_still_accepts_a_document_list():
     assert len(result) == 1
 
 
+# ── `_rerank_if_needed` 的两个关键字入参也要收敛 ──
+#
+# 该方法的 `rerank_enabled` 与 `top_k` 都是**可选关键字**，docstring 写明
+# 「`rerank_enabled` 由调用方传入**已收敛**的布尔」「`top_k` 同理」，默认
+# `None` 时才自行收敛。但「调用方传入的值」这一半完全没有判据：
+#
+#   * `top_k="abc"` / `top_k=[1]` -> `max(1, min("abc", n))` 抛裸
+#     `TypeError: '<' not supported between instances of 'int' and 'str'`；
+#   * `rerank_enabled="no"` / `0` / `[]` -> 真值判断，分别得到「启用」「禁用」
+#     「禁用」——`0` 与 `[]` 恰好与 `False` 同分支（不报错但语义靠巧合），
+#     `"no"` 则**真的去调 rerank provider**，而 `SessionConfig` 对同一个值
+#     直接报错（`require_rerank_enabled` 只认 `bool`）。
+#
+# 两者都不是 `ValueError`，穿透调用方按 `ValueError` 建立的分类。修法是让这两个
+# 形参也过一遍与默认分支**同一组**助手——判据只做了一半。
+
+
+@pytest.mark.parametrize(
+    "written",
+    [
+        pytest.param("abc", id="str"),
+        pytest.param([1], id="list"),
+        pytest.param(True, id="bool"),
+        pytest.param(3.5, id="float"),
+        pytest.param(10**4301, id="beyond-int-str-digits"),
+    ],
+)
+def test_rerank_if_needed_rejects_an_uncoerced_top_k_argument(written):
+    """库调用方传入的 ``top_k`` 与默认分支同判据。"""
+    import asyncio
+
+    from src.services.retrieval_service import RetrievalService
+
+    detail = SimpleNamespace(provider="siliconflow", model_name="m")
+    config = _session_config(rerank_enabled=True, rerank_configurations={"y": detail})
+
+    service = RetrievalService(vector_store=object(), embedding_service=object())
+    service._get_rerank_provider = lambda *args, **kwargs: _RerankStub()
+
+    with pytest.raises(ValueError, match="top_k"):
+        asyncio.run(
+            service._rerank_if_needed(
+                "q",
+                [{"page_content": "d", "metadata": {}, "score": 0.9}],
+                config,
+                top_k=written,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "written",
+    [
+        pytest.param("no", id="str"),
+        pytest.param("false", id="str-false"),
+        pytest.param(0, id="int-zero"),
+        pytest.param(1, id="int-one"),
+        pytest.param([], id="empty-list"),
+    ],
+)
+def test_rerank_if_needed_rejects_an_uncoerced_rerank_enabled_argument(written):
+    """库调用方传入的 ``rerank_enabled`` 与默认分支同判据。"""
+    import asyncio
+
+    from src.services.retrieval_service import RetrievalService
+
+    detail = SimpleNamespace(provider="siliconflow", model_name="m")
+    config = _session_config(rerank_enabled=True, rerank_configurations={"y": detail})
+
+    service = RetrievalService(vector_store=object(), embedding_service=object())
+    service._get_rerank_provider = lambda *args, **kwargs: _RerankStub()
+
+    with pytest.raises(ValueError, match="rerank_enabled"):
+        asyncio.run(
+            service._rerank_if_needed(
+                "q",
+                [{"page_content": "d", "metadata": {}, "score": 0.9}],
+                config,
+                rerank_enabled=written,
+            )
+        )
+
+
+def test_rerank_if_needed_still_accepts_coerced_keyword_arguments():
+    """收紧不能误伤：调用方传入的已收敛取值照常工作。"""
+    import asyncio
+
+    from src.services.retrieval_service import RetrievalService
+
+    detail = SimpleNamespace(provider="siliconflow", model_name="m")
+    config = _session_config(rerank_enabled=True, rerank_configurations={"y": detail})
+
+    service = RetrievalService(vector_store=object(), embedding_service=object())
+    service._get_rerank_provider = lambda *args, **kwargs: _RerankStub()
+
+    result = asyncio.run(
+        service._rerank_if_needed(
+            "q",
+            [{"page_content": "d", "metadata": {}, "score": 0.9}],
+            config,
+            rerank_enabled=True,
+            top_k=3,
+        )
+    )
+
+    assert len(result) == 1
+
+    # ``rerank_enabled=False`` 是「显式禁用」，与默认分支的 ``False`` 同一条出口。
+    result = asyncio.run(
+        service._rerank_if_needed(
+            "q",
+            [{"page_content": "d", "metadata": {}, "score": 0.9}],
+            config,
+            rerank_enabled=False,
+        )
+    )
+
+    assert len(result) == 1
+
+
 def test_retrieve_uses_the_coerced_top_k_even_if_it_changes_mid_flight():
     """检索飞行中改写 ``top_k`` 不得让出口切片抛裸 ``TypeError``。
 

@@ -880,6 +880,21 @@ class RetrievalService:
         ``_coerce_rerank_enabled``）。默认 ``None`` 时自行收敛，供库调用方直接
         调本方法的场景使用。
         """
+        # 上面那段契约此前只覆盖了「默认 ``None`` 时自行收敛」这一半，而
+        # **调用方传入的取值**原样使用。库调用方正是本方法 docstring 点名的场景，
+        # 它没有 ``retrieve`` 开头那道收敛，于是同一个字段在这里分成两套判据：
+        #
+        #   * ``rerank_enabled="no"`` —— 真值判断为 True，**真的去调 rerank
+        #     provider**（实测触发建 provider 的整条链路，凭证缺失时以
+        #     ``ValueError: SILICONFLOW_API_KEY is required`` 收场），而
+        #     ``SessionConfig`` 对同一个值直接报「必须是布尔值」；
+        #   * ``rerank_enabled=0``／``[]`` —— 恰好与 ``False`` 走同一分支，
+        #     不报错，但「能工作」靠的是真值语义的巧合，而不是判据。
+        #
+        # 与 ``top_k`` 的处置完全一致：显式传入的取值同样要过一遍**同一组**
+        # 助手，而不是只判默认分支。``None`` 保留给「未传入」这一哨兵语义。
+        if rerank_enabled is not None:
+            rerank_enabled = _coerce_rerank_enabled(rerank_enabled)
         enabled = (
             _coerce_rerank_enabled(session_config.rerank_enabled)
             if rerank_enabled is None
@@ -915,6 +930,14 @@ class RetrievalService:
         # ``retrieve`` 开头那道收敛——实测直写 ``top_k="abc"``／``None``／``[1]``
         # 时 ``min()`` 抛裸 ``TypeError: '<' not supported between instances of
         # 'int' and 'str'``，不是 ``ValueError``。
+        #
+        # 但「优先用传入值」只覆盖了默认分支那一半：调用方**显式传入**的取值
+        # 此前原样使用，于是同一个形参的两种来源判据不一致——不传时收敛、传了
+        # 反而跳过。库调用方恰恰总是显式传（``retrieve`` 也传）。这里把显式取值
+        # 也过一遍同一个 ``require_scale_field``，与 ``rerank_enabled`` 的处置
+        # 逐字对齐；``None`` 保留给「未传入」这一哨兵语义。
+        if top_k is not None:
+            top_k = require_scale_field(top_k, "top_k")
         effective_top_k = (
             require_scale_field(session_config.top_k, "top_k") if top_k is None else top_k
         )
