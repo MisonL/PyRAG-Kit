@@ -95,6 +95,16 @@ class HybridReranker:
         return [max(0.0, min(1.0, (score - min_score) / score_range)) for score in scores]
 
     def rerank(self, documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # 入参形态与构造器／``_weight_tuple`` 同判据：本类的 docstring 明确
+        # 「库调用方可能绕过 ``Settings`` 与 ``SessionConfig`` 直接构造」，那两个
+        # 入口都为此收敛了，唯独入参这一半漏了。两个内部分支都直接
+        # ``for doc in documents`` 再对 ``doc.get(...)`` 取值，非列表取值的收场
+        # 不在契约内：``5``／``None``／``object()`` 抛裸
+        # ``TypeError: ... is not iterable``；``"abc"``／``{"a": 1}`` 抛
+        # ``AttributeError: 'str' object has no attribute 'get'``（逐字符／逐键
+        # 迭代）。两者都不是 ``ValueError``，穿透调用方按 ``ValueError`` 建立的
+        # 分类。判据与生产路径共用 ``_require_document_list``。
+        documents = _require_document_list(documents, "混合检索融合")
         if self.fusion_strategy == "weighted":
             return self._weighted_rerank(documents)
         return self._rrf_rerank(documents)

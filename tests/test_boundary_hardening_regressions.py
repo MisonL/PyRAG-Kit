@@ -3868,6 +3868,51 @@ def test_hybrid_reranker_weight_message_survives_unrepresentable_values():
         HybridReranker(_UnreprUnstyled(10**308), 10**308)._weight_tuple()
 
 
+# ── HybridReranker.rerank 的 documents 入参也要判形态 ──
+#
+# 本类的 docstring 明确「库调用方可能绕过 ``Settings`` 与 ``SessionConfig``
+# 直接构造」，构造器与 ``_weight_tuple`` 都为此做了收敛；但**入参** ``documents``
+# 这一半漏了。``_weighted_rerank``／``_rrf_rerank`` 都直接 ``for doc in documents``
+# 再对 ``doc.get(...)`` 取值，非列表取值的收场都不在契约内：``5``／``None``／
+# ``object()`` 抛裸 ``TypeError: ... is not iterable``；``"abc"``／``{"a": 1}``
+# 抛 ``AttributeError: 'str' object has no attribute 'get'``（逐字符／逐键迭代）。
+# 两种都不是 ``ValueError``，穿透调用方按 ``ValueError`` 建立的分类。
+# 可达路径：``HybridReranker`` 经 ``src/retrieval/retriever.py`` 的 ``__all__``
+# 对外导出，是公开边界。
+
+
+@pytest.mark.parametrize(
+    "documents",
+    [
+        pytest.param(5, id="int"),
+        pytest.param(None, id="none"),
+        pytest.param("abc", id="str"),
+        pytest.param({"a": 1}, id="dict"),
+        pytest.param(object(), id="object"),
+    ],
+)
+@pytest.mark.parametrize("fusion_strategy", ["rrf", "weighted"])
+def test_hybrid_reranker_rerank_rejects_non_document_list(documents, fusion_strategy):
+    """``rerank`` 收到非文档列表时必须给可读异常，不得裸抛。"""
+    from src.services.retrieval_service import HybridReranker
+
+    reranker = HybridReranker(0.5, 0.5, fusion_strategy=fusion_strategy)
+
+    with pytest.raises((TypeError, ValueError), match="文档列表"):
+        reranker.rerank(documents)
+
+
+def test_hybrid_reranker_rerank_still_accepts_a_document_list():
+    """收紧不能误伤：合法文档列表照常融合排序。"""
+    from src.services.retrieval_service import HybridReranker
+
+    reranker = HybridReranker(0.5, 0.5, fusion_strategy="rrf")
+
+    ranked = reranker.rerank([{"page_content": "d", "semantic_rank": 1, "keyword_rank": 1}])
+
+    assert len(ranked) == 1
+
+
 # ── 子分片的 50% 比例上界：父侧修了，子侧漏了 ──
 #
 # 上一轮给**父**分片加了 `overlap <= size / 2`（`_validate_parent_sizes`），
