@@ -192,6 +192,70 @@ def test_session_config_setitem_still_rejects_unknown_string_fields(session_conf
         session_config["不存在的字段"] = 1
 
 
+# ── 回归：``__getitem__`` 必须与 ``__setitem__`` 同判据 ──
+#
+# 本类声明 ``MutableMapping[str, Any]``，而 ``__setitem__`` 会经
+# ``_require_known_field`` 拒绝未知字段（``KeyError``）与非法形态
+# （``ValueError``）。读取侧此前直接写 ``getattr(self, key)``，对同一 key 抛的
+# 是 ``AttributeError``——判据只做了一半。
+#
+# 后果不是「消息不好看」：``in``／``.get(k, default)``／``.pop(k, default)``／
+# ``.setdefault`` 这些 ``MutableMapping`` 的混入实现**只接 ``KeyError``**。实测
+# ``"nope" in cfg`` 与 ``cfg.get("nope", "d")`` 都抛 ``AttributeError``，而它们
+# 本该分别返回 ``False`` 与 ``"d"``。另外 ``getattr`` 会把 ``__class__``／
+# ``__dict__``／``to_dict`` 这类非字段属性一并返回（实测 ``cfg["to_dict"]`` 拿到
+# 绑定方法），而写入侧对同名 key 抛 ``KeyError``。
+
+
+@pytest.mark.parametrize(
+    ("label", "bad_key"),
+    [
+        ("未知字符串字段", "不存在的字段"),
+        ("非字段属性名", "to_dict"),
+        ("dunder", "__class__"),
+    ],
+    ids=["unknown", "method-name", "dunder"],
+)
+def test_session_config_getitem_rejects_unknown_fields(session_config, label, bad_key):
+    """未知字段名（含非字段属性）在读取侧同样报 ``KeyError``。"""
+    with pytest.raises(KeyError, match="没有字段"):
+        session_config[bad_key]
+
+
+@pytest.mark.parametrize(
+    ("label", "bad_key"),
+    [
+        ("不可哈希的列表", [1, 2]),
+        ("位数超限的整数", 10**4301),
+        ("None", None),
+    ],
+    ids=["list", "huge-int", "none"],
+)
+def test_session_config_getitem_rejects_malformed_field_names(session_config, label, bad_key):
+    """字段名形态非法时必须报 ``ValueError``，不能漏出 ``TypeError`` 或位数上限错误。"""
+    with pytest.raises(ValueError) as excinfo:
+        session_config[bad_key]
+
+    message = str(excinfo.value)
+    assert "字段名必须是字符串" in message, f"{label}: {message}"
+    assert "Exceeds the limit" not in message, f"{label}: {message}"
+
+
+def test_session_config_mapping_protocol_works_for_unknown_keys(session_config):
+    """``MutableMapping`` 的混入实现（只接 ``KeyError``）必须照常工作。"""
+    assert "不存在的字段" not in session_config
+    assert session_config.get("不存在的字段", "dflt") == "dflt"
+    assert session_config.pop("不存在的字段", "dflt") == "dflt"
+    assert "top_k" in session_config
+    assert session_config.get("top_k") == session_config["top_k"]
+
+
+def test_session_config_getitem_still_returns_known_fields(session_config):
+    """收紧不能误伤：已知字段照常可取，且与属性访问一致。"""
+    assert session_config["top_k"] == session_config.top_k
+    assert session_config["chat_temperature"] == session_config.chat_temperature
+
+
 @pytest.mark.parametrize(
     ("label", "attribute", "value"),
     [

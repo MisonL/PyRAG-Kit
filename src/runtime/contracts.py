@@ -124,6 +124,25 @@ class SessionConfig(MutableMapping[str, Any]):
     _FIELD_NAMES: ClassVar[frozenset[str]] = frozenset()
 
     def __getitem__(self, key: str) -> Any:
+        # 读取侧此前直接写 ``getattr(self, key)``，与写入侧的判据只做了一半：
+        # ``__setitem__`` 会经 ``_require_known_field`` 拒绝未知字段（``KeyError``）
+        # 与非法形态（``ValueError``），而读取侧对同一 key 抛的是 ``AttributeError``
+        # ——本类声明的是 ``MutableMapping[str, Any]``，而 ``Mapping`` 协议要求未知
+        # 键抛 ``KeyError``。
+        #
+        # 后果不是「消息不好看」：``in``／``.get(k, default)``／``.pop(k, default)``
+        # ／``.setdefault`` 这些 ``MutableMapping`` 的混入实现**只接 ``KeyError``**。
+        # 实测 ``"nope" in cfg`` 抛 ``AttributeError``（本该是 ``False``）、
+        # ``cfg.get("nope", "d")`` 抛 ``AttributeError``（本该返回 ``"d"``）——
+        # 一个「探测字段是否存在」的调用方拿到的是异常而不是布尔值。
+        #
+        # 另外 ``getattr`` 会把 ``__class__``／``__dict__``／``to_dict`` 这类非字段
+        # 属性一并返回（实测 ``cfg["to_dict"]`` 拿到绑定方法），而写入侧对同名 key
+        # 抛 ``KeyError``——读写两侧对「这个 key 是不是字段」的答案必须一致。
+        #
+        # 复用 ``_require_known_field`` 而不是就地判断：它与写入侧共用同一份
+        # 判据与措辞，两侧不会各自演化。
+        self._require_known_field(key)
         return getattr(self, key)
 
     def __setitem__(self, key: str, value: Any) -> None:

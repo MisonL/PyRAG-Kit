@@ -6,6 +6,8 @@
 
 ### 修复
 
+- **`SessionConfig.__getitem__` 与 `__setitem__` 判据不一致，破坏 `Mapping` 协议**（`src/runtime/contracts.py`）。本类声明 `MutableMapping[str, Any]`，`__setitem__` 会经 `_require_known_field` 拒绝未知字段（`KeyError`）与非法形态（`ValueError`），而读取侧直接写 `getattr(self, key)`——判据只做了一半。后果不是「消息不好看」：`in`／`.get(k, default)`／`.pop(k, default)`／`.setdefault` 这些 `MutableMapping` 的混入实现**只接 `KeyError`**，实测 `"不存在的字段" in cfg` 与 `cfg.get("不存在的字段", "dflt")` 都抛 `AttributeError`，而它们本该分别返回 `False` 与 `"dflt"`——一个「探测字段是否存在」的调用方拿到的是异常而不是布尔值。另外 `getattr` 会把 `__class__`／`__dict__`／`to_dict` 这类非字段属性一并返回（实测 `cfg["to_dict"]` 拿到绑定方法），而写入侧对同名 key 抛 `KeyError`——读写两侧对「这个 key 是不是字段」的答案必须一致。修法：复用写入侧的 `_require_known_field`，两侧共用同一份判据与措辞。回归测试 7 条（未知字段／方法名／dunder／不可哈希 key／位数超限整数／`None`／`Mapping` 协议混入实现），其中 7 条在未修源码时实测变红；另加一条「已知字段照常可取且与属性访问一致」的反向守卫。
+
 - **`Chatbot._display_retrieved_docs` 对非列表 `docs` 静默渲染伪结果**（`src/chat/core.py`）。与召回测试侧的 `display_results`（本组稍早的一条）同判据——两者消费的是检索管线输出的同一种值，而那一侧已有这条守卫，这一侧此前漏了。实测非列表取值两种收场都不在契约内：`"abc"` 是合法可迭代对象，逐**字符**迭代后每个字符经 `document_*` 助手收敛成占位符，渲染出一张 3 行来源与预览都是空串的伪结果表格（用户看到「检索详情」里有 3 条命中，而实际返回的是字符串）；`5`／`True` 抛裸 `TypeError: 'int' object is not iterable`，而本方法在 `chat_async` 的 `try` 内，异常会被兜成「LLM 异步生成出错」——一次成功检索的展示失败被显示成模型故障。修法：按「非列表视为无结果」收敛，与 `display_results` 同判据。回归测试 6 条（`str`／`int`／`bool`／`dict`／`None` + 一条「正常文档列表照常逐条渲染」的反向守卫），其中 4 条在未修源码时实测变红。
 
   （同一次改动把 `tests/test_display_utils.py` 里 `_UNTRUSTED_FREE_ARGUMENTS` 的两条条目从 `src/chat/core.py:369`／`:370` 同步到 `:380`／`:381`——该清单按 `文件:行号` 索引，新增守卫行会让旧行号失效。）
