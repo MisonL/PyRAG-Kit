@@ -291,7 +291,17 @@ class SnapshotRepository:
         # 不构成来源证明。resolve_within 会把符号链接逃逸（root/link -> /etc）
         # 一并拦下。
         resolved = resolve_within(snapshot_dir, self.root, label="知识快照目录")
-        if snapshot_dir.is_symlink():
+        # 符号链接判据必须看**原始**（未解析）取值：``resolve_within`` 已经把
+        # 符号链接解析掉了，对 ``resolved`` 调 ``is_symlink()`` 恒为 False，等于
+        # 没有这条判据。但原始取值的形态不受本方法的标注约束——``resolve_within``
+        # 显式接受 ``str | os.PathLike``（见它的形态判据），因此调用方传字符串是
+        # 合法输入，而 ``str`` 没有 ``is_symlink``：实测传字符串时本方法在
+        # ``resolve_within`` 通过之后抛裸 ``AttributeError: 'str' object has no
+        # attribute 'is_symlink'``——本类其余拒绝路径一律给带指引的 ``ValueError``。
+        # 判据落在 ``resolve_within`` 之后，因此这里只需包一层 ``Path``：
+        # ``int``／``None``／``list`` 已被它拒掉，剩下的必然是 ``str`` 或
+        # ``os.PathLike``。
+        if Path(snapshot_dir).is_symlink():
             raise ValueError(f"知识快照目录不能是符号链接: {snapshot_dir}")
         if resolved.parent != Path(self.root).resolve():
             raise ValueError(

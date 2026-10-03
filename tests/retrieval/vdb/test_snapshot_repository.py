@@ -308,6 +308,56 @@ def test_validate_snapshot_dir_rejects_symlinked_snapshot_dir(tmp_path, monkeypa
         repository.validate_snapshot_dir(link)
 
 
+# ── 回归：``validate_snapshot_dir`` 的字符串路径不得抛裸 ``AttributeError`` ──
+#
+# 符号链接判据看的是**原始**（未解析）取值——``resolve_within`` 已把链接解析掉，
+# 对 ``resolved`` 调 ``is_symlink()`` 恒为 False。而原始取值的形态不受本方法标注
+# 约束：``resolve_within`` 显式接受 ``str | os.PathLike``，因此调用方传字符串是
+# 合法输入，而 ``str`` 没有 ``is_symlink``。实测传字符串时本方法在
+# ``resolve_within`` 通过之后抛裸 ``AttributeError: 'str' object has no attribute
+# 'is_symlink'``——本类其余拒绝路径一律给带指引的 ``ValueError``。
+#
+# 现实性：``FaissStore.save_snapshot(snapshot_dir: str)`` 与
+# ``FaissStore.load_snapshot(snapshot_dir: str | os.PathLike[str])`` 的标注都是
+# ``str``，调用方按那个惯例传字符串就会命中这里。
+
+
+def test_validate_snapshot_dir_accepts_string_path(tmp_path, monkeypatch):
+    """字符串形态的合法快照目录必须照常通过，不得抛裸 ``AttributeError``。"""
+    from src.retrieval.snapshot_repository import SnapshotRepository
+
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_root.mkdir()
+    monkeypatch.setattr("src.utils.config.ROOT_DIR", tmp_path)
+    (tmp_path / "config.toml").write_text('snapshot_root = "snapshots"\n', encoding="utf-8")
+    get_settings.cache_clear()
+    repository = SnapshotRepository(build_run_config(get_settings()))
+    snapshot_dir = _write_row_counts_snapshot(
+        repository.root, "kb-str", chunk_count=1, embedding_rows=1
+    )
+
+    repository.validate_snapshot_dir(str(snapshot_dir))
+
+
+def test_validate_snapshot_dir_rejects_string_symlink(tmp_path, monkeypatch):
+    """字符串形态的符号链接同样必须被那条判据拦下，不能因形态转换而漏掉。"""
+    from src.retrieval.snapshot_repository import SnapshotRepository
+
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_root.mkdir()
+    monkeypatch.setattr("src.utils.config.ROOT_DIR", tmp_path)
+    (tmp_path / "config.toml").write_text('snapshot_root = "snapshots"\n', encoding="utf-8")
+    get_settings.cache_clear()
+    repository = SnapshotRepository(build_run_config(get_settings()))
+    real = repository.root / "kb-real"
+    real.mkdir()
+    link = repository.root / "kb-link"
+    link.symlink_to(real)
+
+    with pytest.raises(ValueError, match="符号链接"):
+        repository.validate_snapshot_dir(str(link))
+
+
 def test_validate_snapshot_dir_rejects_nested_snapshot_dir(tmp_path, monkeypatch):
     """快照目录必须是根的直接子目录，不能嵌在更深层级。"""
     from src.retrieval.snapshot_repository import SnapshotRepository
