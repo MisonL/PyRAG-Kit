@@ -184,6 +184,20 @@ class SnapshotRepository:
         return final_dir
 
     def activate_snapshot(self, snapshot_id: str) -> None:
+        # 与另外三个接收 ``snapshot_id`` 的方法（``create_temp_snapshot_dir``／
+        # ``cleanup_temp_snapshot_dir``／``finalize_snapshot``）共用同一判据。
+        # 本方法此前是**唯一**漏掉它的：它把 ``snapshot_id`` 直接写进标记文件，
+        # 而标记文件正是 ``get_active_snapshot_id``／``get_active_snapshot_dir``
+        # 的输入——两个读取侧都会用 ``_require_snapshot_id_within_root`` 校验。
+        # 于是同一个值在**写**侧被接受、在**读**侧被拒绝，收场是「激活成功」之后
+        # 每一次启动都在 ``VectorStoreFactory._load_existing_state`` 的第一步失败。
+        # 实测 ``activate_snapshot("../evil")`` 正常返回并把 ``../evil`` 写进
+        # ``ACTIVE_SNAPSHOT``，随后 ``get_active_snapshot_id()`` 抛
+        # 「快照 id 不合法: '../evil'」；非字符串（``5``／``None``）与位数超限的
+        # 整数则在这一行抛裸 ``TypeError: data must be str``／``ValueError:
+        # Exceeds the limit``——而本类的契约是带指引的 ``ValueError``。
+        # 判据在写入之前，异常时标记文件保持不变。
+        self._require_snapshot_id_within_root(snapshot_id, source="activate_snapshot")
         marker = self.run_config.active_snapshot_marker
         marker.parent.mkdir(parents=True, exist_ok=True)
         temp_marker = marker.with_suffix(".tmp")

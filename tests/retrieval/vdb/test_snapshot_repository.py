@@ -744,6 +744,58 @@ def test_snapshot_id_must_be_a_single_path_component(tmp_path, monkeypatch, snap
         repository.cleanup_temp_snapshot_dir(snapshot_id)
 
 
+# ── 回归：``activate_snapshot`` 也要过同一份快照 id 判据 ──
+#
+# 它是四个接收 ``snapshot_id`` 的公开方法里**唯一**漏掉
+# ``_require_snapshot_id_within_root`` 的：``create_temp_snapshot_dir``／
+# ``cleanup_temp_snapshot_dir``／``finalize_snapshot`` 都有，它没有。
+#
+# 它把取值直接写进 ``ACTIVE_SNAPSHOT``，而标记文件正是两个读取侧
+# （``get_active_snapshot_id``／``get_active_snapshot_dir``）的输入，两者都会用
+# 同一份判据校验。于是同一个值在**写**侧被接受、在**读**侧被拒绝——实测
+# ``activate_snapshot("../evil")`` 正常返回并把 ``../evil`` 写进标记文件，随后
+# ``get_active_snapshot_id()`` 抛「快照 id 不合法」。非字符串（``5``／``None``）
+# 与位数超限的整数则在这一行抛裸 ``TypeError: data must be str``／
+# ``ValueError: Exceeds the limit``——都不是本类承诺的带指引 ``ValueError``。
+
+
+@pytest.mark.parametrize(
+    "snapshot_id",
+    [
+        pytest.param("../evil", id="relative-escape"),
+        pytest.param("/tmp/elsewhere", id="absolute"),
+        pytest.param("a/b", id="separator"),
+        pytest.param("..", id="dotdot"),
+        pytest.param("", id="empty"),
+        pytest.param(5, id="int"),
+        pytest.param(None, id="none"),
+        pytest.param(10**4301, id="beyond-int-str-digits"),
+    ],
+)
+def test_activate_snapshot_rejects_hostile_ids(run_config, snapshot_id):
+    """写入标记的取值必须与读取侧的判据一致，且失败时不留痕。"""
+    repository = SnapshotRepository(run_config)
+    marker = run_config.active_snapshot_marker
+    marker.write_text("kb-existing", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="快照 id"):
+        repository.activate_snapshot(snapshot_id)
+
+    # 失败不得改写既有的活动标记（``.tmp`` 中间文件也不该留下）。
+    assert marker.read_text(encoding="utf-8") == "kb-existing"
+    assert repository.get_active_snapshot_id() == "kb-existing"
+
+
+def test_activate_snapshot_still_accepts_generated_ids(run_config):
+    """收紧不能误伤：生成 id 的激活路径照常走通。"""
+    repository = SnapshotRepository(run_config)
+    snapshot_id = repository.generate_snapshot_id()
+
+    repository.activate_snapshot(snapshot_id)
+
+    assert repository.get_active_snapshot_id() == snapshot_id
+
+
 def test_snapshot_id_accepts_ids_produced_by_the_generator(tmp_path, monkeypatch):
     """收紧不能误伤：``generate_snapshot_id()`` 的产物必须照常可用。"""
     from src.retrieval.snapshot_repository import SnapshotRepository
