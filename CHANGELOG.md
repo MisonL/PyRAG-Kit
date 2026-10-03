@@ -6,6 +6,8 @@
 
 ### 修复
 
+- **`FaissStore.upsert_embeddings` 的 `embeddings` 入参缺形态判据**（`src/retrieval/vdb/faiss_store.py`）。上一条给同一方法的 `documents` 补了顶层容器判据，而**兄弟入参** `embeddings` 这一半仍裸抛：`np.array(..., dtype=np.float32)` 的三类失败全部穿透契约——`10**4301` 抛 `OverflowError: int too large to convert to float`（`ArithmeticError` 子类，**不是** `ValueError`，调用方的 `except ValueError` 接不住）、`{"a": 1}` 与 `object()` 抛 `TypeError: float() argument must be a string or a real number`、`"abc"` 抛 numpy 的 `ValueError: could not convert string to float`。三者的消息都不指向「这批向量形态不对」，而 `documents` 那一半已给出带指引的 `ValueError`——同一方法的两个入参，收场一个可读一个裸抛。判据只做了一半：同文件 `semantic_search` 的查询向量转换早已按同一分类收敛（`af06dc0` 一带的改动），这里对齐。修法：`np.array` 调用包进 `try`，三类失败统一收敛成带指引的 `ValueError`，与 `semantic_search` 逐字同判据。回归测试 4 条（位数超限整数／`str`／`dict`／`object()`），全部在未修源码时实测变红，并断言失败后 store 未被改动（`documents == []` 且 `embeddings is None`）。
+
 - **`display_results` 对非列表 `documents` 静默渲染伪结果**（`src/retrieval_test/core.py`）。与同一次提交里修的 `ExcelLogger.log_results` 同处、同类——两者在召回测试主循环里拿的是同一个 `documents`。实测 `documents="abc"` 是合法可迭代对象，逐**字符**迭代后每个字符经 `document_*` 助手收敛成占位符，渲染出 3 行内容与来源都是 `N/A` 的伪结果表格（用户看到「召回了 3 条」，而实际返回的是字符串）；`5` 抛裸 `TypeError: 'int' object is not iterable`。修法：按「非列表视为无结果」收敛，与 `log_results` 同判据。回归测试 4 条（`str`／`int`／`bool` + 一条「正常文档列表照常逐条渲染」的反向守卫），其中 3 条在未修源码时实测变红。
 
   （同一次改动把 `_UNTRUSTED_FREE_ARGUMENTS` 里两条按行号登记的条目从 `60`／`61` 同步到 `68`／`69`——该清单按 `文件:行号` 索引，新增守卫行会让旧行号失效。）

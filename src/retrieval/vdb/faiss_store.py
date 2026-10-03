@@ -443,9 +443,30 @@ class FaissStore(VectorStoreBase):
         # cast 溢出（``1e300`` → ``inf``）在这里是**被校验的对象**，不是要给
         # 调用方的警告：下面的有限性判据正是靠它把这一类拦住。不抑制的话它会以
         # ``RuntimeWarning`` 的形式泄漏出去，且出现在报错之前。
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            new_embeddings = np.array(embeddings, dtype=np.float32)
+        #
+        # 转换失败同样要收敛成 ``ValueError``，判据与同文件 ``semantic_search``
+        # 的查询向量转换逐字相同——那里早已按同一分类修过，这一半此前漏了。
+        # ``np.array`` 的失败分三类，只有一类是本项目契约里的类型：
+        #   ``OverflowError``——``np.array(10**4301, dtype=np.float32)``，超出
+        #     双精度范围的整数。它是 ``ArithmeticError`` 子类而**不是**
+        #     ``ValueError``，穿透调用方全部 ``except ValueError`` 分类。
+        #   ``TypeError``——``object()``／``{"a": 1}``，消息是 ``float()
+        #     argument must be a string or a real number``。
+        #   ``ValueError``——``"abc"``，消息是 numpy 的 ``could not convert
+        #     string to float``，与本项目的措辞不同。
+        # 三者的消息都不指向「这批向量形态不对」，而 ``documents`` 那一半已经
+        # 给出了带指引的 ``ValueError``（见上）——同一方法的两个入参，收场不该
+        # 一个可读一个裸抛。
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                new_embeddings = np.array(embeddings, dtype=np.float32)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "待写入的 embeddings 必须是二维数值数组，但得到 "
+                f"{type(embeddings).__name__}（{type(exc).__name__}: {exc}）。"
+                " 请检查向量来源（通常来自 EmbeddingService）。"
+            ) from exc
         if new_embeddings.ndim != 2:
             raise ValueError("embeddings 必须是二维数组。")
         if len(documents) != len(new_embeddings):

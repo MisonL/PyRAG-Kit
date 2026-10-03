@@ -1382,3 +1382,39 @@ def test_upsert_embeddings_still_accepts_document_sequences():
 
     assert len(store.documents) == 1
     assert store.faiss_index.ntotal == 1
+
+
+# ── 回归：upsert_embeddings 的 embeddings 入参缺形态判据 ──
+#
+# 上面那组覆盖的是 ``documents``，而同一方法的**兄弟入参** ``embeddings``
+# 此前完全没有守卫：``np.array(..., dtype=np.float32)`` 的三类失败全部裸抛，
+# 而 ``documents`` 那一半已经给出带指引的 ``ValueError``——同一方法的两个入参，
+# 收场一个可读一个裸抛。实测：
+#   * ``10**4301`` -> ``OverflowError: int too large to convert to float``
+#     （``ArithmeticError`` 子类，**不是** ``ValueError``，穿透调用方全部
+#     ``except ValueError`` 分类）；
+#   * ``{"a": 1}`` -> ``TypeError: float() argument must be a string or a real
+#     number, not 'dict'``；
+#   * ``"abc"`` -> numpy 的 ``ValueError: could not convert string to float``。
+# 判据与同文件 ``semantic_search`` 的查询向量转换逐字相同（那里早已按同一分类
+# 收敛），两者必须一致。
+
+
+@pytest.mark.parametrize(
+    "embeddings",
+    [
+        pytest.param(10**4301, id="int-beyond-double"),
+        pytest.param("abc", id="str"),
+        pytest.param({"a": 1}, id="dict"),
+        pytest.param(object(), id="object"),
+    ],
+)
+def test_upsert_embeddings_rejects_unconvertible_embeddings(embeddings):
+    """形态无法转成 float32 矩阵时，收场必须是带指引的 ``ValueError``。"""
+    store = FaissStore(file_path=None)
+
+    with pytest.raises(ValueError, match="embeddings"):
+        store.upsert_embeddings([{"page_content": "a", "metadata": {}}], embeddings)
+
+    assert store.documents == []
+    assert store.embeddings is None
