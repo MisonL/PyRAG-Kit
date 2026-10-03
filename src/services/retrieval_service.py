@@ -1016,9 +1016,21 @@ class RetrievalService:
         分支直接读原属性，等于把那条缺陷留在库调用方这条路径上（实测
         ``hybrid_fusion_strategy="RRF"`` 时返回 True）。
 
+        但上面这条只修了**兜底分支**那一半：调用方显式传入的取值仍然原样参与
+        ``== "rrf"`` 的比较，于是同一条缺陷换了个入口——实测
+        ``_should_apply_score_threshold(cfg, fusion_strategy="RRF")`` 返回 ``True``
+        而默认分支返回 ``False``，同一个字段的两种来源给出**相反**的结论；传入
+        ``["rrf"]``／``5`` 同样静默按「非 RRF」套上阈值。这是**静默的错误结果**
+        而不是异常：分数是排名倒数之和，被阈值一过滤整批结果就没了，用户看到
+        「检索无结果」而配置里写着 RRF。修法与同文件 ``_rerank_if_needed`` 的
+        ``top_k``／``rerank_enabled`` 逐字对齐：显式传入的取值也过一遍同一个
+        ``_coerce_fusion_strategy``，``None`` 保留给「未传入」这一哨兵语义。
+
         ``retrieval_method`` 同理收敛：与字面量比较对未知取值**不会报错**，而是
         静默判定「不是混合检索」，于是阈值过滤照常套用。
         """
+        if fusion_strategy is not None:
+            fusion_strategy = _coerce_fusion_strategy(fusion_strategy)
         strategy = (
             fusion_strategy
             if fusion_strategy is not None

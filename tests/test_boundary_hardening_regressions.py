@@ -2354,6 +2354,62 @@ def test_score_threshold_rejects_unusable_fusion_strategy_in_default_branch():
             RetrievalService._should_apply_score_threshold(config)
 
 
+# ── `_should_apply_score_threshold` 的 `fusion_strategy` 形参也要收敛 ──
+#
+# 该方法的 docstring 写明「``fusion_strategy`` 优先用调用方传入的**已收敛**取值」，
+# 并解释了为什么兜底分支必须自己收敛（`"RRF"` 走 RRF 融合却不等于字面量
+# `"rrf"`，阈值过滤会被错误地套在排名倒数的量纲上）。但**调用方显式传入**的
+# 取值原样参与比较——判据只做了兜底那一半。与同文件 `_rerank_if_needed` 的
+# `top_k`／`rerank_enabled` 是同一条线索、同一种修法。
+
+
+@pytest.mark.parametrize(
+    "written",
+    [
+        pytest.param("RRF", id="upper"),
+        pytest.param(" rrf ", id="padded"),
+        pytest.param(["rrf"], id="list"),
+        pytest.param(5, id="int"),
+    ],
+)
+def test_score_threshold_coerces_the_supplied_fusion_strategy(written):
+    """调用方传入的 ``fusion_strategy`` 与兜底分支同判据。
+
+    `"RRF"`／`" rrf "` 走的是 RRF 融合，必须与 `"rrf"` 得到同一个结论（不套阈值）；
+    无法识别成任何策略的形态必须报错，而不是静默按「非 RRF」套上阈值。
+    """
+    from src.runtime.contracts import build_session_config
+    from src.services.retrieval_service import RetrievalService
+    from src.utils.config import RetrievalMethod, get_settings
+
+    config = build_session_config(get_settings())
+    config.retrieval_method = RetrievalMethod.HYBRID_SEARCH
+    config.hybrid_fusion_strategy = "rrf"
+
+    if isinstance(written, str) and written.strip().lower() == "rrf":
+        assert (
+            RetrievalService._should_apply_score_threshold(config, fusion_strategy=written) is False
+        )
+        return
+    with pytest.raises(ValueError, match="hybrid_fusion_strategy"):
+        RetrievalService._should_apply_score_threshold(config, fusion_strategy=written)
+
+
+def test_score_threshold_still_accepts_a_coerced_fusion_strategy():
+    """收紧不能误伤：已收敛的融合策略照常判定。"""
+    from src.runtime.contracts import build_session_config
+    from src.services.retrieval_service import RetrievalService
+    from src.utils.config import RetrievalMethod, get_settings
+
+    config = build_session_config(get_settings())
+    config.retrieval_method = RetrievalMethod.HYBRID_SEARCH
+
+    assert RetrievalService._should_apply_score_threshold(config, fusion_strategy="rrf") is False
+    assert (
+        RetrievalService._should_apply_score_threshold(config, fusion_strategy="weighted") is True
+    )
+
+
 # ── 模型配置的展示路径（provider 形态 / 裸插值） ──
 #
 # ``ModelDetail.provider`` 声明为 ``str``，但 ``SessionConfig.llm_configurations``
