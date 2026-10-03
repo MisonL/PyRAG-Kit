@@ -112,6 +112,29 @@ class FaissStore(VectorStoreBase):
 
         if not file_path:
             return
+        # 形态判据与 ``save``／``load``／``save_snapshot``／``load_snapshot`` 一致：
+        # 构造器是同一个 ``file_path`` 的另一条公开入口，而它第一件事就是
+        # ``os.path.exists``——那里早于 ``load`` 里的形态守卫，非路径取值的收场
+        # 不在本类的 ``ValueError`` 契约内。实测：
+        #   * ``["a"]``／``{"a": 1}``／``object()`` -> 裸
+        #     ``TypeError: stat: path should be string, bytes, os.PathLike or
+        #     integer, not ...``；
+        #   * 位数超限的整数（``10**4301``）-> 裸 ``OverflowError: fd is greater
+        #     than maximum``——``ArithmeticError`` 子类，**不是** ``ValueError``，
+        #     穿透调用方全部 ``except ValueError`` 分类；
+        #   * 普通整数（``5``）更隐蔽：``os.path.exists`` 把它当成**文件描述符**
+        #     探测，fd 未打开时静默返回 ``False``，构造"成功"并把整数留在
+        #     ``self.file_path`` 上——与 ``save(5)`` 把字节写进 fd 5 是同一类
+        #     「整数被当成 fd」的问题，只是后果从写错文件变成静默空 store。
+        # 可达路径：``FaissStore`` 是公开类，且
+        # ``VectorStoreFactory.get_vector_store(store_type, file_path)`` 把
+        # ``file_path`` 原样透传到这里。
+        if not isinstance(file_path, (str, os.PathLike)):
+            raise ValueError(
+                "FaissStore 的 file_path 必须是字符串或路径，"
+                f"但得到 {type(file_path).__name__}。"
+                " 请检查该路径来源（通常来自 RunConfig 的 legacy_pkl_path）。"
+            )
         if not os.path.exists(file_path):
             return
         self.load(file_path, trusted_paths=trusted_paths)

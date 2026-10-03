@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import faiss
 import numpy as np
 import pytest
@@ -1337,6 +1339,51 @@ def test_resolve_within_rejects_non_path_arguments_readably(tmp_path):
         resolve_within(None, tmp_path, label="知识快照目录")
     with pytest.raises(ValueError, match="受信根必须是字符串或路径"):
         resolve_within(tmp_path, 5, label="知识快照目录")
+
+
+# ── 回归：``FaissStore.__init__`` 的 ``file_path`` 也要判形态 ──
+#
+# 构造器第一件事就是 ``os.path.exists(file_path)``，而它早于 ``load`` 里那道
+# 形态守卫——本类的 ``save``／``load``／``save_snapshot``／``load_snapshot``
+# 都已按同一判据收紧，构造器这条公开入口漏了。实测非路径取值的收场是裸异常，
+# 都不在本类的 ``ValueError`` 契约内：
+#   * ``["a"]``／``{"a": 1}``／``object()`` -> 裸
+#     ``TypeError: stat: path should be string, bytes, os.PathLike or integer,
+#     not ...``；
+#   * ``10**4301``（位数超限的整数）-> 裸 ``OverflowError: fd is greater than
+#     maximum``——它是 ``ArithmeticError`` 子类而**不是** ``ValueError``，穿透
+#     调用方全部 ``except ValueError`` 分类；
+#   * ``5`` 更隐蔽：``os.path.exists(5)`` 把整数当成**文件描述符**探测（实测
+#     返回 ``False`` 而**不报错**），于是构造静默成功、``file_path`` 留着这个
+#     整数——与 ``save(5)`` 把字节写进 fd 5 是同一类「整数被当成 fd」的问题。
+# 可达路径：``FaissStore`` 是公开类（测试与库调用方直接构造），且
+# ``VectorStoreFactory.get_vector_store(store_type, file_path)`` 把 ``file_path``
+# 原样透传到这里。
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        pytest.param(["a"], id="list"),
+        pytest.param({"a": 1}, id="dict"),
+        pytest.param(object(), id="object"),
+        pytest.param(10**4301, id="beyond-double"),
+        pytest.param(5, id="int-as-fd"),
+        pytest.param(b"x", id="bytes"),
+    ],
+)
+def test_init_rejects_non_path_file_path(bad_path):
+    """``file_path`` 非路径时必须给带指引的 ``ValueError``，不得裸抛或静默接受。"""
+    with pytest.raises(ValueError, match="file_path|路径"):
+        FaissStore(file_path=bad_path, trusted_paths=[Path("/tmp")])
+
+
+def test_init_still_accepts_a_missing_path(tmp_path):
+    """收紧不能误伤：指向不存在文件的合法路径照常构造出空 store。"""
+    store = FaissStore(file_path=str(tmp_path / "missing.pkl"), trusted_paths=[tmp_path])
+
+    assert store.documents == []
+    assert store.embeddings is None
 
 
 # ── 回归：upsert_embeddings 的 documents 顶层容器缺形态判据 ──
