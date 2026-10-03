@@ -959,6 +959,67 @@ def test_write_manifest_still_accepts_path_snapshot_dir(run_config):
     assert (temp_dir / "manifest.toml").is_file()
 
 
+# ── 回归：``load_manifest`` 是 ``write_manifest`` 的读取侧兄弟，形态判据也要对齐 ──
+#
+# ``write_manifest`` 已在上一组用例里按 ``__init__``／``finalize_snapshot`` 的
+# 同一判据收紧（只接受 ``Path``），读取侧这一半此前漏了，而它的失败形态比写入侧
+# 更坏：``snapshot_dir`` 是 ``str`` 时 ``snapshot_dir / "manifest.toml"`` 抛
+# ``TypeError: unsupported operand type(s) for /: 'str' and 'str'``，被下面的
+# ``except Exception`` 接住后**误报成「知识快照不自洽，请重建」**——一个完好的
+# 快照会被要求重建，而真正的错因（路径传成了字符串）在消息里完全不可见。
+#
+# 字符串形态尤其现实：``VectorStoreFactory._load_existing_state`` 里相邻两行分别
+# 以 ``Path``（``validate_snapshot_dir(active_snapshot_dir)``）与同一变量传给
+# ``load_manifest``，而 ``save_snapshot`` 的惯例又是 ``str``；调用方按任一侧的
+# 惯例取值都会命中这里。判据与 ``write_manifest`` 逐字对齐。
+
+
+@pytest.mark.parametrize(
+    "snapshot_dir",
+    [
+        pytest.param(5, id="int"),
+        pytest.param(None, id="none"),
+        pytest.param(["a"], id="list"),
+        pytest.param("not-a-path", id="str"),
+        pytest.param(10**4301, id="beyond-int-str-digits"),
+    ],
+)
+def test_load_manifest_rejects_non_path_snapshot_dir(run_config, snapshot_dir):
+    """``snapshot_dir`` 非 ``Path`` 时必须给带指引的 ``ValueError``，不得误报快照不自洽。"""
+    repository = SnapshotRepository(run_config)
+
+    with pytest.raises(ValueError, match="snapshot_dir") as excinfo:
+        repository.load_manifest(snapshot_dir)
+
+    # 关键：错误消息必须指向「入参形态」，不能把完好的快照说成损坏。
+    message = str(excinfo.value)
+    assert "不自洽" not in message
+    assert "请重建" not in message
+
+
+def test_load_manifest_still_accepts_path_snapshot_dir(run_config):
+    """收紧不能误伤：``create_temp_snapshot_dir()`` 的返回值照常可读。"""
+    from src.runtime.contracts import KnowledgeSnapshotManifest
+
+    repository = SnapshotRepository(run_config)
+    temp_dir = repository.create_temp_snapshot_dir(repository.generate_snapshot_id())
+    manifest = KnowledgeSnapshotManifest.create(
+        snapshot_id="kb-m",
+        store_type="faiss",
+        embedding_provider="local-hash",
+        embedding_model="local-hash-256",
+        chunk_mode="standard",
+        source_digest="d",
+        document_count=0,
+        chunk_count=0,
+    )
+    repository.write_manifest(temp_dir, manifest)
+
+    loaded = repository.load_manifest(temp_dir)
+
+    assert loaded.chunk_count == 0
+
+
 def test_snapshot_id_accepts_ids_produced_by_the_generator(tmp_path, monkeypatch):
     """收紧不能误伤：``generate_snapshot_id()`` 的产物必须照常可用。"""
     from src.retrieval.snapshot_repository import SnapshotRepository

@@ -256,6 +256,24 @@ class SnapshotRepository:
         分块与 embedding 的落盘结构），照着当前代码去解释未知版本会得到错误结果
         而不是报错。
         """
+        # 入参形态与 ``write_manifest`` 同判据：两者是同一份 manifest 的写入/读取
+        # 兄弟，写入侧已按 ``__init__``（``snapshot_root``）、``finalize_snapshot``
+        # （``temp_dir``）的同一判据收紧，读取侧这一半此前漏了。非 ``Path`` 取值
+        # 在下面的 ``snapshot_dir / "manifest.toml"`` 处抛
+        # ``TypeError: unsupported operand type(s) for /: 'str' and 'str'``，被紧接
+        # 着的 ``except Exception`` 接住后**误报成「知识快照不自洽，请重建」**——
+        # 一个完好的快照会被要求重建，真正的错因（路径传成了字符串）在消息里完全
+        # 不可见。判据必须在 ``try`` **之外**：形态问题不是「快照坏了」。
+        #
+        # 字符串形态尤其现实：``VectorStoreFactory._load_existing_state`` 里相邻
+        # 两行分别以 ``Path`` 与同一变量传给 ``validate_snapshot_dir`` 与
+        # ``load_manifest``，而 ``save_snapshot`` 的惯例又是 ``str``。
+        if not isinstance(snapshot_dir, Path):
+            raise ValueError(
+                "load_manifest 的 snapshot_dir 必须是 Path，"
+                f"但得到 {type(snapshot_dir).__name__}。"
+                " 请传入 create_temp_snapshot_dir() 的返回值。"
+            )
         # 解析失败与其它快照文件同样转成「快照不自洽」的 ValueError：本方法在
         # ``VectorStoreFactory`` 里紧跟在 ``validate_snapshot_dir`` 之后，是启动
         # 路径上的第二步。抛裸的 ``TOMLDecodeError``（它继承 ``ValueError``，但
