@@ -153,6 +153,32 @@ class HybridReranker:
                 " 两个权重同时为 0（或含非有限值）会让所有文档得分都是 0 或 nan，"
                 "再被分数阈值过滤，检索会静默返回空结果。"
             )
+        # **单个**权重还要落在 ``[0, 1]``：上面那条只判了「和为正」，于是
+        # ``(-0.5, 1.5)`` 这种「一个为负、另一个补足和」的取值照常通过——而
+        # ``total`` 恰为 1.0 时归一化返回的就是 ``(-0.5, 1.5)`` 本身（不是把它
+        # 压回正值）。负权重让 weighted 融合按**反相关**打分：语义路得分高的文档
+        # 得到更低的分数。实测走 ``retrieve``（``vector=-0.5``／``keyword=1.5``，
+        # 语义路 0.9 与 0.1 两条、关键词路 0.9 一条）：结果从 3 条变成 2 条，
+        # 语义路的高分文档直接消失——「排序反了」被伪装成「结果少了几条」。
+        #
+        # 值域判据与**写入侧**同源：``SessionConfig._validate_unit_weight`` 与
+        # ``Settings.validate_hybrid_weights`` 都要求 0.0 到 1.0。本方法是这三条
+        # 构造路径的共用兜底，这一半此前漏了。不担心过度收紧：两个权重都在
+        # ``[0, 1]`` 且和为正时，归一化结果与任何一种合法加权等价（端点
+        # ``(0, 1)``／``(1, 0)`` 也照常放行）。
+        for label, weight in (
+            ("vector_weight", self.vector_weight),
+            ("keyword_weight", self.keyword_weight),
+        ):
+            numeric = float(weight)
+            if not 0.0 <= numeric <= 1.0:
+                raise ValueError(
+                    f"混合检索的 {label} 必须在 0.0 到 1.0 之间，"
+                    f"但得到 {safe_repr(weight)}（vector_weight="
+                    f"{safe_repr(self.vector_weight)}、keyword_weight="
+                    f"{safe_repr(self.keyword_weight)}）。"
+                    " 负权重会让加权融合按反相关的方向打分（高分文档被排到后面）。"
+                )
         return self.vector_weight / total, self.keyword_weight / total
 
     def _weighted_rerank(self, documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -285,19 +311,40 @@ def _fingerprint(value: Any, seen: set[int]) -> str:
 
 
 def _coerce_threshold(value: Any) -> float:
-    """把分数阈值收敛成有限浮点，非法形态给出可读 ``ValueError``。
+    """把分数阈值收敛成 ``[0, 1]`` 的有限浮点，非法取值给出可读 ``ValueError``。
 
     ``retrieve`` 直接算 ``coerce_score(...) >= session_config.score_threshold``，
     而该字段可被直写（见 ``require_scale_field``）。非数值形态抛裸
     ``TypeError: '>=' not supported between instances of 'float' and 'NoneType'``
     ——落在 ``retrieve`` 既有的错误分类之外。``bool`` 显式拒绝：``True`` 会静默
     变成 ``1.0``，看起来像一个真实阈值。
+
+    **值域同样要判**：本函数此前只收敛形态（是不是有限数值），而**写入侧**有完整
+    的值域判据（``SessionConfig._validate_unit_weight``／
+    ``Settings.validate_chat_score_threshold``：必须在 0.0 到 1.0 之间）。同一个
+    字段的两个入口判据不一致，缺口还是**静默**的：
+
+    * ``score_threshold = 2.0`` —— ``coerce_score(...) >= 2.0`` 对所有文档恒为假，
+      **每一次检索都返回空列表且无任何提示**，正是本项目反复认领的「静默返回空
+      结果」收场（``Settings`` 的 validator 与 ``SessionConfig.__setitem__`` 对
+      同一个取值都直接拒绝）；
+    * ``score_threshold = -1.0`` —— 恒为真，阈值形同不存在，用户以为在过滤。
+
+    ``coerce_score`` 的输出已经被收敛到 ``[0, 1]``（非有限值退回 ``default``），
+    因此用取值域 ``[0, 1]`` 的阈值总能表达出「全过」与「全滤」两个端点，收紧不会
+    误伤任何合法配置。
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"score_threshold 必须是数值，但得到 {safe_repr(value)}。")
     number = to_finite_float(value)
     if number is None:
         raise ValueError(f"score_threshold 必须是有限数值，但得到 {safe_repr(value)}。")
+    if not 0.0 <= number <= 1.0:
+        raise ValueError(
+            f"score_threshold 必须在 0.0 到 1.0 之间，但得到 {safe_repr(value)}。"
+            " 它会与 0.0 到 1.0 的归一化得分比较：大于 1 会让每一次检索都返回空结果，"
+            "小于 0 则等于不过滤。请检查该配置项。"
+        )
     return number
 
 

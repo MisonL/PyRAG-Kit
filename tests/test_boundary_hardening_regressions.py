@@ -5373,3 +5373,155 @@ def test_build_prompt_still_accepts_document_lists():
     prompt = ChatService._build_prompt("问题", "意图", [{"page_content": "正文"}])
 
     assert "正文" in prompt
+
+
+# ── 读取侧的两个「单位区间」字段只判了形态，没判值域 ──
+#
+# ``vector_weight``／``keyword_weight``／``score_threshold`` 在**写入侧**都有完整
+# 的值域判据（``SessionConfig._validate_unit_weight``：必须在 0.0 到 1.0 之间；
+# ``Settings.validate_hybrid_weights`` 同判据），而**读取侧**只收敛形态：
+#
+#   * ``_weight_tuple`` 只判 ``is_double_convertible`` 与 ``total > 0``；
+#   * ``_coerce_threshold`` 只判是不是有限数值。
+#
+# 两个缺口都是**静默**的，且都实测可达（``SessionConfig`` 是公开类、普通属性没有
+# ``__setattr__`` 守卫，直写即命中；``retrieve`` 把取值原样交给这两处）：
+
+
+@pytest.mark.parametrize(
+    "vector_weight,keyword_weight",
+    [
+        pytest.param(-0.5, 1.5, id="negative-vector"),
+        pytest.param(1.5, -0.5, id="negative-keyword"),
+        pytest.param(-2.0, 3.0, id="both-out-of-range"),
+    ],
+)
+def test_negative_hybrid_weights_are_rejected_on_the_read_side(vector_weight, keyword_weight):
+    """负权重会把排序反转，不得静默归一化后照常使用。
+
+    写入侧拒绝 ``-0.5``／``1.5``，读取侧却因为「和为正」而放行；``_weight_tuple``
+    随后返回 ``(-0.5, 1.5)`` 本身（和恰为 1.0），weighted 融合于是按**反相关**
+    的权重打分。实测走 ``retrieve``：语义路得分高的文档被排到后面，其中一半
+    直接被阈值丢掉。
+    """
+    from src.services.retrieval_service import HybridReranker
+
+    with pytest.raises(ValueError, match="vector_weight"):
+        HybridReranker(vector_weight, keyword_weight)._weight_tuple()
+
+
+def test_negative_vector_weight_drops_half_the_results_in_retrieve():
+    """端到端：负权重的收场必须是 ``ValueError``，而不是「结果少了一半」。"""
+    import asyncio
+
+    from src.runtime.contracts import build_session_config
+    from src.services.retrieval_service import RetrievalService
+    from src.utils.config import RetrievalMethod, get_settings
+
+    class _Store:
+        def semantic_search(self, embedding, top_k):
+            return [
+                {"page_content": "SEMANTIC", "metadata": {"chunk_id": "a"}, "score": 0.9},
+                {"page_content": "LOW", "metadata": {"chunk_id": "b"}, "score": 0.1},
+            ]
+
+        def keyword_search(self, query, top_k):
+            return [{"page_content": "KEYWORD", "metadata": {"chunk_id": "c"}, "score": 0.9}]
+
+        def resolve_parent_content(self, parent_id):
+            return None
+
+    class _Embedding:
+        async def embed_query(self, query):
+            return [0.0] * 4
+
+    config = build_session_config(get_settings())
+    config.retrieval_method = RetrievalMethod.HYBRID_SEARCH
+    config.hybrid_fusion_strategy = "weighted"
+    config.rerank_enabled = False
+    config.score_threshold = 0.0
+    config.vector_weight = -0.5
+    config.keyword_weight = 1.5
+
+    service = RetrievalService(_Store(), _Embedding())
+
+    with pytest.raises(ValueError, match="vector_weight"):
+        asyncio.run(service.retrieve("q", config))
+
+
+@pytest.mark.parametrize(
+    "threshold",
+    [
+        pytest.param(2.0, id="above-one"),
+        pytest.param(-1.0, id="negative"),
+        pytest.param(100.0, id="far-above-one"),
+    ],
+)
+def test_out_of_range_score_threshold_is_rejected_on_the_read_side(threshold):
+    """阈值超出 ``[0, 1]`` 必须报错，而不是静默「全部过滤」或「不过滤」。
+
+    ``score_threshold = 2.0`` 时 ``coerce_score(...) >= 2.0`` 对所有文档恒为假，
+    **每一次检索都返回空列表且无任何提示**——正是本项目反复认领的「静默返回空
+    结果」收场；``score_threshold = -1.0`` 则恒为真，阈值形同不存在。写入侧对
+    这两个取值都直接拒绝。
+    """
+    import asyncio
+
+    from src.runtime.contracts import build_session_config
+    from src.services.retrieval_service import RetrievalService
+    from src.utils.config import RetrievalMethod, get_settings
+
+    class _Store:
+        def semantic_search(self, embedding, top_k):
+            return [{"page_content": "d", "metadata": {"chunk_id": "a"}, "score": 0.9}]
+
+        def resolve_parent_content(self, parent_id):
+            return None
+
+    class _Embedding:
+        async def embed_query(self, query):
+            return [0.0] * 4
+
+    config = build_session_config(get_settings())
+    config.retrieval_method = RetrievalMethod.SEMANTIC_SEARCH
+    config.rerank_enabled = False
+    config.score_threshold = threshold
+
+    service = RetrievalService(_Store(), _Embedding())
+
+    with pytest.raises(ValueError, match="score_threshold"):
+        asyncio.run(service.retrieve("q", config))
+
+
+def test_in_range_weights_and_thresholds_still_work():
+    """收紧不能误伤：``[0, 1]`` 之内的取值照常工作，含两个端点。"""
+    import asyncio
+
+    from src.runtime.contracts import build_session_config
+    from src.services.retrieval_service import HybridReranker, RetrievalService
+    from src.utils.config import RetrievalMethod, get_settings
+
+    assert HybridReranker(0.0, 1.0)._weight_tuple() == (0.0, 1.0)
+    assert HybridReranker(1.0, 0.0)._weight_tuple() == (1.0, 0.0)
+    assert HybridReranker(0.5, 0.5)._weight_tuple() == (0.5, 0.5)
+
+    class _Store:
+        def semantic_search(self, embedding, top_k):
+            return [{"page_content": "d", "metadata": {"chunk_id": "a"}, "score": 0.9}]
+
+        def resolve_parent_content(self, parent_id):
+            return None
+
+    class _Embedding:
+        async def embed_query(self, query):
+            return [0.0] * 4
+
+    # 阈值端点 1.0 合法，但 0.9 分的文档确实低于它——被过滤是正确行为，
+    # 因此只断言「不抛错」，不断言结果条数。
+    for threshold, expected in ((0.0, 1), (0.5, 1), (1.0, 0)):
+        config = build_session_config(get_settings())
+        config.retrieval_method = RetrievalMethod.SEMANTIC_SEARCH
+        config.rerank_enabled = False
+        config.score_threshold = threshold
+        service = RetrievalService(_Store(), _Embedding())
+        assert len(asyncio.run(service.retrieve("q", config))) == expected
