@@ -893,6 +893,72 @@ def test_finalize_snapshot_still_accepts_path_temp_dir(run_config):
     assert (final_dir / "chunks.pkl").read_bytes() == b"x"
 
 
+# ── 回归：``write_manifest`` 的 ``snapshot_dir`` 也要判形态 ──
+#
+# 与 ``__init__``（``snapshot_root``）、``finalize_snapshot``（``temp_dir``）同
+# 一处判据，这一处此前漏了：非 ``Path`` 取值在 ``snapshot_dir / "manifest.toml"``
+# 处抛裸 ``TypeError: unsupported operand type(s) for /: 'str' and 'str'``——没有
+# 字段名、也没有「该传什么」的指引，而本类的其余拒绝路径一律给带指引的
+# ``ValueError``。
+#
+# 字符串形态尤其现实：同一个 ``temp_dir`` 在 ``KnowledgeBuildService.build`` 里
+# 紧邻的两行分别以 ``str``（``vector_store.save_snapshot(str(temp_dir))``）与
+# ``Path``（``write_manifest(temp_dir, ...)``）传给两个 API，调用方按前者的惯例
+# 传字符串就会命中这里。
+
+
+@pytest.mark.parametrize(
+    "snapshot_dir",
+    [
+        pytest.param(5, id="int"),
+        pytest.param(None, id="none"),
+        pytest.param(["a"], id="list"),
+        pytest.param("not-a-path", id="str"),
+        pytest.param(10**4301, id="beyond-int-str-digits"),
+    ],
+)
+def test_write_manifest_rejects_non_path_snapshot_dir(run_config, snapshot_dir):
+    """``snapshot_dir`` 非 ``Path`` 时必须给带指引的 ``ValueError``，不得裸抛。"""
+    from src.runtime.contracts import KnowledgeSnapshotManifest
+
+    repository = SnapshotRepository(run_config)
+    manifest = KnowledgeSnapshotManifest.create(
+        snapshot_id="kb-m",
+        store_type="faiss",
+        embedding_provider="local-hash",
+        embedding_model="local-hash-256",
+        chunk_mode="standard",
+        source_digest="d",
+        document_count=0,
+        chunk_count=0,
+    )
+
+    with pytest.raises(ValueError, match="snapshot_dir"):
+        repository.write_manifest(snapshot_dir, manifest)
+
+
+def test_write_manifest_still_accepts_path_snapshot_dir(run_config):
+    """收紧不能误伤：``create_temp_snapshot_dir()`` 的返回值照常可用。"""
+    from src.runtime.contracts import KnowledgeSnapshotManifest
+
+    repository = SnapshotRepository(run_config)
+    temp_dir = repository.create_temp_snapshot_dir(repository.generate_snapshot_id())
+    manifest = KnowledgeSnapshotManifest.create(
+        snapshot_id="kb-m",
+        store_type="faiss",
+        embedding_provider="local-hash",
+        embedding_model="local-hash-256",
+        chunk_mode="standard",
+        source_digest="d",
+        document_count=0,
+        chunk_count=0,
+    )
+
+    repository.write_manifest(temp_dir, manifest)
+
+    assert (temp_dir / "manifest.toml").is_file()
+
+
 def test_snapshot_id_accepts_ids_produced_by_the_generator(tmp_path, monkeypatch):
     """收紧不能误伤：``generate_snapshot_id()`` 的产物必须照常可用。"""
     from src.retrieval.snapshot_repository import SnapshotRepository

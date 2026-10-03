@@ -227,6 +227,24 @@ class SnapshotRepository:
         return f"{prefix}-{uuid.uuid4().hex[:12]}"
 
     def write_manifest(self, snapshot_dir: Path, manifest: KnowledgeSnapshotManifest) -> None:
+        # 形态判据与同类的 ``__init__``（``snapshot_root``）、``finalize_snapshot``
+        # （``temp_dir``）一致：只接受 ``Path``，不静默强转。此前这一处漏了，非
+        # ``Path`` 取值在 ``snapshot_dir / "manifest.toml"`` 处抛裸
+        # ``TypeError: unsupported operand type(s) for /: 'str' and 'str'``——没有
+        # 字段名、也没有「该传什么」的指引，而本类的其余拒绝路径一律给带指引的
+        # ``ValueError``。
+        #
+        # 字符串形态尤其现实：同一个 ``temp_dir`` 在
+        # ``KnowledgeBuildService.build`` 里紧邻的两行分别以 ``str``（
+        # ``vector_store.save_snapshot(str(temp_dir))``）与 ``Path``
+        # （``write_manifest(temp_dir, ...)``）传给两个 API，调用方按前者的惯例
+        # 传字符串就会命中这里。
+        if not isinstance(snapshot_dir, Path):
+            raise ValueError(
+                "write_manifest 的 snapshot_dir 必须是 Path，"
+                f"但得到 {type(snapshot_dir).__name__}。"
+                " 请传入 create_temp_snapshot_dir() 的返回值。"
+            )
         (snapshot_dir / "manifest.toml").write_text(manifest.to_toml(), encoding="utf-8")
 
     def load_manifest(self, snapshot_dir: Path) -> KnowledgeSnapshotManifest:
