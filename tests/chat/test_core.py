@@ -759,6 +759,59 @@ def test_display_retrieved_docs_survives_malformed_documents(document):
     assert buffer.getvalue()
 
 
+# ── 回归：``_display_retrieved_docs`` 的顶层容器形态 ──
+#
+# 与召回测试侧的 ``display_results`` 同判据——两者消费的是检索管线输出的同一种
+# 值，而那一侧已有这条守卫，这一侧此前漏了。实测非列表取值两种收场都不在契约内：
+#   * ``"abc"`` 是合法可迭代对象，逐**字符**迭代后每个字符经 ``document_*`` 助手
+#     收敛成占位符，渲染出一张 3 行来源与预览都是空串的伪结果表格（用户看到
+#     「检索详情」里有 3 条命中，而实际返回的是字符串）；
+#   * ``5``／``True`` 抛裸 ``TypeError: 'int' object is not iterable``，而本方法在
+#     ``chat_async`` 的 ``try`` 内，异常会被兜成「LLM 异步生成出错」——一次成功
+#     检索的展示失败被显示成模型故障。
+
+
+@pytest.mark.parametrize(
+    "docs",
+    [
+        pytest.param("abc", id="str"),
+        pytest.param(5, id="int"),
+        pytest.param(True, id="bool"),
+        pytest.param({"a": 1}, id="dict"),
+        pytest.param(None, id="none"),
+    ],
+)
+def test_display_retrieved_docs_treats_non_list_as_empty(docs):
+    """非列表的 ``docs`` 一律按「无相关文档」收敛，不得渲染伪结果或裸抛。"""
+    from io import StringIO
+
+    buffer = StringIO()
+    bot = _silent_bot(buffer)
+
+    bot._display_retrieved_docs(docs)
+
+    output = buffer.getvalue()
+    assert "无相关文档" in output
+    # ``"abc"`` 修复前会渲染出一张 3 行的伪表格；这里断言表格标题不出现。
+    assert "检索详情" not in output
+
+
+def test_display_retrieved_docs_still_renders_a_normal_list():
+    """收紧不能误伤：正常文档列表照常逐条渲染。"""
+    from io import StringIO
+
+    buffer = StringIO()
+    bot = _silent_bot(buffer)
+
+    bot._display_retrieved_docs(
+        [{"page_content": "正文", "metadata": {"source": "a.md"}, "score": 0.5}]
+    )
+
+    output = buffer.getvalue()
+    assert "检索详情" in output
+    assert "a.md" in output
+
+
 # ── 回归：批量更新要按**最终值**校验，而不是逐个对旧值校验 ──
 #
 # ``chat_config`` 的 setter 在副本上逐个写字段，但每个字段的校验读的是**副本当时

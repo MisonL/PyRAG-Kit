@@ -352,6 +352,17 @@ class Chatbot:
                 yield "抱歉，处理请求时遇到错误。"
 
     def _display_retrieved_docs(self, docs: list[dict[str, Any]]):
+        # 形态先收敛，与召回测试侧的 ``display_results`` 同判据——两者消费的是
+        # 检索管线输出的同一种值，而那一侧已有这条守卫，这一侧此前漏了。实测
+        # 非列表取值两种收场都不在契约内：``"abc"`` 是合法可迭代对象，逐**字符**
+        # 迭代后每个字符经 ``document_*`` 助手收敛成占位符，渲染出一张 3 行来源与
+        # 预览都是空串的伪结果表格（用户看到「检索详情」里有 3 条命中，而实际返回
+        # 的是字符串）；``5``／``True`` 抛裸
+        # ``TypeError: 'int' object is not iterable``，而本方法在
+        # ``chat_async`` 的 ``try`` 内，异常会被兜成「LLM 异步生成出错」——一次
+        # 成功检索的展示失败被显示成模型故障。
+        if not isinstance(docs, list):
+            docs = []
         if not docs:
             self.console.print("[yellow]无相关文档。[/yellow]")
             return
