@@ -176,6 +176,25 @@ class SnapshotRepository:
 
     def finalize_snapshot(self, temp_dir: Path, snapshot_id: str) -> Path:
         self._require_snapshot_id_within_root(snapshot_id, source="finalize_snapshot")
+        # 兄弟入参 ``temp_dir`` 同样要判形态：本方法的两个参数，此前只有
+        # ``snapshot_id`` 有判据。``temp_dir.replace(...)`` 是 ``Path`` 的方法，
+        # 非 ``Path`` 取值在这里抛的是与「快照目录写错了」无关的裸异常——实测
+        # ``5``／``None``／``["a"]`` 抛 ``AttributeError: ... object has no
+        # attribute 'replace'``，而 ``str`` 更隐蔽：字符串**有** ``replace``，
+        # 只是语义完全不同，抛的是 ``TypeError: replace expected at least 2
+        # arguments, got 1``。本类其余拒绝路径一律给带指引的 ``ValueError``。
+        #
+        # 字符串形态尤其现实：同项目里目录参数普遍标注 ``str | os.PathLike``
+        # （``FaissStore.save_snapshot(snapshot_dir: str)``、本类的
+        # ``save_snapshot`` 等），调用方按那个惯例传字符串就会命中这里。
+        # 判据与 ``__init__`` 对 ``snapshot_root`` 的一致：只接受 ``Path``
+        # （本方法的标注就是它），不做静默强转。
+        if not isinstance(temp_dir, Path):
+            raise ValueError(
+                "finalize_snapshot 的 temp_dir 必须是 Path，"
+                f"但得到 {type(temp_dir).__name__}。"
+                " 请传入 create_temp_snapshot_dir() 的返回值。"
+            )
         final_dir = self.root / snapshot_id
         if final_dir.exists():
             shutil.rmtree(final_dir)

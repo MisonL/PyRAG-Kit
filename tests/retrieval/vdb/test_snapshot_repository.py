@@ -796,6 +796,53 @@ def test_activate_snapshot_still_accepts_generated_ids(run_config):
     assert repository.get_active_snapshot_id() == snapshot_id
 
 
+# ── 回归：``finalize_snapshot`` 的 ``temp_dir`` 也要判形态 ──
+#
+# 同一方法的两个参数，此前只有 ``snapshot_id`` 有判据（``_require_snapshot_id_
+# within_root``），``temp_dir`` 这一半没有。``temp_dir.replace(final_dir)`` 是
+# ``Path`` 的方法，非 ``Path`` 取值在那里抛的是与「快照目录写错了」无关的裸异常：
+# ``5``／``None``／``["a"]`` 抛 ``AttributeError: ... object has no attribute
+# 'replace'``，而 ``str`` 更隐蔽——字符串**有** ``replace``，只是语义完全不同，
+# 抛 ``TypeError: replace expected at least 2 arguments, got 1``。
+#
+# 字符串形态尤其现实：同项目里目录参数普遍标注 ``str | os.PathLike``
+# （``FaissStore.save_snapshot(snapshot_dir: str)`` 等），调用方按那个惯例传
+# 字符串就会命中这里。本类其余拒绝路径一律给带指引的 ``ValueError``。
+
+
+@pytest.mark.parametrize(
+    "temp_dir",
+    [
+        pytest.param(5, id="int"),
+        pytest.param(None, id="none"),
+        pytest.param(["a"], id="list"),
+        pytest.param("not-a-path", id="str"),
+        pytest.param(10**4301, id="beyond-int-str-digits"),
+    ],
+)
+def test_finalize_snapshot_rejects_non_path_temp_dir(run_config, temp_dir):
+    """``temp_dir`` 非 ``Path`` 时必须给带指引的 ``ValueError``，不得裸抛。"""
+    repository = SnapshotRepository(run_config)
+    snapshot_id = repository.generate_snapshot_id()
+    repository.create_temp_snapshot_dir(snapshot_id)
+
+    with pytest.raises(ValueError, match="temp_dir"):
+        repository.finalize_snapshot(temp_dir, snapshot_id)
+
+
+def test_finalize_snapshot_still_accepts_path_temp_dir(run_config):
+    """收紧不能误伤：``create_temp_snapshot_dir()`` 的返回值照常可用。"""
+    repository = SnapshotRepository(run_config)
+    snapshot_id = repository.generate_snapshot_id()
+    temp_dir = repository.create_temp_snapshot_dir(snapshot_id)
+    (temp_dir / "chunks.pkl").write_bytes(b"x")
+
+    final_dir = repository.finalize_snapshot(temp_dir, snapshot_id)
+
+    assert final_dir.exists()
+    assert (final_dir / "chunks.pkl").read_bytes() == b"x"
+
+
 def test_snapshot_id_accepts_ids_produced_by_the_generator(tmp_path, monkeypatch):
     """收紧不能误伤：``generate_snapshot_id()`` 的产物必须照常可用。"""
     from src.retrieval.snapshot_repository import SnapshotRepository
