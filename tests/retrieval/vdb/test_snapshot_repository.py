@@ -1224,6 +1224,67 @@ def test_load_manifest_reports_oversized_count_literal_as_inconsistent_snapshot(
     assert "不自洽" in str(excinfo.value)
 
 
+# ── 回归：清单的**计数字段**读写两侧判据必须一致 ──
+#
+# ``to_toml``（写入侧）经 ``_manifest_count`` 收敛：拒绝 ``bool``、拒绝非整数
+# 浮点、拒绝负数、拒绝超过 ``2**64`` 的取值。而 ``from_mapping``（读取侧）写的是
+# 裸 ``int(data[...])``——这些取值**全部被静默接受**，读出来的计数与磁盘上写的
+# 不是同一个数：
+#
+#   * ``document_count = 1.5``  -> ``1``（截断）
+#   * ``document_count = true`` -> ``1``（bool 是 int 子类）
+#   * ``document_count = -5``   -> ``-5``（负的分块数）
+#   * ``document_count = 10**300`` -> 原样接受（写入侧判它超出 2**64）
+#
+# manifest 是快照的准入凭据（``load_manifest`` 的返回值被
+# ``VectorStoreFactory`` 拿去比对 embedding 配置），一个「读得出来但写不进去」
+# 的计数意味着准入校验建立在一个磁盘上并不存在的数字上。两侧的 docstring 都
+# 写着「与另一侧同源」，判据却只对齐了异常分类那一半。
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        pytest.param("1.5", id="float"),
+        pytest.param("true", id="bool"),
+        pytest.param("-5", id="negative"),
+        pytest.param("1" + "0" * 300, id="beyond-2**64"),
+    ],
+)
+def test_load_manifest_rejects_count_values_the_write_side_refuses(literal):
+    """写入侧拒绝的计数取值，读取侧同样要拒绝并给出重建指引。"""
+    from src.retrieval.snapshot_repository import SnapshotRepository
+    from src.utils.config import get_settings
+
+    repository = SnapshotRepository(build_run_config(get_settings()))
+    toml_text = _manifest_toml()
+    for field in ("document_count", "chunk_count"):
+        toml_text = toml_text.replace(f"{field} = 3", f"{field} = {literal}")
+    _, snapshot_dir = _write_manifest_snapshot(repository.root, "kb-count-shape", toml_text)
+
+    with pytest.raises(ValueError, match="重建") as excinfo:
+        repository.load_manifest(snapshot_dir)
+
+    assert "不自洽" in str(excinfo.value)
+
+
+def test_load_manifest_keeps_accepting_a_decimal_string_count():
+    """收紧不能误伤：``.env``／TOML 来源本来就会以数字字符串到达。"""
+    from src.retrieval.snapshot_repository import SnapshotRepository
+    from src.utils.config import get_settings
+
+    repository = SnapshotRepository(build_run_config(get_settings()))
+    toml_text = _manifest_toml()
+    for field in ("document_count", "chunk_count"):
+        toml_text = toml_text.replace(f"{field} = 3", f'{field} = "3"')
+    _, snapshot_dir = _write_manifest_snapshot(repository.root, "kb-count-str", toml_text)
+
+    manifest = repository.load_manifest(snapshot_dir)
+
+    assert manifest.document_count == 3
+    assert manifest.chunk_count == 3
+
+
 def test_load_manifest_still_accepts_a_valid_manifest():
     """收紧不能误伤：合法 manifest 照常通过。"""
     from src.retrieval.snapshot_repository import SnapshotRepository

@@ -637,6 +637,22 @@ class KnowledgeSnapshotManifest:
         ``ValueError: Exceeds the limit (4300 digits)``——异常类型与内容都与
         「清单字段不合法」无关，调用方的 ``except`` 分类随之失准。
         ``safe_repr`` 对位数超限的值给出量级描述，消息仍然可用。
+
+        **计数字段**同样要用写入侧的 ``_manifest_count``，不能写裸 ``int()``：
+        ``to_toml`` 早已按「拒 ``bool``、拒非整数浮点、拒负数、拒超 ``2**64``」
+        收敛，同一份清单的两个方向判据必须一致。裸 ``int()`` 的失败面有两类，
+        且**静默的比抛异常的更危险**：
+
+        * 抛异常：``"abc"`` 抛 ``ValueError: invalid literal for int()``（没有
+          字段名），``None``／``[1]`` 抛 ``TypeError``——不是本函数的
+          ``ValueError`` 契约；
+        * 静默改写：``1.5`` 截断成 ``1``、``True`` 当成 ``1``、``-5`` 原样接受、
+          ``10**300`` 原样接受——全部是写入侧明确拒绝的取值，读回来却成了一个
+          磁盘上并不存在的计数。而 manifest 是快照的准入凭据
+          （``VectorStoreFactory`` 拿它比对 embedding 配置）。
+
+        数字字符串仍照旧接受（``"3"`` -> ``3``）：``.env``／TOML 来源本来就会
+        以字符串到达，``_manifest_count`` 经 ``to_finite_float`` 覆盖这条路径。
         """
         return cls(
             schema_version=_manifest_text(data["schema_version"]),
@@ -647,8 +663,8 @@ class KnowledgeSnapshotManifest:
             embedding_model=_manifest_text(data["embedding_model"]),
             chunk_mode=_manifest_text(data["chunk_mode"]),
             source_digest=_manifest_text(data["source_digest"]),
-            document_count=int(data["document_count"]),
-            chunk_count=int(data["chunk_count"]),
+            document_count=_manifest_count(data["document_count"], "document_count"),
+            chunk_count=_manifest_count(data["chunk_count"], "chunk_count"),
         )
 
 
