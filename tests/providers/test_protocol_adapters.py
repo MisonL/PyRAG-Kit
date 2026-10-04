@@ -520,6 +520,31 @@ def test_google_rejects_malformed_function_tool_choice():
         GoogleProvider._convert_tool_choice({"type": "function", "function": {}})
 
 
+# `GoogleProvider._convert_tools` 的容器判据与 `_convert_tool_choice` 的
+# 「function 非对象」判据在整套测试里从未执行（`sys.settrace` 行覆盖证实；
+# 把它们的 `raise` 换成 `pass` 后全量 3238 条仍然全绿）。既有用例看似覆盖了同一
+# 入口，其实都绕过了这两条：`test_google_convert_tools_rejects_malformed_definitions`
+# 传的是「列表**内含**畸形元素」（`[{"type": ["google_search"]}]`），命中的是
+# 元素级判据；`test_google_rejects_malformed_function_tool_choice` 传的
+# `function={}` 是合法 Mapping，命中的是缺 name 那条。删除后行为确实改变（实测）：
+#   * 1245 `tools=5` → 带序号的 `ValueError` 变成裸
+#     `TypeError: 'int' object is not iterable`（`enumerate(tools)`）；
+#   * 1333 `function` 非对象 → 带字段名的 `ValueError` 变成裸
+#     `AttributeError: 'str' object has no attribute 'get'`。
+@pytest.mark.parametrize("tools", [5, {"a": 1}, "oops", object()])
+def test_google_convert_tools_rejects_non_sequence_container(tools):
+    """``tools`` 非序列时必须给带指引的 ``ValueError``，不是裸 ``TypeError``。"""
+    with pytest.raises(ValueError, match="Google 工具定义必须是列表"):
+        GoogleProvider._convert_tools(tools)
+
+
+@pytest.mark.parametrize("function", ["lookup", 5, ["x"]])
+def test_google_rejects_tool_choice_with_non_object_function(function):
+    """``tool_choice.function`` 非对象时给带字段名的 ``ValueError``，不是裸 ``AttributeError``。"""
+    with pytest.raises(ValueError, match="function tool_choice 的 function 必须是对象"):
+        GoogleProvider._convert_tool_choice({"type": "function", "function": function})
+
+
 def test_anthropic_merges_parallel_tool_results_into_one_user_turn():
     converted = AnthropicProvider._convert_messages(
         [
