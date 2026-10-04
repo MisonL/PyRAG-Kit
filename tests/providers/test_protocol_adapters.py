@@ -141,6 +141,70 @@ def test_anthropic_rejects_malformed_tool_choices(tool_choice):
         AnthropicProvider._convert_tool_choice(tool_choice)
 
 
+# `_convert_tools` 与 `_convert_tool_choice` 各有四条以上判据，上面两条用例只
+# 覆盖了其中一部分：`test_anthropic_rejects_malformed_tool_definitions` 覆盖
+# 「元素非对象」「function 非对象」「parameters 非对象」，但工具**缺 name** 与
+# **description 非字符串**两条从未执行；`test_anthropic_rejects_malformed_tool_choices`
+# 覆盖「未知字符串」「function 缺 name」「tool 缺 name」，但 **function 取值非对象**
+# 那条从未执行。`sys.settrace` 行覆盖证实这三条在整套测试里从未执行；把它们的
+# `raise` 换成 `pass` 后全量 3188 条仍然全绿（同一批里的「tools 非序列」「tool
+# 缺 name」「tool_choice 兜底」三条已由既有用例钉住，变异后确实变红）。
+#
+# 删除后行为确实改变（实测）：
+#   * 缺 name → **静默接受**，`{"function": {}}` 产出 `{'name': None, ...}`，把
+#     `name: None` 的工具定义发给上游；
+#   * description 非字符串 → **静默接受**，整数 `description` 原样进请求体；
+#   * function 取值非对象 → 带指引的 `ValueError` 变成裸
+#     `AttributeError: 'str' object has no attribute 'get'`。
+@pytest.mark.parametrize(
+    "tool",
+    [
+        {"type": "function", "function": {}},
+        {"parameters": {}},
+        {"description": "只有描述没有名字"},
+        {"function": {"description": "也没有名字"}},
+    ],
+)
+def test_anthropic_rejects_tool_definitions_without_a_name(tool):
+    """工具定义缺 name 必须 ``ValueError``，不能静默产出 ``name=None``。"""
+    with pytest.raises(ValueError, match="缺少 function.name"):
+        AnthropicProvider._convert_tools([tool])
+
+
+@pytest.mark.parametrize("description", [5, True, ["d"], {"d": 1}])
+def test_anthropic_rejects_non_string_tool_description(description):
+    """``description`` 必须是非字符串，不能原样进请求体。"""
+    with pytest.raises(ValueError, match="description 必须是字符串"):
+        AnthropicProvider._convert_tools([{"name": "lookup", "description": description}])
+
+
+@pytest.mark.parametrize("function", ["bad", 5, ["x"]])
+def test_anthropic_rejects_tool_choice_with_non_object_function(function):
+    """``tool_choice.function`` 非对象时给带指引的 ``ValueError``，不是裸 ``AttributeError``。"""
+    with pytest.raises(ValueError, match="tool_choice.function 必须是对象"):
+        AnthropicProvider._convert_tool_choice({"type": "function", "function": function})
+
+
+def test_anthropic_accepts_well_formed_tools_and_tool_choice():
+    """收紧不能误伤：合法工具定义与 tool_choice 照常转换。"""
+    converted = AnthropicProvider._convert_tools(
+        [
+            {
+                "type": "function",
+                "function": {"name": "lookup", "description": "查表", "parameters": {}},
+            }
+        ]
+    )
+
+    assert converted == [{"name": "lookup", "description": "查表", "input_schema": {}}]
+    assert AnthropicProvider._convert_tool_choice(
+        {"type": "function", "function": {"name": "lookup"}}
+    ) == {
+        "type": "tool",
+        "name": "lookup",
+    }
+
+
 def test_anthropic_stream_errors_are_explicit():
     with pytest.raises(RuntimeError, match="上游失败"):
         AnthropicProvider._stream_event(
