@@ -1510,3 +1510,53 @@ def test_upsert_embeddings_rejects_unconvertible_embeddings(embeddings):
 
     assert store.documents == []
     assert store.embeddings is None
+
+
+# ── 回归：upsert_embeddings 的一维守卫（变异测试翻出的覆盖空洞）──
+#
+# 写入侧 `upsert_embeddings` 与载入侧 `_validate_embeddings_shape` 都判
+# `ndim != 2`，但只有载入侧那条有测试钉住：把写入侧这条守卫的 `raise` 删掉
+# 后，全量套件仍然全绿。它的可达性不是理论上的——**等长**的一维输入会先通过
+# 「数量一致」判据，然后 store 被写坏，直到 `_rebuild_indices` 读
+# `.shape[1]` 时才以 `IndexError: tuple index out of range` 崩掉（实测）。
+
+
+def test_upsert_embeddings_rejects_a_one_dimensional_matrix_without_mutating():
+    """一维 embeddings 必须被拒，而不是写进 store 后再于派生期崩掉。
+
+    ``[4 条文档]`` + ``np.zeros(4)`` 的一维数组：删掉 ``ndim != 2`` 守卫后
+    ``len(documents) == len(embeddings) == 4`` 会骗过「数量一致」判据，随后
+    ``_rebuild_indices`` 读 ``self.embeddings.shape[1]`` 抛
+    ``IndexError``——不是本方法的 ``ValueError`` 契约，且 store 已被写坏。
+    """
+    store = FaissStore(file_path=None)
+
+    with pytest.raises(ValueError, match="二维数组"):
+        store.upsert_embeddings(
+            [{"page_content": "a", "metadata": {}}] * 4,
+            np.zeros(4, dtype=np.float32),
+        )
+
+    assert store.documents == []
+    assert store.embeddings is None
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param((4,), id="one-dimensional"),
+        pytest.param((2, 2, 2), id="three-dimensional"),
+        pytest.param((), id="zero-dimensional"),
+    ],
+)
+def test_upsert_embeddings_rejects_non_matrix_shapes(shape):
+    """一/三/零维数组都要被拒——判据是 ``ndim != 2``，不是「恰好一维」。"""
+    store = FaissStore(file_path=None)
+    documents = [{"page_content": "a", "metadata": {}}] * max(
+        1, int(np.prod(shape) if shape else 1)
+    )
+
+    with pytest.raises(ValueError, match="二维数组"):
+        store.upsert_embeddings(documents, np.zeros(shape, dtype=np.float32))
+
+    assert store.documents == []
