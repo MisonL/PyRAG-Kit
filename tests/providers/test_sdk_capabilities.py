@@ -272,6 +272,61 @@ def test_completion_request_omits_implicit_temperature_for_model_defaults():
     assert explicit.to_invoke_kwargs()["temperature"] == 0.7
 
 
+# `_build_chat_request` 用三条「与模型 options.extra_body 重复」判据挡住同一字段
+# 被两处配置：显式参数（`reasoning` 的 effort 分支与无 effort 分支各一条）与
+# 请求级 `extra_body`。三条在整套测试里从未执行（`sys.settrace` 行覆盖证实；
+# 把它们的 `raise` 换成 `pass` 后全量 3212 条仍然全绿）。删除后行为确实改变
+# （实测）：
+#   * 1167（`reasoning` 带 effort）与 1171（`reasoning` 无 effort）→ **静默接受**，
+#     显式 `reasoning` 覆盖模型 options 里的 `reasoning`，两处配置谁生效取决于
+#     调用顺序，没有任何提示；
+#   * 1185（请求级 `extra_body` 与模型 options 的键重复）→ **静默覆盖**，
+#     实测 `{"foo": 1}` 被 `{"foo": 2}` 顶掉。
+# 同批的 1145（`seed` 重复）经甄别是**等价变异**：删除后仍抛 `ValueError`，
+# 只是消息换成 `_validated_extra_body` 那条「不允许覆盖请求字段: seed」，结论不变，
+# 故不补测试。
+def _chat_request_provider(**options):
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "demo"
+    provider._protocol = "chat_completions"
+    provider._provider = "openai"
+    provider._options = options
+    return provider
+
+
+@pytest.mark.parametrize(
+    "reasoning",
+    [{"effort": "high"}, {"summary": "auto"}],
+    ids=["with-effort", "without-effort"],
+)
+def test_openai_chat_request_rejects_reasoning_duplicating_model_options(reasoning):
+    """显式 ``reasoning`` 与模型 options 里的 ``reasoning`` 重复时必须报错，不能静默覆盖。"""
+    provider = _chat_request_provider(extra_body={"reasoning": {"configured": True}})
+
+    with pytest.raises(ValueError, match="reasoning 与模型 options.extra_body 重复"):
+        provider._build_chat_request(prompt="hi", stream=False, reasoning=reasoning)
+
+
+def test_openai_chat_request_rejects_request_extra_body_overriding_model_options():
+    """请求级 ``extra_body`` 与模型 options 的同名键重复时必须报错，不能静默覆盖。"""
+    provider = _chat_request_provider(extra_body={"foo": 1})
+
+    with pytest.raises(ValueError, match="extra_body 与模型 options 重复: foo"):
+        provider._build_chat_request(prompt="hi", stream=False, extra_body={"foo": 2})
+
+
+def test_openai_chat_request_keeps_distinct_reasoning_and_extra_body():
+    """收紧不能误伤：不重复的 ``reasoning`` 与 ``extra_body`` 照常进请求。"""
+    provider = _chat_request_provider(extra_body={"foo": 1})
+
+    request = provider._build_chat_request(
+        prompt="hi", stream=False, reasoning={"effort": "high"}, extra_body={"bar": 2}
+    )
+
+    assert request["reasoning_effort"] == "high"
+    assert request["extra_body"] == {"foo": 1, "bar": 2}
+
+
 def test_completion_request_copy_preserves_implicit_temperature_marker():
     request = CompletionRequest(prompt="hi")
     copied = request.copy_with(stream=False)
