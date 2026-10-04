@@ -549,3 +549,47 @@ def test_create_provider_rejects_unknown_provider_with_value_error():
         )
 
     assert "不支持的模型提供商: definitely_not_a_provider" in str(excinfo.value)
+
+
+# ── 回归：`_create_provider` 协议／能力两条守卫 ──
+#
+# 同一函数内四条守卫只有一条被钉住：`test_factory_rejects_options_for_provider_without_options_parameter`
+# 覆盖了「构造函数不支持 options」（342 行），而 315／329 两条在整套测试里从未执行
+# （`sys.settrace` 行覆盖证实；把它们的 `raise` 换成 `pass` 后全量 3186 条全绿，
+# 且没有任何测试断言这两条消息）。删除后行为确实改变（实测）：
+#   * 315 行 `protocol` 归一化为空（`protocol=""`）→ 从 `ValueError: provider
+#     protocol 不能为空。` 变成裸 `AttributeError: 'NoneType' object has no
+#     attribute 'value'`（把带字段名的 `ValueError` 换成了别的异常）；
+#   * 329 行 `issubclass` 失败 → **静默返回**一个不是 `expected_type` 子类的
+#     实例（`local-hash` 传 `expected_type=LargeLanguageModel` 时拿到
+#     `LocalHashEmbeddingProvider`），类型契约被无声破坏。
+# 两条都经公开 getter 可达（`config.protocol` 与 `config.provider` 由
+# `ModelDetail` 承载，`_detail_with` 直写字段即可构造）。用 `_ORIGINAL_FACTORY`
+# 是因为 `patch_settings` 把真实 `_get_provider_class` 换成了替身，只有原始类能
+# 走到 `_provider_map` 里的真实 provider 信息。
+#
+# 同一函数的 326 行（协议不在该 provider 的 `protocols` 白名单内）经甄别是**等价
+# 变异**，故不补测试：删除后仍是 `ValueError`、结论不变——OpenAI 兼容渠道落到适配器
+# 自己的 `_normalize_protocol`（消息换成「OpenAI 兼容渠道不支持 X 协议」），
+# google/anthropic 落到 360 行（「构造函数不支持 protocol=X」）。三种收场都拒绝且
+# 都带指引，没有静默接受，不满足「行为确实改变」的判据。
+def test_create_provider_rejects_empty_protocol_readably():
+    """`protocol=""` 归一化为空时必须给带字段名的 ``ValueError``，不是裸 ``AttributeError``。"""
+    with pytest.raises(ValueError) as excinfo:
+        _ORIGINAL_FACTORY._create_provider("openai", "m", "llm", LargeLanguageModel, protocol="")
+
+    assert "protocol" in str(excinfo.value) and "不能为空" in str(excinfo.value)
+
+
+def test_create_provider_rejects_class_that_is_not_the_expected_type():
+    """provider 类不是 `expected_type` 子类时必须 ``TypeError``，不能静默返回。
+
+    `local-hash` 是纯 embedding 渠道（`LocalHashEmbeddingProvider`），把它按
+    `expected_type=LargeLanguageModel` 取用时，能力表那一关（role 在
+    `capabilities` 内）放行，随后 `issubclass` 判据必须拦住——否则调用方拿到
+    一个不是 `LargeLanguageModel` 的实例，类型契约被无声破坏。
+    """
+    with pytest.raises(TypeError) as excinfo:
+        _ORIGINAL_FACTORY._create_provider("local-hash", "m", "embedding", LargeLanguageModel)
+
+    assert "需要实现 LargeLanguageModel" in str(excinfo.value)
