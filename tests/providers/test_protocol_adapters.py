@@ -967,6 +967,99 @@ def test_ark_responses_request_omits_implicit_temperature():
     assert "temperature" not in request
 
 
+# `VolcengineProvider._build_responses_request` 有一组「同一字段两处配置」与
+# 「取值形态」判据，九条在整套测试里从未执行（`sys.settrace` 行覆盖证实；把它们
+# 的 `raise` 换成 `pass` 后全量 3226 条仍然全绿）。删除后行为确实改变（实测）：
+#   * 1218 模型 options 同时给 `conversation` 与 `session` → **静默接受**，只有
+#     `session` 生效，`conversation` 被丢弃；
+#   * 1222／1227／1256／1261 同一标量字段在模型 options 与 `extra_body`（或请求级
+#     参数）两处出现 → **静默覆盖**，实测 `{"top_k": 1}` 被 `{"top_k": 2}` 顶掉；
+#   * 1303／1311／1315 `session`／`conversation` 非对象 → 带字段名的 `ValueError`
+#     变成裸 `TypeError: 'int' object is not iterable`（`dict(...)`）；
+#   * 1336 请求级 `extra_body` 与模型 options 的同名键重复 → **静默覆盖**。
+def _ark_responses_provider(**options):
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "ark-model"
+    provider._options = {"server_verified_protocols": ["responses"], **options}
+    return provider
+
+
+def test_ark_responses_rejects_conversation_and_session_together():
+    """模型 options 同时给 `conversation` 与 `session` 时必须报错，不能静默丢弃其一。"""
+    provider = _ark_responses_provider(conversation={"a": 1}, session={"b": 2})
+
+    with pytest.raises(ValueError, match="不能同时设置 conversation 和 session"):
+        provider._build_responses_request(CompletionRequest(prompt="hello", stream=False))
+
+
+@pytest.mark.parametrize("field", ["top_k", "seed"])
+def test_ark_responses_rejects_scalar_option_duplicating_extra_body(field):
+    """模型 options 的标量字段与其 `extra_body` 同名键重复时必须报错。"""
+    provider = _ark_responses_provider(**{field: 1, "extra_body": {field: 2}})
+
+    with pytest.raises(ValueError, match=rf"模型 options 的 {field} 与 extra_body 重复"):
+        provider._build_responses_request(CompletionRequest(prompt="hello", stream=False))
+
+
+@pytest.mark.parametrize("field", ["frequency_penalty", "presence_penalty"])
+def test_ark_responses_rejects_sampling_field_duplicating_extra_body(field):
+    """采样字段与模型 options 的 `extra_body` 重复时必须报错。"""
+    provider = _ark_responses_provider(**{field: 0.5, "extra_body": {field: 0.5}})
+
+    with pytest.raises(ValueError, match=rf"{field} 与模型 options.extra_body 重复"):
+        provider._build_responses_request(CompletionRequest(prompt="hello", stream=False))
+
+
+def test_ark_responses_rejects_request_top_k_duplicating_extra_body():
+    """请求级 `top_k` 与模型 options 的 `extra_body` 重复时必须报错。"""
+    provider = _ark_responses_provider(extra_body={"top_k": 1})
+
+    with pytest.raises(ValueError, match="top_k 与模型 options.extra_body 重复"):
+        provider._build_responses_request(CompletionRequest(prompt="hello", stream=False, top_k=2))
+
+
+@pytest.mark.parametrize("field", ["session", "conversation"])
+def test_ark_responses_rejects_non_object_request_state(field):
+    """请求级 `session`/`conversation` 非对象时给带字段名的 ``ValueError``，不是裸 ``TypeError``。"""
+    provider = _ark_responses_provider()
+
+    with pytest.raises(ValueError, match=rf"Ark Responses {field} 必须是对象"):
+        provider._build_responses_request(
+            CompletionRequest(prompt="hello", stream=False, **{field: 5})
+        )
+
+
+@pytest.mark.parametrize("field", ["session", "conversation"])
+def test_ark_responses_rejects_non_object_configured_state(field):
+    """模型 options 的 `session`/`conversation` 非对象时同样给带字段名的 ``ValueError``。"""
+    provider = _ark_responses_provider(**{field: 5})
+
+    with pytest.raises(ValueError, match=rf"模型 options.{field} 必须是对象"):
+        provider._build_responses_request(CompletionRequest(prompt="hello", stream=False))
+
+
+def test_ark_responses_request_extra_body_cannot_override_model_options():
+    """请求级 `extra_body` 与模型 options 的同名键重复时必须报错，不能静默覆盖。"""
+    provider = _ark_responses_provider(extra_body={"foo": 1})
+
+    with pytest.raises(ValueError, match="extra_body 与模型 options 重复: foo"):
+        provider._build_responses_request(
+            CompletionRequest(prompt="hello", stream=False, extra_body={"foo": 2})
+        )
+
+
+def test_ark_responses_accepts_distinct_state_and_extra_body():
+    """收紧不能误伤：合法的 `session` 与不重复的 `extra_body` 照常进请求。"""
+    provider = _ark_responses_provider(extra_body={"foo": 1})
+
+    request = provider._build_responses_request(
+        CompletionRequest(prompt="hello", stream=False, session={"id": "s1"}, extra_body={"bar": 2})
+    )
+
+    assert request["session"] == {"id": "s1"}
+    assert request["extra_body"] == {"foo": 1, "bar": 2}
+
+
 def test_ark_responses_request_preserves_configured_temperature():
     provider = object.__new__(VolcengineProvider)
     provider._model_name = "ark-model"
