@@ -821,6 +821,84 @@ def test_openai_chat_explicit_extra_body_extensions_cannot_be_silently_overridde
         provider._build_chat_request(prompt="hi", stream=False, **kwargs)
 
 
+# `_build_responses_request` 与 `_build_chat_request` 同属一组「同一字段两处配置」
+# 判据，下面五条在整套测试里从未执行（`sys.settrace` 行覆盖证实；把它们的 `raise`
+# 换成 `pass` 后全量 3216 条仍然全绿）。删除后行为确实改变（实测）：
+#   * 1407 `options.text` 非对象 → 带字段名的 `ValueError` 变成裸
+#     `TypeError: 'int' object is not iterable`（`dict(configured_text)`）；
+#   * 1456 显式 `frequency_penalty`/`presence_penalty` 与模型 options 的
+#     `extra_body` 重复 → **静默接受**，两处配置谁生效取决于调用顺序；
+#   * 1596 `background` 非布尔 → **静默接受**，`"yes"` 原样进请求体；
+#   * 1598 `background=true` 配流式 → **静默接受**，把官方不支持的组合发出去；
+#   * 1610 请求级 `extra_body` 与模型 options 的同名键重复 → **静默覆盖**。
+# 同函数的 1415（`options.stop`/`seed` 与 extra_body 重复）与 1553
+# （`reasoning_effort` 与 extra_body 重复）经甄别是**等价变异**，不补测试：
+# 删除后仍抛 `ValueError`，只是消息换成 `_merge_extra_body`／`_validated_extra_body`
+# 那条，结论不变。
+def _responses_request_provider(**options):
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "demo"
+    provider._provider = "openai"
+    provider._protocol = "responses"
+    provider._base_url = "https://gateway.example.com/v1"
+    provider._options = options
+    return provider
+
+
+def test_openai_responses_rejects_non_object_options_text():
+    """`options.text` 非对象时必须给带字段名的 ``ValueError``，不是裸 ``TypeError``。"""
+    provider = _responses_request_provider(text=5)
+
+    with pytest.raises(ValueError, match="options.text 必须是对象"):
+        provider._build_responses_request(prompt="hi", stream=False)
+
+
+@pytest.mark.parametrize("field", ["frequency_penalty", "presence_penalty"])
+def test_openai_responses_rejects_sampling_field_duplicating_model_extra_body(field):
+    """显式采样字段与模型 options 的 ``extra_body`` 重复时必须报错，不能静默接受。"""
+    provider = _responses_request_provider(extra_body={field: 0.5})
+
+    with pytest.raises(ValueError, match=rf"{field} 与模型 options.extra_body 重复"):
+        provider._build_responses_request(prompt="hi", stream=False, **{field: 0.5})
+
+
+@pytest.mark.parametrize("background", ["yes", 1, [], {"a": 1}])
+def test_openai_responses_rejects_non_boolean_background(background):
+    """``background`` 必须是布尔值，不能把任意取值原样发给服务端。"""
+    provider = _responses_request_provider()
+
+    with pytest.raises(ValueError, match="background 必须是布尔值"):
+        provider._build_responses_request(prompt="hi", stream=False, background=background)
+
+
+def test_openai_responses_rejects_background_with_streaming():
+    """``background=true`` 与流式互斥，必须在构造阶段拦住。"""
+    provider = _responses_request_provider()
+
+    with pytest.raises(ValueError, match="background 请求不支持流式模式"):
+        provider._build_responses_request(prompt="hi", stream=True, background=True)
+
+
+def test_openai_responses_request_extra_body_cannot_override_model_options():
+    """请求级 ``extra_body`` 与模型 options 的同名键重复时必须报错，不能静默覆盖。"""
+    provider = _responses_request_provider(extra_body={"foo": 1})
+
+    with pytest.raises(ValueError, match="extra_body 与模型 options 重复: foo"):
+        provider._build_responses_request(prompt="hi", stream=False, extra_body={"foo": 2})
+
+
+def test_openai_responses_accepts_distinct_extra_body_and_background():
+    """收紧不能误伤：不重复的 ``extra_body`` 与非流式 ``background`` 照常进请求。"""
+    provider = _responses_request_provider(extra_body={"foo": 1})
+
+    request = provider._build_responses_request(
+        prompt="hi", stream=False, extra_body={"bar": 2}, background=True
+    )
+
+    assert request["extra_body"] == {"foo": 1, "bar": 2}
+    assert request["background"] is True
+
+
 def test_ark_responses_rejects_instructions_with_enabled_caching():
     """官方规定 ``instructions`` 与 ``caching={"type": "enabled"}`` 互斥。
 
