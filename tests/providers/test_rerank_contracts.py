@@ -48,6 +48,51 @@ def test_rerank_rejects_invalid_top_n(provider_type, top_n):
         provider._validate_inputs("query", ["document"], top_n)
 
 
+# `_validate_inputs` 有四个判据：query 非空字符串、documents 非空列表、
+# documents 元素全为字符串、top_n 范围。上面两条只钉住了最后一条——前三条的
+# 用例要么喂合法输入（`"query"`／`["document"]`），要么根本不经过这里，于是
+# 把前三道 `raise` 换成 `pass` 后全量套件仍然全绿。删除后行为确实改变（实测）：
+# `query=5`／`"  "`、`documents=[]`、`documents=["a", 5]` 全部**静默接受**并原样
+# 进入请求体发给上游；`documents=5` 从带指引的 `ValueError` 变成裸
+# `TypeError: 'int' object is not iterable`（`any(...)` 迭代失败）。
+@pytest.mark.parametrize("provider_type", [JinaProvider, SiliconflowRerankProvider])
+@pytest.mark.parametrize("query", [5, None, "  ", ""], ids=["int", "none", "blank", "empty"])
+def test_rerank_rejects_invalid_query(provider_type, query):
+    """query 必须是非空字符串，不能静默放行非字符串或空白串。"""
+    provider = object.__new__(provider_type)
+
+    with pytest.raises(ValueError, match="query 必须是非空字符串"):
+        provider._validate_inputs(query, ["document"], 1)
+
+
+@pytest.mark.parametrize("provider_type", [JinaProvider, SiliconflowRerankProvider])
+@pytest.mark.parametrize("documents", [5, None, [], "abc"], ids=["int", "none", "empty", "str"])
+def test_rerank_rejects_invalid_documents_container(provider_type, documents):
+    """documents 必须是非空列表；非列表取值要给 ``ValueError`` 而不是裸 ``TypeError``。"""
+    provider = object.__new__(provider_type)
+
+    with pytest.raises(ValueError, match="documents 必须是非空列表"):
+        provider._validate_inputs("query", documents, 1)
+
+
+@pytest.mark.parametrize("provider_type", [JinaProvider, SiliconflowRerankProvider])
+@pytest.mark.parametrize("documents", [["a", 5], [None], ["ok", {"t": 1}]])
+def test_rerank_rejects_non_string_document_entries(provider_type, documents):
+    """documents 的元素必须全是字符串，否则会在请求体里被静默序列化。"""
+    provider = object.__new__(provider_type)
+
+    with pytest.raises(ValueError, match="documents 必须全部是字符串"):
+        provider._validate_inputs("query", documents, 1)
+
+
+@pytest.mark.parametrize("provider_type", [JinaProvider, SiliconflowRerankProvider])
+def test_rerank_validate_inputs_accepts_well_formed_arguments(provider_type):
+    """收紧不能误伤：合法的 query／documents／top_n 照常通过。"""
+    provider = object.__new__(provider_type)
+
+    assert provider._validate_inputs("query", ["document"], 1) is None
+
+
 @pytest.mark.parametrize("provider_type", [JinaProvider, SiliconflowRerankProvider])
 def test_rerank_invalid_index_is_explicit(provider_type):
     provider = object.__new__(provider_type)
