@@ -1328,6 +1328,98 @@ def test_knowledge_build_surfaces_unusable_embedding_detail_as_value_error():
         _ = service.embedding_service.embedding_model_detail.model_name
 
 
+# ── `embedding_model_detail` 的**键**形态也要收敛 ──
+#
+# 上面那组用例覆盖的是「键在、值不可用」；而**键本身形态非法**这一半此前漏了。
+# ``key not in configurations`` 对不可哈希的取值抛裸 ``TypeError: unhashable
+# type: 'list'``——早于本方法任何拒绝路径，而本方法其余分支一律给带可选值列表的
+# ``ValueError``，调用方（``embed_query`` 的 Google 分支与
+# ``knowledge_build_service`` 的清单写入）也按 ``ValueError`` 分类。
+#
+# 可达性：``default_embedding_provider`` 没有 validator（``Settings`` 里只是普通
+# ``str``），而 ``RunConfig`` 是 frozen dataclass、字段无校验器，嵌入方可以自拼
+# ``RunConfig(default_embedding_provider=["local-hash"], ...)``。
+# ``ModelProviderFactory._get_model_detail`` 对同一个 key 早已收敛（判据
+# 「必须是字符串」），两条路径必须一致。
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        pytest.param(["local-hash"], id="list"),
+        pytest.param({"local-hash": 1}, id="dict"),
+        pytest.param({1, 2}, id="set"),
+    ],
+)
+def test_embedding_model_detail_rejects_unhashable_provider_key(key):
+    """不可哈希的 provider key 必须收敛成带指引的 ``ValueError``。"""
+    from src.services.embedding_service import EmbeddingService
+
+    service = EmbeddingService(
+        SimpleNamespace(
+            default_embedding_provider=key,
+            embedding_configurations={"local-hash": SimpleNamespace(provider="x", model_name="m")},
+        )
+    )
+
+    with pytest.raises(ValueError, match="default_embedding_provider"):
+        _ = service.embedding_model_detail
+
+
+def test_embedding_model_detail_still_accepts_a_string_provider_key():
+    """收紧不能误伤：字符串 key 照常取到配置。"""
+    from src.services.embedding_service import EmbeddingService
+
+    detail = SimpleNamespace(provider="local-hash", model_name="m")
+    service = EmbeddingService(
+        SimpleNamespace(
+            default_embedding_provider="local-hash",
+            embedding_configurations={"local-hash": detail},
+        )
+    )
+
+    assert service.embedding_model_detail is detail
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        pytest.param(["local-hash"], id="list"),
+        pytest.param({"local-hash": 1}, id="dict"),
+        pytest.param({1, 2}, id="set"),
+    ],
+)
+def test_vector_store_factory_rejects_unhashable_provider_key(key):
+    """同一条判据的第二个落点：``VectorStoreFactory._require_embedding_detail``。
+
+    它与 ``EmbeddingService.embedding_model_detail`` 是同一段逻辑的两个副本
+    （同一字段、同一来源、同样的「先判映射再判键」），因此判据只修一处会留下
+    另一个入口。
+    """
+    from src.retrieval.vdb.factory import VectorStoreFactory
+
+    run_config = SimpleNamespace(
+        default_embedding_provider=key,
+        embedding_configurations={"local-hash": SimpleNamespace(provider="x", model_name="m")},
+    )
+
+    with pytest.raises(ValueError, match="default_embedding_provider"):
+        VectorStoreFactory._require_embedding_detail(run_config)
+
+
+def test_vector_store_factory_still_accepts_a_string_provider_key():
+    """收紧不能误伤：字符串 key 照常取到配置。"""
+    from src.retrieval.vdb.factory import VectorStoreFactory
+
+    detail = SimpleNamespace(provider="local-hash", model_name="m")
+    run_config = SimpleNamespace(
+        default_embedding_provider="local-hash",
+        embedding_configurations={"local-hash": detail},
+    )
+
+    assert VectorStoreFactory._require_embedding_detail(run_config) is detail
+
+
 # ── user / betas 的取值校验 ──
 #
 # ``CompletionRequest`` 是普通 dataclass、``__post_init__`` 不校验这两个字段

@@ -76,6 +76,22 @@ class EmbeddingService:
         """
         configurations = self.run_config.embedding_configurations
         key = self.embedding_provider_key
+        # 键形态必须在成员判断**之前**收敛：``key not in configurations`` 对
+        # 不可哈希的取值抛裸 ``TypeError: unhashable type: 'list'``——早于本方法
+        # 任何拒绝路径，而本方法其余分支一律给带可选值列表的 ``ValueError``，
+        # 调用方（``embed_query`` 的 Google 分支与 ``knowledge_build_service``
+        # 的清单写入）也按 ``ValueError`` 分类。可达性：``default_embedding_provider``
+        # 没有 validator（``Settings`` 里只是普通 ``str``），而 ``RunConfig`` 是
+        # frozen dataclass、字段无校验器。判据与
+        # ``ModelProviderFactory._get_model_detail`` 的同名守卫一致（那里要求
+        # 「必须是字符串」），两条路径必须给出同一种收场。
+        if not isinstance(key, str):
+            raise ValueError(
+                "default_embedding_provider 必须是字符串，"
+                f"但得到 {safe_repr(key)}。"
+                " 请检查 config.toml 里的 default_embedding_provider 与"
+                " embedding_configurations 是否对应。"
+            )
         if not isinstance(configurations, Mapping) or key not in configurations:
             # 先渲染成字符串再排序，理由同 ``display_utils._require_model_detail``
             # 的同名位置：``sorted(configurations)`` 直接比较**原始键**，混合类型

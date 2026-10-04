@@ -71,6 +71,18 @@ class VectorStoreFactory:
         """
         configurations = run_config.embedding_configurations
         key = run_config.default_embedding_provider
+        # 键形态必须在成员判断**之前**收敛，判据与措辞都与
+        # ``EmbeddingService.embedding_model_detail`` 的同名守卫一致（两处是同一段
+        # 逻辑的副本，同一字段、同一来源）：``key not in configurations`` 对不可
+        # 哈希的取值抛裸 ``TypeError: unhashable type: 'list'``，而本函数的契约是
+        # 带指引的 ``ValueError``。
+        if not isinstance(key, str):
+            raise ValueError(
+                "default_embedding_provider 必须是字符串，"
+                f"但得到 {safe_repr(key)}。"
+                " 请检查 config.toml 里的 default_embedding_provider 与"
+                " embedding_configurations 是否对应。"
+            )
         if not isinstance(configurations, Mapping) or key not in configurations:
             raise ValueError(
                 f"当前 embedding 配置缺少活动提供商: {safe_repr(key)}。"
