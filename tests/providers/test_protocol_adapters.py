@@ -1100,9 +1100,68 @@ def test_openai_responses_rejects_ark_only_multimodal_content():
         )
 
 
+# `_convert_responses_tools` 在 OpenAI 兼容与 Ark 两份实现里逐字同构，各有五条
+# 元素级判据。既有用例只覆盖了「容器非序列」（`test_responses_converters_reject_non_sequence_tools`）
+# 与「元素非对象」，另外五条从未执行：`sys.settrace` 行覆盖证实，把它们的 `raise`
+# 换成 `pass` 后全量 3200 条仍然全绿（只有容器那条变异后变红）。删除后行为确实
+# 改变（实测，两个 provider 同形）：
+#   * 原生工具缺有效 `type` → **静默接受**，`{"native": 1}` 原样透传；
+#   * 原生 `type=function` 缺 `name` → **静默接受**，产出没有 `name` 的工具；
+#   * 原生 function 的 `parameters` 非对象 → 带序号的 `ValueError` 变成裸
+#     `TypeError: 'int' object is not iterable`（`dict(parameters)`）；
+#   * 统一 schema 缺 `function.name` → **静默接受**，产出 `name: None`；
+#   * 统一 schema 的 `function.parameters` 非对象 → 同样变成裸 `TypeError`。
+# 两个 provider 用同一组形态参数化，避免只钉住其中一份。
+@pytest.mark.parametrize(
+    "converter",
+    [
+        OpenAICompatibleProvider._convert_responses_tools,
+        VolcengineProvider._convert_responses_tools,
+    ],
+    ids=["openai", "ark"],
+)
+@pytest.mark.parametrize(
+    ("tools", "expected"),
+    [
+        ([{"native": 1}], "缺少有效 type"),
+        ([{"type": "function"}], "缺少 name"),
+        ([{"type": "function", "name": "n", "parameters": 5}], "parameters 必须是对象"),
+        ([{"function": {}}], "缺少 function.name"),
+        ([{"function": {"name": "n", "parameters": 5}}], "function.parameters 必须是对象"),
+    ],
+    ids=[
+        "missing-type",
+        "native-missing-name",
+        "native-bad-parameters",
+        "missing-function-name",
+        "bad-function-parameters",
+    ],
+)
+def test_responses_tool_converters_reject_malformed_entries(converter, tools, expected):
+    """元素级形态非法时必须给带指引的 ``ValueError``，不能静默接受或抛裸 ``TypeError``。"""
+    with pytest.raises(ValueError, match=expected):
+        converter(tools)
+
+
+@pytest.mark.parametrize(
+    "converter",
+    [
+        OpenAICompatibleProvider._convert_responses_tools,
+        VolcengineProvider._convert_responses_tools,
+    ],
+    ids=["openai", "ark"],
+)
+def test_responses_tool_converters_accept_well_formed_entries(converter):
+    """收紧不能误伤：原生工具与统一 schema 两种合法形态照常转换。"""
+    native = converter([{"type": "function", "name": "lookup", "parameters": {"type": "object"}}])
+    assert native[0]["name"] == "lookup"
+
+    unified = converter([{"function": {"name": "lookup", "parameters": {"type": "object"}}}])
+    assert unified[0]["name"] == "lookup"
+
+
 def test_responses_request_converts_chat_tool_choice_to_flat_function_shape():
     provider = _responses_provider()
-
     request = provider._build_responses_request(
         "hello",
         tools=TOOLS,
