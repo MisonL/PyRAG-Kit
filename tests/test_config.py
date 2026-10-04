@@ -1357,3 +1357,78 @@ def test_absolute_path_field_is_not_resolved(tmp_path):
     """绝对路径不做 ``resolve``，因此不受影响（收紧不能误伤）。"""
     settings = Settings(snapshot_root=str(tmp_path / "kb"), _env_file=None)
     assert settings.snapshot_root == str(tmp_path / "kb")
+
+
+# ── Settings 整数/数值守卫的**测试覆盖**补缺 ──
+#
+# 下面几条是**变异测试**翻出来的覆盖空洞：把对应守卫的 ``raise`` 删掉之后，
+# 全量套件仍然全绿——守卫本身正确，却没有任何一条测试会在它被删掉时变红。
+# 甄别方法是「删除守卫 + 真实 ``Settings(...)`` 入口」，只保留**行为确实改变**
+# 的那些（静默接受、静默截断，或把带字段名的 ``ValueError`` 换成别的异常）；
+# 纯等价变异（删除后落到下一个守卫、结论不变）不在此列。
+#
+# 每条都以「删除守卫即变红」的形态写：断言的是守卫存在时的收场。
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        pytest.param("chat_top_k", 1.5, id="chat_top_k"),
+        pytest.param("log_retention_days", 1.5, id="log_retention_days"),
+        pytest.param("kb_chunk_overlap", 1.5, id="kb_chunk_overlap"),
+        pytest.param("kb_child_chunk_overlap", 1.5, id="kb_child_chunk_overlap"),
+    ],
+)
+def test_integer_settings_reject_a_non_integral_float(field, value):
+    """非整数浮点必须被拒，而不是 ``int()`` 静默截断。
+
+    这四处各有一条 ``isinstance(number, float) and not number.is_integer()``
+    判据。删除后 ``int(1.5)`` 会把 ``1.5`` 悄悄变成 ``1``——用户写
+    ``chat_top_k = 1.5`` 得到的是「取 1 条」，没有任何报错，与「配置写错了」
+    的收场相去甚远。``1.5`` 是合法 TOML 浮点，无需任何技巧即可到达。
+    """
+    with pytest.raises(ValidationError, match="整数"):
+        Settings(**{field: value}, _env_file=None)
+
+
+def test_settings_reject_an_unknown_fusion_strategy():
+    """合法字符串但不在 ``{"rrf", "weighted"}`` 时必须报错。
+
+    ``validate_hybrid_fusion_strategy`` 的成员判据删除后，``"bogus"`` 会被
+    ``Settings`` 静默接受并原样存进 ``hybrid_fusion_strategy``，随后
+    ``HybridReranker`` 的派发（``if == "weighted" else _rrf_rerank``）按 RRF
+    出结果——用户配置里写着一个无效策略、程序却按 RRF 跑，是静默错误结果。
+    """
+    with pytest.raises(ValidationError, match="融合策略"):
+        Settings(hybrid_fusion_strategy="bogus", _env_file=None)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param([1], id="list"),
+        pytest.param({"a": 1}, id="dict"),
+        pytest.param(object(), id="object"),
+    ],
+)
+def test_numeric_settings_reject_a_non_numeric_container(value):
+    """``_coerce_number`` 对非数值容器必须给带字段名的 ``ValueError``。
+
+    最后那条 ``raise ValueError(f"{field_label} 必须是数值，但得到 ...")`` 删除
+    后，列表/字典/对象会一路落到 pydantic 的类型校验，抛的是没有字段语义的
+    ``TypeError``（实测 ``Settings(chat_top_k=[1])`` 报 ``TypeError``）——而本
+    项目其余数值字段一律以带字段名的 ``ValueError`` 收敛。
+    """
+    with pytest.raises((ValidationError, ValueError)):
+        Settings(chat_top_k=value, _env_file=None)
+
+
+def test_settings_reject_a_numeric_literal_that_overflows_to_infinity():
+    """``"1e400"`` 是合法十进制字面量，但 ``float()`` 后是 ``inf``。
+
+    ``_coerce_number`` 的 ``isfinite`` 判据删除后，``"1e400"`` 会被转成
+    ``inf`` 返回，随后落到整数上界判据，报「必须是整数，但得到 inf」——把
+    「字面量溢出」说成了「类型不对」，且不再是原始字符串。
+    """
+    with pytest.raises(ValidationError, match="有限数值"):
+        Settings(chat_top_k="1e400", _env_file=None)
