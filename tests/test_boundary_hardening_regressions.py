@@ -2346,7 +2346,7 @@ def test_generate_reply_rejects_unusable_chat_temperature(bad_value):
     assert model.calls == []
 
 
-@pytest.mark.parametrize("value", [0.0, 0.7, 1.0, 2, 0])
+@pytest.mark.parametrize("value", [0.0, 0.7, 1.0, 0])
 def test_generate_reply_keeps_working_for_valid_chat_temperature(value):
     """收紧不能误伤：合法的非负数值照旧传给模型。"""
     import asyncio
@@ -2383,9 +2383,80 @@ def test_chat_temperature_reader_and_validator_agree():
         with pytest.raises(ValueError, match="chat_temperature"):
             require_chat_temperature(bad_value)
     # 合法取值两侧都要接受，且收敛成同一形态（float）。
-    for good_value in (0.0, 0.7, 2):
+    for good_value in (0.0, 0.7, 1.0):
         config["chat_temperature"] = good_value
         assert config.chat_temperature == require_chat_temperature(good_value) == float(good_value)
+
+
+@pytest.mark.parametrize(
+    "out_of_range",
+    [
+        pytest.param(1.5, id="above-one-float"),
+        pytest.param(2.0, id="two-float"),
+        pytest.param(2, id="two-int"),
+        pytest.param(100, id="way-above"),
+    ],
+)
+def test_chat_temperature_reader_enforces_the_same_upper_bound(out_of_range):
+    """读取侧必须与 ``Settings`` 同判上界：``chat_temperature`` 的契约是 ``0.0`` 到 ``1.0``。
+
+    ``Settings.validate_chat_temperature`` 与 ``config.toml.example`` 的注释都把范围
+    钉在 ``0.0``–``1.0``，而 ``require_chat_temperature``（``SessionConfig`` 的构造器
+    与 ``__setitem__``、``ChatService.generate_reply``、``Chatbot.chat_async`` 的兜底
+    分支共用）此前只判了 ``>= 0``。它的 docstring 却声称与两个校验器「判据一致」——
+    这个上界就是漏掉的那一半：``1.5``／``2.0`` 走 ``SessionConfig(...)`` 构造器与
+    配置属性直写都能进请求 kwargs，而同样的值写进 ``config.toml`` 会被 ``Settings``
+    明确拒绝。同一个字段两条入口对同一取值给相反结论。
+    """
+    import asyncio
+
+    from pydantic import ValidationError
+
+    from src.runtime.contracts import build_session_config
+    from src.services.chat_service import ChatService
+    from src.utils.config import Settings, get_settings, require_chat_temperature
+
+    # ``Settings`` 的判据作为基准：先确认它拒绝，避免这条测试自己被写反。
+    with pytest.raises(ValidationError):
+        Settings(chat_temperature=out_of_range)
+
+    # 读取侧的收敛函数必须给同一种收场。
+    with pytest.raises(ValueError, match="chat_temperature"):
+        require_chat_temperature(out_of_range)
+
+    # 配置边界（``SessionConfig`` 的 ``__setitem__``）与生产读取路径同样拒绝，
+    # 且被拒之前没有发起请求。
+    model = _RecordingSamplingModel()
+    service = ChatService(model, None)
+    config = build_session_config(get_settings())
+    config.chat_temperature = out_of_range
+
+    async def consume():
+        return [chunk async for chunk in service.generate_reply("问题", "意图", [], config)]
+
+    with pytest.raises(ValueError, match="chat_temperature"):
+        asyncio.run(consume())
+    assert model.calls == []
+
+
+def test_chat_temperature_setitem_rejects_out_of_range_values():
+    """``SessionConfig["chat_temperature"] = 1.5`` 与 ``Settings`` 同收场。
+
+    ``__setitem__`` 走的是与构造器同一份校验器表（``_VALIDATORS``），因此上界一旦
+    补进 ``require_chat_temperature``，两条写入入口自动一致；这条钉住「只修读取侧、
+    漏掉 ``__setitem__``」这一类半拉子修复。
+    """
+    from src.runtime.contracts import build_session_config
+    from src.utils.config import get_settings
+
+    config = build_session_config(get_settings())
+    for out_of_range in (1.5, 2.0, 2):
+        with pytest.raises(ValueError, match="chat_temperature"):
+            config["chat_temperature"] = out_of_range
+    # 端点仍放行。
+    for boundary in (0.0, 1.0):
+        config["chat_temperature"] = boundary
+        assert config.chat_temperature == float(boundary)
 
 
 # ── 阈值过滤的融合策略判据（库调用方的默认分支） ──

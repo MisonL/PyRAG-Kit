@@ -518,12 +518,13 @@ def require_rerank_enabled(value: Any, *, label: str = "rerank_enabled") -> bool
 
 
 def require_chat_temperature(value: Any) -> float:
-    """把 ``chat_temperature`` 收敛成非负有限浮点，非法取值给出带字段名的 ``ValueError``。
+    """把 ``chat_temperature`` 收敛成 ``0.0`` 到 ``1.0`` 的有限浮点，非法取值给出带字段名的 ``ValueError``。
 
     ``chat_temperature`` 有**完整**的校验器——``Settings.validate_chat_temperature``
     与 ``SessionConfig._validate_chat_temperature`` 各自一份，判据一致（拒 ``bool``、
-    非数值、非有限、负数、超出双精度的整数）。但两个**读取点**都直读原属性，而
-    ``SessionConfig`` 是公开类、普通属性没有 ``__setattr__`` 守卫：
+    非数值、非有限、负数、超出双精度的整数、以及大于 ``1.0`` 的取值）。但两个
+    **读取点**都直读原属性，而 ``SessionConfig`` 是公开类、普通属性没有
+    ``__setattr__`` 守卫：
 
     * ``ChatService.generate_reply``：``session_config.chat_temperature`` 直接进
       ``CompletionRequest``，再原样成为 SDK 的 kwargs。实测 ``"abc"``／``None``／
@@ -535,17 +536,23 @@ def require_chat_temperature(value: Any) -> float:
     * ``Chatbot.chat_async`` 的兜底分支（``chat_service`` 缺失时）读
       ``self.session_config["chat_temperature"]``，同一个值。
 
-    收敛语义与两处校验器一致（返回 ``float``，非负且有限）。与
+    上界 ``1.0`` 必须在这里也判：契约由 ``Settings.validate_chat_temperature`` 与
+    ``config.toml.example`` 的注释共同钉在 ``0.0``–``1.0``，而本函数此前只判了
+    ``>= 0``。于是同一个 ``1.5`` 写进 ``config.toml`` 被 ``Settings`` 明确拒绝，
+    而经 ``SessionConfig(...)`` 构造器、属性直写或配置菜单却一路进请求 kwargs——
+    两条入口对同一取值给相反结论，正是本函数要消除的那类分歧。
+
+    收敛语义与两处校验器一致（返回 ``float``，落在 ``[0.0, 1.0]``）。与
     ``_validate_chat_temperature`` 的分工：那里是配置边界的**拒绝**，这里是运行期
     读取可直写字段时的**收敛**——两者共用同一判据，措辞也一致。
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"chat_temperature 必须是数值，但得到 {safe_repr(value)}。")
     if not is_double_convertible(value):
-        raise ValueError(f"chat_temperature 必须是非负有限数值，但得到 {safe_repr(value)}。")
+        raise ValueError(f"chat_temperature 必须在 0.0 到 1.0 之间，但得到 {safe_repr(value)}。")
     number = float(value)
-    if not math.isfinite(number) or number < 0.0:
-        raise ValueError(f"chat_temperature 必须是非负有限数值，但得到 {safe_repr(value)}。")
+    if not math.isfinite(number) or not 0.0 <= number <= 1.0:
+        raise ValueError(f"chat_temperature 必须在 0.0 到 1.0 之间，但得到 {safe_repr(value)}。")
     return number
 
 
