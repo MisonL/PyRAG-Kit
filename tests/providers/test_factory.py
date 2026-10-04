@@ -510,3 +510,42 @@ def test_getters_still_accept_valid_details():
     )
 
     assert provider.model_name == "m"
+
+
+# ── 回归：`_get_provider_class` 的白名单守卫 ──
+#
+# 本文件 `patch_settings` 是 `autouse=True`，它把 `_get_provider_class`
+# **整体换成** `mock_get_provider_class`（含一份自己的「不支持的模型提供商」
+# 分支）。于是 `test_unsupported_provider_type` 断言的消息来自替身，真实守卫
+# （`factory.py` 里 `if provider_name not in _provider_map: raise ValueError`）
+# 在整套测试里从未被执行——把它的 `raise` 换成 `pass`，3160 条测试全绿。
+#
+# 这个判据的价值在于它是**唯一**的白名单执行者：`require_provider_name` 的注释
+# 写明「白名单是工厂的职责（`_get_provider_class` 会给『不支持的模型提供商』）」，
+# 而 `_create_provider` 在 `_provider_map.get(...)` 返回 `None` 时会落到这里
+# （`factory.py:327`）。删掉守卫后，`get_llm_provider`（经 `_create_provider`）与
+# 诊断入口直调 `_get_provider_class` 都改抛裸 `KeyError: 'unknown'`，不再带指引。
+#
+# fixture 替换的是**重新导入**出的那个类；模块顶部导入的 `_ORIGINAL_FACTORY` 仍是
+# 未被打补丁的原始类，用它才能钉住源码里那份实现。
+_ORIGINAL_FACTORY = ModelProviderFactory
+
+
+def test_get_provider_class_enforces_the_provider_map_whitelist():
+    """未知渠道名必须给带指引的 ``ValueError``，不能是裸 ``KeyError``。"""
+    real = _ORIGINAL_FACTORY._get_provider_class.__wrapped__
+
+    with pytest.raises(ValueError) as excinfo:
+        real("definitely_not_a_provider")
+
+    assert "不支持的模型提供商: definitely_not_a_provider" in str(excinfo.value)
+
+
+def test_create_provider_rejects_unknown_provider_with_value_error():
+    """真正建 provider 的路径（`_create_provider`）同样收敛成 ``ValueError``。"""
+    with pytest.raises(ValueError) as excinfo:
+        _ORIGINAL_FACTORY._create_provider(
+            "definitely_not_a_provider", "m", "llm", LargeLanguageModel
+        )
+
+    assert "不支持的模型提供商: definitely_not_a_provider" in str(excinfo.value)
