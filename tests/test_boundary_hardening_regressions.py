@@ -4252,6 +4252,153 @@ def test_hybrid_reranker_rerank_still_accepts_a_document_list():
     assert len(ranked) == 1
 
 
+# ── HybridReranker 构造期守卫的**测试覆盖**补缺 ──
+#
+# 下面五条不是新缺陷，而是**变异测试**翻出来的覆盖空洞：把对应守卫的
+# ``raise`` 删掉之后，全量套件（3129 条）**仍然全绿**——守卫本身正确，却
+# 没有任何一条测试会在它被删掉时变红。每个守卫都实测可达（``HybridReranker``
+# 经 ``src/retrieval/retriever.py`` 的 ``__all__`` 对外导出，docstring 自己
+# 写明「库调用方可能绕过 ``Settings`` 与 ``SessionConfig`` 直接构造」）。
+#
+# 每条都用「删除守卫即变红」的形态写：断言的是**守卫存在时的收场**，因此
+# 守卫一旦被删，行为退化（静默接受或抛出别的异常）就会让断言失败。
+
+
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        pytest.param("bogus", id="unknown-word"),
+        pytest.param("hybrid", id="retrieval-method-name"),
+        pytest.param("", id="empty"),
+        pytest.param(" rrf x ", id="normalizes-to-nothing-valid"),
+    ],
+)
+def test_hybrid_reranker_rejects_a_string_strategy_outside_the_allowed_set(strategy):
+    """合法字符串但不在 ``{"rrf", "weighted"}`` 时必须报错。
+
+    删除构造器末尾那道成员判据后，``rerank`` 的派发是
+    ``if == "weighted" else _rrf_rerank``——**没有**最后的兜底分支，未知策略
+    会静默按 RRF 融合。用户配置里写着一个无效策略、程序却按 RRF 出结果，是
+    与 ``retrieval_method`` 静默退化同类的问题。``_coerce_fusion_strategy``
+    只做 ``.strip().lower()``、不判成员，所以这道守卫是生产路径上的唯一拦截点。
+    """
+    from src.services.retrieval_service import HybridReranker
+
+    with pytest.raises(ValueError, match="融合策略"):
+        HybridReranker(0.5, 0.5, fusion_strategy=strategy)
+
+
+@pytest.mark.parametrize(
+    "rrf_k",
+    [
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="inf"),
+        pytest.param(10**400, id="beyond-double"),
+        pytest.param("60", id="numeric-string"),
+        pytest.param(None, id="none"),
+        pytest.param(True, id="bool"),
+    ],
+)
+def test_hybrid_reranker_rejects_a_non_finite_rrf_k(rrf_k):
+    """``rrf_k`` 非有限／非数值必须报错，而不是静默收下。
+
+    删除这道守卫后，``nan`` 会静默通过（``nan <= 0`` 为 False），随后每个文档
+    得分都是 ``nan``、与分数阈值比较恒为 False，整批结果被静默丢弃；``"60"``
+    被 ``float()`` 悄悄转成 ``60.0``；``10**400`` 则把干净的 ``ValueError``
+    换成下一行的裸 ``OverflowError``（``ArithmeticError`` 子类，穿透调用方的
+    ``except ValueError`` 分类）。
+    """
+    from src.services.retrieval_service import HybridReranker
+
+    with pytest.raises(ValueError, match="rrf_k"):
+        HybridReranker(0.5, 0.5, rrf_k=rrf_k)
+
+
+@pytest.mark.parametrize(
+    "rrf_k",
+    [
+        pytest.param(0, id="zero-int"),
+        pytest.param(0.0, id="zero-float"),
+        pytest.param(-1, id="negative-int"),
+        pytest.param(-60, id="negative-matches-default-rank"),
+    ],
+)
+def test_hybrid_reranker_rejects_a_non_positive_rrf_k(rrf_k):
+    """``rrf_k <= 0`` 必须报错：它是 RRF 分母 ``rrf_k + rank``。
+
+    删除这道守卫后 ``self.rrf_k`` 会静默变成 0 或负数——``rrf_k = -rank`` 时
+    分母为零，``rerank()`` 抛 ``ZeroDivisionError``（不是 ``ValueError``）。
+    """
+    from src.services.retrieval_service import HybridReranker
+
+    with pytest.raises(ValueError, match="rrf_k"):
+        HybridReranker(0.5, 0.5, rrf_k=rrf_k)
+
+
+@pytest.mark.parametrize(
+    ("vector_weight", "keyword_weight"),
+    [
+        pytest.param(10**400, 0.5, id="vector-unconvertible"),
+        pytest.param(0.5, 10**400, id="keyword-unconvertible"),
+    ],
+)
+def test_weight_tuple_rejects_a_single_unconvertible_weight(vector_weight, keyword_weight):
+    """单个权重超出 double 范围时，``_weight_tuple`` 必须给带指引的 ``ValueError``。
+
+    这道守卫用 ``is_double_convertible`` 而非 ``math.isfinite``（后者对超大
+    ``int`` 自己就抛 ``OverflowError``）。删除它之后，下面的
+    ``float(self.vector_weight)`` 会抛裸 ``OverflowError``——``ArithmeticError``
+    子类而**不是** ``ValueError``，穿透调用方全部 ``except ValueError`` 分类。
+    构造器不做这道判据，因此这是库调用方直接构造后的第一道拦截。
+    """
+    from src.services.retrieval_service import HybridReranker
+
+    with pytest.raises(ValueError, match="有限数值"):
+        HybridReranker(vector_weight, keyword_weight)._weight_tuple()
+
+
+def test_weight_tuple_still_accepts_in_range_weights():
+    """收紧不能误伤：两个权重都在 ``[0, 1]`` 内时照常归一化。"""
+    from src.services.retrieval_service import HybridReranker
+
+    assert HybridReranker(0.0, 1.0)._weight_tuple() == (0.0, 1.0)
+    assert HybridReranker(0.5, 0.5)._weight_tuple() == (0.5, 0.5)
+
+
+def test_retrieve_rejects_an_oversized_candidate_pool():
+    """``top_k × retrieval_candidate_multiplier`` 越界必须在 ``retrieve`` 里被拦。
+
+    两个字段各自都在单字段上界（2000）之内，只有**乘积**越界——而乘积才是真正
+    送进 ``faiss_index.search()`` 的值。``SessionConfig`` 的属性没有
+    ``__setattr__`` 守卫，直写即可命中。删除 ``retrieve`` 里那道乘积判据后，
+    ``effective_top_k = 2000 × 2000`` 会静默传给 store；FAISS 既不报错也不截断，
+    按该规模分配结果数组。
+    """
+    from src.runtime.contracts import build_session_config
+    from src.services.retrieval_service import RetrievalService
+
+    class _Store:
+        def semantic_search(self, embedding, top_k):
+            return []
+
+        def resolve_parent_content(self, parent_id):
+            return None
+
+    class _Embedding:
+        async def embed_query(self, query):
+            return [0.0] * 4
+
+    config = build_session_config(get_settings())
+    config.retrieval_method = RetrievalMethod.SEMANTIC_SEARCH
+    config.rerank_enabled = False
+    # 属性直写，绕过 ``__setitem__``——两个字段各自合法，乘积越界。
+    config.top_k = 2000
+    config.retrieval_candidate_multiplier = 2000
+
+    with pytest.raises(ValueError, match="乘积超出合理范围"):
+        asyncio.run(RetrievalService(_Store(), _Embedding()).retrieve("q", config))
+
+
 # ── 子分片的 50% 比例上界：父侧修了，子侧漏了 ──
 #
 # 上一轮给**父**分片加了 `overlap <= size / 2`（`_validate_parent_sizes`），
