@@ -9437,3 +9437,128 @@ def test_normalization_still_accepts_well_formed_messages():
     assert responses[0]["role"] == "user"
 
     assert normalize_messages("hi", None, None) == [{"role": "user", "content": "hi"}]
+
+
+# ── Ark Chat／Embedding／Classification 的形态判据 ──
+#
+# 六条判据在整套测试里从未执行（行覆盖证实；把它们的 ``raise`` 换成 ``pass`` 后
+# 全量 3434 条仍全绿）。删除后行为确实改变（实测，均经公开入口）：
+# * 1027 ``max_tokens`` 与 ``max_completion_tokens`` 同时出现在模型 options →
+#   **静默接受**，只有 ``max_tokens`` 进请求，另一处配置被无声丢弃；
+# * 1404 原生 Responses 调用缺 ``input``／``input=None`` → **静默接受**，
+#   请求不带 ``input`` 直接发给服务端；
+# * 1420 ``session`` 非对象 → 带字段名的 ``ValueError`` 变成裸 ``TypeError:
+#   'int' object is not iterable``（``dict(session)``）；
+# * 2249／2296 Embedding 的 ``embed_documents``／``aembed_documents`` 请求参数
+#   覆盖 ``input``／``model`` → 消息从「不允许覆盖请求字段」退化成
+#   ``require_text_list`` 抛的「不支持请求参数」，把「参数冲突」说成「不支持的
+#   参数」；
+# * 2978 ``async_classify`` 的 ``labels`` 形态判据 → 非列表抛裸 ``TypeError``、
+#   元素非字符串抛裸 ``AttributeError``。
+
+
+def test_ark_chat_rejects_conflicting_max_tokens_options():
+    """两处输出长度配置同时出现必须报错，不能静默只取其一。"""
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "doubao-model"
+    provider._protocol = "chat_completions"
+    provider._options = {"max_tokens": 10, "max_completion_tokens": 20}
+
+    with pytest.raises(ValueError, match="不能同时设置 max_tokens 和 max_completion_tokens"):
+        provider._build_chat_request(prompt="hi", stream=False)
+
+
+@pytest.mark.parametrize(
+    "params",
+    [{"model": "m"}, {"model": "m", "input": None}],
+    ids=["missing-input", "none-input"],
+)
+def test_ark_native_responses_requires_input(params):
+    """原生 Responses 调用缺 ``input`` 必须在请求前报错。"""
+    with pytest.raises(ValueError, match="创建需要 input"):
+        VolcengineProvider._validate_native_response_kwargs(params)
+
+
+def test_ark_native_responses_rejects_non_object_session():
+    """``session`` 非对象必须给出可读消息，不能漏出裸 ``TypeError``。"""
+    with pytest.raises(ValueError, match="session 必须是对象"):
+        VolcengineProvider._validate_native_response_kwargs(
+            {"model": "m", "input": "hi", "session": 5}
+        )
+
+
+def test_ark_native_responses_still_accepts_valid_session():
+    """反向守卫：合法 ``session`` 照常归一为 dict。"""
+    params = VolcengineProvider._validate_native_response_kwargs(
+        {"model": "m", "input": "hi", "session": {"a": 1}}
+    )
+
+    assert params["session"] == {"a": 1}
+
+
+def _ark_embedding_provider():
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "doubao-embedding"
+    provider._protocol = "chat_completions"
+    provider._options = {}
+    return provider
+
+
+@pytest.mark.parametrize("field", ["input", "model"])
+def test_ark_embedding_rejects_request_field_overrides(field):
+    """请求参数覆盖 ``input``／``model`` 必须报「不允许覆盖请求字段」。
+
+    删除守卫后消息退化成 ``require_text_list`` 的「不支持请求参数」——把参数
+    冲突说成参数不受支持，排查方向被带偏。
+    """
+    provider = _ark_embedding_provider()
+
+    with pytest.raises(ValueError, match="不允许覆盖请求字段"):
+        provider.embed_documents(["a"], **{field: ["b"] if field == "input" else "other"})
+
+
+@pytest.mark.parametrize("field", ["input", "model"])
+def test_ark_async_embedding_rejects_request_field_overrides(field):
+    """异步入口同判据（另一份实现）。"""
+    provider = _ark_embedding_provider()
+
+    async def run():
+        return await provider.aembed_documents(
+            ["a"], **{field: ["b"] if field == "input" else "other"}
+        )
+
+    with pytest.raises(ValueError, match="不允许覆盖请求字段"):
+        asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "labels",
+    [5, [], [5], ["  "], ["ok", None]],
+    ids=["int", "empty", "non-string-entry", "blank-entry", "none-entry"],
+)
+def test_ark_async_classify_rejects_malformed_labels(labels):
+    """异步 Classification 的 ``labels`` 必须是非空字符串列表。
+
+    删除守卫后实测非列表抛裸 ``TypeError: 'int' object is not iterable``、元素
+    非字符串抛裸 ``AttributeError: 'int' object has no attribute 'strip'``。
+    """
+    provider = _ark_embedding_provider()
+
+    async def run():
+        return await provider.async_classify(query="q", labels=labels)
+
+    with pytest.raises(ValueError, match="labels 必须是非空字符串列表"):
+        asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "labels",
+    [5, [], [5], ["  "]],
+    ids=["int", "empty", "non-string-entry", "blank-entry"],
+)
+def test_ark_sync_classify_rejects_malformed_labels(labels):
+    """同步 Classification 是另一份实现，同样要有判据（既有用例已覆盖，这里作对照）。"""
+    provider = _ark_embedding_provider()
+
+    with pytest.raises(ValueError, match="labels 必须是非空字符串列表"):
+        provider.classify(query="q", labels=labels)

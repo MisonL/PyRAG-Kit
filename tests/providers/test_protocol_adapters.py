@@ -4216,3 +4216,123 @@ def test_finish_reason_normalization_keeps_enum_and_plain_values_intact():
     # 只有 value 时取 value
     value_only = SimpleNamespace(value="max_tokens")
     assert GoogleProvider._normalize_finish_reason(value_only) == "MAX_TOKENS"
+
+
+# ── Ark Responses 的 format／tools／tool_choice 形态判据 ──
+#
+# ``VolcengineProvider._convert_responses_format``／``_convert_responses_tools``／
+# ``_convert_responses_tool_choice`` 与 OpenAI 兼容侧同构，但四条判据在整套测试里
+# 从未执行（行覆盖证实；把它们的 ``raise`` 换成 ``pass`` 后全量 3434 条仍全绿）。
+# 既有用例只覆盖了容器层（``tools`` 非列表）与「``function`` 非对象」，下面这几条
+# 全绕开了。删除后行为确实改变（实测）：
+# * 863 ``json_schema`` 非 dict → 裸 ``AttributeError: 'int' object has no
+#   attribute 'get'``（``schema.get("name")``）；
+# * 878 ``type`` 既非 ``json_schema`` 也非 ``json_object``、且没有 ``format`` 键
+#   → **静默返回空字典**，请求体里 ``format`` 直接消失，用户要的结构化输出约束
+#   被无声丢弃；
+# * 893 工具元素非 Mapping → 整数抛裸 ``TypeError: argument of type 'int' is not
+#   iterable``、字符串抛 ``dictionary update sequence ...``；
+# * 911 ``function`` 非对象 → 裸 ``AttributeError: 'str' object has no attribute
+#   'get'``；
+# * 942 未知字符串 → 消息从「不支持 tool_choice: x」退化成 959 那条通用消息；
+# * 955 ``function`` tool_choice 缺 name → **静默接受**，产出 ``name: None``；
+# * 959 非字符串非工具对象 → **静默返回 None**，请求不带 ``tool_choice``，等于
+#   「让模型自己决定用不用工具」。
+
+
+@pytest.mark.parametrize(
+    "response_format",
+    [{"type": "json_schema", "json_schema": 5}, {"type": "json_schema", "json_schema": "s"}],
+    ids=["int", "str"],
+)
+def test_ark_responses_rejects_non_object_json_schema(response_format):
+    with pytest.raises(ValueError, match="json_schema 必须是对象"):
+        VolcengineProvider._convert_responses_format(response_format)
+
+
+@pytest.mark.parametrize(
+    "response_format",
+    [{"type": "xml"}, {}, {"type": ""}, {"type": 5}],
+    ids=["xml", "empty", "blank-type", "int-type"],
+)
+def test_ark_responses_rejects_unsupported_response_format(response_format):
+    """不支持的 ``type`` 必须报错。
+
+    删除守卫后实测静默返回 ``{}``——请求体里的 ``format`` 消失，用户配置的
+    结构化输出约束被无声丢弃。
+    """
+    with pytest.raises(ValueError, match="仅支持 json_schema 或 json_object"):
+        VolcengineProvider._convert_responses_format(response_format)
+
+
+@pytest.mark.parametrize("tool", [5, "x", ["y"]], ids=["int", "str", "list"])
+def test_ark_responses_tools_reject_non_mapping_entries(tool):
+    with pytest.raises(ValueError, match=r"工具定义\[0\] 必须是对象"):
+        VolcengineProvider._convert_responses_tools([tool])
+
+
+def test_ark_responses_tools_reject_non_mapping_function():
+    with pytest.raises(ValueError, match=r"工具定义\[0\]\.function 必须是对象"):
+        VolcengineProvider._convert_responses_tools([{"function": "bad"}])
+
+
+def test_ark_responses_tool_choice_rejects_unknown_string():
+    """未知字符串必须给出指明取值的消息，而不是落到通用兜底。"""
+    with pytest.raises(ValueError, match="不支持 tool_choice: x"):
+        VolcengineProvider._convert_responses_tool_choice("x")
+
+
+@pytest.mark.parametrize(
+    "tool_choice",
+    [{"type": "function", "function": {"x": 1}}, {"type": "function", "function": {}}],
+    ids=["missing-name", "empty-function"],
+)
+def test_ark_responses_tool_choice_requires_function_name(tool_choice):
+    """``function`` tool_choice 必须带 name。
+
+    删除守卫后实测静默接受，产出 ``{"type": "function", "name": None}``。
+    """
+    with pytest.raises(ValueError, match="缺少 name"):
+        VolcengineProvider._convert_responses_tool_choice(tool_choice)
+
+
+@pytest.mark.parametrize(
+    "tool_choice",
+    [5, {}, {"type": "custom", "name": "n"}, []],
+    ids=["int", "empty-dict", "custom-type", "list"],
+)
+def test_ark_responses_tool_choice_rejects_unsupported_shapes(tool_choice):
+    """兜底判据必须真的兜住。
+
+    删除后实测静默返回 ``None``——请求里干脆不带 ``tool_choice``，等于「让模型
+    自己决定用不用工具」。
+    """
+    with pytest.raises(ValueError, match="必须是 auto、none、required 或工具对象"):
+        VolcengineProvider._convert_responses_tool_choice(tool_choice)
+
+
+def test_ark_responses_format_still_accepts_supported_shapes():
+    """反向守卫：``json_schema``／``json_object``／已带 ``format`` 的形态照常转换。"""
+    assert VolcengineProvider._convert_responses_format({"type": "json_object"}) == {
+        "format": {"type": "json_object"}
+    }
+    assert VolcengineProvider._convert_responses_format({"type": "json_schema"}) == {
+        "format": {
+            "type": "json_schema",
+            "json_schema": {"name": "response", "schema": {}, "strict": True},
+        }
+    }
+    assert VolcengineProvider._convert_responses_format({"format": {"type": "text"}}) == {
+        "format": {"type": "text"}
+    }
+
+
+def test_ark_responses_tool_choice_still_accepts_supported_values():
+    """反向守卫：别名与原生工具对象照常转换。"""
+    assert VolcengineProvider._convert_responses_tool_choice("REQUIRED") == "required"
+    assert VolcengineProvider._convert_responses_tool_choice(
+        {"type": "function", "function": {"name": "f"}}
+    ) == {"type": "function", "name": "f"}
+    assert VolcengineProvider._convert_responses_tool_choice({"type": "web_search"}) == {
+        "type": "web_search"
+    }
