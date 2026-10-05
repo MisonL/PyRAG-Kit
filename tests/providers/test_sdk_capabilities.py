@@ -9765,3 +9765,75 @@ def test_anthropic_async_beta_tool_runner_rejects_compaction_control():
         asyncio.run(
             provider.async_beta_tool_runner([], prompt="hi", compaction_control={"enabled": True})
         )
+
+
+# ── SDK 客户端属性的三条守卫 ──
+#
+# ``sdk_client``／``async_sdk_client`` 是 provider 基类上「供原生资源调用」的出口，
+# 三条判据在整套测试里从未执行（行覆盖证实；把它们的 ``raise`` 换成 ``pass``
+# 后全量 3540 条仍全绿）。删除后行为确实改变（实测）：
+# * 2140 同步侧没有 ``_get_client`` → 带 provider 类名的 ``AttributeError``
+#   变成裸 ``TypeError: 'NoneType' object is not callable``；
+# * 2150 ``_get_aclient()`` 返回 ``None`` → **静默返回 None**，调用方拿到
+#   ``None`` 当客户端用，在更远处才崩；
+# * 2158 客户端没有 ``aio`` 节点 → **静默返回 None**，同样把「没有异步客户端」
+#   说成「有，但它是 None」。
+#
+# 同批的 2155（``client_getter()`` 返回 ``None``）经甄别是**等价变异**，不补
+# 测试：删掉后 ``getattr(None, "aio", None)`` 得到 ``None``，随即被 2158 以
+# **同一条消息**拦住，结论不变。
+
+
+class _ClientlessProvider(LargeLanguageModel):
+    """没有 ``_get_client``／``_get_aclient`` 的 provider——两者都是纯基类实现。"""
+
+    def invoke(self, *_args, **_kwargs):
+        return iter(())
+
+    async def ainvoke(self, *_args, **_kwargs):
+        return
+        yield  # pragma: no cover - 让函数成为异步生成器
+
+    def stream_events(self, *_args, **_kwargs):
+        return iter(())
+
+    async def astream_events(self, *_args, **_kwargs):
+        return
+        yield  # pragma: no cover - 让函数成为异步生成器
+
+
+def test_sdk_client_reports_missing_getter_readably():
+    """没有 ``_get_client`` 时必须报出 provider 类名，而不是裸 ``TypeError``。"""
+    with pytest.raises(AttributeError, match="_ClientlessProvider 没有同步 SDK 客户端"):
+        _ = _ClientlessProvider().sdk_client
+
+
+def test_async_sdk_client_reports_none_client_readably():
+    """``_get_aclient()`` 返回 ``None`` 时必须报错，不能静默交出 ``None``。"""
+    provider = _ClientlessProvider()
+    provider._get_aclient = lambda: None
+
+    with pytest.raises(AttributeError, match="_ClientlessProvider 没有异步 SDK 客户端"):
+        _ = provider.async_sdk_client
+
+
+def test_async_sdk_client_reports_missing_aio_node_readably():
+    """客户端没有 ``aio`` 节点时必须报错，不能静默交出 ``None``。
+
+    这是「没有异步客户端」与「有但它是 None」的分界——两条守卫消息相同但位置
+    不同，少一条就会把一种说成另一种。
+    """
+    provider = _ClientlessProvider()
+    provider._get_client = lambda: SimpleNamespace()
+
+    with pytest.raises(AttributeError, match="_ClientlessProvider 没有异步 SDK 客户端"):
+        _ = provider.async_sdk_client
+
+
+def test_sdk_client_still_resolves_through_aio_node():
+    """反向守卫：同步客户端可用时，异步出口从 ``aio`` 节点解析。"""
+    provider = _ClientlessProvider()
+    aio = object()
+    provider._get_client = lambda: SimpleNamespace(aio=aio)
+
+    assert provider.async_sdk_client is aio
