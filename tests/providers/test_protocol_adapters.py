@@ -4692,3 +4692,99 @@ def test_google_media_uri_reports_invalid_uri_readably():
             None,
             None,
         )
+
+
+# ── Google 工具调用／工具结果四条形态判据 ──
+#
+# 这四条在整套测试里从未执行（行覆盖证实；把它们的 ``raise`` 换成 ``pass`` 后
+# 全量 3544 条仍全绿）。删除后行为确实改变（实测，均经 ``GoogleProvider._contents``）：
+# * 1811 ``function_call`` 缺 name（或 name 非字符串）→ 缺名时 **静默产出**一个
+#   ``name=None`` 的 ``FunctionCall``，非字符串时漏出裸
+#   ``ValidationError: 1 validation error for FunctionCall``；
+# * 1819 ``arguments`` 是非法 JSON 字符串 → 消息从「不是有效 JSON」退化成
+#   「必须是 JSON 对象」——把「JSON 语法错了」说成「JSON 顶层不是对象」；
+# * 1823 ``arguments`` 是非对象（数组）→ 裸 ``TypeError: cannot convert
+#   dictionary update sequence element #0 to a sequence``（``dict(arguments)``）；
+# * 1837 ``function_response`` 无可关联的 ``tool_call_id``／``name`` → 缺标识时
+#   **静默产出**一个无名的 ``FunctionResponse``（Google 侧无法关联回任何调用），
+#   非字符串标识时漏出裸 ``ValidationError``。
+#
+# 同批的 1795 经甄别是**等价变异**，不补测试：它是 ``role="tool"`` 路径的同一条
+# 判据，删掉后落到 1837 那条 ``function_response`` 分支，抛**同一条消息**的同一个
+# ``ValueError``，结论不变。
+
+
+def _google_contents(parts):
+    return GoogleProvider._contents([{"role": "user", "content": parts}], None, None)
+
+
+@pytest.mark.parametrize(
+    "part",
+    [
+        {"type": "function_call", "arguments": {}},
+        {"type": "function_call", "name": 5, "arguments": {}},
+    ],
+    ids=["missing-name", "non-string-name"],
+)
+def test_google_function_call_requires_string_name(part):
+    """``function_call`` 必须带字符串 name。
+
+    删除守卫后缺名静默产出 ``name=None`` 的 ``FunctionCall``，非字符串 name
+    漏出裸 pydantic ``ValidationError``。
+    """
+    with pytest.raises(ValueError, match="function_call 缺少 name"):
+        _google_contents([part])
+
+
+def test_google_function_call_rejects_invalid_json_arguments():
+    """``arguments`` 是非法 JSON 字符串时必须报「不是有效 JSON」。"""
+    with pytest.raises(ValueError, match="arguments 不是有效 JSON"):
+        _google_contents([{"type": "function_call", "name": "f", "arguments": "{bad"}])
+
+
+def test_google_function_call_rejects_non_object_arguments():
+    """``arguments`` 必须是 JSON 对象，数组要报「必须是 JSON 对象」而不是裸 ``TypeError``。"""
+    with pytest.raises(ValueError, match="arguments 必须是 JSON 对象"):
+        _google_contents([{"type": "function_call", "name": "f", "arguments": [1, 2]}])
+
+
+@pytest.mark.parametrize(
+    "part",
+    [
+        {"type": "function_response", "response": {}},
+        {"type": "function_response", "response": {}, "tool_call_id": 5},
+        {"type": "function_response", "response": {}, "name": 5},
+    ],
+    ids=["no-identifier", "non-string-id", "non-string-name"],
+)
+def test_google_function_response_requires_linkable_identifier(part):
+    """``function_response`` 必须带可关联的 ``tool_call_id`` 或 ``name``。
+
+    删除守卫后缺标识静默产出无名的 ``FunctionResponse``，Google 侧无法关联回
+    任何一次调用；非字符串标识漏出裸 pydantic ``ValidationError``。
+    """
+    with pytest.raises(ValueError, match="function_response 缺少可关联的 tool_call_id/name"):
+        _google_contents([part])
+
+
+def test_google_tool_parts_still_convert_when_well_formed():
+    """反向守卫：合法的 ``function_call`` 与 ``function_response`` 照常转换。"""
+    contents = _google_contents(
+        [
+            {"type": "function_call", "id": "c1", "name": "f", "arguments": {"a": 1}},
+            {"type": "function_response", "tool_call_id": "c1", "response": {"ok": True}},
+        ]
+    )
+
+    calls = [
+        part.function_call for content in contents for part in content.parts if part.function_call
+    ]
+    responses = [
+        part.function_response
+        for content in contents
+        for part in content.parts
+        if part.function_response
+    ]
+    assert [call.name for call in calls] == ["f"]
+    assert calls[0].args == {"a": 1}
+    assert [response.name for response in responses] == ["f"]
