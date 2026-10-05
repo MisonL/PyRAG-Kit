@@ -4415,6 +4415,109 @@ def test_provider_resource_guard_normalizes_duplicate_sdk_arguments():
         provider.get_interaction("interaction-1", id="interaction-2")
 
 
+# ``_guard_provider_resource_method`` 把 SDK 抛出的 ``TypeError`` 收敛成带渠道名
+# 与原始消息的 ``ValueError``，分三个子类：unexpected keyword / multiple values /
+# missing required；同步与异步各有一份（2016/2020/2024 与 2046/2048/2050）。
+# 既有用例只钉住**同步**的「multiple values」那一条，其余五条在整套测试里从未
+# 执行（行覆盖证实；把它们换成 ``pass`` 后全量 3397 条仍全绿）。
+#
+# 删除后收场从 ``ValueError`` 退化成裸 ``TypeError``：调用方的错误分类按
+# ``ValueError`` 写，而 SDK 的 ``TypeError`` 文本只说「哪个参数不对」，没有
+# 渠道名——排查时无法定位到是哪个 provider 的资源方法。
+
+
+def _resource_guard_sync_provider(sdk_call):
+    class Interactions:
+        def get(self, *, id, **kwargs):
+            return sdk_call(id=id, **kwargs)
+
+    provider = object.__new__(GoogleProvider)
+    provider._model_name = "gemini"
+    provider._provider = "test"
+    provider._get_client = lambda: SimpleNamespace(interactions=Interactions())
+    return provider
+
+
+def _resource_guard_async_provider(sdk_call):
+    class Caches:
+        async def get(self, *, name, **kwargs):
+            return sdk_call(name=name, **kwargs)
+
+    class Aio:
+        caches = Caches()
+
+    provider = object.__new__(GoogleProvider)
+    provider._model_name = "gemini"
+    provider._provider = "test"
+    provider._get_client = lambda: SimpleNamespace(aio=Aio())
+    return provider
+
+
+def _unexpected_keyword(**_kwargs):
+    raise TypeError("get() got an unexpected keyword argument 'tenant'")
+
+
+def _duplicate_argument(id=None, **_kwargs):
+    raise TypeError("get() got multiple values for argument 'id'")
+
+
+def _missing_required_argument(**_kwargs):
+    raise TypeError("get() missing 1 required positional argument: 'name'")
+
+
+_RESOURCE_GUARD_CASES = [
+    pytest.param(_unexpected_keyword, "不匹配", id="unexpected-keyword"),
+    pytest.param(_duplicate_argument, "重复", id="duplicate-argument"),
+    pytest.param(_missing_required_argument, "不匹配", id="missing-required"),
+]
+
+
+@pytest.mark.parametrize(("sdk_call", "expected"), _RESOURCE_GUARD_CASES)
+def test_resource_guard_reports_sync_type_errors_readably(sdk_call, expected):
+    """同步资源入口的 ``TypeError`` 必须收敛成带渠道名的 ``ValueError``。"""
+    provider = _resource_guard_sync_provider(sdk_call)
+
+    with pytest.raises(ValueError, match=f"test 资源 SDK 参数{expected}"):
+        provider.get_interaction("interaction-1", extra_body={"tenant": "t"})
+
+
+@pytest.mark.parametrize(("sdk_call", "expected"), _RESOURCE_GUARD_CASES)
+def test_resource_guard_reports_async_type_errors_readably(sdk_call, expected):
+    """异步资源入口是**另一份包装器**，三条判据同样必须生效。
+
+    同步侧的用例打不到这里——``async_wrapper`` 与 ``wrapper`` 是两个独立的闭包。
+    """
+    provider = _resource_guard_async_provider(sdk_call)
+
+    async def run():
+        return await provider.async_get_cache("caches/1", extra_body={"tenant": "t"})
+
+    with pytest.raises(ValueError, match=f"test 资源 SDK 参数{expected}"):
+        asyncio.run(run())
+
+
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+def test_resource_guard_keeps_unrelated_type_errors_intact(async_mode):
+    """反向守卫：与参数无关的 ``TypeError`` 必须原样透出，不能被误分类。
+
+    守卫按消息内容分类；一条与 SDK 参数无关的 ``TypeError`` 若被收敛成
+    「资源 SDK 参数不匹配」，排查方向会被带偏。
+    """
+
+    def unrelated(**_kwargs):
+        raise TypeError("unsupported operand type(s) for +: 'int' and 'str'")
+
+    if async_mode:
+        provider = _resource_guard_async_provider(unrelated)
+        coroutine = provider.async_get_cache("caches/1", extra_body={"tenant": "t"})
+        with pytest.raises(TypeError, match="unsupported operand"):
+            asyncio.run(coroutine)
+    else:
+        provider = _resource_guard_sync_provider(unrelated)
+        with pytest.raises(TypeError, match="unsupported operand"):
+            provider.get_interaction("interaction-1", extra_body={"tenant": "t"})
+
+
 def test_resource_argument_validator_keeps_nested_business_values_isolated():
     original = {"query": {"text": "hello"}}
     validated = validate_secret_free_resource_args((original,), "Provider")
