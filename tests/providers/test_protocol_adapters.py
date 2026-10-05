@@ -4414,3 +4414,281 @@ def test_anthropic_tool_choice_still_accepts_supported_values():
         "name": "t",
     }
     assert AnthropicProvider._convert_tool_choice({"name": "n"}) == {"type": "tool", "name": "n"}
+
+
+# ── Google 配置边界与响应格式的十八条判据 ──
+#
+# 这些判据在整套测试里从未执行（行覆盖证实；把它们的 ``raise`` 换成 ``pass`` 后
+# 全量 3505 条仍全绿）。删除后行为确实改变（实测，均经真实入口）：
+# * 681 ``debug_config`` 含未知字段 → **静默接受**，``nope`` 被 pydantic 静默
+#   忽略、产出一个什么都没设的 ``DebugConfig``；
+# * 685 当前 SDK 没有 ``DebugConfig`` 时 → 漏出裸 ``NameError``，而不是
+#   ``RuntimeError``「当前 google-genai SDK 不支持 debug_config」；
+# * 689 ``DebugConfig`` 构造失败（``replay_id=5`` 这类非法值）→ **静默返回
+#   None**，配置被无声丢弃；
+# * 947 ``http_options`` 与请求级 HTTP 扩展同时出现 → **静默接受**，请求级值
+#   覆盖 SDK 容器；
+# * 951 ``config`` 与同级配置关键字同时出现 → **静默返回 config**，同级的
+#   ``temperature`` 等被无声丢弃；
+# * 979 Embedding 请求含不支持的参数 → **静默接受**，参数原样进 SDK；
+# * 1127／1134／1137 ``response_format`` 及其 ``json_schema``／``schema``
+#   非对象 → 裸 ``AttributeError: 'int' object has no attribute 'get'`` 或
+#   ``TypeError: 'int' object is not iterable``；
+# * 1144 ``type`` 既非 ``json_object`` 也非 ``json_schema`` → **静默返回
+#   None**，结构化输出约束消失；
+# * 1180 ``extra_body`` 与模型 options 重复 → **静默覆盖**，模型级值被请求级顶掉；
+# * 1191 ``http_options`` 与请求级扩展冲突 → **静默接受**，两者同时生效；
+# * 1391／1406／1412 同一量在两处配置（``max_tokens`` 与
+#   ``max_output_tokens``、``thinking`` 与 ``thinking_config``、``response_format``
+#   与请求参数）→ 前两者**静默丢弃**一个（1406 实测被 pydantic 拒绝成
+#   ``ValidationError``），1412 **静默接受**请求级值；
+# * 1477 data URI 无逗号 → 退化成裸 ``ValueError: not enough values to unpack``；
+# * 1481 data URI 缺 MIME → **静默接受**，产出 ``mime_type=""`` 的块；
+# * 1541 ``urlsplit`` 解析失败 → ``parsed`` 从未赋值，漏出裸 ``UnboundLocalError``。
+#
+# 同批的 1164／1171 经甄别是**等价变异**，不补测试：两条与共享 helper
+# ``validate_secret_free_payload`` 抛**同一条消息的同一个 ``ValueError````，
+# 删除后结论不变。
+
+
+class _GoogleConfigStub:
+    """``GenerateContentConfig`` 的最小替身，能记录构造参数。"""
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+def _google_config_provider(**options):
+    provider = object.__new__(GoogleProvider)
+    provider._model_name = "gemini-1.5-flash"
+    provider._provider = "google"
+    provider._options = dict(options)
+    return provider
+
+
+def test_google_debug_config_rejects_unknown_field():
+    """``debug_config`` 含未知字段必须报错。
+
+    删除后实测静默产出「什么都没设」的 ``DebugConfig``——配置写错了却看不出来。
+    """
+    with pytest.raises(ValueError, match="包含不支持的字段: nope"):
+        GoogleProvider._coerce_debug_config({"nope": 1})
+
+
+def test_google_debug_config_reports_missing_sdk_support(monkeypatch):
+    """当前 SDK 没有 ``DebugConfig`` 时必须报「SDK 不支持」，不能漏出 ``NameError``。"""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "google.genai.client", None)
+
+    with pytest.raises(RuntimeError, match="SDK 不支持 debug_config"):
+        GoogleProvider._coerce_debug_config({"client_mode": "x"})
+
+
+@pytest.mark.parametrize(
+    "debug_config",
+    [{"replay_id": 5}, {"replays_directory": 5}, {"client_mode": 5}],
+    ids=["replay-id", "replays-directory", "client-mode"],
+)
+def test_google_debug_config_reports_invalid_values(debug_config):
+    """``DebugConfig`` 构造失败必须收敛成「配置无效」，不能静默返回 ``None``。"""
+    with pytest.raises(ValueError, match="debug_config 配置无效"):
+        GoogleProvider._coerce_debug_config(debug_config)
+
+
+def test_google_debug_config_still_accepts_valid_fields():
+    """反向守卫：合法字段照常转换。"""
+    config = GoogleProvider._coerce_debug_config({"client_mode": "auto", "replay_id": "r1"})
+
+    assert config.client_mode == "auto"
+    assert config.replay_id == "r1"
+
+
+def test_google_resource_config_rejects_http_options_with_request_level_fields():
+    """``http_options`` 不能与请求级 HTTP 扩展同时传入。
+
+    删除后实测静默接受，请求级值直接覆盖 SDK 容器——用户配置的两套 HTTP 设置
+    谁生效取决于调用顺序。
+    """
+    with pytest.raises(ValueError, match="http_options 不能与请求级 HTTP 配置同时传入"):
+        GoogleProvider._resource_config(
+            _GoogleConfigStub,
+            None,
+            {"http_options": {"a": 1}, "extra_body": {"b": 2}},
+        )
+
+
+def test_google_resource_config_rejects_config_with_sibling_keywords():
+    """``config`` 不能与同级配置关键字同时传入，否则同级值被无声丢弃。"""
+    with pytest.raises(ValueError, match="config 不能与同级配置关键字同时传入"):
+        GoogleProvider._resource_config(_GoogleConfigStub, {"x": 1}, {"temperature": 0.5})
+
+
+def test_google_embedding_rejects_unsupported_request_kwargs():
+    """Embedding 请求含不支持参数必须报错，不能静默进 SDK。"""
+    with pytest.raises(ValueError, match="Embedding 不支持请求参数: bogus"):
+        GoogleProvider._validate_embedding_kwargs({"bogus": 1})
+
+
+def test_google_embedding_still_accepts_supported_request_kwargs():
+    """反向守卫：受支持的参数照常通过（``None`` 值视为未设置）。"""
+    assert (
+        GoogleProvider._validate_embedding_kwargs(
+            {"task_type": "RETRIEVAL_DOCUMENT", "auto_truncate": None}
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("response_format", [5, "json_object", ["a"]], ids=["int", "str", "list"])
+def test_google_response_format_rejects_non_mapping(response_format):
+    with pytest.raises(ValueError, match="response_format 必须是对象"):
+        GoogleProvider._response_format_values(response_format)
+
+
+@pytest.mark.parametrize("json_schema", [5, "s", ["a"]], ids=["int", "str", "list"])
+def test_google_response_format_rejects_non_mapping_json_schema(json_schema):
+    with pytest.raises(ValueError, match=r"json_schema 必须是对象"):
+        GoogleProvider._response_format_values({"type": "json_schema", "json_schema": json_schema})
+
+
+@pytest.mark.parametrize("schema", [5, "s", ["a"]], ids=["int", "str", "list"])
+def test_google_response_format_rejects_non_mapping_schema(schema):
+    with pytest.raises(ValueError, match="必须是 JSON Schema 对象"):
+        GoogleProvider._response_format_values(
+            {"type": "json_schema", "json_schema": {"schema": schema}}
+        )
+
+
+@pytest.mark.parametrize(
+    "response_format",
+    [{"type": "xml"}, {}, {"type": ""}, {"type": 5}, {"schema": {}}],
+    ids=["xml", "empty", "blank-type", "int-type", "schema-only"],
+)
+def test_google_response_format_rejects_unsupported_types(response_format):
+    """不支持的 ``type`` 必须报错。
+
+    删除后实测静默返回 ``None``——用户配置的结构化输出约束从请求里消失。
+    """
+    with pytest.raises(ValueError, match="仅支持 json_object 或 json_schema"):
+        GoogleProvider._response_format_values(response_format)
+
+
+def test_google_response_format_still_accepts_supported_types():
+    """反向守卫：``json_object`` 与 ``json_schema`` 照常转换。"""
+    assert GoogleProvider._response_format_values({"type": "json_object"}) == {
+        "response_mime_type": "application/json"
+    }
+    assert GoogleProvider._response_format_values(
+        {"type": "json_schema", "json_schema": {"schema": {"type": "object"}}}
+    ) == {
+        "response_mime_type": "application/json",
+        "response_json_schema": {"type": "object"},
+    }
+
+
+_GOOGLE_HTTP_BASE = {
+    "extra_body": None,
+    "extra_headers": None,
+    "extra_query": None,
+    "timeout": None,
+}
+
+
+def test_google_extra_body_cannot_be_silently_overridden():
+    """请求级 ``extra_body`` 与模型 options 同名键必须报错，不能静默覆盖。
+
+    删除后实测模型级 ``{"k": 1}`` 被请求级 ``{"k": 2}`` 顶掉，谁生效取决于
+    调用顺序且无任何提示。
+    """
+    provider = _google_config_provider(extra_body={"k": 1})
+
+    with pytest.raises(ValueError, match="extra_body 与模型 options 重复: k"):
+        provider._generation_http_options(**{**_GOOGLE_HTTP_BASE, "extra_body": {"k": 2}})
+
+
+def test_google_http_options_cannot_coexist_with_request_level_extensions():
+    """``http_options`` 与请求级 HTTP 扩展不能同时生效。
+
+    删除后实测两者同时返回、都被套用——用户配置的两套 HTTP 设置发生叠加。
+    """
+    provider = _google_config_provider(http_options={"h": 1})
+
+    with pytest.raises(ValueError, match="不能与请求级"):
+        provider._generation_http_options(**{**_GOOGLE_HTTP_BASE, "extra_body": {"b": 2}})
+
+
+def test_google_http_options_and_extra_body_still_merge_when_disjoint():
+    """反向守卫：不冲突的 ``extra_body`` 与请求级扩展照常合并。"""
+    provider = _google_config_provider(extra_body={"k": 1})
+
+    merged, *_ = provider._generation_http_options(**{**_GOOGLE_HTTP_BASE, "extra_body": {"j": 2}})
+
+    assert merged == {"k": 1, "j": 2}
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        (
+            {"max_tokens": 10, "max_output_tokens": 20},
+            "max_tokens 与 options.max_output_tokens 重复",
+        ),
+        (
+            {"thinking": {"a": 1}, "thinking_config": {"b": 2}},
+            "thinking 与 options.thinking_config 重复",
+        ),
+    ],
+    ids=["max-tokens", "thinking"],
+)
+def test_google_generation_config_rejects_duplicate_scalar_options(options, message):
+    """同一量在两处配置必须报错，不能静默丢弃其一。"""
+    provider = _google_config_provider(**options)
+
+    with pytest.raises(ValueError, match=message):
+        provider._build_generation_config(None, None, None)
+
+
+def test_google_generation_config_rejects_response_format_duplicate():
+    """``response_format`` 同时出现在 options 与请求参数必须报错。"""
+    provider = _google_config_provider(response_format={"type": "json_object"})
+
+    with pytest.raises(ValueError, match="response_format 与模型 options 重复"):
+        provider._build_generation_config(None, None, None, response_format={"type": "json_object"})
+
+
+def test_google_decode_data_uri_requires_comma():
+    with pytest.raises(ValueError, match="缺少逗号分隔符"):
+        GoogleProvider._decode_data_uri("data:image/png;base64", "媒体")
+
+
+def test_google_decode_data_uri_requires_mime_type():
+    """``data:`` URI 缺 MIME 类型必须报错，不能产出 ``mime_type=""`` 的块。"""
+    with pytest.raises(ValueError, match="缺少 MIME 类型"):
+        GoogleProvider._decode_data_uri("data:;base64,QUFB", "媒体")
+
+
+def test_google_decode_data_uri_still_accepts_well_formed_value():
+    """反向守卫：合法 data URI 照常解码。"""
+    assert GoogleProvider._decode_data_uri("data:image/png;base64,QUFB", "媒体") == (
+        "image/png",
+        b"AAA",
+    )
+
+
+def test_google_media_uri_reports_invalid_uri_readably():
+    """``urlsplit`` 解析失败必须收敛成带上下文的 ``ValueError``。
+
+    删除守卫后 ``parsed`` 从未赋值，漏出裸 ``UnboundLocalError``。
+    """
+    with pytest.raises(ValueError, match="URI 无效"):
+        GoogleProvider._contents(
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "image_url", "image_url": {"url": "http://[bad"}}],
+                }
+            ],
+            None,
+            None,
+        )
