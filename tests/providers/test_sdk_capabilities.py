@@ -8972,3 +8972,281 @@ def test_responses_background_timeout_still_reports_string_id():
         provider._poll_background_response(response, {})
 
     assert "resp_abc" in str(excinfo.value)
+
+
+# ── 流终止与拒答守卫 ──
+#
+# ``OpenAICompatibleProvider`` 与 ``VolcengineProvider`` 各自有四条「流在终结事件
+# 之前结束」与四条「返回拒答」守卫，分布在 ``invoke``／``ainvoke``（纯文本生成）
+# 与 ``stream_events``／``astream_events``（结构化事件）两套入口上，合计 30 条。
+# 这些判据在整套测试里从未执行（`sys.settrace` 行覆盖证实）；把它们的 ``raise``
+# 换成 ``pass`` 后全量 3361 条仍然全绿——既有用例只钉住 Responses 异步流的一条
+# 拒 delta 收敛（``test_openai_responses_async_streaming_refusal_delta_is_coerced``）。
+#
+# 删除后的后果分两类（实测，均经公开入口）：
+# * **流提前结束**：静默正常返回 ``["hi"]``（invoke 侧）或一串 ``StreamEvent``
+#   （stream_events 侧）。调用方无法区分「模型答完了」与「连接断了」，半截答案
+#   当成完整答案进入对话历史；
+# * **拒答**：非流式静默返回空列表，流式退化成相邻的「流提前结束」消息——把
+#   「模型明确拒绝回答」说成「流断了」，两者需要完全不同的处置。
+PROVIDER_STREAM_MATRIX = [
+    (OpenAICompatibleProvider, "responses", "responses"),
+    (OpenAICompatibleProvider, "chat_completions", "chat"),
+    (VolcengineProvider, "responses", "responses"),
+    (VolcengineProvider, "chat_completions", "chat"),
+]
+
+_RESPONSES_REFUSAL_BODY = {
+    "id": "r1",
+    "status": "completed",
+    "output": [{"type": "message", "role": "assistant", "refusal": "no", "content": []}],
+}
+# Ark 的 ``_extract_result`` 只认 ``output[].type == "refusal"``，与 OpenAI 侧的
+# ``output[].refusal`` 字段形态不同（见两处 ``_extract_result`` 的对比）。
+_ARK_REFUSAL_BODY = {
+    "id": "r1",
+    "status": "completed",
+    "output": [{"type": "refusal", "refusal": "no"}],
+}
+_RESPONSES_TEXT_BODY = {
+    "id": "r1",
+    "status": "completed",
+    "output": [
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "hi"}],
+        }
+    ],
+}
+_RESPONSES_REFUSAL_EVENT = {
+    "type": "response.refusal.delta",
+    "item_id": "i1",
+    "output_index": 0,
+    "delta": "no",
+}
+_RESPONSES_TEXT_EVENT = {
+    "type": "response.output_text.delta",
+    "item_id": "i1",
+    "output_index": 0,
+    "delta": "hi",
+}
+_RESPONSES_DONE_EVENT = {"type": "response.completed", "response": {"id": "r1"}}
+_CHAT_REFUSAL_BODY = {
+    "id": "c1",
+    "object": "chat.completion",
+    "choices": [
+        {
+            "index": 0,
+            "finish_reason": "content_filter",
+            "message": {"role": "assistant", "refusal": "no"},
+        }
+    ],
+}
+_CHAT_REFUSAL_CHUNK = {
+    "id": "c1",
+    "object": "chat.completion.chunk",
+    "choices": [{"index": 0, "delta": {"refusal": "no"}}],
+}
+_CHAT_TEXT_CHUNK = {
+    "id": "c1",
+    "object": "chat.completion.chunk",
+    "choices": [{"index": 0, "delta": {"content": "hi"}}],
+}
+_CHAT_FINISH_CHUNK = {
+    "id": "c1",
+    "object": "chat.completion.chunk",
+    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+}
+
+
+def _sync_iterator(items):
+    return iter(items)
+
+
+def _async_iterator(items):
+    async def gen():
+        for item in items:
+            yield item
+
+    return gen()
+
+
+def _stream_client(payload, kind, *, is_async):
+    """构造只区分 ``stream=`` 的假 SDK 客户端。
+
+    非流式调用返回响应对象本身、流式调用返回迭代器——两者不能混，否则
+    ``_raise_for_*`` 会拿到迭代器并把「响应缺字段」误报成非法响应。
+    """
+
+    def create(**kwargs):
+        if kwargs.get("stream"):
+            return _async_iterator(payload) if is_async else _sync_iterator(payload)
+        return payload[0]
+
+    if kind == "responses":
+        return SimpleNamespace(responses=SimpleNamespace(create=create))
+    return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+
+
+def _stream_provider(provider_type, protocol, kind, payload, *, is_async):
+    provider = object.__new__(provider_type)
+    provider._model_name = "demo"
+    provider._provider = "demo"
+    provider._protocol = protocol
+    provider._options = {"server_verified_protocols": ["responses", "chat_completions"]}
+    provider._server_verified_protocols = frozenset({"responses", "chat_completions"})
+    client = _stream_client(payload, kind, is_async=is_async)
+    if is_async:
+        provider._get_aclient = lambda: client
+    else:
+        provider._get_client = lambda: client
+    return provider
+
+
+def _refusal_body(provider_type, kind):
+    if kind != "responses":
+        return _CHAT_REFUSAL_BODY
+    if provider_type is VolcengineProvider:
+        return _ARK_REFUSAL_BODY
+    return _RESPONSES_REFUSAL_BODY
+
+
+def _unterminated_payload(kind):
+    if kind == "responses":
+        return [_RESPONSES_TEXT_EVENT]
+    return [_CHAT_TEXT_CHUNK]
+
+
+def _terminated_payload(kind):
+    if kind == "responses":
+        return [_RESPONSES_TEXT_EVENT, _RESPONSES_DONE_EVENT]
+    return [_CHAT_TEXT_CHUNK, _CHAT_FINISH_CHUNK]
+
+
+@pytest.mark.parametrize(
+    ("provider_type", "protocol", "kind"),
+    PROVIDER_STREAM_MATRIX,
+    ids=lambda value: value if isinstance(value, str) else value.__name__,
+)
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+def test_streaming_refusal_is_explicit(provider_type, protocol, kind, async_mode):
+    """拒答必须报成「返回拒答」，不能退化成「流提前结束」或静默返回空。
+
+    删除流式拒答守卫后，收场从「返回拒答: no」变成「流在 … 之前结束」——把
+    模型明确拒绝回答说成连接中断，两者需要完全不同的处置；删除非流式守卫后
+    则**静默返回空列表**，调用方把「拒答」当成「模型没话说」。
+    """
+    if kind == "responses":
+        payload = [_RESPONSES_REFUSAL_EVENT]
+    else:
+        payload = [_CHAT_REFUSAL_CHUNK]
+    provider = _stream_provider(provider_type, protocol, kind, payload, is_async=async_mode)
+
+    if async_mode:
+
+        async def run():
+            return [x async for x in provider.ainvoke(prompt="hi", stream=True)]
+
+        with pytest.raises(RuntimeError, match="返回拒答"):
+            asyncio.run(run())
+    else:
+        with pytest.raises(RuntimeError, match="返回拒答"):
+            list(provider.invoke(prompt="hi", stream=True))
+
+
+@pytest.mark.parametrize(
+    ("provider_type", "protocol", "kind"),
+    PROVIDER_STREAM_MATRIX,
+    ids=lambda value: value if isinstance(value, str) else value.__name__,
+)
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+def test_non_streaming_refusal_is_explicit(provider_type, protocol, kind, async_mode):
+    """非流式拒答同样必须显式报错。
+
+    删除后实测静默返回 ``[]``——一次明确的拒答变成「模型没有输出」。
+    """
+    payload = [_refusal_body(provider_type, kind)]
+    provider = _stream_provider(provider_type, protocol, kind, payload, is_async=async_mode)
+
+    if async_mode:
+
+        async def run():
+            return [x async for x in provider.ainvoke(prompt="hi", stream=False)]
+
+        with pytest.raises(RuntimeError, match="返回拒答"):
+            asyncio.run(run())
+    else:
+        with pytest.raises(RuntimeError, match="返回拒答"):
+            list(provider.invoke(prompt="hi", stream=False))
+
+
+@pytest.mark.parametrize(
+    ("provider_type", "protocol", "kind"),
+    PROVIDER_STREAM_MATRIX,
+    ids=lambda value: value if isinstance(value, str) else value.__name__,
+)
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+def test_streaming_without_terminal_event_is_explicit(provider_type, protocol, kind, async_mode):
+    """流在终结事件之前结束必须报错，不能静默交付半截答案。
+
+    删除后实测静默返回 ``["hi"]``：调用方无法区分「模型答完了」与「连接断了」。
+    """
+    provider = _stream_provider(
+        provider_type, protocol, kind, _unterminated_payload(kind), is_async=async_mode
+    )
+
+    if async_mode:
+
+        async def run():
+            return [x async for x in provider.ainvoke(prompt="hi", stream=True)]
+
+        with pytest.raises(RuntimeError, match="之前结束"):
+            asyncio.run(run())
+    else:
+        with pytest.raises(RuntimeError, match="之前结束"):
+            list(provider.invoke(prompt="hi", stream=True))
+
+
+@pytest.mark.parametrize(
+    ("provider_type", "protocol", "kind"),
+    PROVIDER_STREAM_MATRIX,
+    ids=lambda value: value if isinstance(value, str) else value.__name__,
+)
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+def test_stream_events_requires_terminal_event(provider_type, protocol, kind, async_mode):
+    """``stream_events``／``astream_events`` 是另一套实现，终止判据同样要生效。
+
+    删除后实测静默产出一串 ``StreamEvent``——结构化事件流的调用方连「流是否
+    完整」都无从判断，而它们正是靠这条区分「完整事件」与「半截事件」。
+    """
+    provider = _stream_provider(
+        provider_type, protocol, kind, _unterminated_payload(kind), is_async=async_mode
+    )
+
+    if async_mode:
+
+        async def run():
+            return [x async for x in provider.astream_events(prompt="hi")]
+
+        with pytest.raises(RuntimeError, match="之前结束"):
+            asyncio.run(run())
+    else:
+        with pytest.raises(RuntimeError, match="之前结束"):
+            list(provider.stream_events(prompt="hi"))
+
+
+@pytest.mark.parametrize(
+    ("provider_type", "protocol", "kind"),
+    PROVIDER_STREAM_MATRIX,
+    ids=lambda value: value if isinstance(value, str) else value.__name__,
+)
+def test_terminated_stream_still_yields_content(provider_type, protocol, kind):
+    """反向守卫：带终结事件的正常流照常产出内容与 finish 事件。"""
+    provider = _stream_provider(
+        provider_type, protocol, kind, _terminated_payload(kind), is_async=False
+    )
+
+    events = list(provider.stream_events(prompt="hi"))
+
+    assert any(event.type == "finish" for event in events)
