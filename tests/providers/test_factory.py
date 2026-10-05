@@ -593,3 +593,127 @@ def test_create_provider_rejects_class_that_is_not_the_expected_type():
         _ORIGINAL_FACTORY._create_provider("local-hash", "m", "embedding", LargeLanguageModel)
 
     assert "需要实现 LargeLanguageModel" in str(excinfo.value)
+
+
+# ── 回归：`_provider_info_for_role` 与诊断入口的六条守卫 ──
+#
+# 这些判据在整套测试里从未执行（行覆盖证实；把它们的 `raise` 换成 `pass` 后
+# 全量 3471 条仍全绿）。删除后行为确实改变（实测，经公开诊断入口
+# `capabilities`／`capability_report`／`protocol_status` 与公开 getter）：
+#   * 236 模块导入失败 → 删掉 ``except ImportError`` 的 ``raise`` 后
+#     ``ProviderClass`` 未赋值，函数**静默返回 None**，调用方拿到 ``None`` 并在
+#     后面某处才崩；
+#   * 244 模块里找不到 provider 类 → 同上，静默返回 ``None``；
+#   * 277 渠道名不在 ``_provider_map`` → 带指引的 ``ValueError: 不支持的模型
+#     提供商: nope`` 变成裸 ``AttributeError: 'NoneType' object has no attribute
+#     'get'``（``info.get(...)``），诊断界面拿到的是崩溃而不是「渠道名写错了」；
+#   * 280 角色不在该渠道的 ``capabilities`` 内 → **静默返回**该渠道的 provider
+#     信息（实测返回 ``local-hash`` 的 embedding 实现），角色契约被无声破坏；
+#   * 412 ``server_verified_protocols`` 非字符串非序列 → 裸 ``TypeError: 'int'
+#     object is not iterable``（``for value in configured``）；
+#   * 431 登记了未知协议名 → ``normalized_protocol`` 未赋值，漏出裸
+#     ``UnboundLocalError: cannot access local variable 'normalized_protocol'``；
+#   * 554 ``role=None`` 且渠道名无法推断出任何角色 → 消息从「无法为提供商 nope
+#     推断模型角色，请显式传入 role。」退化成「模型角色必须是字符串，但得到
+#     None。」——把「渠道名不存在」说成「角色名不是字符串」。
+#
+# 同批的 360 行经甄别是**死代码**，不补测试：它的条件
+# （``protocol_value not in provider_info["protocols"]``）是 326 行那条的严格
+# 子集，326 先命中，因此这条分支在现有配置下不可达。
+#
+# 用 `_ORIGINAL_FACTORY` 的原因同上：``patch_settings`` 替换的是重新导入的
+# 那个类，只有原始类能走到真实的 ``_provider_map`` 与 provider 信息。
+
+
+def test_provider_info_for_role_rejects_unknown_provider():
+    """渠道名不在 ``_provider_map`` 时必须给带指引的 ``ValueError``。"""
+    with pytest.raises(ValueError) as excinfo:
+        _ORIGINAL_FACTORY._provider_info_for_role("nope", "llm")
+
+    assert "不支持的模型提供商: nope" in str(excinfo.value)
+
+
+def test_provider_info_for_role_rejects_unsupported_capability():
+    """角色不在该渠道 ``capabilities`` 内必须报错。
+
+    ``local-hash`` 是纯 embedding 渠道；按 ``llm`` 角色查询时判据必须拦住，
+    否则调用方拿到 embedding 实现，角色契约被无声破坏。
+    """
+    with pytest.raises(TypeError) as excinfo:
+        _ORIGINAL_FACTORY._provider_info_for_role("local-hash", "llm")
+
+    assert "不支持 llm 能力" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"server_verified_protocols": 5},
+        {"server_verified_protocols": {"responses": 1}},
+    ],
+    ids=["int", "dict"],
+)
+def test_runtime_verified_protocols_rejects_non_sequence_container(options):
+    """``server_verified_protocols`` 必须是字符串或协议序列。
+
+    映射是 ``Sequence`` 的反面：``for value in {"responses": 1}`` 会迭代出键
+    而不是报错，因此这里要显式排除。
+    """
+    with pytest.raises(ValueError) as excinfo:
+        _ORIGINAL_FACTORY._runtime_verified_protocols(options, frozenset({"responses"}), "qwen")
+
+    assert "server_verified_protocols 必须是字符串或协议序列" in str(excinfo.value)
+
+
+def test_runtime_verified_protocols_rejects_unknown_protocol():
+    """登记了未知协议名必须给带可选值列表的消息。
+
+    删除守卫后 ``normalized_protocol`` 从未赋值，漏出裸 ``UnboundLocalError``。
+    """
+    with pytest.raises(ValueError) as excinfo:
+        _ORIGINAL_FACTORY._runtime_verified_protocols(
+            {"server_verified_protocols": ["nope"]}, frozenset({"responses"}), "qwen"
+        )
+
+    message = str(excinfo.value)
+    assert "不支持的 server_verified_protocols 协议: nope" in message
+    assert "可选值" in message
+
+
+def test_protocol_status_requires_explicit_role_for_unknown_provider():
+    """``role=None`` 且渠道名不存在时必须说「无法推断角色」，而不是「角色不是字符串」。"""
+    with pytest.raises(ValueError) as excinfo:
+        _ORIGINAL_FACTORY.protocol_status("nope", "chat_completions")
+
+    assert "推断模型角色" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("module", "class_name", "expected"),
+    [
+        ("src.providers.nonexistent_module", "X", ImportError),
+        ("src.providers.jina", "NoSuchProviderClass", AttributeError),
+    ],
+    ids=["missing-module", "missing-class"],
+)
+def test_get_provider_class_reports_import_failures_readably(module, class_name, expected):
+    """动态导入失败必须报成带模块名的异常，不能静默返回 ``None``。
+
+    删除守卫后函数在 ``except`` 里走空，落到函数末尾隐式返回 ``None``——调用方
+    拿到 ``None`` 后会在更远的地方崩，错误现场与真正的病因分开了。
+    """
+    real = _ORIGINAL_FACTORY._get_provider_class.__wrapped__
+    saved = _ORIGINAL_FACTORY._provider_map["local-hash"]
+    _ORIGINAL_FACTORY._provider_map["local-hash"] = {
+        "module": module,
+        "class": class_name,
+        "capabilities": {"embedding"},
+    }
+    try:
+        with pytest.raises(expected) as excinfo:
+            real("local-hash")
+    finally:
+        _ORIGINAL_FACTORY._provider_map["local-hash"] = saved
+
+    message = str(excinfo.value)
+    assert module in message or class_name in message
