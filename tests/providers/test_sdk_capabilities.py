@@ -2081,6 +2081,68 @@ def test_google_tool_call_merge_rejects_ambiguous_unidentified_parallel_calls():
         )
 
 
+# `_merge_tool_call` 有五条「分片指向多个调用／缺少稳定标识」的守卫在整套测试里
+# 从未执行（`sys.settrace` 行覆盖证实；把它们的 `raise` 换成 `pass` 后全量 3283 条
+# 仍然全绿）。既有用例 `test_google_tool_call_merge_rejects_ambiguous_unidentified_
+# parallel_calls` 命中的只是「先建一条、再补一条」这条路径，下面三条全绕开了。
+# 删除后行为确实改变（实测）：
+#   * 2303 同 index 已有两条 name 不同的记录 → **静默接受**，两个并行调用的参数
+#     被并进同一条记录；
+#   * 2341 同 id 已挂在两条不同 key 的记录上 → **静默接受**，同样合并；
+#   * 2326 index 分片匹配到多条「无 index 且同名」的记录 → **静默接受**。
+# 这三处的后果与源码注释写明的意图正相反：注释明确「绝不能从分片位置合成
+# index——该位置每个 chunk 都会重置，会把并行的独立调用合并在一起」，而合并后
+# 两次工具调用的参数会互相污染。
+# 同批的 2316 与 2376 经甄别是**等价变异**，不补测试：删除后落到相邻守卫，仍抛
+# `RuntimeError` 且消息仍指向同一类问题（实测分别是「index 指向多个调用」与
+# 「无法确认是否为同一调用」），结论不变。
+@pytest.mark.parametrize(
+    ("existing", "fragment"),
+    [
+        pytest.param(
+            [
+                (("index", 0), {"type": "function", "index": 0, "name": "lookup"}),
+                (("index", 0, "b"), {"type": "function", "index": 0, "name": "search"}),
+            ],
+            {"index": 0, "arguments": {"third": 3}},
+            id="same-index-different-names",
+        ),
+        pytest.param(
+            [
+                (("id", "call-1"), {"type": "function", "id": "call-1", "name": "lookup"}),
+                (("index", 7), {"type": "function", "index": 7, "id": "call-1", "name": "search"}),
+            ],
+            {"id": "call-1", "arguments": {"third": 3}},
+            id="same-id-two-keys",
+        ),
+    ],
+)
+def test_google_tool_call_merge_rejects_fragments_pointing_at_multiple_calls(existing, fragment):
+    """分片同时匹配多条已累积记录时必须 ``RuntimeError``，不能把两次调用合并成一条。"""
+    # 手工构造累积状态：走 ``_merge_tool_call`` 建这两条时它们会被同名规则合并，
+    # 构造不出「两条独立记录」这个前提。
+    accumulator = {key: {**value, "arguments": {}} for key, value in existing}
+
+    with pytest.raises(RuntimeError, match="指向多个调用"):
+        GoogleProvider._merge_tool_call(accumulator, fragment)
+
+    assert len(accumulator) == len(existing)
+
+
+def test_google_tool_call_merge_rejects_index_fragment_matching_multiple_unidentified_records():
+    """index 分片匹配到多条「无 index 且同名」的记录时必须报错，不能静默合并。"""
+    # 同上，手工构造两条同名且都无 index 的记录，模拟上游把它们当作两次独立调用
+    accumulator = {
+        ("position", 0): {"type": "function", "index": None, "name": "lookup", "arguments": {}},
+        ("position", 1): {"type": "function", "index": None, "name": "lookup", "arguments": {}},
+    }
+
+    with pytest.raises(RuntimeError, match="缺少稳定 id/index"):
+        GoogleProvider._merge_tool_call(accumulator, {"index": 3, "arguments": {"third": 3}})
+
+    assert len(accumulator) == 2
+
+
 def test_google_sync_stream_merges_tool_call_when_id_arrives_after_first_chunk():
     provider = object.__new__(GoogleProvider)
     provider._model_name = "gemini"
