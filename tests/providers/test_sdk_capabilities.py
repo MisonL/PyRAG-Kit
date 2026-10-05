@@ -8208,6 +8208,231 @@ def test_responses_content_part_detail_must_not_raise_type_error(part_type, bad_
         _responses_content_part(part, "input[0]", provider="openai")
 
 
+# `_responses_content_part` 的二十六条形态判据在整套测试里从未执行（`sys.settrace`
+# 行覆盖证实；把它们的 `raise` 换成 `pass` 后全量 3286 条仍然全绿）。既有用例
+# `test_responses_content_part_detail_must_not_raise_type_error` 只钉住两个分支里
+# 的 `detail` 成员判据，其余形态判据全绕开了。删除后行为确实改变（实测，全在
+# `src/providers/__base__/model_provider.py`）：**二十五条静默接受**——畸形取值
+# 原样进 `converted` 字典再发给上游（如 `text: 5`、`file_id: 5`、`detail: "ultra"`、
+# 整块缺 URI 却产出 `{"type": "input_video"}`）；**两条变成裸 `TypeError`**——
+# `dict(...)` 对非映射取值抛 `TypeError: 'int' object is not iterable`。
+# 最值得记的是四条 `prompt_cache_breakpoint` 守卫（700／810／858／901）：它们
+# 拦住的是「把 OpenAI 专属字段发给 Ark SDK」——删掉后 Ark 侧静默丢弃该字段，
+# 而调用方以为缓存已生效。
+_DATA_PNG = "data:image/png;base64,AAA"
+
+
+@pytest.mark.parametrize(
+    ("part", "provider", "expected"),
+    [
+        pytest.param(5, "openai", r"必须是字符串或对象", id="part-not-str-or-object"),
+        pytest.param(
+            {"type": "text", "text": 5}, "openai", r"\.text 必须是字符串", id="text-not-string"
+        ),
+        pytest.param(
+            {"type": "text", "text": "a", "prompt_cache_breakpoint": 1},
+            "ark",
+            "prompt_cache_breakpoint 不受 Ark",
+            id="text-pcb-on-ark",
+        ),
+        pytest.param(
+            {"type": "input_audio", "audio_url": "https://x/a.wav", "file_id": 5},
+            "ark",
+            r"\.file_id 必须是字符串",
+            id="audio-file-id-not-string",
+        ),
+        pytest.param(
+            {"type": "input_audio", "audio_url": "https://x/a.wav", "chunking_strategy": 5},
+            "ark",
+            r"chunking_strategy 必须是对象",
+            id="audio-chunking-not-mapping",
+        ),
+        pytest.param(
+            {"type": "input_video", "video_url": {"url": 5}},
+            "ark",
+            r"video_url\.url 必须是字符串",
+            id="video-url-not-string",
+        ),
+        pytest.param(
+            {"type": "input_video", "video_url": {"url": "https://x/v.mp4"}, "file_id": 5},
+            "ark",
+            r"\.file_id 必须是字符串",
+            id="video-file-id-not-string",
+        ),
+        pytest.param(
+            {"type": "input_video", "video_url": {}},
+            "ark",
+            "缺少 video_url 或 file_id",
+            id="video-missing-url-and-file-id",
+        ),
+        pytest.param(
+            {"type": "image_url", "image_url": 5},
+            "openai",
+            r"\.image_url 必须是字符串或对象",
+            id="image-url-not-str-or-object",
+        ),
+        pytest.param(
+            {"type": "image_url", "image_url": {"url": 5}},
+            "openai",
+            r"image_url\.url 必须是字符串",
+            id="image-url-value-not-string",
+        ),
+        pytest.param(
+            {"type": "image_url", "file_id": 5},
+            "openai",
+            r"\.file_id 必须是字符串",
+            id="image-file-id-not-string",
+        ),
+        pytest.param(
+            {"type": "image_url", "image_url": _DATA_PNG, "detail": "ultra"},
+            "openai",
+            r"\.detail 必须是",
+            id="image-detail-not-allowed",
+        ),
+        pytest.param(
+            {"type": "image_url", "image_url": _DATA_PNG, "image_pixel_limit": {"min_pixels": 1}},
+            "openai",
+            "image_pixel_limit 不受 OpenAI",
+            id="image-pixel-limit-on-openai",
+        ),
+        pytest.param(
+            {"type": "image_url", "image_url": _DATA_PNG, "image_pixel_limit": 5},
+            "ark",
+            r"image_pixel_limit 必须是对象",
+            id="image-pixel-limit-not-mapping",
+        ),
+        pytest.param(
+            {"type": "image_url", "image_url": _DATA_PNG, "prompt_cache_breakpoint": 1},
+            "ark",
+            "prompt_cache_breakpoint 不受 Ark",
+            id="image-pcb-on-ark",
+        ),
+        pytest.param(
+            {"type": "input_image", "image_url": 5},
+            "openai",
+            r"\.image_url 必须是字符串",
+            id="input-image-url-not-string",
+        ),
+        pytest.param(
+            {"type": "input_image", "image_url": _DATA_PNG, "file_id": 5},
+            "openai",
+            r"\.file_id 必须是字符串",
+            id="input-image-file-id-not-string",
+        ),
+        pytest.param(
+            {"type": "input_image"},
+            "openai",
+            "缺少 image_url 或 file_id",
+            id="input-image-missing-url-and-file-id",
+        ),
+        pytest.param(
+            {"type": "input_image", "image_url": _DATA_PNG, "image_pixel_limit": 5},
+            "ark",
+            r"image_pixel_limit 必须是对象",
+            id="input-image-pixel-limit-not-mapping",
+        ),
+        pytest.param(
+            {"type": "input_image", "image_url": _DATA_PNG, "prompt_cache_breakpoint": 1},
+            "ark",
+            "prompt_cache_breakpoint 不受 Ark",
+            id="input-image-pcb-on-ark",
+        ),
+        pytest.param(
+            {"type": "file", "file": 5},
+            "openai",
+            r"\.file 必须是字符串或对象",
+            id="file-not-str-or-object",
+        ),
+        pytest.param(
+            {"type": "file"},
+            "openai",
+            "缺少 file_id、file_data 或 file_url",
+            id="file-missing-all-three",
+        ),
+        pytest.param(
+            {"type": "file", "file_id": 5},
+            "openai",
+            r"\.file_id 必须是字符串",
+            id="file-id-not-string",
+        ),
+        pytest.param(
+            {"type": "file", "file_id": "f", "detail": "auto"},
+            "ark",
+            r"\.detail 不受 Ark",
+            id="file-detail-on-ark",
+        ),
+        pytest.param(
+            {"type": "file", "file_id": "f", "prompt_cache_breakpoint": 1},
+            "ark",
+            "prompt_cache_breakpoint 不受 Ark",
+            id="file-pcb-on-ark",
+        ),
+        pytest.param(
+            {"type": "input_file", "file_id": 5},
+            "openai",
+            r"\.file_id 必须是字符串",
+            id="input-file-id-not-string",
+        ),
+        pytest.param(
+            {"type": "input_file", "file_id": "f", "prompt_cache_breakpoint": 1},
+            "ark",
+            "prompt_cache_breakpoint 不受 Ark",
+            id="input-file-pcb-on-ark",
+        ),
+    ],
+)
+def test_responses_content_part_rejects_malformed_blocks(part, provider, expected):
+    """内容块形态非法时必须给带字段名的 ``ValueError``，不能静默接受或抛裸 ``TypeError``。"""
+    with pytest.raises(ValueError, match=expected):
+        _responses_content_part(part, "input[0]", provider=provider)
+
+
+@pytest.mark.parametrize(
+    ("part", "provider"),
+    [
+        pytest.param({"type": "text", "text": "hi"}, "openai", id="text"),
+        pytest.param(
+            {"type": "text", "text": "hi", "prompt_cache_breakpoint": True},
+            "openai",
+            id="text-pcb-openai",
+        ),
+        pytest.param(
+            {
+                "type": "input_audio",
+                "audio_url": "https://x/a.wav",
+                "chunking_strategy": {"size": 1},
+            },
+            "ark",
+            id="audio-chunking",
+        ),
+        pytest.param({"type": "input_video", "video_url": "https://x/v.mp4"}, "ark", id="video"),
+        pytest.param(
+            {"type": "image_url", "image_url": _DATA_PNG, "detail": "original"},
+            "openai",
+            id="image",
+        ),
+        pytest.param(
+            {"type": "image_url", "image_url": _DATA_PNG, "image_pixel_limit": {"min_pixels": 1}},
+            "ark",
+            id="image-pixel-limit-ark",
+        ),
+        pytest.param({"type": "input_image", "image_url": _DATA_PNG}, "openai", id="input-image"),
+        pytest.param({"type": "file", "file_id": "file-1"}, "openai", id="file"),
+        pytest.param(
+            {"type": "file", "file_url": "https://x/f.pdf", "detail": "high"},
+            "openai",
+            id="file-detail",
+        ),
+        pytest.param({"type": "input_file", "file_id": "file-1"}, "openai", id="input-file"),
+    ],
+)
+def test_responses_content_part_accepts_well_formed_blocks(part, provider):
+    """收紧不能误伤：各分支的合法内容块照常转换。"""
+    converted = _responses_content_part(dict(part), "input[0]", provider=provider)
+
+    assert converted["type"].startswith("input_")
+
+
 def test_responses_stream_delta_survives_unhashable_event_type():
     """网关 SSE chunk 的 ``type`` 是 list 时不得抛 TypeError。
 
