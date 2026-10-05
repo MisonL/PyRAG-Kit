@@ -1,6 +1,8 @@
 import asyncio
+import base64
 import importlib
 import math
+import struct
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -754,6 +756,46 @@ def test_normalize_embedding_vector_still_passes_through_non_finite_floats():
     """
     assert normalize_embedding_vector([float("inf"), 1.0]) == [float("inf"), 1.0]
     assert math.isnan(normalize_embedding_vector([float("nan")])[0])
+
+
+# `normalize_embedding_vector` 的 base64／类型分支有三条判据在整套测试里从未执行
+# （`sys.settrace` 行覆盖证实；把它们的 `raise` 换成 `pass` 后全量 3323 条仍然全绿）。
+# 既有用例只喂 list 形态（走 `isinstance(value, (list, tuple))` 分支），三条都绕开了。
+# 删除后行为确实改变（实测，全在 `src/providers/__base__/model_provider.py`）：
+#   * 1397 非法 base64 → `encoded` 未赋值，抛 `UnboundLocalError`（不是
+#     `ValueError`，穿透 `EmbeddingService` 的 `except ValueError`）；
+#   * 1399 不支持的类型 → 同样抛 `UnboundLocalError`，把「SDK 返回了奇怪类型」
+#     说成一个与类型无关的名字错误；
+#   * 1402 空字节串 → **静默返回空列表**（一个零维 embedding 被当成合法结果）；
+#     长度非 4 的倍数 → 裸 `struct.error: unpack requires a buffer of 4 bytes`。
+def test_normalize_embedding_vector_rejects_invalid_base64():
+    """非法 base64 必须报 ``ValueError``，不是 ``UnboundLocalError``。"""
+    with pytest.raises(ValueError, match="base64 内容无效"):
+        normalize_embedding_vector("!!!not-base64!!!")
+
+
+@pytest.mark.parametrize("value", [5, None, {"a": 1}, object()])
+def test_normalize_embedding_vector_rejects_unsupported_types(value):
+    """SDK 返回不支持的类型时必须给带类型名的 ``TypeError``，不是 ``UnboundLocalError``。"""
+    with pytest.raises(TypeError, match="不支持的类型"):
+        normalize_embedding_vector(value)
+
+
+@pytest.mark.parametrize(
+    "value", [b"", b"12345", b"\x00\x00\x00"], ids=["empty", "not-multiple-of-4", "three-bytes"]
+)
+def test_normalize_embedding_vector_rejects_non_float32_byte_lengths(value):
+    """字节长度不是 4 的倍数时必须 ``ValueError``，不能静默返回空列表或抛 ``struct.error``。"""
+    with pytest.raises(ValueError, match="不是有效的 float32 字节序列"):
+        normalize_embedding_vector(value)
+
+
+def test_normalize_embedding_vector_accepts_valid_base64_and_bytes():
+    """收紧不能误伤：合法的 base64 与字节串照常解出浮点列表。"""
+    encoded = base64.b64encode(struct.pack("<2f", 1.5, -2.5)).decode()
+
+    assert normalize_embedding_vector(encoded) == [1.5, -2.5]
+    assert normalize_embedding_vector(struct.pack("<2f", 1.5, -2.5)) == [1.5, -2.5]
 
 
 @pytest.mark.parametrize("value", _BEYOND_DOUBLE_INTS)
