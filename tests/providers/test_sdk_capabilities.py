@@ -3928,6 +3928,52 @@ def test_anthropic_modern_models_allow_explicit_legacy_sampling_for_proxies():
     assert provider.supports_sampling_option("top_k") is True
 
 
+# `_normalize_sampling_value` 的三条「必须是数字」判据在整套测试里从未执行
+# （`sys.settrace` 行覆盖证实；把它们的 `raise` 换成 `pass` 后全量 3251 条仍全绿）。
+# 既有用例 `test_anthropic_modern_models_omit_deprecated_sampling_defaults` 只喂
+# **合法数字**（`temperature=0.2`／`top_k=5`），所以三条都绕开了。删除后行为确实
+# 改变（实测）：
+#   * 299 `temperature="abc"` → 消息从「Anthropic temperature 必须是数字。」换成
+#     「当前 Claude 模型不支持该 temperature；请省略该字段或使用 1.0。」——把
+#     **类型错误**说成**值域错误**，照着提示改的人会把 `abc` 换成 `1.0`，而那与
+#     真正的问题无关；
+#   * 309 `top_p="abc"` → `to_finite_float` 返回 `None`，`None >= 0.99` 抛裸
+#     `TypeError: '>=' not supported between instances of 'NoneType' and 'float'`；
+#   * 312 `top_p=0.5`（合法数字但低于阈值）→ 落到函数末尾的 top_k 分支，消息变成
+#     「当前 Claude 模型不支持 top_k；请移除该字段。」——用户传的是 `top_p`，
+#     报错却说 `top_k`，改错字段。
+@pytest.mark.parametrize("value", ["abc", [1], {"a": 1}, object()])
+def test_anthropic_modern_models_reject_non_numeric_temperature(value):
+    """`temperature` 非数字时消息要直指「必须是数字」，不能说成「值不受支持」。"""
+    provider = object.__new__(AnthropicProvider)
+    provider._model_name = "claude-sonnet-4-6"
+    provider._options = {}
+
+    with pytest.raises(ValueError, match="temperature 必须是数字"):
+        provider._normalize_sampling_value("temperature", value)
+
+
+@pytest.mark.parametrize("value", ["abc", [1], {"a": 1}, object()])
+def test_anthropic_modern_models_reject_non_numeric_top_p(value):
+    """`top_p` 非数字时给带字段名的 ``ValueError``，不是裸 ``TypeError``。"""
+    provider = object.__new__(AnthropicProvider)
+    provider._model_name = "claude-sonnet-4-6"
+    provider._options = {}
+
+    with pytest.raises(ValueError, match="top_p 必须是数字"):
+        provider._normalize_sampling_value("top_p", value)
+
+
+def test_anthropic_modern_models_reject_low_top_p_with_the_right_field_name():
+    """`top_p` 低于阈值时消息要指向 `top_p`，不能误报成 `top_k`。"""
+    provider = object.__new__(AnthropicProvider)
+    provider._model_name = "claude-sonnet-4-6"
+    provider._options = {}
+
+    with pytest.raises(ValueError, match="该 top_p"):
+        provider._normalize_sampling_value("top_p", 0.5)
+
+
 def test_anthropic_default_max_tokens_scales_with_model_family():
     provider = object.__new__(AnthropicProvider)
     provider._options = {}
