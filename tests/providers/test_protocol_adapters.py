@@ -86,6 +86,63 @@ def test_anthropic_rejects_malformed_tool_call_arguments():
         )
 
 
+# `_convert_messages` 的三条 assistant `tool_calls[]` 形态判据在整套测试里从未执行
+# （`sys.settrace` 行覆盖证实；把它们的 `raise` 换成 `pass` 后全量 3260 条仍全绿）。
+# 既有用例 `test_anthropic_rejects_malformed_tool_call_arguments`／
+# `test_anthropic_rejects_tool_call_without_id_or_name` 命中的都是**元素内部**字段
+# （`arguments` 非法 JSON、缺 `id`、缺 `function.name`），三条形态判据都绕开了。
+# 删除后行为确实改变（实测）：707 元素非对象 → 裸
+# `AttributeError: 'int' object has no attribute 'get'`；710 `function` 非对象 →
+# 裸 `AttributeError: 'str' object has no attribute 'get'`；730 `arguments` 非对象 →
+# 裸 `TypeError: 'int' object is not iterable`（`dict(arguments)`）。
+@pytest.mark.parametrize("call", [5, "bad", ["x"]])
+def test_anthropic_rejects_non_object_tool_call_entry(call):
+    """`tool_calls[]` 元素非对象时必须给带序号的 ``ValueError``，不是裸 ``AttributeError``。"""
+    with pytest.raises(ValueError, match=r"tool_calls\[0\] 必须是对象"):
+        AnthropicProvider._convert_messages([{"role": "assistant", "tool_calls": [call]}])
+
+
+@pytest.mark.parametrize("function", ["bad", 5, ["x"]])
+def test_anthropic_rejects_non_object_tool_call_function(function):
+    """`tool_calls[].function` 非对象时给带字段名的 ``ValueError``，不是裸 ``AttributeError``。"""
+    with pytest.raises(ValueError, match=r"tool_calls\[0\].function 必须是对象"):
+        AnthropicProvider._convert_messages(
+            [{"role": "assistant", "tool_calls": [{"function": function}]}]
+        )
+
+
+@pytest.mark.parametrize("arguments", [5, ["a"], 5.5])
+def test_anthropic_rejects_non_object_tool_call_arguments(arguments):
+    """`tool_calls[].function.arguments` 非 JSON 对象时给带字段名的 ``ValueError``。"""
+    with pytest.raises(ValueError, match=r"tool_calls\[0\] 的 arguments 必须是 JSON 对象"):
+        AnthropicProvider._convert_messages(
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"id": "call-1", "function": {"name": "lookup", "arguments": arguments}}
+                    ],
+                }
+            ]
+        )
+
+
+def test_anthropic_accepts_well_formed_tool_call_arguments():
+    """收紧不能误伤：JSON 字符串与对象两种合法形态的 ``arguments`` 照常转换。"""
+    for arguments in ('{"q": "x"}', {"q": "x"}):
+        converted = AnthropicProvider._convert_messages(
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"id": "call-1", "function": {"name": "lookup", "arguments": arguments}}
+                    ],
+                }
+            ]
+        )
+        assert converted[0]["content"][0]["input"] == {"q": "x"}
+
+
 def test_anthropic_rejects_image_content_without_url():
     with pytest.raises(ValueError, match="图片内容缺少有效 image_url"):
         AnthropicProvider._convert_content([{"type": "image_url", "image_url": {}}])

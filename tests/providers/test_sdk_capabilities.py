@@ -3974,6 +3974,83 @@ def test_anthropic_modern_models_reject_low_top_p_with_the_right_field_name():
         provider._normalize_sampling_value("top_p", 0.5)
 
 
+# `_build_message_params` 的六条「配置与请求参数不冲突」判据在整套测试里从未执行
+# （`sys.settrace` 行覆盖证实；把它们的 `raise` 换成 `pass` 后全量 3260 条仍全绿）。
+# 删除后行为确实改变（实测，全在 `src/providers/anthropic.py`）：
+#   * 916 `allow_deprecated_sampling="yes"` → **静默接受**，非空字符串为真，等同于
+#     显式打开「转发已废弃采样字段」，与调用方写 `False` 的意图正好相反；
+#   * 920 `options.response_format` 非对象 → 带字段名的 `ValueError` 变成裸
+#     `TypeError: 'int' object is not iterable`；
+#   * 922／930 `response_format`／`output_format` 同时出现在 options 与请求参数 →
+#     **静默接受**，请求侧取值被丢弃，两处配置冲突无从察觉；
+#   * 962 请求级 `extra_body` 与模型 options 的 `extra_body` 有同名键 → **静默覆盖**；
+#   * 995 `extra_body` 的键与已建好的请求字段（如 `model`）重名 → **静默接受**，
+#     该字段会被 `extra_body` 覆盖掉再发给服务端。
+def _anthropic_options_provider(**options):
+    provider = object.__new__(AnthropicProvider)
+    provider._model_name = "claude-sonnet-4-6"
+    provider._options = options
+    return provider
+
+
+@pytest.mark.parametrize("value", ["yes", 1, 0, [], {}])
+def test_anthropic_rejects_non_boolean_allow_deprecated_sampling(value):
+    """`allow_deprecated_sampling` 必须是布尔值，不能靠真值语义静默生效。"""
+    provider = _anthropic_options_provider(allow_deprecated_sampling=value)
+
+    with pytest.raises(ValueError, match="allow_deprecated_sampling 必须是布尔值"):
+        provider._build_message_params(prompt="hi")
+
+
+@pytest.mark.parametrize("value", [5, "json_object", ["a"]])
+def test_anthropic_rejects_non_object_options_response_format(value):
+    """`options.response_format` 非对象时给带字段名的 ``ValueError``，不是裸 ``TypeError``。"""
+    provider = _anthropic_options_provider(response_format=value)
+
+    with pytest.raises(ValueError, match="response_format 必须是对象"):
+        provider._build_message_params(prompt="hi")
+
+
+@pytest.mark.parametrize("field", ["response_format", "output_format"])
+def test_anthropic_rejects_field_configured_in_both_options_and_request(field):
+    """同一字段同时配在 options 与请求参数时必须报错，不能静默丢掉一侧。"""
+    request_value = {"type": "json_object"} if field == "response_format" else str
+    provider = _anthropic_options_provider(**{field: request_value})
+
+    with pytest.raises(ValueError, match=rf"{field} 与配置项重复"):
+        provider._build_message_params(prompt="hi", stream=True, **{field: request_value})
+
+
+def test_anthropic_rejects_request_extra_body_overriding_configured_extra_body():
+    """请求级 `extra_body` 与模型 options 的 `extra_body` 同名键必须报错，不能静默覆盖。"""
+    provider = _anthropic_options_provider(extra_body={"temperature": 0.5})
+
+    with pytest.raises(ValueError, match="extra_body 不允许覆盖配置字段: temperature"):
+        provider._build_message_params(prompt="hi", extra_body={"temperature": 0.9})
+
+
+def test_anthropic_rejects_extra_body_overriding_a_request_field():
+    """`extra_body` 的键与已建好的请求字段重名时必须报错，不能静默顶掉该字段。"""
+    provider = _anthropic_options_provider(extra_body={"model": "other-model"})
+
+    with pytest.raises(ValueError, match="extra_body 不允许覆盖请求字段: model"):
+        provider._build_message_params(prompt="hi")
+
+
+def test_anthropic_accepts_distinct_configured_and_request_values():
+    """收紧不能误伤：不冲突的 options／请求参数组合照常构造请求。"""
+    provider = _anthropic_options_provider(extra_body={"metadata": {"team": "search"}})
+
+    params = provider._build_message_params(
+        prompt="hi", response_format={"type": "json_object"}, extra_body={"seed": 7}
+    )
+
+    assert params["output_config"] == {
+        "format": {"type": "json_schema", "schema": {"type": "object"}}
+    }
+    assert params["extra_body"] == {"metadata": {"team": "search"}, "seed": 7}
+
+
 def test_anthropic_default_max_tokens_scales_with_model_family():
     provider = object.__new__(AnthropicProvider)
     provider._options = {}
