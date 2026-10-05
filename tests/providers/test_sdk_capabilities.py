@@ -10,6 +10,7 @@ from google.genai import types
 from src.providers.__base__.model_provider import (
     CompletionRequest,
     LargeLanguageModel,
+    StreamEvent,
     TextEmbeddingModel,
     _normalize_responses_native_item,
     _responses_content_part,
@@ -6494,6 +6495,139 @@ def test_responses_input_still_requires_tool_call_id():
                     ],
                 }
             ],
+        )
+
+
+@pytest.mark.parametrize("bad_tool_call", [5, "oops", ["x"]])
+def test_chat_tool_call_normalization_rejects_non_mapping_entries(bad_tool_call):
+    """``tool_calls`` 的元素必须是对象，非 Mapping 不能走到 ``dict()`` 或迭代。
+
+    删除该守卫后，整数元素抛裸 ``TypeError: 'int' object is not iterable``，
+    字符串元素抛 ``dictionary update sequence element #0 has length 1``——
+    两者都与「工具调用写错了」无关，且 ``TypeError`` 会穿透只捕获 ``ValueError``
+    的调用方。
+    """
+    with pytest.raises(ValueError, match=r"必须是对象"):
+        normalize_chat_messages(
+            [{"role": "assistant", "content": "", "tool_calls": [bad_tool_call]}]
+        )
+
+
+def test_chat_tool_call_normalization_rejects_non_mapping_function_field():
+    """嵌套 ``function`` 非对象时必须报错，不能静默改用顶层同名字段。
+
+    输入里顶层 ``name``/``arguments`` 都合法，只有 ``function`` 是字符串。
+    删除守卫后本函数会退回 ``normalized`` 取值并正常返回，把一个明显畸形的
+    工具调用当作有效请求发出。
+    """
+    with pytest.raises(ValueError, match=r"\.function 必须是对象"):
+        normalize_chat_messages(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "name": "n",
+                            "arguments": "{}",
+                            "function": "bad",
+                        }
+                    ],
+                }
+            ]
+        )
+
+
+def test_responses_function_call_item_rejects_non_mapping_function_field():
+    """Responses 原生 ``function_call`` 的嵌套 ``function`` 同样要校验。
+
+    这条守卫与 ``_chat_tool_call_item`` 里的是**两份独立代码**（969 与 384），
+    Chat 路径的测试杀不掉它。删除后原生 item 分支静默接受，把字符串 ``function``
+    丢弃、改用顶层字段拼出请求。
+    """
+    with pytest.raises(ValueError, match=r"\.function 必须是对象"):
+        normalize_responses_input(
+            None,
+            None,
+            [
+                {
+                    "role": "assistant",
+                    "type": "function_call",
+                    "call_id": "c1",
+                    "name": "n",
+                    "arguments": "{}",
+                    "function": "bad",
+                }
+            ],
+        )
+
+
+def test_responses_function_call_item_requires_function_name():
+    """原生 ``function_call`` 缺函数名必须在请求前报错。
+
+    删除守卫后返回 ``name=None`` 的 item，把无名调用发给 Responses。
+    """
+    with pytest.raises(ValueError, match="缺少函数名"):
+        normalize_responses_input(
+            None,
+            None,
+            [
+                {
+                    "role": "assistant",
+                    "type": "function_call",
+                    "call_id": "c1",
+                    "arguments": "{}",
+                }
+            ],
+        )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {
+            "role": "assistant",
+            "type": "function_call",
+            "call_id": "c1",
+            "name": "n",
+            "arguments": {"k": object()},
+        },
+        {"type": "function_call_output", "call_id": "c1", "output": {"k": object()}},
+    ],
+)
+def test_responses_json_text_rejects_unserializable_payload(message):
+    """工具参数与输出必须可 JSON 序列化，否则 ``json.dumps`` 会抛裸 ``TypeError``。
+
+    删除守卫后异常不再收敛为带 ``location`` 的 ``ValueError``；实测在
+    ``_responses_json_text`` 内部先撞 ``TypeError``，调用方只捕获 ``ValueError``
+    时无法给出「哪个字段写错了」的消息。
+    """
+    with pytest.raises(ValueError, match="必须可序列化为 JSON"):
+        normalize_responses_input(None, None, [message])
+
+
+def test_validate_complete_tool_call_requires_name_in_stream_events():
+    """流式工具调用在发出 completed 事件前必须带函数名。
+
+    ``validate_complete_tool_call`` 的 name 判据是流式两条路径（Chat Completions
+    与 Responses）共用的第一道闸。删除后无名调用被当作完整事件交付。
+    """
+    finish = StreamEvent(type="finish", finish_reason="tool_calls", usage={})
+    with pytest.raises(RuntimeError, match="缺少 name"):
+        OpenAICompatibleProvider._chat_completion_events(
+            finish,
+            {0: {"id": "t1", "type": "function", "arguments": "{}"}},
+            set(),
+        )
+    with pytest.raises(RuntimeError, match="缺少 name"):
+        OpenAICompatibleProvider._responses_completion_event(
+            StreamEvent(
+                type="tool_call_completed",
+                tool_call={"id": "t1", "type": "function", "arguments": "{}"},
+            ),
+            {},
         )
 
 
