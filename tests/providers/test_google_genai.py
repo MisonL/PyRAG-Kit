@@ -242,6 +242,91 @@ def test_google_http_options_reject_connection_override_containers():
             )
 
 
+class _ModelDumpRaisesTypeError:
+    """``model_dump(exclude_none=True)`` 抛 ``TypeError`` 的替身。
+
+    真实 ``google-genai`` 的 HttpOptions 接受 ``exclude_none``；这里模拟的是
+    SDK 签名变化或第三方对象只实现无参 ``model_dump`` 的情形。
+    """
+
+    def model_dump(self, *args, **kwargs):
+        raise TypeError("model_dump() got an unexpected keyword argument 'exclude_none'")
+
+
+class _ModelDumpRaisesOtherError:
+    def model_dump(self, *args, **kwargs):
+        raise KeyError("boom")
+
+
+class _ModelDumpReturnsScalar:
+    def model_dump(self, *args, **kwargs):
+        return 5
+
+
+class _ModelDumpTakesNoArguments:
+    """无参 ``model_dump``：第一次带参调用抛 ``TypeError``，第二次成功。"""
+
+    def model_dump(self, *args, **kwargs):
+        if args or kwargs:
+            raise TypeError("takes 1 positional argument but 2 were given")
+        return {"headers": {"X-Trace": "ok"}}
+
+
+# ``_validate_http_options`` 有两条输入路径：Mapping（直接 ``dict()``）与
+# 对象（走 ``model_dump``）。两条路径上的形态判据在整套测试里从未执行——
+# 既有用例只喂合法 Mapping 或真实 ``types.HttpOptions``。把它们的 ``raise``
+# 换成 ``pass`` 后全量 3353 条仍全绿（只有 585 那条被
+# ``test_google_http_options_reject_nested_non_string_key`` 钉住）。
+@pytest.mark.parametrize(
+    "value",
+    [5, "abc", [1, 2], object()],
+    ids=["int", "str", "list", "object"],
+)
+def test_google_http_options_reject_non_mapping_without_model_dump(value):
+    """非 Mapping 且无 ``model_dump`` 必须给出可读消息。
+
+    删除守卫后取值落到 ``model_dump`` 分支，得到「无法读取」——把一个**类型
+    错误**说成**读取失败**，照提示排查的人会去查权限而不是配置形态。
+    """
+    with pytest.raises(ValueError, match="必须是对象表或 google-genai HttpOptions"):
+        GoogleProvider._validate_http_options(value)
+
+
+def test_google_http_options_reports_model_dump_failure_readably():
+    """``model_dump`` 抛异常时必须收敛成 ``ValueError``，不能漏出 ``UnboundLocalError``。
+
+    删除两条 ``except`` 里的守卫后，``payload`` 从未赋值，异常从
+    「无法读取」退化成裸 ``UnboundLocalError: cannot access local variable
+    'payload'``——调用方按 ``ValueError`` 分类，接不住它。
+    """
+    with pytest.raises(ValueError, match="无法读取"):
+        GoogleProvider._validate_http_options(_ModelDumpRaisesOtherError())
+
+
+def test_google_http_options_falls_back_to_no_argument_model_dump():
+    """带参 ``model_dump`` 抛 ``TypeError`` 时回退到无参调用，不能吞掉合法对象。
+
+    回退成功仍走完整校验，因此这里是**反向守卫**：合法对象照常通过。
+    """
+    GoogleProvider._validate_http_options(_ModelDumpTakesNoArguments())
+
+
+def test_google_http_options_reports_dump_failure_after_fallback():
+    """回退（无参）也失败时必须给「无法读取」，不能漏出 ``UnboundLocalError``。"""
+    with pytest.raises(ValueError, match="无法读取"):
+        GoogleProvider._validate_http_options(_ModelDumpRaisesTypeError())
+
+
+def test_google_http_options_reject_model_dump_returning_non_mapping():
+    """``model_dump`` 返回非 Mapping 必须显式报错，而不是裸 ``TypeError``。
+
+    删除守卫后 ``"timeout" in payload`` 对整数抛裸
+    ``TypeError: argument of type 'int' is not iterable``。
+    """
+    with pytest.raises(ValueError, match="http_options 必须是对象"):
+        GoogleProvider._validate_http_options(_ModelDumpReturnsScalar())
+
+
 def test_google_invoke_non_stream_refusal_is_explicit_error():
     provider = GoogleProvider(model_name="gemini-1.5-flash")
     response = SimpleNamespace(
