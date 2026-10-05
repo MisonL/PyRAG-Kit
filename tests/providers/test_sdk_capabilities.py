@@ -9837,3 +9837,363 @@ def test_sdk_client_still_resolves_through_aio_node():
     provider._get_client = lambda: SimpleNamespace(aio=aio)
 
     assert provider.async_sdk_client is aio
+
+
+# ── OpenAI 兼容渠道 openai_compatible.py 覆盖缺口守卫 ──
+#
+# 下列判据在整套测试里从未执行（行覆盖 + 变异扫描双证：把它们的 ``raise`` 换成
+# ``pass`` 后全量 3552 条仍全绿，唯一被抓住的 1208／1706 是覆盖器的假阳性、
+# 既有用例已覆盖）。删除后行为确实改变（实测，均经真实入口）：
+# * 289 构造期缺 ``api_key`` → **静默接受**，无凭证的 provider 被构造出来；
+# * 343 ``_normalize_protocol`` 未知协议 → **静默返回 None**，``_protocol`` 变
+#   ``None``，后续 ``== "responses"`` 判断全部落空；
+# * 478 ``_validate_sdk_resource_call`` 的 ``Signature.bind`` 抛 ``ValueError``
+#   （位置专用参数）→ **静默跳过**参数校验，未知参数一路发到 SDK；
+# * 568 ``_background_poll_config`` 的 ``timeout`` 非正／非数值 → 0 与负值被
+#   **静默接受**，``None`` 抛裸 ``TypeError``，超大整数抛裸 ``OverflowError``；
+# * 585／617 后台响应缺 ``id`` → 裸 ``AttributeError``（``_client``／``_aclient``）；
+# * 920 ``_require_responses_resource`` 非 responses 协议 → 不再拦，把本地 SDK
+#   资源当远端 Responses 能力；
+# * 936 ``_merge_options`` options 覆盖请求字段 → **静默覆盖** ``model``／``input``；
+# * 987 ``_merge_resource_kwargs`` 调用方覆盖 Facade 已绑定字段 → **静默覆盖**；
+# * 1145 Chat ``seed`` 与 options.extra_body 重复 → 消息退化成「extra_body 不允许
+#   覆盖请求字段」；
+# * 1264 ``_convert_responses_tool_choice`` 既非字符串也非 Mapping → 裸 ``TypeError``；
+# * 1273／1279 function tool_choice 缺 name → 1273 删掉后**静默产出**
+#   ``{"type": "function", "name": None}``，1279 删掉后**静默返回 None**；
+# * 1627 ``_convert_responses_format`` 的 json_schema 非对象 → 裸 ``AttributeError``；
+# * 1649 response_format 的 type 不支持且无 format → **静默返回 None**；
+# * 1885 Chat 错误体含 ``error`` 且状态码正常 → 消息退化成「响应缺少有效 choices」；
+# * 1906 ``allow_empty_choices`` 下 ``choices=None`` 且有 detail → **静默接受**；
+# * 2290 Responses 终止事件非 ``response.completed`` → **静默产出一个 finish 事件**；
+# * 2580／2617 ``parse``／``async_parse`` 缺 text_format → 消息退化成
+#   ``normalize_messages`` 的「聊天请求必须提供 prompt 或 messages」；
+# * 2598／2632 ``parse`` 同时用 request.response_format 与 text_format →
+#   **静默接受**，两者之一被无声丢弃；
+# * 3078／3137／3117 Embedding 请求参数与模型 options 重复／覆盖 ``model`` →
+#   **静默接受**或消息退化；
+# * 3195／4465 ``file_content`` 缺 ``files.content`` 资源 → 裸
+#   ``TypeError: 'NoneType' object is not callable``，同构的
+#   ``container_file_content`` 却有专属 ``NotImplementedError``（sibling 缺口）；
+# * 3355／4612 ``stream_responses``／``async_stream_responses`` 同时传 request 与
+#   原生关键字参数 → 裸 ``AttributeError``。
+#
+# 同批的 951（``_validated_extra_body`` 非对象）经甄别是**等价变异**，不补测试：
+# 删掉后落到下游 ``validate_secret_free_payload``，抛同一条消息的同一个
+# ``ValueError``，结论不变。
+
+
+def _openai_compatible_provider(**options):
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "demo"
+    provider._provider = "openai"
+    provider._protocol = "responses"
+    provider._base_url = None
+    provider._options = options
+    return provider
+
+
+def test_openai_compatible_constructor_requires_api_key():
+    """构造期缺 ``api_key`` 必须报错，不能静默构造出无凭证的 provider。"""
+    settings = SimpleNamespace(demo_api_key=None, demo_base_url="https://demo.invalid/v1")
+
+    with pytest.raises(ValueError, match="demo_api_key is required for demo"):
+        OpenAICompatibleProvider("m", "demo", settings=settings, options={})
+
+
+@pytest.mark.parametrize(
+    "protocol",
+    [
+        pytest.param("grpc", id="unknown"),
+        pytest.param("", id="empty"),
+        pytest.param("chat-completions-x", id="near-miss"),
+    ],
+)
+def test_openai_compatible_protocol_rejects_unsupported_names(protocol):
+    """未知协议名必须报错，不能静默返回 ``None`` 让后续分支全部落空。"""
+    with pytest.raises(ValueError, match="不支持 .* 协议"):
+        OpenAICompatibleProvider._normalize_protocol(protocol)
+
+
+def test_openai_compatible_sdk_parameter_validation_failure_is_not_skipped():
+    """``Signature.bind`` 抛 ``ValueError`` 时不得静默跳过校验。"""
+
+    class _ValueErrorSignature(inspect.Signature):
+        def bind(self, *args, **kwargs):
+            raise ValueError("positional-only argument passed as keyword")
+
+        def bind_partial(self, *args, **kwargs):
+            raise ValueError("positional-only argument passed as keyword")
+
+    def method(x):
+        return x
+
+    method.__signature__ = _ValueErrorSignature()
+
+    with pytest.raises(ValueError, match="SDK 参数无法验证"):
+        OpenAICompatibleProvider._validate_sdk_resource_call(method, (), {}, "OpenAI 资源")
+
+
+@pytest.mark.parametrize(
+    "timeout",
+    [
+        pytest.param(0, id="zero"),
+        pytest.param(-1, id="negative"),
+        pytest.param("0", id="string"),
+        pytest.param(True, id="bool"),
+        pytest.param(None, id="none"),
+        pytest.param(10**4301, id="huge-int"),
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="inf"),
+    ],
+)
+def test_openai_compatible_background_timeout_must_be_positive_number(timeout):
+    """``background_timeout`` 非正／非数值必须报错，不是静默接受或裸异常。"""
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._options = {"background_timeout": timeout}
+
+    with pytest.raises(ValueError, match="background_timeout 必须是正数"):
+        provider._background_poll_config()
+
+
+@pytest.mark.parametrize(
+    "status",
+    [pytest.param("queued", id="queued"), pytest.param("in_progress", id="in-progress")],
+)
+def test_openai_compatible_background_poll_requires_response_id(status):
+    """后台响应缺 ``id`` 必须报 ``RuntimeError``，不是裸 ``AttributeError``。"""
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._provider = "demo"
+
+    with pytest.raises(RuntimeError, match="background 响应缺少 id"):
+        provider._poll_background_response({"status": status, "id": ""}, {})
+
+
+def test_openai_compatible_background_poll_requires_response_id_async():
+    """异步分支同判据。"""
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._provider = "demo"
+
+    with pytest.raises(RuntimeError, match="background 响应缺少 id"):
+        asyncio.run(provider._poll_background_response_async({"status": "queued", "id": ""}, {}))
+
+
+def test_openai_compatible_responses_resource_rejects_chat_protocol():
+    """非 responses 协议下不得把本地 SDK 资源当成远端 Responses 能力。"""
+    provider = _openai_compatible_provider()
+    provider._protocol = "chat_completions"
+    provider._get_client = lambda: pytest.fail("非 responses 协议不应初始化客户端")
+
+    with pytest.raises(ValueError, match="仅适用于 responses 协议"):
+        provider.retrieve_response("resp-1")
+
+
+@pytest.mark.parametrize("field", ["model", "input", "messages"])
+def test_openai_compatible_merge_options_rejects_reserved_field_override(field):
+    """``options`` 覆盖请求保留字段必须报错，不能静默覆盖。"""
+    with pytest.raises(ValueError, match="Provider options 不允许覆盖请求字段"):
+        OpenAICompatibleProvider._merge_options({"model": "a", "input": "b"}, {field: "x"})
+
+
+def test_openai_compatible_merge_resource_kwargs_rejects_caller_override():
+    """调用方覆盖 Facade 已绑定的资源字段必须报错，不能静默覆盖。"""
+    with pytest.raises(ValueError, match="资源 SDK 参数重复"):
+        OpenAICompatibleProvider._merge_resource_kwargs(
+            {"response_id": "r1"}, {"response_id": "r2"}, "拉取响应"
+        )
+
+
+def test_openai_compatible_chat_seed_duplicating_extra_body_reports_seed():
+    """Chat ``seed`` 与 options.extra_body 重复时消息必须点名 ``seed``。"""
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "demo"
+    provider._provider = "openai"
+    provider._protocol = "chat_completions"
+    provider._options = {"extra_body": {"seed": 1}}
+    provider._get_client = lambda: SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kw: SimpleNamespace()))
+    )
+
+    with pytest.raises(ValueError, match="Chat Completions seed 与模型 options.extra_body 重复"):
+        provider._build_chat_request(prompt="hi", seed=2)
+
+
+@pytest.mark.parametrize(
+    "tool_choice",
+    [pytest.param(5, id="int"), pytest.param(1.5, id="float"), pytest.param([1], id="list")],
+)
+def test_openai_compatible_responses_tool_choice_rejects_non_string_non_mapping(tool_choice):
+    """``tool_choice`` 既非字符串也非 Mapping 必须给带字段名的 ``ValueError``。"""
+    with pytest.raises(ValueError, match="必须是字符串或对象"):
+        OpenAICompatibleProvider._convert_responses_tool_choice(tool_choice)
+
+
+@pytest.mark.parametrize(
+    "tool_choice",
+    [
+        pytest.param({"type": "function", "function": {}}, id="empty-function"),
+        pytest.param({"type": "function", "function": {"name": ""}}, id="blank-name"),
+    ],
+)
+def test_openai_compatible_responses_tool_choice_requires_function_name(tool_choice):
+    """``function`` 形态的 tool_choice 缺 name 必须报错，不能静默产出无名对象。"""
+    with pytest.raises(ValueError, match="function tool_choice 缺少 name"):
+        OpenAICompatibleProvider._convert_responses_tool_choice(tool_choice)
+
+
+def test_openai_compatible_responses_tool_choice_function_not_mapping_without_name():
+    """``function`` 非 Mapping 且顶层无 name 时，兜底判据必须拦住，不能静默返回 None。"""
+    with pytest.raises(ValueError, match="function tool_choice 缺少 name"):
+        OpenAICompatibleProvider._convert_responses_tool_choice({"type": "function", "function": 5})
+
+
+@pytest.mark.parametrize(
+    "response_format",
+    [
+        pytest.param({"type": "json_schema", "json_schema": 5}, id="int"),
+        pytest.param({"type": "json_schema", "json_schema": "s"}, id="str"),
+    ],
+)
+def test_openai_compatible_responses_format_rejects_non_object_json_schema(response_format):
+    """``json_schema`` 非对象必须报错，不是裸 ``AttributeError``。"""
+    with pytest.raises(ValueError, match="json_schema 必须是对象"):
+        OpenAICompatibleProvider._convert_responses_format(response_format)
+
+
+@pytest.mark.parametrize(
+    "response_format",
+    [pytest.param({"type": "xml"}, id="xml"), pytest.param({}, id="empty")],
+)
+def test_openai_compatible_responses_format_rejects_unsupported_type(response_format):
+    """不支持的 ``type`` 必须报错，不能静默返回 ``None`` 丢掉结构化输出约束。"""
+    with pytest.raises(ValueError, match="仅支持 json_schema 或 json_object"):
+        OpenAICompatibleProvider._convert_responses_format(response_format)
+
+
+def test_openai_compatible_chat_error_body_reports_detail():
+    """Chat 错误体含 ``error`` 且状态码正常时必须报 detail，不是「缺少 choices」。"""
+    with pytest.raises(RuntimeError, match="返回错误: boom"):
+        OpenAICompatibleProvider._raise_for_chat_response_error(
+            {"status": 200, "error": {"message": "boom"}}, provider="openai"
+        )
+
+
+def test_openai_compatible_chat_error_with_empty_choices_and_detail():
+    """``allow_empty_choices`` 下 ``choices=None`` 且有 detail 时必须报错。"""
+    with pytest.raises(RuntimeError, match="返回错误"):
+        OpenAICompatibleProvider._raise_for_chat_response_error(
+            {"choices": None, "msg": "boom"}, allow_empty_choices=True, provider="openai"
+        )
+
+
+def test_openai_compatible_terminal_event_without_error_status_is_rejected():
+    """终止事件非 ``response.completed`` 必须报错，不能静默产出 finish 事件。"""
+    with pytest.raises(RuntimeError, match="收到终止事件: response.incomplete"):
+        OpenAICompatibleProvider._responses_stream_event(
+            {"type": "response.incomplete", "response": {}}, error_provider="openai"
+        )
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_openai_compatible_parse_requires_text_format(async_mode):
+    """``parse``／``async_parse`` 缺 ``text_format`` 必须报专属消息。"""
+    provider = _openai_compatible_provider()
+
+    with pytest.raises(ValueError, match="必须提供 text_format"):
+        if async_mode:
+            asyncio.run(provider.async_parse(None))
+        else:
+            provider.parse(None)
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_openai_compatible_parse_rejects_dual_response_format(async_mode):
+    """``request.response_format`` 与 ``text_format`` 同时使用必须报错，不能静默接受。"""
+    provider = _openai_compatible_provider()
+    provider._get_client = lambda: SimpleNamespace(
+        responses=SimpleNamespace(parse=lambda **kw: "ok")
+    )
+
+    async def async_parse():
+        return await provider.async_parse(
+            dict, CompletionRequest(prompt="hi", response_format={"type": "json_object"})
+        )
+
+    with pytest.raises(ValueError, match="不能同时使用 request.response_format 和 text_format"):
+        if async_mode:
+            asyncio.run(async_parse())
+        else:
+            provider.parse(
+                dict, CompletionRequest(prompt="hi", response_format={"type": "json_object"})
+            )
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_openai_compatible_embedding_rejects_request_option_overlap(async_mode):
+    """Embedding 请求参数与模型 options 重复时必须报错，不能静默接受。"""
+    provider = _openai_compatible_provider(dimensions=128)
+    provider._get_client = lambda: SimpleNamespace(
+        embeddings=SimpleNamespace(create=lambda **kw: SimpleNamespace(data=[]))
+    )
+    provider._get_aclient = lambda: SimpleNamespace(
+        embeddings=SimpleNamespace(create=lambda **kw: SimpleNamespace(data=[]))
+    )
+
+    async def run():
+        return await provider.aembed_documents(["x"], dimensions=64)
+
+    with pytest.raises(ValueError, match="Embedding 请求参数与模型 options 重复"):
+        if async_mode:
+            asyncio.run(run())
+        else:
+            provider.embed_documents(["x"], dimensions=64)
+
+
+def test_openai_compatible_embedding_rejects_reserved_field_override():
+    """Embedding 请求参数覆盖 ``model`` 必须报「不允许覆盖请求字段」。"""
+    provider = _openai_compatible_provider()
+    provider._get_aclient = lambda: SimpleNamespace(
+        embeddings=SimpleNamespace(create=lambda **kw: SimpleNamespace(data=[]))
+    )
+
+    async def run():
+        return await provider.aembed_documents(["x"], model="other")
+
+    with pytest.raises(ValueError, match="Embedding 不允许覆盖请求字段"):
+        asyncio.run(run())
+
+
+def test_openai_compatible_file_content_reports_missing_sdk_resource():
+    """``file_content`` 缺 ``files.content`` 必须报 ``NotImplementedError``。"""
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._provider = "openai"
+    provider._get_client = lambda: SimpleNamespace(files=SimpleNamespace())
+
+    with pytest.raises(NotImplementedError, match=r"files\.content"):
+        provider.file_content("file-1")
+
+
+def test_openai_compatible_async_file_content_reports_missing_sdk_resource():
+    """异步分支同判据。"""
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._provider = "openai"
+    provider._get_aclient = lambda: SimpleNamespace(files=SimpleNamespace())
+
+    async def run():
+        return await provider.async_file_content("file-1")
+
+    with pytest.raises(NotImplementedError, match=r"files\.content"):
+        asyncio.run(run())
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_openai_compatible_stream_responses_rejects_request_and_kwargs(async_mode):
+    """``stream_responses`` 同时传 request 与原生关键字参数必须报错。"""
+    provider = _openai_compatible_provider()
+    provider._get_client = lambda: pytest.fail("双来源必须在构造请求前拦住")
+
+    with pytest.raises(ValueError, match="不能同时传 request 和原生关键字参数"):
+        if async_mode:
+            provider.async_stream_responses(CompletionRequest(prompt="hi"), model="x")
+        else:
+            provider.stream_responses(CompletionRequest(prompt="hi"), model="x")
