@@ -9562,3 +9562,206 @@ def test_ark_sync_classify_rejects_malformed_labels(labels):
 
     with pytest.raises(ValueError, match="labels 必须是非空字符串列表"):
         provider.classify(query="q", labels=labels)
+
+
+# ── Anthropic 流终止与 parse 必填参数的八条守卫 ──
+#
+# 这八条在整套测试里从未执行（行覆盖证实；把它们的 ``raise`` 换成 ``pass`` 后
+# 全量 3479 条仍全绿）。既有用例只钉住 ``beta_tool_runner`` **同步**侧的
+# ``compaction_control`` 与 ``output_format`` 在 create/stream 两条路径上的判据。
+# 删除后行为确实改变（实测）：
+# * 1175／1210 ``invoke``／``ainvoke`` 的流在 ``message_stop`` 之前结束 → **静默
+#   返回已收到的片段**（实测 ``["hi"]``），调用方无法区分「答完了」与「断了」；
+# * 1541／1634 ``stream_events``／``astream_events`` 同判据 → 静默产出一串
+#   ``StreamEvent``，结构化事件流的调用方连「流是否完整」都无从判断；
+# * 1663／2146 ``parse``／``async_parse`` 与 1815／2032 ``beta_parse``／
+#   ``async_beta_parse`` 缺 ``output_format`` → 消息从「必须提供 output_format」
+#   退化成 ``normalize_messages`` 的「聊天请求必须提供 prompt 或 messages」，
+#   把「缺少结构化输出」说成「缺少提问」，排查方向被带偏；
+# * 944 ``output_format`` 传字典 schema（流式路径）→ **静默接受**，把整个字典
+#   当作 Python 类型原样放进请求的 ``output_format``；
+# * 2124 ``async_beta_tool_runner`` 的 ``compaction_control``（异步侧是**另一处**）
+#   → 消息退化成 ``CompletionRequest.__init__() got an unexpected keyword``，
+#   既不提 Anthropic 也不提 compaction_control。
+
+_ANTHROPIC_TEXT_EVENT = {
+    "type": "content_block_delta",
+    "index": 0,
+    "delta": {"type": "text_delta", "text": "hi"},
+}
+_ANTHROPIC_STOP_EVENT = {"type": "message_stop"}
+
+
+class _AnthropicSyncStream:
+    def __init__(self, events):
+        self._events = events
+
+    def __iter__(self):
+        return iter(self._events)
+
+
+class _AnthropicAsyncStream:
+    def __init__(self, events):
+        self._events = events
+
+    def __aiter__(self):
+        async def gen():
+            for event in self._events:
+                yield event
+
+        return gen()
+
+
+def _anthropic_stream_provider(events, *, is_async):
+    provider = object.__new__(AnthropicProvider)
+    provider._model_name = "claude-fable-5"
+    provider._options = {}
+    provider._provider = "anthropic"
+
+    class SyncContext:
+        def __enter__(self):
+            return _AnthropicSyncStream(events)
+
+        def __exit__(self, *exc):
+            return False
+
+    class AsyncContext:
+        async def __aenter__(self):
+            return _AnthropicAsyncStream(events)
+
+        async def __aexit__(self, *exc):
+            return False
+
+    if is_async:
+
+        class Messages:
+            @staticmethod
+            def stream(**_kwargs):
+                return AsyncContext()
+
+        client = SimpleNamespace(aio=SimpleNamespace(messages=Messages()), messages=Messages())
+    else:
+
+        class Messages:
+            @staticmethod
+            def stream(**_kwargs):
+                return SyncContext()
+
+        client = SimpleNamespace(messages=Messages())
+
+    provider._get_client = lambda: client
+    provider._get_aclient = lambda: client
+    return provider
+
+
+def _anthropic_invoke_text(events, *, is_async):
+    # ``_iter_invoke_stream_text``／``_aiter_invoke_stream_text`` 是 classmethod，
+    # 直接消费响应流，不经过 provider 实例。
+    response = _AnthropicAsyncStream(events) if is_async else _AnthropicSyncStream(events)
+    if is_async:
+
+        async def run():
+            return [item async for item in AnthropicProvider._aiter_invoke_stream_text(response)]
+
+        return asyncio.run(run())
+    return list(AnthropicProvider._iter_invoke_stream_text(response))
+
+
+def _anthropic_stream_events(events, *, is_async):
+    provider = _anthropic_stream_provider(events, is_async=is_async)
+    if is_async:
+
+        async def run():
+            return [item async for item in provider.astream_events(prompt="hi")]
+
+        return asyncio.run(run())
+    return list(provider.stream_events(prompt="hi"))
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_anthropic_invoke_stream_requires_message_stop(is_async):
+    """``invoke`` 的文本流必须在 ``message_stop`` 之后才算完整。
+
+    删除守卫后实测静默返回已收到的片段——半截答案当成完整答案交给调用方。
+    """
+    with pytest.raises(RuntimeError, match="message_stop 之前结束"):
+        _anthropic_invoke_text([_ANTHROPIC_TEXT_EVENT], is_async=is_async)
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_anthropic_stream_events_requires_message_stop(is_async):
+    """``stream_events`` 是另一套实现，终止判据同样要生效。"""
+    with pytest.raises(RuntimeError, match="message_stop 之前结束"):
+        _anthropic_stream_events([_ANTHROPIC_TEXT_EVENT], is_async=is_async)
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_anthropic_invoke_stream_still_yields_text_when_stopped(is_async):
+    """反向守卫：带 ``message_stop`` 的正常流照常产出全部文本。"""
+    assert _anthropic_invoke_text(
+        [_ANTHROPIC_TEXT_EVENT, _ANTHROPIC_STOP_EVENT], is_async=is_async
+    ) == ["hi"]
+
+
+def _anthropic_parse_provider():
+    provider = object.__new__(AnthropicProvider)
+    provider._model_name = "claude-fable-5"
+    provider._options = {}
+    provider._provider = "anthropic"
+    return provider
+
+
+@pytest.mark.parametrize(
+    ("method", "message"),
+    [
+        ("parse", "Anthropic parse 必须提供 output_format"),
+        ("beta_parse", "Anthropic Beta parse 必须提供 output_format"),
+    ],
+)
+def test_anthropic_parse_requires_output_format(method, message):
+    """同步两个 parse 入口缺 ``output_format`` 必须给专��消息。"""
+    provider = _anthropic_parse_provider()
+
+    with pytest.raises(ValueError, match="必须提供 output_format"):
+        getattr(provider, method)(None)
+
+
+@pytest.mark.parametrize(
+    ("method", "message"),
+    [
+        ("async_parse", "Anthropic parse 必须提供 output_format"),
+        ("async_beta_parse", "Anthropic Beta parse 必须提供 output_format"),
+    ],
+)
+def test_anthropic_async_parse_requires_output_format(method, message):
+    """异步两个 parse 入口是**另一份**实现，同样要有专��消息。"""
+    provider = _anthropic_parse_provider()
+
+    with pytest.raises(ValueError, match="必须提供 output_format"):
+        asyncio.run(getattr(provider, method)(None))
+
+
+def test_anthropic_stream_rejects_mapping_output_format():
+    """流式路径的 ``output_format`` 必须是 Python 类型，不能是字典 schema。
+
+    删除守卫后实测字典被原样放进请求的 ``output_format``——SDK 只接受类型对象，
+    这个请求到服务端才失败。
+    """
+    provider = _anthropic_parse_provider()
+
+    with pytest.raises(ValueError, match="必须是 Python 类型"):
+        provider._build_message_params(prompt="hi", output_format={"type": "object"}, stream=True)
+
+
+def test_anthropic_async_beta_tool_runner_rejects_compaction_control():
+    """异步 tool runner 的 ``compaction_control`` 判据是**另一处**守卫。
+
+    同步侧已有 ``test_anthropic_beta_tool_runner_rejects_unsupported_compaction_control``，
+    异步侧此前从未执行。
+    """
+    provider = _anthropic_parse_provider()
+
+    with pytest.raises(ValueError, match="当前 SDK 不支持 compaction_control"):
+        asyncio.run(
+            provider.async_beta_tool_runner([], prompt="hi", compaction_control={"enabled": True})
+        )

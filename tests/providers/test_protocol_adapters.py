@@ -4336,3 +4336,81 @@ def test_ark_responses_tool_choice_still_accepts_supported_values():
     assert VolcengineProvider._convert_responses_tool_choice({"type": "web_search"}) == {
         "type": "web_search"
     }
+
+
+# ── Anthropic tool_choice／图片 data URI 的四条形态判据 ──
+#
+# 这四条在整套测试里从未执行（行覆盖证实；把它们的 ``raise`` 换成 ``pass`` 后
+# 全量 3479 条仍全绿）。既有用例覆盖的是「未知字符串」「function 缺 name」与
+# 「data URI 不是有效 Base64」，形态判据全绕开了。删除后行为确实改变（实测）：
+# * 576 ``tool_choice`` 既非字符串也非 Mapping（整数）→ 裸 ``TypeError: 'int'
+#   object is not iterable``（``dict(tool_choice)``）；列表则退化成兜底消息；
+# * 600 非字符串非工具对象（空 dict、未知 ``type``）→ **静默返回 None**，
+#   请求不带 ``tool_choice``，等于「让模型自己决定用不用工具」；
+# * 627 data URI 无逗号 → 消息从「缺少逗号分隔符」退化成裸
+#   ``ValueError: not enough values to unpack (expected 2, got 1)``；
+# * 636 data URI 缺 MIME 或 base64 标记 → **静默接受**，产出一个
+#   ``media_type`` 为空串（或 ``header`` 被当成 data）的图片块发给上游。
+
+
+@pytest.mark.parametrize("tool_choice", [5, 1.5, object()], ids=["int", "float", "object"])
+def test_anthropic_tool_choice_rejects_non_string_non_mapping(tool_choice):
+    with pytest.raises(ValueError, match="必须是字符串或对象"):
+        AnthropicProvider._convert_tool_choice(tool_choice)
+
+
+@pytest.mark.parametrize(
+    "tool_choice",
+    [{}, {"type": "custom", "name": "n"}, {"type": ""}, {"type": 5}],
+    ids=["empty", "custom", "blank-type", "int-type"],
+)
+def test_anthropic_tool_choice_rejects_unsupported_shapes(tool_choice):
+    """兜底判据必须真的兜住，不能静默返回 None。"""
+    with pytest.raises(ValueError, match="必须是 auto、any、none、tool 或 function 对象"):
+        AnthropicProvider._convert_tool_choice(tool_choice)
+
+
+def test_anthropic_image_data_uri_requires_comma():
+    """``data:`` URI 缺逗号时必须给「缺少逗号分隔符」，而不是裸解包错误。"""
+    with pytest.raises(ValueError, match="缺少逗号分隔符"):
+        AnthropicProvider._convert_content(
+            [{"type": "image_url", "image_url": {"url": "data:image/png;base64"}}]
+        )
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["data:image/png,AAAA", "data:;base64,AAAA", "data:,AAAA", "data:image/png;utf8,AAAA"],
+    ids=["no-base64-marker", "no-mime", "neither", "wrong-encoding"],
+)
+def test_anthropic_image_data_uri_requires_mime_and_base64(url):
+    """``data:`` URI 必须同时带 MIME 类型与 ``base64`` 标记。
+
+    删除守卫后实测静默接受，产出 ``media_type`` 为空串的图片块发给上游。
+    """
+    with pytest.raises(ValueError, match="必须包含 MIME 类型和 base64 标记"):
+        AnthropicProvider._convert_content([{"type": "image_url", "image_url": {"url": url}}])
+
+
+def test_anthropic_image_data_uri_still_accepts_well_formed_value():
+    """反向守卫：合法 data URI 照常转成 base64 图片块。"""
+    converted = AnthropicProvider._convert_content(
+        [{"type": "image_url", "image_url": {"url": "data:image/png;base64,QUFB"}}]
+    )
+
+    assert converted == [
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "QUFB"},
+        }
+    ]
+
+
+def test_anthropic_tool_choice_still_accepts_supported_values():
+    """反向守卫：别名、原生工具对象与带 name 的裸对象照常转换。"""
+    assert AnthropicProvider._convert_tool_choice("required") == {"type": "any"}
+    assert AnthropicProvider._convert_tool_choice({"type": "tool", "name": "t"}) == {
+        "type": "tool",
+        "name": "t",
+    }
+    assert AnthropicProvider._convert_tool_choice({"name": "n"}) == {"type": "tool", "name": "n"}
