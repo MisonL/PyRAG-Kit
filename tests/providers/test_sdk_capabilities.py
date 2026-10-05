@@ -9353,3 +9353,87 @@ def test_terminated_stream_still_yields_content(provider_type, protocol, kind):
     events = list(provider.stream_events(prompt="hi"))
 
     assert any(event.type == "finish" for event in events)
+
+
+# ── 消息归一化的形态判据 ──
+#
+# ``normalize_chat_messages``／``normalize_messages``／``normalize_responses_input``
+# 是四个 provider 公共的**统一请求边界**，上面六条形态判据在整套测试里从未执行
+# （行覆盖证实；把它们的 ``raise`` 换成 ``pass`` 后全量 3405 条仍全绿）。既有用例
+# 覆盖的是元素**内部**字段（缺 id、缺 name、非法 arguments），这几条**形态**判据
+# 全绕开了。删除后行为确实改变（实测）：
+# * 消息元素非对象 → 整数抛裸 ``TypeError: 'int' object is not iterable``、字符串抛
+#   ``dictionary update sequence element #0 has length 1``；
+# * ``tool_calls`` 非序列 → 裸 ``TypeError``，或对字符串退化成元素级错误消息；
+# * ``messages`` 非序列 → 裸 ``TypeError``（字符串则退化成元素级消息）；
+# * ``prompt`` 为空／全空白 → **静默接受**，产出 ``{"role": "user", "content": None}``
+#   或全空白内容发给模型；
+# * Responses ``content`` 非序列 → 裸 ``TypeError``；
+# * ``role="function"`` → **静默接受**，产出一个没有 ``tool_call_id`` 的 function
+#   消息，Responses 无法把它关联回任何调用。
+
+
+@pytest.mark.parametrize("bad_message", [5, "oops", ["x"]], ids=["int", "str", "list"])
+def test_chat_messages_reject_non_mapping_entries(bad_message):
+    """``messages`` 的元素必须是对象。"""
+    with pytest.raises(ValueError, match=r"messages\[0\] 必须是对象"):
+        normalize_chat_messages([bad_message])
+
+
+@pytest.mark.parametrize("bad_tool_calls", [5, "abc", {"a": 1}], ids=["int", "str", "dict"])
+def test_chat_messages_reject_non_sequence_tool_calls(bad_tool_calls):
+    """``tool_calls`` 必须是序列；字符串虽可迭代但语义不同，须显式排除。"""
+    with pytest.raises(ValueError, match=r"tool_calls 必须是序列"):
+        normalize_chat_messages(
+            [{"role": "assistant", "content": "", "tool_calls": bad_tool_calls}]
+        )
+
+
+@pytest.mark.parametrize("bad_messages", [5, "abc", {"a": 1}], ids=["int", "str", "dict"])
+def test_normalize_messages_rejects_non_sequence_container(bad_messages):
+    """``messages`` 容器本身必须是序列，不能是字符串或映射。"""
+    with pytest.raises(ValueError, match="messages 必须是消息对象序列"):
+        normalize_messages(None, None, bad_messages)
+
+
+@pytest.mark.parametrize("prompt", [None, "", "   "], ids=["none", "empty", "blank"])
+def test_normalize_messages_requires_prompt_or_messages(prompt):
+    """既没有 ``messages`` 也没有非空 ``prompt`` 时必须报错。
+
+    删除守卫后实测产出 ``{"role": "user", "content": None}``（或全空白内容）并
+    发给模型——一次「请求内容为空」的配置错误变成真实提问。
+    """
+    with pytest.raises(ValueError, match="必须提供 prompt 或 messages"):
+        normalize_messages(prompt, None, None)
+
+
+@pytest.mark.parametrize("bad_content", [5, {"a": 1}, object()], ids=["int", "dict", "object"])
+def test_responses_input_rejects_non_sequence_content(bad_content):
+    """Responses 消息的 ``content`` 必须是字符串或内容块序列。"""
+    with pytest.raises(ValueError, match="content 必须是字符串或内容块序列"):
+        normalize_responses_input(None, None, [{"role": "user", "content": bad_content}])
+
+
+def test_responses_input_rejects_function_role_without_tool_call_id():
+    """``role="function"`` 的消息必须带 ``tool_call_id``。
+
+    删除守卫后实测静默接受，产出没有 ``tool_call_id`` 的 function 消息——
+    Responses 侧无法把它关联回任何一次函数调用。
+    """
+    with pytest.raises(ValueError, match="function 消息缺少 tool_call_id"):
+        normalize_responses_input(None, None, [{"role": "function", "name": "f"}])
+
+
+def test_normalization_still_accepts_well_formed_messages():
+    """反向守卫：合法消息形态照常归一，不受上述收紧影响。"""
+    chat = normalize_chat_messages(
+        [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}]
+    )
+    assert [message["role"] for message in chat] == ["user", "assistant"]
+
+    responses = normalize_responses_input(
+        None, None, [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+    )
+    assert responses[0]["role"] == "user"
+
+    assert normalize_messages("hi", None, None) == [{"role": "user", "content": "hi"}]

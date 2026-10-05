@@ -14,9 +14,11 @@ from src.providers.__base__.model_provider import (
     CompletionRequest,
     LargeLanguageModel,
     StreamEventError,
+    TextEmbeddingModel,
     _responses_content_part,
     is_retryable_error,
     iterate_async,
+    normalize_client_retries,
     normalize_embedding_vector,
     raise_for_stream_error_event,
     require_token_count,
@@ -1026,3 +1028,67 @@ def test_openai_compatible_still_accepts_string_provider():
     provider = OpenAICompatibleProvider("demo", "openai", settings=settings)
 
     assert provider._provider == "openai"
+
+
+# ── 客户端重试次数、流形态与 embedding 结果判据 ──
+#
+# 三条判据在整套测试里从未执行（行覆盖证实；把它们的 ``raise`` 换成 ``pass``
+# 后全量 3405 条仍全绿）。删除后行为确实改变（实测）：
+# * ``normalize_client_retries`` 的兜底分支（None／列表等既非 bool、str、int、
+#   float 的取值）→ ``numeric`` 从未赋值，漏出裸 ``UnboundLocalError:
+#   cannot access local variable 'numeric'``，而调用方的错误分类按
+#   ``ValueError`` 写；
+# * ``iterate_async`` 的非迭代器分支 → **静默产出空序列**，SDK 返回了无法消费
+#   的对象却被当成「流正常结束」，模型答了什么内容完全丢失；
+# * ``TextEmbeddingModel.embed_query``／``aembed_query`` 的空结果判据 → 裸
+#   ``IndexError: list index out of range``，把「provider 没返回向量」说成
+#   「下标越界」。
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, [1], {"a": 1}, (1, 2), object()],
+    ids=["none", "list", "dict", "tuple", "object"],
+)
+def test_normalize_client_retries_rejects_non_numeric_types_readably(value):
+    """非数值形态必须报成 ``ValueError``，不能漏出 ``UnboundLocalError``。"""
+    with pytest.raises(ValueError, match="max_retries 必须是整数"):
+        normalize_client_retries(value, "Test")
+
+
+@pytest.mark.parametrize("value", [3, 0, "3", 2.0])
+def test_normalize_client_retries_still_accepts_legal_values(value):
+    """反向守卫：合法取值（含十进制字符串与整值浮点）照常归一。"""
+    assert normalize_client_retries(value, "Test") == int(float(value))
+
+
+def test_iterate_async_rejects_non_iterable_stream_response():
+    """SDK 流式响应既不是异步也不是同步迭代器时必须报错，不能静默返回空序列。"""
+
+    async def consume():
+        return [item async for item in iterate_async(42)]
+
+    with pytest.raises(TypeError, match="既不是异步迭代器也不是同步迭代器"):
+        asyncio.run(consume())
+
+
+class _EmptyEmbedding(TextEmbeddingModel):
+    """返回空结果的 embedding provider——模拟 SDK 静默失败。"""
+
+    def embed_documents(self, texts, **_kwargs):
+        return []
+
+    async def aembed_documents(self, texts, **_kwargs):
+        return []
+
+
+def test_embed_query_reports_empty_provider_result_readably():
+    """provider 返回空列表必须报成 ``ValueError``，不能是裸 ``IndexError``。"""
+    with pytest.raises(ValueError, match="返回空结果"):
+        _EmptyEmbedding().embed_query("q")
+
+
+def test_aembed_query_reports_empty_provider_result_readably():
+    """异步入口同判据。"""
+    with pytest.raises(ValueError, match="返回空结果"):
+        asyncio.run(_EmptyEmbedding().aembed_query("q"))
