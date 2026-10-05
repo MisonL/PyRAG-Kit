@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import json
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -25,7 +26,12 @@ from src.providers.google import GoogleProvider
 from src.providers.openai import OpenAIProvider
 from src.providers.openai_compatible import OpenAICompatibleProvider
 from src.providers.resources import AsyncGoogleResources, GoogleResources
-from src.providers.volcengine import _ARK_BUILTIN_TOOL_ITEM_TYPES, VolcengineProvider
+from src.providers.volcengine import (
+    _ARK_BUILTIN_TOOL_ITEM_TYPES,
+    VolcengineProvider,
+    _require_ark_content,
+    _require_ark_list,
+)
 from src.utils.config import ModelDetail
 from src.utils.security import (
     find_sensitive_option_paths,
@@ -10197,3 +10203,373 @@ def test_openai_compatible_stream_responses_rejects_request_and_kwargs(async_mod
             provider.async_stream_responses(CompletionRequest(prompt="hi"), model="x")
         else:
             provider.stream_responses(CompletionRequest(prompt="hi"), model="x")
+
+
+# ── Ark／Volcengine 渠道 volcengine.py 覆盖缺口守卫 ──
+#
+# 下列判据在整套测试里从未执行（行覆盖 + 变异扫描双证；把它们的 ``raise`` 换成
+# ``pass`` 后全量 3598 条仍全绿）。删除后行为确实改变（实测，均经真实入口）：
+# * 106／125 ``_require_ark_list``／``_require_ark_content`` 非列表 → 裸
+#   ``TypeError: 'int' object is not iterable``（str 还会被**逐字符**当成元素）；
+# * 558 ``__init__`` 未知协议 → 不再拦，``_protocol`` 落空；
+# * 582 ``__init__`` 缺全部凭证 → **静默构造**出无凭证的 provider；
+# * 605 ``_client_options`` 认证不完整 → **静默返回空字典**，SDK 拿到无认证客户端；
+# * 648 ``_normalize_client_options`` region 非字符串 → 裸 ``AttributeError``，
+#   空白 → **静默接受**、region 变成空串；
+# * 660／671 ``_normalize_verified_protocols`` 非序列 → 裸 ``TypeError``，元素
+#   非法 → 裸 ``AttributeError``；
+# * 675 登记未知协议 → **静默接受**，``frozenset({'grpc'})`` 通过；
+# * 801 ``_require_classification_resource`` 资源未挂载 → **静默返回 None**；
+# * 857／889 ``_convert_responses_format``／``_convert_responses_tools`` 形态 →
+#   裸 ``AttributeError``／``TypeError``；
+# * 1035／1040／1084／1088 Ark Chat 的 top_k／seed 在模型 options 与 extra_body
+#   两处配置 → **静默接受**，其中一个被无声丢弃；
+# * 1108 extra_body 与模型 options 重复 → **静默覆盖**；
+# * 1507 ``_prepare_batch_kwargs`` 缺必填参数 → 消息退化成「不支持请求参数」，
+#   把「缺字段」说成「字段不受支持」；
+# * 1510 资源 model 非字符串／空白 → **静默接受**，非法 model 一路发给 SDK；
+# * 1663 Responses 状态 ``incomplete`` → **静默返回 None**，不完整响应当成成功；
+# * 2396／2718 ``create_response``／``async_create_response`` 同时传 request 与
+#   原生关键字参数 → 裸 ``AttributeError``；
+# * 2525／2881 ``count_tokens``／``async_count_tokens`` 响应缺 ``data`` →
+#   **静默返回 0**，把「响应不完整」报成「没有 token」；
+# * 2608／2957 Classification 资源导入失败 → 裸 ``UnboundLocalError``；
+# * 3028／3051 ``close``／``aclose`` 首个关闭异常 → **静默吞掉**，不向上报告。
+#
+# 同批的 578（部分 AK/SK）与 631（timeout 非数值）经甄别是**等价变异**，不补测试：
+# 578 删掉后落到 582 的同一条消息，631 删掉后落到下游 ``normalize_client_timeout``
+# 的同一条消息，结论都不变。
+
+
+def _volcengine_provider(**options):
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "demo"
+    provider._provider = "volcengine"
+    provider._protocol = "chat_completions"
+    provider._options = options
+    provider._base_url = None
+    provider._api_key = "ak"
+    provider._secret_key = "sk"
+    provider._ark_api_key = "ark-key"
+    return provider
+
+
+def _volcengine_init(settings):
+    """用给定 settings 跑一遍真实构造路径（构造期凭证判据在 ``get_settings`` 之后）。"""
+    import src.providers.volcengine as volcengine_module
+
+    original = volcengine_module.get_settings
+    volcengine_module.get_settings = lambda: settings
+    try:
+        return VolcengineProvider("m", protocol="ark", options={})
+    finally:
+        volcengine_module.get_settings = original
+
+
+async def _async_value(value):
+    return value
+
+
+class _ClassificationImportBlocker:
+    """拦截 ``volcenginesdkarkruntime.resources.classification`` 的导入。"""
+
+    _TARGET = "volcenginesdkarkruntime.resources.classification"
+
+    def find_spec(self, name, path=None, target=None):
+        if name == self._TARGET:
+            raise ImportError(f"No module named {name!r}")
+
+
+def _with_blocked_classification_import(call):
+    # 必须先逐出 ``sys.modules`` 里的缓存：全套运行时更早的用例可能已经导入过该
+    # 模块，此后 ``from ... import`` 直接命中缓存、根本不会走 ``find_spec``，拦截器
+    # 形同虚设（单跑时缓存为空才通过）。逐出后再装拦截器，才能稳定复现「SDK 未
+    # 提供该资源」这条分支。
+    target = _ClassificationImportBlocker._TARGET
+    cached = sys.modules.pop(target, None)
+    blocker = _ClassificationImportBlocker()
+    sys.meta_path.insert(0, blocker)
+    try:
+        return call()
+    finally:
+        sys.meta_path.remove(blocker)
+        if cached is not None:
+            sys.modules[target] = cached
+
+
+@pytest.mark.parametrize(
+    "value",
+    [pytest.param(5, id="int"), pytest.param(1.5, id="float"), pytest.param({"a": 1}, id="dict")],
+)
+def test_ark_require_list_rejects_non_sequence(value):
+    """Ark 容器字段非列表必须报 ``RuntimeError``，不是裸 ``TypeError``。"""
+    with pytest.raises(RuntimeError, match="必须是列表"):
+        _require_ark_list(value, label="output")
+
+
+def test_ark_require_list_treats_string_as_sequence_of_characters():
+    """字符串会被**逐字符**当成元素——必须显式拒绝，不能静默拆成字符列表。"""
+    with pytest.raises(RuntimeError, match="必须是列表"):
+        _require_ark_list("ab", label="output")
+
+
+def test_ark_require_content_rejects_non_sequence():
+    """嵌套 ``content`` 非列表必须报 ``RuntimeError``。"""
+    with pytest.raises(RuntimeError, match="必须是列表"):
+        _require_ark_content({"content": 5}, label="content")
+
+
+@pytest.mark.parametrize(
+    "protocol",
+    [pytest.param("grpc", id="unknown"), pytest.param("", id="empty")],
+)
+def test_volcengine_init_rejects_unsupported_protocol(protocol):
+    """未知协议必须报错，不能静默留下落空的 ``_protocol``。"""
+    with pytest.raises(ValueError, match="仅支持 ark/chat_completions 或 responses"):
+        VolcengineProvider("m", protocol=protocol)
+
+
+def test_volcengine_init_requires_credentials():
+    """缺全部凭证必须报错，不能静默构造出无凭证的 provider。"""
+    settings = SimpleNamespace(
+        volc_access_key=None, volc_secret_key=None, ark_api_key=None, volc_base_url=None
+    )
+
+    with pytest.raises(ValueError, match="需要配置 ARK_API_KEY"):
+        _volcengine_init(settings)
+
+
+def test_volcengine_client_options_require_complete_credentials():
+    """``_client_options`` 认证不完整必须报错，不能静默返回空字典。"""
+    provider = object.__new__(VolcengineProvider)
+    provider._options = {}
+    provider._base_url = None
+    provider._api_key = None
+    provider._secret_key = None
+    provider._ark_api_key = None
+
+    with pytest.raises(ValueError, match="认证配置不完整"):
+        provider._client_options()
+
+
+def test_volcengine_client_options_reject_non_string_region():
+    """region 非字符串必须报错，不是裸 ``AttributeError``。"""
+    with pytest.raises(ValueError, match="region 必须是非空字符串"):
+        VolcengineProvider._normalize_client_options({"region": 5})
+
+
+def test_volcengine_client_options_reject_blank_region():
+    """region 纯空白必须报错，不能静默收敛成空串。"""
+    with pytest.raises(ValueError, match="region 必须是非空字符串"):
+        VolcengineProvider._normalize_client_options({"region": "   "})
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [pytest.param(5, id="int"), pytest.param(1.5, id="float")],
+)
+def test_volcengine_verified_protocols_reject_non_sequence(configured):
+    """``server_verified_protocols`` 非序列必须报错，不是裸 ``TypeError``。"""
+    with pytest.raises(ValueError, match="必须是字符串或协议序列"):
+        VolcengineProvider._normalize_verified_protocols(configured)
+
+
+def test_volcengine_verified_protocols_reject_non_string_element():
+    """登记项非字符串必须报错，不是裸 ``AttributeError``。"""
+    with pytest.raises(ValueError, match="中的协议必须是非空字符串"):
+        VolcengineProvider._normalize_verified_protocols([5])
+
+
+def test_volcengine_verified_protocols_reject_unknown_name():
+    """登记未知协议必须报错，不能静默接受 ``frozenset({'grpc'})``。"""
+    with pytest.raises(ValueError, match="不支持登记服务端协议: grpc"):
+        VolcengineProvider._normalize_verified_protocols(["grpc"])
+
+
+def test_ark_classification_guard_reports_missing_resource():
+    """分类资源未挂载时必须报错，不能静默返回 ``None``。"""
+    provider = _volcengine_provider()
+    provider._protocol = "responses"
+    provider._client = object()
+    provider._get_classification_resource = lambda: (_ for _ in ()).throw(
+        NotImplementedError("no classification")
+    )
+
+    with pytest.raises(NotImplementedError, match="Ark classify"):
+        provider._require_classification_resource("classify")
+
+
+@pytest.mark.parametrize(
+    "response_format",
+    [pytest.param(5, id="int"), pytest.param("s", id="str")],
+)
+def test_ark_responses_format_rejects_non_object(response_format):
+    """``response_format`` 非对象必须报错，不是裸 ``AttributeError``。"""
+    with pytest.raises(ValueError, match="response_format 必须是对象"):
+        VolcengineProvider._convert_responses_format(response_format)
+
+
+@pytest.mark.parametrize("tools", [pytest.param(5, id="int"), pytest.param(1.5, id="float")])
+def test_ark_responses_tools_reject_non_sequence(tools):
+    """``tools`` 非列表必须报错，不是裸 ``TypeError``。"""
+    with pytest.raises(ValueError, match="工具定义必须是列表"):
+        VolcengineProvider._convert_responses_tools(tools)
+
+
+@pytest.mark.parametrize("field", ["top_k", "seed"])
+def test_ark_chat_model_options_reject_duplicate_with_extra_body(field):
+    """模型 options 的 top_k／seed 与 extra_body 重复时必须报错，不能静默丢弃。"""
+    provider = _volcengine_provider(extra_body={field: 1}, **{field: 2})
+
+    with pytest.raises(ValueError, match=rf"模型 options 的 {field} 与 extra_body 重复"):
+        provider._build_chat_request("hi")
+
+
+@pytest.mark.parametrize("field", ["top_k", "seed"])
+def test_ark_chat_request_rejects_duplicate_with_model_extra_body(field):
+    """请求级 top_k／seed 与模型 options.extra_body 重复时必须报错。"""
+    provider = _volcengine_provider(extra_body={field: 1})
+
+    with pytest.raises(ValueError, match=rf"{field} 与模型 options.extra_body 重复"):
+        provider._build_chat_request("hi", **{field: 2})
+
+
+def test_ark_chat_extra_body_duplicate_with_model_options():
+    """请求级 extra_body 与模型 options 重复时必须报错，不能静默覆盖。"""
+    provider = _volcengine_provider(extra_body={"a": 1})
+
+    with pytest.raises(ValueError, match="extra_body 与模型 options 重复"):
+        provider._build_chat_request("hi", extra_body={"a": 2})
+
+
+def test_ark_batch_kwargs_reports_missing_required_parameter():
+    """缺必填参数必须点名，不能退化成「不支持请求参数」。"""
+    with pytest.raises(ValueError, match="缺少必填参数: name"):
+        VolcengineProvider._prepare_batch_kwargs(
+            {}, "demo", "知识库", frozenset({"name"}), ("name",)
+        )
+
+
+@pytest.mark.parametrize("model", [pytest.param(5, id="int"), pytest.param("   ", id="blank")])
+def test_ark_batch_kwargs_rejects_invalid_model(model):
+    """资源 model 非字符串／空白必须报错，不能静默发给 SDK。"""
+    with pytest.raises(ValueError, match="model 必须是非空字符串"):
+        VolcengineProvider._prepare_batch_kwargs(
+            {"model": model, "name": "k"},
+            "demo",
+            "知识库",
+            frozenset({"model", "name"}),
+            ("name",),
+        )
+
+
+def test_ark_responses_incomplete_status_is_rejected():
+    """状态 ``incomplete`` 必须报错，不能静默当成成功。"""
+    with pytest.raises(RuntimeError, match="响应不完整"):
+        VolcengineProvider._raise_for_response_error(
+            {"status": "incomplete", "incomplete_details": {"reason": "max_tokens"}}
+        )
+
+
+def test_ark_responses_incomplete_reason_with_huge_int_reports_readably():
+    """``incomplete`` 原因是大整数时消息不得抛位数超限的 ``ValueError``。"""
+    with pytest.raises(RuntimeError) as excinfo:
+        VolcengineProvider._raise_for_response_error(
+            {"status": "incomplete", "incomplete_details": {"reason": 10**4300}}
+        )
+
+    assert "Exceeds the limit" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_ark_create_response_rejects_request_and_kwargs(async_mode):
+    """``create_response`` 同时传 request 与原生关键字参数必须报错。"""
+    provider = _volcengine_provider()
+    provider._protocol = "responses"
+    provider._server_verified_protocols = frozenset({"responses"})
+    provider._get_client = lambda: pytest.fail("双来源必须在构造请求前拦住")
+    provider._get_aclient = lambda: pytest.fail("双来源必须在构造请求前拦住")
+
+    with pytest.raises(ValueError, match="不能同时传 request 和原生关键字参数"):
+        if async_mode:
+            asyncio.run(provider.async_create_response(CompletionRequest(prompt="hi"), model="x"))
+        else:
+            provider.create_response(CompletionRequest(prompt="hi"), model="x")
+
+
+@pytest.mark.parametrize(
+    "items",
+    [pytest.param([], id="empty"), pytest.param(None, id="missing-field")],
+)
+def test_ark_count_tokens_requires_data(items):
+    """tokenization 响应缺 ``data`` 必须报错，不能静默返回 0。"""
+    provider = _ark_provider_with_tokenization_response(items)
+
+    with pytest.raises(RuntimeError, match="tokenization 响应缺少 data"):
+        provider.count_tokens("hi")
+
+
+@pytest.mark.parametrize(
+    "items",
+    [pytest.param([], id="empty"), pytest.param(None, id="missing-field")],
+)
+def test_ark_async_count_tokens_requires_data(items):
+    """异步分支同判据。"""
+    provider = _ark_provider_with_tokenization_response(items)
+    provider._get_aclient = lambda: SimpleNamespace(
+        tokenization=SimpleNamespace(
+            create=lambda **kwargs: _async_value(SimpleNamespace(data=items))
+        )
+    )
+
+    async def run():
+        return await provider.async_count_tokens("hi")
+
+    with pytest.raises(RuntimeError, match="tokenization 响应缺少 data"):
+        asyncio.run(run())
+
+
+def test_ark_classification_import_failure_reports_readably():
+    """Classification 模块导入失败时必须报 ``NotImplementedError``，不是裸 ``UnboundLocalError``。"""
+    provider = _volcengine_provider()
+    provider._protocol = "responses"
+    provider._classification_resource = None
+    provider._get_client = lambda: SimpleNamespace()
+
+    with pytest.raises(NotImplementedError, match="Ark Classification 资源"):
+        _with_blocked_classification_import(provider._get_classification_resource)
+
+
+def test_ark_async_classification_import_failure_reports_readably():
+    """异步分支同判据。"""
+    provider = _volcengine_provider()
+    provider._protocol = "responses"
+    provider._async_classification_resource = None
+    provider._get_aclient = lambda: SimpleNamespace()
+
+    async def run():
+        return await provider._get_async_classification_resource()
+
+    with pytest.raises(NotImplementedError, match="Ark Async Classification 资源"):
+        _with_blocked_classification_import(lambda: asyncio.run(run()))
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_volcengine_close_reports_first_error(async_mode):
+    """``close``／``aclose`` 首个关闭异常必须向上报告，不能静默吞掉。"""
+
+    class _BadClose:
+        def close(self):
+            raise RuntimeError("close 失败")
+
+    provider = object.__new__(VolcengineProvider)
+    provider._client = _BadClose()
+    provider._aclient = None
+    provider._classification_resource = None
+    provider._async_classification_resource = None
+
+    with pytest.raises(RuntimeError, match="close 失败"):
+        if async_mode:
+            asyncio.run(provider.aclose())
+        else:
+            provider.close()
