@@ -300,6 +300,74 @@ def test_google_merges_consecutive_same_role_messages():
     assert [part.text for part in contents[0].parts] == ["第一条", "第二条"]
 
 
+# `GoogleProvider._contents` 的两条判据在整套测试里从未执行（`sys.settrace` 行覆盖
+# 证实；把它们的 `raise` 换成 `pass` 后全量 3245 条仍然全绿）。删除后行为确实改变
+# （实测）：
+#   * 1641 工具结果既无 `tool_call_id` 也无 `name` → **静默接受**，产出一个没有
+#     `name` 的 `FunctionResponse`，Google 侧无法把它关联回任何一次函数调用；
+#   * 1881 assistant `tool_calls[]` 的 `arguments` 非对象 → 带字段名的
+#     `ValueError` 变成裸 `TypeError: 'int' object is not iterable`（`dict(...)`）。
+# 同函数的 1862／1865／1869 经甄别是**等价变异**，不补测试：上游
+# `normalize_messages` 已用同措辞判据拦下（消息变成
+# `messages[0].tool_calls[0] ...`），删除后收场不变。
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"role": "tool", "content": '{"status":"paid"}'},
+        {"role": "tool", "tool_call_id": 5, "content": "x"},
+    ],
+)
+def test_google_rejects_tool_result_without_correlatable_call_id(message):
+    """工具结果既无 `tool_call_id` 也无 `name` 时必须报错，不能产出无名的响应块。"""
+    with pytest.raises(ValueError, match="缺少可关联的 tool_call_id/name"):
+        GoogleProvider._contents([message], None, None)
+
+
+@pytest.mark.parametrize("arguments", [5, ["a"], 5.5])
+def test_google_rejects_non_object_function_call_arguments(arguments):
+    """assistant `tool_calls[].function.arguments` 非 JSON 对象时给带指引的 ``ValueError``。"""
+    with pytest.raises(ValueError, match="arguments 必须是 JSON 对象"):
+        GoogleProvider._contents(
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "function": {"name": "lookup_order", "arguments": arguments},
+                        }
+                    ],
+                }
+            ],
+            None,
+            None,
+        )
+
+
+def test_google_accepts_json_string_and_object_function_call_arguments():
+    """收紧不能误伤：JSON 字符串与对象两种合法形态的 ``arguments`` 照常转换。"""
+    for arguments in ("{}", {"outer": 1}):
+        contents = GoogleProvider._contents(
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "function": {"name": "lookup_order", "arguments": arguments},
+                        }
+                    ],
+                }
+            ],
+            None,
+            None,
+        )
+        calls = [part.function_call for part in contents[0].parts if part.function_call is not None]
+        assert len(calls) == 1
+        assert calls[0].name == "lookup_order"
+        assert isinstance(calls[0].args, dict)
+
+
 def test_google_rejects_external_media_urls_and_unknown_part_types():
     with pytest.raises(ValueError, match="仅支持 data: URI、gs:// URI 或 Google Files URI"):
         GoogleProvider._contents(
