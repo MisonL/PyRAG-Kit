@@ -4788,3 +4788,600 @@ def test_google_tool_parts_still_convert_when_well_formed():
     assert [call.name for call in calls] == ["f"]
     assert calls[0].args == {"a": 1}
     assert [response.name for response in responses] == ["f"]
+
+
+# ── Google 渠道 google.py 覆盖缺口守卫（选项／凭证／资源／媒体／partial_args／
+#    分片合并／token 统计／Embedding／流终止／close）──
+#
+# 下列判据在整套测试里从未执行（行覆盖 + 变异扫描双证；把它们的 ``raise`` 换成
+# ``pass`` 后全量 3638 条仍全绿）。删除后行为确实改变（实测，均经真实入口）：
+# * 239／391 ``options`` 非 Mapping → 裸 ``TypeError: 'int' object is not iterable``；
+# * 401 options 键非字符串 → 裸 ``TypeError: sequence item 0: expected str instance``；
+# * 585 ``http_options`` 键非字符串 → **静默返回 None**、校验整段跳过；
+# * 677 ``debug_config`` 键非字符串 → 裸 ``TypeError``；
+# * 448 ``_require_resource`` 资源为 None → **静默返回 None**；
+# * 490 异步 ``aio`` 节点缺失 → 消息退化成「未提供 Auth Token 资源」，丢掉「异步」；
+# * 370 缺 google-auth → 消息退化成「凭证文件无法加载」；
+# * 374 凭证文件无法加载 → 裸 ``UnboundLocalError``；
+# * 925 ``output_dimensionality`` 非整数 → 裸 ``TypeError``，布尔 → **静默接受 True**；
+# * 929 维度越界 → **静默接受 0／10**9；
+# * 1571 Vertex 模式非 gs:// HTTPS → 消息退化，丢掉「Vertex 模式」；
+# * 1590 ``mime_type`` 非字符串 → 裸 ``AttributeError``，空白 → 消息退化；
+# * 1795 工具结果缺标识 → **静默产出**无名 ``FunctionResponse``；
+# * 1958／1973／2000 ``parts``／``embeddings``／``candidates`` 非列表 → 裸 ``TypeError``；
+# * 2100 ``partial_arg`` 缺值 → **静默返回 None**；
+# * 2141 json_path 索引过大 → **静默接受**（会按该下标把列表填充到那么大）；
+# * 2153 json_path 不支持的写法 → **死循环**（``rest`` 不推进，实测挂起）；
+# * 2164 ``partial_args`` 非列表 → 裸 ``TypeError``；
+# * 2172 根值非对象 → 裸 ``ValueError: dictionary update sequence element``；
+# * 2180／2192 json_path 无法写入 → 裸 ``AttributeError``／``TypeError``；
+# * 2286／2316／2354／2376／2403／2406／2409 工具调用分片合并的七条冲突判据 →
+#   **静默合并**两个不同调用（或换成另一条同族消息）；
+# * 2781／2786／2828／3016／3021／3059／3065 token 统计的字段支持判据 →
+#   消息退化成裸 ``AttributeError``（``models``／``aio`` 不存在）；
+# * 2832／3069 compute_tokens 的 tools 判据 → 被 ``_validate_compute_token_fields``
+#   先拦（**死代码**）；
+# * 3184／3307／4382／4488 流在终止事件前结束 → **静默返回已收片段**；
+# * 3556／3659 ``validate_reward`` 双配置 → 裸 ``AttributeError``；
+# * 4012 Live 缺 ``aio`` → 裸 ``UnboundLocalError``；4016 connect 非可调用 → 裸 ``TypeError``；
+# * 4530／4594 Embedding 覆盖 ``model`` → 消息退化；4554／4620 Vertex 单内容非唯一 →
+#   **静默接受多个 embedding**；4564／4632 数量不一致 → **静默返回不匹配的向量**；
+# * 4692／4714 ``close``／``aclose`` 首个异常 → **静默吞掉**。
+#
+# 同批的 1164／1171／1519／1862／1865／1869 经甄别是**等价变异**，不补测试：
+# 1164／1171 删掉后落到下游 ``validate_secret_free_payload`` 的同一条消息；
+# 1519 删掉后落到调用方 ``_contents`` 的同一条消息；1862／1865／1869 删掉后落到
+# 上游 ``normalize_chat_messages`` 的同族消息，结论都不变。
+
+
+def _google_options_provider(**options):
+    provider = object.__new__(GoogleProvider)
+    provider._model_name = "gemini-1.5-flash"
+    provider._provider = "google"
+    provider._options = dict(options)
+    provider._client = None
+    return provider
+
+
+def _google_contents_vertex(parts):
+    """``_contents`` 的 Vertex 模式入口（既有 ``_google_contents`` 不带该开关）。"""
+    return GoogleProvider._contents(
+        [{"role": "user", "content": parts}], None, None, vertex_mode=True
+    )
+
+
+@pytest.mark.parametrize(
+    "options",
+    [pytest.param(5, id="int"), pytest.param([1, 2], id="list")],
+)
+def test_google_constructor_rejects_non_mapping_options(options):
+    """``options`` 非 Mapping 必须报 ``ValueError``，不是裸 ``TypeError``。"""
+    with pytest.raises(ValueError, match="Google options 必须是对象"):
+        GoogleProvider("m", options=options)
+
+
+def test_google_validate_options_rejects_non_mapping():
+    """``_validate_options`` 自身也要收敛非 Mapping。"""
+    with pytest.raises(ValueError, match="Google options 必须是对象"):
+        GoogleProvider._validate_options(5)
+
+
+def test_google_options_reject_non_string_key():
+    """``options`` 键非字符串必须报错，不是裸 ``TypeError``。"""
+    with pytest.raises(ValueError, match="Google options 的键必须是字符串"):
+        GoogleProvider("m", options={1: "x"})
+
+
+def test_google_http_options_reject_non_string_key():
+    """``http_options`` 键非字符串必须报错，不能静默跳过校验。"""
+    with pytest.raises(ValueError, match=r"options\.http_options 的键必须是字符串"):
+        GoogleProvider._validate_options({"http_options": {1: "x"}})
+
+
+def test_google_debug_config_rejects_non_string_key():
+    """``debug_config`` 键非字符串必须报错，不是裸 ``TypeError``。"""
+    with pytest.raises(ValueError, match="Google debug_config 的键必须是字符串"):
+        GoogleProvider._coerce_debug_config({1: "x"})
+
+
+def test_google_require_resource_rejects_none_resource():
+    """资源属性存在但为 ``None`` 时必须报错，不能静默返回 ``None``。"""
+    with pytest.raises(NotImplementedError, match="未提供 Tuned Models资源"):
+        GoogleProvider._require_resource(
+            SimpleNamespace(tuned_models=None), "tuned_models", "Tuned Models"
+        )
+
+
+def test_google_async_resource_reports_missing_aio_node():
+    """异步 ``aio`` 节点缺失时消息必须保留「异步」。"""
+    provider = _google_options_provider()
+    provider._get_client = lambda: SimpleNamespace()
+
+    with pytest.raises(NotImplementedError, match="异步 Auth Token资源"):
+        provider._require_provider_resource("async_create_auth_token")
+
+
+def test_google_credentials_require_google_auth(monkeypatch):
+    """缺 google-auth 时必须报专属消息，不能退化成「文件无法加载」。"""
+    import builtins
+
+    original = builtins.__import__
+
+    def _fake_import(name, *args, **kwargs):
+        if name == "google.auth" or name.startswith("google.auth."):
+            raise ImportError("no google-auth")
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
+
+    with pytest.raises(RuntimeError, match="缺少 google-auth"):
+        GoogleProvider._load_credentials_file("/x")
+
+
+def test_google_credentials_file_failure_reports_readably():
+    """凭证文件无法加载时必须报 ``ValueError``，不是裸 ``UnboundLocalError``。"""
+    with pytest.raises(ValueError, match="GOOGLE_APPLICATION_CREDENTIALS 文件无法加载"):
+        GoogleProvider._load_credentials_file("/nonexistent/definitely-not-here.json")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [pytest.param("x", id="str"), pytest.param(True, id="bool"), pytest.param(1.5, id="float")],
+)
+def test_google_embedding_dimensions_reject_non_integer(value):
+    """``output_dimensionality`` 非整数必须报错，布尔不能静默当 1。"""
+    with pytest.raises(ValueError, match="output_dimensionality 必须是整数"):
+        GoogleProvider._validate_embedding_dimensions(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [pytest.param(0, id="zero"), pytest.param(-1, id="negative"), pytest.param(10**9, id="huge")],
+)
+def test_google_embedding_dimensions_reject_out_of_range(value):
+    """``output_dimensionality`` 越界必须报错，不能静默接受。"""
+    with pytest.raises(ValueError, match="output_dimensionality 必须在 1 到"):
+        GoogleProvider._validate_embedding_dimensions(value)
+
+
+def test_google_vertex_media_rejects_non_gs_https_uri():
+    """Vertex 模式仅支持 gs:// 或可公开访问 HTTPS，消息必须点明 Vertex 模式。"""
+    with pytest.raises(ValueError, match="Vertex/Enterprise 模式仅支持 gs://"):
+        _google_contents_vertex([{"type": "file", "file": "https://user:pass@example.com/x"}])
+
+
+@pytest.mark.parametrize(
+    "mime",
+    [pytest.param(5, id="int"), pytest.param("  ", id="blank")],
+)
+def test_google_media_mime_type_must_be_non_empty_string(mime):
+    """媒体块的 ``mime_type`` 必须是非空字符串，不是裸 ``AttributeError``。"""
+    with pytest.raises(ValueError, match="mime_type 必须是非空字符串"):
+        _google_contents(
+            [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/x.png", "mime_type": mime},
+                }
+            ]
+        )
+
+
+def test_google_tool_result_requires_linkable_identifier():
+    """工具结果块缺可关联标识时必须报错，不能静默产出无名响应。"""
+    with pytest.raises(ValueError, match="工具结果缺少可关联的 tool_call_id/name"):
+        _google_contents([{"type": "tool_result", "response": {}}])
+
+
+@pytest.mark.parametrize(
+    "method,attr,source",
+    [
+        pytest.param("_require_parts", "parts", "响应", id="parts"),
+        pytest.param("_require_embeddings", "embeddings", "响应", id="embeddings"),
+        pytest.param("_require_candidates", "candidates", "响应", id="candidates"),
+    ],
+)
+def test_google_response_containers_reject_non_list(method, attr, source):
+    """响应容器字段非列表必须报 ``RuntimeError``，不是裸 ``TypeError``。"""
+    owner = SimpleNamespace(**{attr: 5})
+
+    with pytest.raises(RuntimeError, match="必须是列表"):
+        getattr(GoogleProvider, method)(owner, source=source)
+
+
+def test_google_partial_arg_value_requires_a_value():
+    """``PartialArg`` 没有任何标量值时必须报错，不能静默返回 ``None``。"""
+    with pytest.raises(ValueError, match="partial_args 缺少有效值"):
+        GoogleProvider._partial_arg_value(SimpleNamespace())
+
+
+def test_google_partial_arg_tokens_reject_oversized_index():
+    """json_path 索引过大必须报错，不能静默接受（会按该下标填充列表）。"""
+    with pytest.raises(ValueError, match="json_path 索引过大"):
+        GoogleProvider._partial_arg_tokens("$[999999]")
+
+
+def test_google_partial_arg_tokens_reject_unsupported_path():
+    """不支持的 json_path 必须报错——删掉守卫会**死循环**（``rest`` 不推进）。"""
+    with pytest.raises(ValueError, match="不支持的 json_path"):
+        GoogleProvider._partial_arg_tokens("$..x")
+
+
+def test_google_partial_args_to_mapping_rejects_non_list():
+    """``partial_args`` 非列表且非 Mapping 必须报错，不是裸 ``TypeError``。"""
+    with pytest.raises(ValueError, match="partial_args 必须是列表"):
+        GoogleProvider._partial_args_to_mapping(5)
+
+
+def test_google_partial_args_root_value_must_be_object():
+    """根路径的 partial 值必须是 JSON 对象，不是裸 ``ValueError: dictionary update``。"""
+    with pytest.raises(ValueError, match="根值必须是 JSON 对象"):
+        GoogleProvider._partial_args_to_mapping([SimpleNamespace(json_path="$", string_value="x")])
+
+
+def test_google_partial_args_write_into_list_rejects_conflict():
+    """向列表元素写入子字段时类型冲突必须报错，不是裸 ``AttributeError``。"""
+    with pytest.raises(ValueError, match="json_path 无法写入"):
+        GoogleProvider._partial_args_to_mapping(
+            [
+                SimpleNamespace(json_path="$[0]", string_value="x"),
+                SimpleNamespace(json_path="$[0].a", string_value="y"),
+            ]
+        )
+
+
+def test_google_partial_args_write_into_scalar_rejects_conflict():
+    """向标量写入子字段必须报错，不是裸 ``TypeError: 'str' object does not support``。"""
+    with pytest.raises(ValueError, match="json_path 无法写入"):
+        GoogleProvider._partial_args_to_mapping(
+            [
+                SimpleNamespace(json_path="$.a", string_value="x"),
+                SimpleNamespace(json_path="$.a.b", string_value="y"),
+            ]
+        )
+
+
+def _merge_into(accumulator, tool_call):
+    GoogleProvider._merge_tool_call(accumulator, tool_call)
+    return accumulator
+
+
+def _fc(**kwargs):
+    return {"type": "function", **kwargs}
+
+
+def test_google_merge_tool_call_rejects_move_onto_existing_key():
+    """把分片并入已存在的 key 时必须报错，不能静默覆盖。"""
+    with pytest.raises(RuntimeError, match="id/index 指向多个调用"):
+        _merge_into(
+            {("index", 5): _fc(index=5, name="other"), ("id", "a"): _fc(id="a", name="f")},
+            _fc(index=5, id="a", name="f"),
+        )
+
+
+def test_google_merge_tool_call_index_branch_rejects_multiple_id_matches():
+    """index 分支里同一 id 命中多个候选时必须报错。"""
+    with pytest.raises(RuntimeError, match="id 指向多个调用"):
+        _merge_into(
+            {("id", "a"): _fc(id="a", name="f"), ("position", 0): _fc(name="f", id="a")},
+            _fc(index=1, id="a", name="f"),
+        )
+
+
+def test_google_merge_tool_call_id_branch_rejects_ambiguous_name_candidates():
+    """call_id 分支下同名多候选时必须报错，不能静默挑一个。"""
+    with pytest.raises(RuntimeError, match="无法关联并行调用"):
+        _merge_into(
+            {("position", 0): _fc(name="f"), ("position", 1): _fc(name="f")},
+            _fc(call_id="c1", name="f"),
+        )
+
+
+def test_google_merge_tool_call_without_identity_rejects_ambiguous_candidates():
+    """既无 id 也无 index 且同名多候选时必须报错。"""
+    with pytest.raises(RuntimeError, match="无法关联并行调用"):
+        _merge_into(
+            {("position", 0): _fc(name="f"), ("position", 1): _fc(name="f")},
+            _fc(name="f"),
+        )
+
+
+def test_google_merge_tool_call_rejects_conflicting_id():
+    """同一分片键上的 id 冲突必须报错，不能静默保留旧值。"""
+    with pytest.raises(RuntimeError, match="id 指向多个调用"):
+        _merge_into(
+            {("index", 0): _fc(index=0, id="a", name="f")},
+            _fc(index=0, call_id="b", name="f"),
+        )
+
+
+def test_google_merge_tool_call_rejects_conflicting_index():
+    """同一分片键上的 index 冲突必须报错。"""
+    with pytest.raises(RuntimeError, match="index 指向多个调用"):
+        _merge_into(
+            {("id", "a"): _fc(id="a", index=0, name="f")},
+            _fc(index=1, id="a", name="f"),
+        )
+
+
+def test_google_merge_tool_call_rejects_conflicting_name():
+    """同一分片键上的 name 冲突必须报错。"""
+    with pytest.raises(RuntimeError, match="name 指向多个调用"):
+        _merge_into({("id", "a"): _fc(id="a", name="f")}, _fc(call_id="a", name="g"))
+
+
+def _google_vertex_mode_provider(vertex, **options):
+    provider = object.__new__(GoogleProvider)
+    provider._model_name = "gemini-1.5-flash"
+    provider._provider = "google"
+    provider._options = {**options, "vertexai": vertex}
+    client = SimpleNamespace(vertexai=vertex)
+    provider._client = client
+    provider._get_client = lambda: client
+    provider._get_aclient = lambda: client
+    return provider
+
+
+def _tool_defs():
+    return [{"type": "function", "function": {"name": "f"}}]
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("field", ["system_prompt", "tools"])
+def test_google_developer_count_tokens_rejects_unsupported_fields(async_mode, field):
+    """Developer API 的 count_tokens 不支持 system_prompt／tools。"""
+    provider = _google_vertex_mode_provider(False)
+    kwargs = {field: "sys" if field == "system_prompt" else _tool_defs()}
+    request = CompletionRequest(prompt="hi", **kwargs)
+
+    with pytest.raises(ValueError, match="Developer API 的 count_tokens 不支持"):
+        if async_mode:
+            asyncio.run(provider.async_count_tokens(request))
+        else:
+            provider.count_tokens(request)
+
+
+def test_google_compute_tokens_rejects_system_prompt():
+    """Vertex compute_tokens 不支持 system_prompt。"""
+    provider = _google_vertex_mode_provider(True)
+
+    with pytest.raises(ValueError, match="compute_tokens 不支持 system_prompt"):
+        provider.compute_tokens(CompletionRequest(prompt="hi", system_prompt="sys"))
+
+
+def test_google_async_compute_tokens_requires_vertex_mode():
+    """compute_tokens 仅支持 Vertex/Enterprise 模式。"""
+    provider = _google_vertex_mode_provider(False)
+
+    with pytest.raises(ValueError, match="仅支持 Vertex/Enterprise 模式"):
+        asyncio.run(provider.async_compute_tokens(CompletionRequest(prompt="hi")))
+
+
+def test_google_async_compute_tokens_rejects_system_prompt():
+    """异步 compute_tokens 不支持 system_prompt。"""
+    provider = _google_vertex_mode_provider(True)
+
+    with pytest.raises(ValueError, match="compute_tokens 不支持 system_prompt"):
+        asyncio.run(
+            provider.async_compute_tokens(CompletionRequest(prompt="hi", system_prompt="sys"))
+        )
+
+
+def _google_stream_provider():
+    """构造一个「无终止事件」的 Google 流替身。"""
+    chunk = SimpleNamespace(
+        response_id="r",
+        candidates=[
+            SimpleNamespace(
+                content=SimpleNamespace(parts=[SimpleNamespace(text="hi")]),
+                finish_reason=None,
+            )
+        ],
+    )
+
+    class _AsyncIter:
+        def __init__(self):
+            self._done = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._done:
+                raise StopAsyncIteration
+            self._done = True
+            return chunk
+
+    provider = object.__new__(GoogleProvider)
+    provider._model_name = "gemini"
+    provider._provider = "google"
+    provider._options = {}
+    aio = SimpleNamespace(
+        models=SimpleNamespace(generate_content_stream=lambda **kwargs: _AsyncIter())
+    )
+    provider._client = SimpleNamespace(
+        models=SimpleNamespace(generate_content_stream=lambda **kwargs: iter([chunk])),
+        aio=aio,
+    )
+    provider._get_client = lambda: provider._client
+    provider._get_aclient = lambda: provider._client
+    return provider
+
+
+def test_google_stream_events_rejects_missing_terminal_event():
+    """流在终止事件之前结束必须报错，不能静默返回已收片段。"""
+    provider = _google_stream_provider()
+
+    with pytest.raises(RuntimeError, match="流在终止事件之前结束"):
+        list(provider.stream_events(CompletionRequest(prompt="hi")))
+
+
+def test_google_async_stream_events_rejects_missing_terminal_event():
+    """异步分支同判据。"""
+    provider = _google_stream_provider()
+
+    async def _drain():
+        return [event async for event in provider.astream_events(CompletionRequest(prompt="hi"))]
+
+    with pytest.raises(RuntimeError, match="异步流在终止事件之前结束"):
+        asyncio.run(_drain())
+
+
+def test_google_invoke_stream_rejects_missing_terminal_event():
+    """``invoke(stream=True)`` 同判据。"""
+    provider = _google_stream_provider()
+
+    with pytest.raises(RuntimeError, match="流在终止事件之前结束"):
+        list(provider.invoke("hi", stream=True))
+
+
+def test_google_ainvoke_stream_rejects_missing_terminal_event():
+    """``ainvoke(stream=True)`` 同判据。"""
+    provider = _google_stream_provider()
+
+    async def _drain():
+        return [chunk async for chunk in provider.ainvoke("hi", stream=True)]
+
+    with pytest.raises(RuntimeError, match="异步流在终止事件之前结束"):
+        asyncio.run(_drain())
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_google_validate_tuning_reward_rejects_dual_configs(async_mode):
+    """``single_reward_config`` 与 ``composite_reward_config`` 不能同时传入。"""
+    provider = object.__new__(GoogleProvider)
+    provider._model_name = "m"
+    provider._options = {}
+    provider._client = SimpleNamespace(tunings=object(), aio=SimpleNamespace(tunings=object()))
+    provider._get_client = lambda: provider._client
+
+    async def _run():
+        return await provider.async_validate_tuning_reward(
+            "p",
+            sample_response=None,
+            example=None,
+            single_reward_config=1,
+            composite_reward_config=2,
+        )
+
+    with pytest.raises(ValueError, match="不能同时传入"):
+        if async_mode:
+            asyncio.run(_run())
+        else:
+            provider.validate_tuning_reward(
+                "p",
+                sample_response=None,
+                example=None,
+                single_reward_config=1,
+                composite_reward_config=2,
+            )
+
+
+def test_google_connect_live_reports_missing_aio_node():
+    """缺 ``aio`` 节点时必须报 ``NotImplementedError``，不是裸 ``UnboundLocalError``。"""
+    provider = object.__new__(GoogleProvider)
+    provider._model_name = "m"
+    provider._options = {}
+    provider._client = SimpleNamespace()
+    provider._get_client = lambda: provider._client
+
+    with pytest.raises(NotImplementedError, match="未提供异步 Live 资源"):
+        provider.connect_live()
+
+
+def test_google_connect_live_rejects_non_callable_connect():
+    """``live.connect`` 不可调用时必须报错，不是裸 ``TypeError``。"""
+    provider = object.__new__(GoogleProvider)
+    provider._model_name = "m"
+    provider._options = {}
+    provider._client = SimpleNamespace(aio=SimpleNamespace(live=SimpleNamespace(connect=5)))
+    provider._get_client = lambda: provider._client
+
+    with pytest.raises(NotImplementedError, match="未提供可调用的 Live 连接资源"):
+        provider.connect_live()
+
+
+def _google_embedding_provider(vertex, count):
+    provider = object.__new__(GoogleProvider)
+    provider._model_name = "gemini-embedding-001"
+    provider._provider = "google"
+    provider._options = {"vertexai": vertex}
+    provider._client = None
+
+    def _mk(**kwargs):
+        return SimpleNamespace(embeddings=[SimpleNamespace(values=[0.1]) for _ in range(count)])
+
+    async def _amk(**kwargs):
+        return _mk(**kwargs)
+
+    models = SimpleNamespace(embed_content=_mk)
+    aio = SimpleNamespace(models=SimpleNamespace(embed_content=_amk))
+    provider._client = SimpleNamespace(vertexai=vertex, models=models, aio=aio)
+    provider._get_client = lambda: provider._client
+    return provider
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_google_embedding_rejects_reserved_field_override(async_mode):
+    """Embedding 请求覆盖 ``model`` 必须报「不允许覆盖请求字段」。"""
+    provider = _google_embedding_provider(False, 1)
+
+    async def _run():
+        return await provider.aembed_documents(["a"], model="x")
+
+    with pytest.raises(ValueError, match="Embedding 不允许覆盖请求字段"):
+        if async_mode:
+            asyncio.run(_run())
+        else:
+            provider.embed_documents(["a"], model="x")
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_google_vertex_embedding_requires_single_embedding(async_mode):
+    """Vertex 单内容请求必须返回唯一 embedding，不能静默接受多个。"""
+    provider = _google_embedding_provider(True, 2)
+
+    async def _run():
+        return await provider.aembed_documents(["a"])
+
+    with pytest.raises(RuntimeError, match="单内容请求未返回唯一 embedding"):
+        if async_mode:
+            asyncio.run(_run())
+        else:
+            provider.embed_documents(["a"])
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_google_embedding_count_must_match_input(async_mode):
+    """Embedding 返回数量与输入数量不一致时必须报错。"""
+    provider = _google_embedding_provider(False, 2)
+
+    async def _run():
+        return await provider.aembed_documents(["a"])
+
+    with pytest.raises(RuntimeError, match="返回数量与输入文本数量不一致"):
+        if async_mode:
+            asyncio.run(_run())
+        else:
+            provider.embed_documents(["a"])
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_google_close_reports_first_error(async_mode):
+    """``close``／``aclose`` 首个关闭异常必须向上报告，不能静默吞掉。"""
+
+    class _BadClose:
+        def close(self):
+            raise RuntimeError("close 失败")
+
+        aio = SimpleNamespace(aclose=lambda: (_ for _ in ()).throw(RuntimeError("close 失败")))
+
+    provider = object.__new__(GoogleProvider)
+    provider._client = _BadClose()
+    provider._provider = "google"
+
+    with pytest.raises(RuntimeError, match="close 失败"):
+        if async_mode:
+            asyncio.run(provider.aclose())
+        else:
+            provider.close()
