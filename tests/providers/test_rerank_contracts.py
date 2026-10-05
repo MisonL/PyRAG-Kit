@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 from src.providers.jina import JinaProvider
@@ -292,3 +294,151 @@ def test_rerank_parse_response_never_leaks_a_bare_key_error(provider_type):
             pass
         except BaseException as exc:
             raise AssertionError(f"{probe!r} 抛出了 {type(exc).__name__}: {exc}") from exc
+
+
+# ── 响应解析的形态判据 ──
+#
+# ``_parse_response`` 的四条形态判据（results 非列表、结果项非 Mapping、
+# index/document 关联、document 不可映射）在整套测试里从未执行：既有用例
+# ``test_rerank_invalid_index_is_explicit``／``test_rerank_unknown_document_is_explicit``
+# 命中的都是「index 值越界」与「document 映射不到输入」两条**取值**判据。
+# 行覆盖证实四条从未执行；把它们的 ``raise`` 换成 ``pass`` 后全量 3341 条仍全绿。
+#
+# ``rerank``／``arerank`` 里「响应必须是 JSON 对象」那两条同样是缺口：
+# 它们在 ``payload.get("results")`` 之前，非 Mapping 取值会先撞裸
+# ``AttributeError: 'list' object has no attribute 'get'``。删掉后实测正是如此。
+
+
+class _FakeResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        if isinstance(self._payload, Exception):
+            raise self._payload
+        return self._payload
+
+
+class _FakeClient:
+    payload: object = None
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def post(self, *args, **kwargs):
+        return _FakeResponse(self.payload)
+
+
+class _FakeAsyncClient(_FakeClient):
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def post(self, *args, **kwargs):
+        return _FakeResponse(self.payload)
+
+
+class _FakeHttpx:
+    Client = _FakeClient
+    AsyncClient = _FakeAsyncClient
+
+
+def _fake_rerank_providers(provider_type):
+    """构造绕过网络与配置读取的 provider 实例。"""
+    provider = object.__new__(provider_type)
+    provider._model_name = "m"
+    provider._options = {}
+    provider._base_url = "https://example.invalid/v1/rerank"
+    provider._api_key = "k"
+    return [provider]
+
+
+def _fake_rerank_http(monkeypatch, payload):
+    """把两个 provider 内部 ``import httpx`` 拿到的客户端换成假实现。"""
+    import sys
+
+    _FakeClient.payload = payload
+    monkeypatch.setitem(sys.modules, "httpx", _FakeHttpx())
+
+
+@pytest.mark.parametrize("provider_type", [JinaProvider, SiliconflowRerankProvider])
+@pytest.mark.parametrize("bad_item", [5, "text", ["x"]], ids=["int", "str", "list"])
+def test_rerank_rejects_non_mapping_result_item(provider_type, bad_item):
+    """结果项必须是 Mapping。
+
+    删除守卫后 ``"index" in res`` 对整数取值抛裸 ``TypeError: argument of type
+    'int' is not iterable``——而本模块承诺的解析契约是 ``RuntimeError``，
+    调用方的错误分类与日志脱敏都按 ``RuntimeError`` 写，接不住 ``TypeError``。
+    """
+    provider = object.__new__(provider_type)
+
+    with pytest.raises(RuntimeError, match="包含无效结果项"):
+        provider._parse_response([bad_item], ["one"])
+
+
+@pytest.mark.parametrize("provider_type", [JinaProvider, SiliconflowRerankProvider])
+def test_rerank_rejects_index_document_mismatch(provider_type):
+    """响应声明的 ``index`` 与随附的 ``document`` 文本必须指向同一个输入文档。
+
+    上游返回的 index 与 document 不一致时，删除守卫会**静默接受**：实测返回
+    ``([0], [1.0])``，把「命中的是另一篇文档」当成有效排序交给检索层。
+    """
+    provider = object.__new__(provider_type)
+
+    with pytest.raises(RuntimeError, match="index 与 document 不匹配"):
+        provider._parse_response(
+            [{"index": 0, "document": {"text": "other"}, "relevance_score": 0.9}],
+            ["one", "other"],
+        )
+
+
+@pytest.mark.parametrize("provider_type", [JinaProvider, SiliconflowRerankProvider])
+def test_rerank_rejects_non_mapping_result_entries(provider_type):
+    """``_parse_response`` 声明 ``results`` 是列表，传入非列表必须显式报错。
+
+    这条与 ``rerank``／``arerank`` 里那条同消息判据构成前后两道闸；删除后本
+    函数会在 ``for res in results`` 处以形态各异的异常崩掉。
+    """
+    provider = object.__new__(provider_type)
+
+    with pytest.raises(RuntimeError, match="缺少有效的 results 列表"):
+        provider._parse_response("not-a-list", ["one"])
+
+
+@pytest.mark.parametrize("provider_type", [JinaProvider, SiliconflowRerankProvider])
+def test_rerank_response_must_be_json_object(provider_type, monkeypatch):
+    """上游响应必须是 JSON 对象：同步与异步两条入口都要在 ``.get`` 之前报错。
+
+    走公开 ``rerank``／``arerank`` 入口并用假 ``httpx`` 拦网，验证删除守卫后
+    收场从 ``RuntimeError`` 退化成裸 ``AttributeError``。
+    """
+    import asyncio
+
+    monkeypatch.setattr(
+        "src.providers.jina.get_settings",
+        lambda: SimpleNamespace(jina_api_key="k"),
+    )
+    monkeypatch.setattr(
+        "src.providers.siliconflow_rerank.get_settings",
+        lambda: SimpleNamespace(siliconflow_api_key="k", siliconflow_base_url="https://x/v1"),
+    )
+
+    for provider in _fake_rerank_providers(provider_type):
+        _fake_rerank_http(monkeypatch, ["not", "a", "map"])
+        for run in (
+            lambda p: p.rerank(query="q", documents=["a", "b"], top_n=2),
+            lambda p: asyncio.run(p.arerank(query="q", documents=["a", "b"], top_n=2)),
+        ):
+            with pytest.raises(RuntimeError, match="响应必须是 JSON 对象"):
+                run(provider)
