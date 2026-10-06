@@ -1560,3 +1560,102 @@ def test_upsert_embeddings_rejects_non_matrix_shapes(shape):
         store.upsert_embeddings(documents, np.zeros(shape, dtype=np.float32))
 
     assert store.documents == []
+
+
+# ── 废弃入口与信任边界判据的覆盖缺口 ──
+#
+# 下列判据在整套测试里从未执行（行覆盖 + 变异扫描双证；把它们的 ``raise`` 换成
+# ``pass`` 后全量 3725 条仍全绿）。删除后行为确实改变（实测，均经真实入口）：
+# * 554／559／668／675／995 五个废弃入口（``add_documents``／``aadd_documents``／
+#   ``search``／``asearch``／``get_embedding_model``）→ **静默返回 None**（async
+#   入口返回一个什么都不做的协程），调用方拿到 None 当结果用，崩在更远处；
+# * 723 ``load`` 对不存在的文件 → 消息从「向量存储文件未找到: {path}」退化成
+#   ``open()`` 的 errno 消息，丢了本模块的定位语义；
+# * 831 ``load_snapshot`` 对不存在的目录 → 从 ``FileNotFoundError``（带路径）
+#   退化成下游的「未被激活，缺少标记文件」``ValueError``——把「目录不存在」
+#   报成「快照没激活」，指向完全错误的排查方向；
+# * 595 ``semantic_search`` 的查询向量形态 → 二维／空向量不再报「必须是一维
+#   且非空」，落到维度不一致的消息（二维 ``(2,2)`` 报「维度 2 与索引维度 4
+#   不一致」，空向量报「维度 0」），用户按消息去换模型也修不好。
+def test_faiss_store_deprecated_add_documents_reports_readably():
+    """``add_documents`` 已废弃，必须报错而不是静默返回 None。"""
+    store = FaissStore(file_path=None)
+
+    with pytest.raises(RuntimeError, match="add_documents 已废弃"):
+        store.add_documents([])
+
+
+def test_faiss_store_deprecated_aadd_documents_reports_readably():
+    """``aadd_documents`` 已废弃，await 后必须报错而不是静默返回 None。"""
+    import asyncio
+
+    store = FaissStore(file_path=None)
+
+    with pytest.raises(RuntimeError, match="aadd_documents 已废弃"):
+        asyncio.run(store.aadd_documents([]))
+
+
+def test_faiss_store_deprecated_search_reports_readably():
+    """``search`` 已废弃，必须报错而不是静默返回 None。"""
+    store = FaissStore(file_path=None)
+
+    with pytest.raises(RuntimeError, match="search 已废弃"):
+        store.search("query")
+
+
+def test_faiss_store_deprecated_asearch_reports_readably():
+    """``asearch`` 已废弃，await 后必须报错而不是静默返回 None。"""
+    import asyncio
+
+    store = FaissStore(file_path=None)
+
+    with pytest.raises(RuntimeError, match="asearch 已废弃"):
+        asyncio.run(store.asearch("query"))
+
+
+def test_faiss_store_get_embedding_model_reports_readably():
+    """``get_embedding_model`` 不再持有嵌入模型，必须报错而不是静默返回 None。"""
+    store = FaissStore(file_path=None)
+
+    with pytest.raises(RuntimeError, match="EmbeddingService"):
+        store.get_embedding_model()
+
+
+def test_faiss_store_load_reports_missing_file_with_its_path(tmp_path):
+    """``load`` 对不存在的文件必须报带路径的 ``FileNotFoundError``。"""
+    store = FaissStore(file_path=None)
+    missing = tmp_path / "missing.pkl"
+
+    with pytest.raises(FileNotFoundError, match="向量存储文件未找到"):
+        store.load(str(missing), trusted_paths=[str(tmp_path)])
+
+
+def test_faiss_store_load_snapshot_reports_missing_directory(tmp_path):
+    """``load_snapshot`` 对不存在的目录必须报 ``FileNotFoundError``。
+
+    删除守卫后落到「快照未被激活，缺少标记文件」的 ``ValueError``——把
+    「目录不存在」误报成「快照没激活」。
+    """
+    store = FaissStore(file_path=None)
+    missing = tmp_path / "missing-snapshot"
+
+    with pytest.raises(FileNotFoundError, match="知识快照目录不存在"):
+        store.load_snapshot(str(missing), snapshot_root=str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "query_vector",
+    [
+        pytest.param(np.zeros((2, 2), dtype=np.float32), id="two-dimensional"),
+        pytest.param(np.zeros((0,), dtype=np.float32), id="empty"),
+    ],
+)
+def test_faiss_store_rejects_non_1d_or_empty_query_vector(query_vector):
+    """二维／空查询向量必须报「一维且非空」，不能落到维度不一致的消息。"""
+    store = FaissStore(file_path=None)
+    store.documents = [{"page_content": "doc", "metadata": {}}]
+    store.embeddings = np.zeros((1, 4), dtype=np.float32)
+    store._rebuild_indices()
+
+    with pytest.raises(ValueError, match="一维且非空"):
+        store.semantic_search(query_vector, top_k=1)

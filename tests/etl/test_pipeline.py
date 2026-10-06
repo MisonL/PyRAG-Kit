@@ -577,3 +577,50 @@ def test_hierarchical_mode_accepts_valid_child_sizes(monkeypatch):
 
     assert chunks
     assert splitter.parent_documents, "层级模式必须产出父块"
+
+
+# ── 基础清洗器与分片器的容器形态判据 ──
+#
+# 下列判据在整套测试里从未执行（行覆盖 + 变异扫描双证；把它们的 ``raise`` 换成
+# ``pass`` 后全量 3725 条仍全绿）。删除后行为确实改变（实测）：
+# * ``basic_cleaner`` 的 ``documents`` 容器／元素形态 → 删掉 43 后 ``5`` 变成裸
+#   ``TypeError: 'int' object is not iterable``（不是本模块承诺的 ``ValueError``）；
+# * ``_require_separators`` 的 135（非列表）→ 同样退化成裸 ``TypeError``；
+#   138（元素非字符串）→ **静默接受** ``["a", 5]``，后续按分隔符切分时
+#   才以形态各异的错误崩掉（或更糟：静默产出错误的分片）。
+#
+# 既有用例只喂合法输入（``["document"]`` 之类），两条判据从未被反向覆盖。
+def test_basic_cleaner_rejects_non_sequence_documents():
+    """``documents`` 非序列必须给带字段名的 ``ValueError``，不是裸 ``TypeError``。"""
+    import pytest
+
+    from src.etl.cleaners.basic_cleaner import BasicCleaner
+
+    with pytest.raises(ValueError, match="documents 必须是文档列表"):
+        BasicCleaner().clean(5)
+
+
+def test_basic_cleaner_rejects_non_document_entries():
+    """``documents`` 的元素必须是 ``Document``，不能静默丢弃不合规条目。"""
+    import pytest
+
+    from src.etl.cleaners.basic_cleaner import BasicCleaner
+
+    with pytest.raises(ValueError, match=r"documents\[1\] 必须是 Document"):
+        BasicCleaner().clean([Document(content="ok", metadata={}), "not-a-document"])
+
+
+def test_recursive_text_splitter_requires_list_of_string_separators():
+    """分隔符表必须是非空字符串的列表：容器与元素两条判据都要生效。"""
+    import pytest
+
+    with pytest.raises(ValueError, match="分隔符表必须是列表"):
+        RecursiveTextSplitter._require_separators(5)
+
+
+def test_recursive_text_splitter_rejects_non_string_separator_entry():
+    """元素非字符串必须报错，不能静默接受后产出错误的分片。"""
+    import pytest
+
+    with pytest.raises(ValueError, match="每一项都必须是字符串"):
+        RecursiveTextSplitter._require_separators(["\n\n", 5])

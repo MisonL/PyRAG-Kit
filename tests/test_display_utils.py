@@ -958,3 +958,54 @@ def test_display_chat_config_still_renders_valid_details():
     config = _chat_config_for("google", active_rerank="siliconflow", rerank_enabled=True)
 
     display_chat_config(console, config)
+
+
+# ── markup_text 的 NUL 模板与 _require_model_detail 的非映射形态 ──
+#
+# 下列判据在整套测试里从未执行（行覆盖 + 变异扫描双证；把它们的 ``raise`` 换成
+# ``pass`` 后全量 3725 条仍全绿）。删除后行为确实改变（实测）：
+# * 76／78 附近的 NUL 模板判据：``markup_text("a\x00b", "v")`` 删掉后不再报
+#   「模板不得包含 NUL」，而是落到「占位符少于实参数量」——用户被指向占位符，
+#   真正的问题（模板里混进了控制字符）没人说；
+# * 297 ``_require_model_detail`` 的「configurations 非映射」判据：传 ``None``
+#   时删掉后落到下游的「key 必须是可哈希的取值」，把「配置映射本身不是映射」
+#   说成「key 形态非法」，指向错误的排查方向。
+#
+# NUL 那条与既有的「占位符数量不符」必须分开断言：两者消息都是 ``ValueError``，
+# 只看异常类型无法区分。
+def test_markup_text_rejects_nul_in_template():
+    """模板里混入 NUL 字符必须点名 NUL，不能报成占位符数量不符。"""
+    from src.ui.display_utils import markup_text
+
+    with pytest.raises(ValueError, match="NUL"):
+        markup_text("a\x00b", "value")
+
+
+def test_markup_text_still_rejects_placeholder_mismatch_with_its_own_message():
+    """反向守卫：占位符数量不符仍是「占位符」消息，与 NUL 那条可区分。"""
+    from src.ui.display_utils import markup_text
+
+    with pytest.raises(ValueError, match="占位符") as excinfo:
+        markup_text("没有占位符", "值")
+
+    assert "NUL" not in str(excinfo.value)
+
+
+def test_require_model_detail_rejects_non_mapping_configurations():
+    """``configurations`` 不是映射时必须点名这一半，不能报成 key 形态非法。"""
+    from src.ui.display_utils import _require_model_detail
+
+    with pytest.raises(ValueError) as excinfo:
+        _require_model_detail(None, "demo", "Rerank")
+
+    message = str(excinfo.value)
+    assert "未找到key" in message
+    assert "必须是可哈希的取值" not in message
+
+
+def test_require_model_detail_rejects_non_mapping_configurations_with_list():
+    """列表也是非映射；``_require_model_detail`` 收空列表与 ``None`` 都要覆盖。"""
+    from src.ui.display_utils import _require_model_detail
+
+    with pytest.raises(ValueError, match="未找到key"):
+        _require_model_detail(["not", "a", "mapping"], "demo", "LLM")

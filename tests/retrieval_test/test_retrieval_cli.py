@@ -801,3 +801,23 @@ def test_display_results_still_renders_real_document_lists(monkeypatch):
     rendered = buffer.getvalue()
     assert "第一条" in rendered
     assert "无结果" not in rendered
+
+
+def test_excel_logger_reports_exhausted_name_attempts(tmp_path, monkeypatch):
+    """后缀耗尽时必须报 ``RuntimeError``，不能静默返回一个未创建的路径。
+
+    删除守卫后 ``_reserve_log_path`` 在 ``for`` 循环结束后隐式返回 ``None``，
+    调用方拿到 ``None`` 当路径用——崩在更远处，且与「同一秒内日志太多」
+    这个真实原因完全无关。``_MAX_LOG_NAME_ATTEMPTS`` 有 100，全量预置不现实，
+    这里把它收到 2 再预置两个候选文件。
+    """
+    from src.retrieval_test import excel_logger
+    from src.retrieval_test.excel_logger import ExcelLogger
+
+    monkeypatch.setattr(excel_logger, "_MAX_LOG_NAME_ATTEMPTS", 2)
+    timestamp = "20260101_000000"
+    (tmp_path / f"recall_test_log_{timestamp}.xlsx").write_bytes(b"taken-0")
+    (tmp_path / f"recall_test_log_{timestamp}_1.xlsx").write_bytes(b"taken-1")
+
+    with pytest.raises(RuntimeError, match="无法再创建新文件"):
+        ExcelLogger._reserve_log_path(str(tmp_path), timestamp)

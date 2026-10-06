@@ -1432,3 +1432,93 @@ def test_settings_reject_a_numeric_literal_that_overflows_to_infinity():
     """
     with pytest.raises(ValidationError, match="有限数值"):
         Settings(chat_top_k="1e400", _env_file=None)
+
+
+# ── 校验器守卫的覆盖缺口（变异扫描：删除后全量 3725 条仍全绿） ──
+#
+# 下列判据删除后行为确实改变（实测，经 ``Settings(**kwargs)`` 真实入口）：
+# * 966 「两个权重同时为零」组合校验 → **静默接受**，检索时每个文档得分都是
+#   0.0 并被分数阈值全部过滤——用户看到的是「搜不到」，配置本身却「合法」；
+# * 987 无效日志级别 → **静默接受** ``"BOGUS"``（只做了 ``.upper()``），
+#   日志系统拿到一个不认识的级别名，行为由 logging 内部兜底决定；
+# * 1035 无效融合策略 → **静默接受** ``"bogus"``，检索时按字符串比较落进
+#   else 分支（纯关键词检索），用户配置的混合检索静默失效；
+# * 1202 空路径 → **静默接受** 空串（解析成当前工作目录），路径随运行位置
+#   漂移；
+# * 867 负的分片重叠 → **静默接受** ``-1``；
+# * 984 非字符串日志级别 → 裸 ``AttributeError``（``5.upper()``）；
+# * 1030 非字符串融合策略 → 裸 ``AttributeError``；
+# * 1184 非字符串路径 → 裸 ``AttributeError``（``5.strip()``）；
+# * 831 非整数分片尺寸 → 消息退化成「kb_chunk_overlap 必须小于 kb_chunk_size」
+#   （把「1.5 不是整数」说成「重叠太大」）；
+# * 937 ``overlap == size`` → 消息退化成「不能超过一半」（把「必须小于」说成
+#   「超过一半」，指向错误的边界）。
+def test_settings_rejects_both_weights_zero():
+    """两个检索权重同时为零必须报错，不能静默接受。
+
+    后果是**静默空结果**：``weighted`` 融合下每个文档得分都是 0.0，随后被
+    ``chat_score_threshold`` 全部过滤——用户看到的是「搜不到」。
+    """
+    with pytest.raises(ValidationError, match="不能同时为 0"):
+        Settings(chat_vector_weight=0.0, chat_keyword_weight=0.0, _env_file=None)
+
+
+def test_settings_rejects_invalid_log_level():
+    """无效日志级别必须报错，不能静默接受 ``BOGUS``。"""
+    with pytest.raises(ValidationError, match="无效的日志级别"):
+        Settings(log_level="bogus", _env_file=None)
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        pytest.param(5, id="int"),
+        pytest.param(None, id="none"),
+    ],
+)
+def test_settings_rejects_non_string_log_level(bad_value):
+    """非字符串日志级别必须给带字段名的 ``ValidationError``，不是裸 ``AttributeError``。"""
+    with pytest.raises(ValidationError, match="log_level 必须是字符串"):
+        Settings(log_level=bad_value, _env_file=None)
+
+
+def test_settings_rejects_invalid_fusion_strategy():
+    """无效融合策略必须报错，不能静默接受 ``bogus``。"""
+    with pytest.raises(ValidationError, match="无效的混合检索融合策略"):
+        Settings(hybrid_fusion_strategy="bogus", _env_file=None)
+
+
+def test_settings_rejects_non_string_fusion_strategy():
+    """非字符串融合策略必须给 ``ValidationError``，不是裸 ``AttributeError``。"""
+    with pytest.raises(ValidationError, match="融合策略必须是字符串"):
+        Settings(hybrid_fusion_strategy=5, _env_file=None)
+
+
+def test_settings_rejects_empty_snapshot_root():
+    """空路径必须报错：``Path("")`` 会解析成当前工作目录，使路径随运行位置漂移。"""
+    with pytest.raises(ValidationError, match="不能为空"):
+        Settings(snapshot_root="", _env_file=None)
+
+
+def test_settings_rejects_non_string_snapshot_root():
+    """非字符串路径必须给 ``ValidationError``，不是裸 ``AttributeError``。"""
+    with pytest.raises(ValidationError, match="必须是字符串"):
+        Settings(snapshot_root=5, _env_file=None)
+
+
+def test_settings_rejects_negative_chunk_overlap():
+    """负的分片重叠必须报错，不能静默接受。"""
+    with pytest.raises(ValidationError, match="必须是非负整数"):
+        Settings(kb_chunk_overlap=-1, _env_file=None)
+
+
+def test_settings_reports_fractional_chunk_size_as_non_integer():
+    """``1.5`` 不是整数：消息必须点名「必须是整数」，不能退化成「重叠太大」。"""
+    with pytest.raises(ValidationError, match="必须是整数"):
+        Settings(kb_chunk_size=1.5, _env_file=None)
+
+
+def test_settings_reports_overlap_equal_to_size_with_its_own_message():
+    """``overlap == size`` 必须报「必须小于」，不能退化成「不能超过一半」。"""
+    with pytest.raises(ValidationError, match="必须小于 kb_chunk_size"):
+        Settings(kb_chunk_size=100, kb_chunk_overlap=100, _env_file=None)

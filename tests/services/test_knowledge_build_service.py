@@ -293,3 +293,134 @@ def test_build_reports_which_file_is_unreadable(tmp_path, monkeypatch):
         assert not list(snapshot_root.glob(".tmp-*")), "失败后临时快照目录必须被清理"
     finally:
         unreadable.chmod(0o644)
+
+
+# ── 文档数与 embedding 数不一致、活动快照切换失败的覆盖缺口 ──
+#
+# 两条判据在整套测试里从未执行（行覆盖 + 变异扫描双证；把它们的 ``raise`` 换成
+# ``pass`` 后全量 3725 条仍全绿）。删除后行为确实改变（实测）：
+# * 92 文档数与 embedding 行数不一致 → ``np.vstack`` 后的错位数据被
+#   **静默写入** store（或由 store 以形态无关的错误拒绝），而不是在
+#   ``build`` 里以「知识快照中的文档数量与 embedding 数量不一致」报出；
+# * 113 ``finalize_snapshot`` 后拿不到活动快照目录 → 报错缺失，
+#   ``build`` 会继续走到 ``validate_snapshot_dir(None)`` 的裸异常。
+#
+# 既有用例里 ``_IncompleteVectorStore`` 只覆盖了「临时快照不自洽」这条
+# **先于**两条判据的路径，两条判据本身从未被反向覆盖。
+class _MismatchedEmbeddingService:
+    """embed 返回的行数与输入文本数不一致，用于触发 92 行判据。"""
+
+    embedding_provider_key = "local-hash"
+    embedding_model_detail = SimpleNamespace(model_name="local-hash-32")
+
+    async def embed_in_batches(self, texts):
+        import numpy as np
+
+        return np.zeros((len(texts) + 1, 4), dtype=np.float32)
+
+
+class _CountingPipeline:
+    """每个文件产出一个分块。"""
+
+    class _Splitter:
+        def __init__(self):
+            self.parent_documents: dict = {}
+
+    splitter = _Splitter()
+
+    def process(self, document):
+        from src.models.document import Document
+
+        return [Document(content="chunk", metadata={"source": "a.md"})]
+
+
+def test_build_rejects_document_embedding_count_mismatch(tmp_path, monkeypatch):
+    """embedding 行数与文档数不一致时必须在写入 store 之前报错。"""
+    knowledge_base = tmp_path / "knowledge_base"
+    knowledge_base.mkdir()
+    (knowledge_base / "article.md").write_text("内容", encoding="utf-8")
+
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_root.mkdir()
+
+    run_config = _RunConfig(knowledge_base, snapshot_root)
+    repository = SnapshotRepository(run_config)
+    monkeypatch.setattr(repository, "generate_snapshot_id", lambda: "kb-mismatch")
+
+    class _Store:
+        def save_snapshot(self, snapshot_dir):
+            raise AssertionError("不一致的数据不应走到 save_snapshot")
+
+    monkeypatch.setattr(
+        "src.services.knowledge_build_service.Pipeline.from_file_path",
+        lambda *args, **kwargs: _CountingPipeline(),
+    )
+    service = KnowledgeBuildService(run_config, _Store(), _MismatchedEmbeddingService(), repository)
+
+    with pytest.raises(ValueError, match="文档数量与 embedding 数量不一致"):
+        asyncio.run(service.build("standard"))
+
+    assert not (snapshot_root / "kb-mismatch").exists()
+    assert not (snapshot_root / ".tmp-kb-mismatch").exists()
+
+
+def test_build_reports_missing_active_snapshot_after_finalize(tmp_path, monkeypatch):
+    """``finalize_snapshot`` 之后拿不到活动快照目录时必须显式报错。
+
+    删除守卫后 ``build`` 会继续用 ``None`` 调 ``validate_snapshot_dir``，
+    崩在路径处理内部，消息与真实原因（快照切换失败）无关。
+    """
+    knowledge_base = tmp_path / "knowledge_base"
+    knowledge_base.mkdir()
+    (knowledge_base / "article.md").write_text("内容", encoding="utf-8")
+
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_root.mkdir()
+
+    run_config = _RunConfig(knowledge_base, snapshot_root)
+    repository = SnapshotRepository(run_config)
+    monkeypatch.setattr(repository, "generate_snapshot_id", lambda: "kb-lost")
+    monkeypatch.setattr(repository, "get_active_snapshot_dir", lambda: None)
+
+    class _Store:
+        def upsert_embeddings(self, documents, embeddings):
+            return None
+
+        def save_snapshot(self, snapshot_dir):
+            # 写出通过 ``validate_snapshot_dir`` 所需的最小文件集
+            import json
+            import pickle
+
+            import faiss
+            import numpy as np
+
+            target = Path(snapshot_dir)
+            with (target / "chunks.pkl").open("wb") as file:
+                pickle.dump([{"page_content": "c", "metadata": {"source": "a.md"}}], file)
+            with (target / "parents.pkl").open("wb") as file:
+                pickle.dump({}, file)
+            np.save(target / "embeddings.npy", np.zeros((1, 4), dtype=np.float32))
+            index = faiss.IndexFlatL2(4)
+            index.add(np.zeros((1, 4), dtype=np.float32))
+            faiss.write_index(index, str(target / "semantic.index"))
+            (target / "stats.json").write_text(json.dumps({"chunk_count": 1}), encoding="utf-8")
+            with (target / "lexical.index").open("wb") as file:
+                pickle.dump([{"t": 1}], file)
+
+    class _Embedding:
+        embedding_provider_key = "local-hash"
+        embedding_model_detail = SimpleNamespace(model_name="local-hash-32")
+
+        async def embed_in_batches(self, texts):
+            import numpy as np
+
+            return np.zeros((len(texts), 4), dtype=np.float32)
+
+    monkeypatch.setattr(
+        "src.services.knowledge_build_service.Pipeline.from_file_path",
+        lambda *args, **kwargs: _CountingPipeline(),
+    )
+    service = KnowledgeBuildService(run_config, _Store(), _Embedding(), repository)
+
+    with pytest.raises(RuntimeError, match="活动知识快照切换失败"):
+        asyncio.run(service.build("standard"))

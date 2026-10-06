@@ -1,5 +1,6 @@
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from rich.console import Console
@@ -868,3 +869,93 @@ def test_chat_config_setter_still_rejects_an_illegal_final_state():
             bot.chat_config = payload
 
         assert bot.session_config.to_dict() == before, f"{label}: 配置处于改了一半的状态"
+
+
+# ── 「服务尚未初始化」三条判据的覆盖缺口 ──
+#
+# 三条判据在整套测试里从未执行（行覆盖 + 变异扫描双证；把它们的 ``raise`` 换成
+# ``pass`` 后全量 3725 条仍全绿）。删除后行为确实改变（实测，经真实入口）：
+# ``reload_llm``／``apply_config_update_async``（260）在 ``retrieval_service is
+# None`` 时不再报错，而是拿 ``None`` 去构造 ``ChatService``——崩在构造器内部，
+# 消息与真实原因（服务没装配好）无关；``chat_async``（332）在 ``chat_service``
+# 为 ``None`` 时静默走完整个生成器，用户拿到空回答而不是「聊天服务尚未初始化」。
+def test_reload_llm_reports_missing_retrieval_service(monkeypatch):
+    """``retrieval_service`` 未初始化时必须报错，不能拿 None 去构造 ChatService。"""
+    bot = object.__new__(Chatbot)
+    bot.console = Console()
+    bot.session_config = SimpleNamespace(active_llm_configuration="new-model")
+    bot.retrieval_service = None
+    bot.llm_model = None
+    bot.chat_service = None
+
+    class _Model:
+        pass
+
+    monkeypatch.setattr(
+        "src.chat.core.ModelProviderFactory.get_llm_provider",
+        lambda _llm_key, _configurations=None: _Model(),
+    )
+
+    assert bot.reload_llm() is False
+
+
+def test_chat_async_reports_missing_chat_service(monkeypatch):
+    """``chat_service`` 与 ``llm_model`` 都未初始化时用户必须收到显式错误。
+
+    删除守卫后生成器**什么都不产出**就结束——用户拿到空回答，与「模型真的
+    回答为空」无法区分；守卫在场时异常被外层 ``except`` 收敛成致歉文本。
+    """
+    bot = object.__new__(Chatbot)
+    bot.console = Console()
+    bot.session_config = {
+        "chat_temperature": 0.7,
+        "active_llm_configuration": "openai",
+        "llm_configurations": {},
+    }
+    bot.chat_service = None
+    bot.llm_model = None
+    bot.retrieval_service = None
+    bot.logger = MagicMock()
+
+    async def _drain():
+        return [chunk async for chunk in bot.chat_async("你好")]
+
+    chunks = asyncio.run(_drain())
+
+    assert chunks, "两个服务都缺失时必须产出显式错误文本，不能是空回答"
+
+
+def test_apply_config_update_async_reports_missing_retrieval_service(monkeypatch):
+    """异步配置更新路径上 ``retrieval_service`` 未初始化也必须报错。
+
+    与 ``test_reload_llm_reports_missing_retrieval_service`` 是**两条独立路径**
+    （同步 ``reload_llm`` 与 ``apply_config_update_async`` 各有自己的判据），
+    既有用例只覆盖了后者且 ``retrieval_service`` 非 ``None``。
+    """
+
+    class _Model:
+        pass
+
+    class DummySessionConfig:
+        active_llm_configuration = "new-model"
+
+        def __setitem__(self, key, value):
+            setattr(self, key, value)
+
+    messages = []
+    bot = object.__new__(Chatbot)
+    bot.console = SimpleNamespace(print=lambda message: messages.append(str(message)))
+    bot.logger = SimpleNamespace(warning=lambda *_args, **_kwargs: None)
+    bot.session_config = DummySessionConfig()
+    bot.retrieval_service = None
+    bot.llm_model = object()
+    bot.chat_service = object()
+
+    monkeypatch.setattr(
+        "src.chat.core.ModelProviderFactory.get_llm_provider",
+        lambda *_args, **_kwargs: _Model(),
+    )
+
+    asyncio.run(bot.apply_config_update_async({"active_llm_configuration": "new-model"}, True))
+
+    assert any("LLM 切换失败" in message for message in messages)

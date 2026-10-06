@@ -782,3 +782,38 @@ def test_snapshot_manifest_survives_huge_integer_field(field_name):
 
     assert isinstance(getattr(manifest, field_name), str)
     assert getattr(manifest, field_name)  # 非空，仍可用于日志与报错
+
+
+# ── set_many 与 __delitem__ 的覆盖缺口 ──
+#
+# 下列判据在整套测试里从未执行（行覆盖 + 变异扫描双证；把它们的 ``raise`` 换成
+# ``pass`` 后全量 3725 条仍全绿）。删除后行为确实改变（实测，经真实入口）：
+# * 244 ``set_many`` 的「两个权重同时为零」组合校验 → **静默接受**
+#   （``(0.0, 0.0)`` 写进配置），检索时每个文档得分都是 0.0 并被分数阈值全部
+#   过滤——用户看到的是「搜不到」，而配置本身「合法」。逐条 ``__setitem__``
+#   的等价判据（``_reject_both_weights_zero``，385）有覆盖且仍然生效，但
+#   ``set_many`` 是**批量入口**、按终态判，与它不是同一条路径；
+# * 428 ``__delitem__`` → ``del cfg["top_k"]`` **静默成功**，字段数不变但
+#   配置进入「声称少一个字段、实际没少」的状态，``to_dict()`` 仍照原样导出。
+@pytest.mark.parametrize(
+    "values",
+    [
+        pytest.param({"vector_weight": 0.0, "keyword_weight": 0.0}, id="both-zero"),
+    ],
+)
+def test_set_many_rejects_terminal_state_with_both_weights_zero(session_config, values):
+    """``set_many`` 按**终态**做组合校验，两个权重同时为零必须报错。
+
+    逐条 ``__setitem__`` 的等价判据（``_reject_both_weights_zero``）已覆盖，
+    但批量入口是另一条路径：它先逐字段过单字段校验、再按终态判组合约束，
+    删掉守卫后 ``(0.0, 0.0)`` 会被写进配置。
+    """
+    with pytest.raises(ValueError, match="不能同时为 0"):
+        session_config.set_many(values)
+
+
+@pytest.mark.parametrize("field", ["top_k", "vector_weight", "chat_temperature"])
+def test_session_config_rejects_field_deletion(session_config, field):
+    """``SessionConfig`` 不支持删除字段：``del`` 必须报错而不是静默「成功」。"""
+    with pytest.raises(TypeError, match="不支持删除字段"):
+        del session_config[field]

@@ -1501,3 +1501,187 @@ def test_load_snapshot_rejects_a_non_utf8_marker(tmp_path):
 
     message = str(excinfo.value)
     assert "ACTIVE_SNAPSHOT" in message, message
+
+
+# ── 快照形态与解析判据的覆盖缺口 ──
+#
+# 下列判据在整套测试里从未执行（行覆盖 + 变异扫描双证；把它们的 ``raise`` 换成
+# ``pass`` 后全量 3725 条仍全绿）。删除后行为确实改变（实测，均经
+# ``validate_snapshot_dir`` 真实入口）：
+# * 149 快照 id 解析后不在根目录之下（符号链接环）→ **静默通过**，把「这份
+#   id 会逃出快照根」放行到后续路径拼接；
+# * 367 manifest.toml 无法解析 → **静默通过校验**，把「快照被截断」留到加载
+#   时才以别的异常暴露；
+# * 398／470／514／550 四个文件（embeddings.npy／stats.json／semantic.index／
+#   lexical.index）解析失败 → **裸 ``UnboundLocalError``**（变量未绑定），
+#   而调用方按「快照不自洽」的 ``ValueError`` 分类；
+# * 412／562 ``chunks.pkl``／``lexical.index`` 顶层非列表 → **裸 ``TypeError:
+#   object of type 'int' has no len()``**；475 ``stats.json`` 顶层非对象 →
+#   **裸 ``AttributeError: 'list' object has no attribute 'get'``；
+# * 418 ``embeddings.npy`` 非二维 → 消息退化成「分块数与向量数不一致」
+#   （一维 (4,) 报「embeddings.npy=4」），指向错误的修复方向。
+def _build_self_consistent_snapshot(root, snapshot_id="kb-shape"):
+    """造一个行数自洽的最小快照，供逐文件破坏。"""
+    import json
+
+    import faiss
+    import numpy as np
+
+    snapshot_dir = Path(root) / snapshot_id
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    manifest = KnowledgeSnapshotManifest.create(
+        snapshot_id=snapshot_id,
+        store_type="faiss",
+        embedding_provider="local-hash",
+        embedding_model="local-hash-256",
+        chunk_mode="standard",
+        source_digest="shape-digest",
+        document_count=2,
+        chunk_count=2,
+    )
+    (snapshot_dir / "manifest.toml").write_text(manifest.to_toml(), encoding="utf-8")
+    with (snapshot_dir / "chunks.pkl").open("wb") as file:
+        pickle.dump(
+            [
+                {"page_content": "a", "metadata": {"source": "a.md"}},
+                {"page_content": "b", "metadata": {"source": "b.md"}},
+            ],
+            file,
+        )
+    with (snapshot_dir / "parents.pkl").open("wb") as file:
+        pickle.dump({}, file)
+    np.save(snapshot_dir / "embeddings.npy", np.zeros((2, 4), dtype=np.float32))
+    index = faiss.IndexFlatL2(4)
+    index.add(np.zeros((2, 4), dtype=np.float32))
+    faiss.write_index(index, str(snapshot_dir / "semantic.index"))
+    (snapshot_dir / "stats.json").write_text(json.dumps({"chunk_count": 2}), encoding="utf-8")
+    with (snapshot_dir / "lexical.index").open("wb") as file:
+        pickle.dump([{"t": 1}, {"t": 2}], file)
+    return snapshot_dir
+
+
+def _restore_snapshot_files(snapshot_dir):
+    """把 _build_self_consistent_snapshot 写出的文件按原样重写（供逐条破坏后恢复）。"""
+    import json
+
+    import faiss
+    import numpy as np
+
+    with (snapshot_dir / "chunks.pkl").open("wb") as file:
+        pickle.dump(
+            [
+                {"page_content": "a", "metadata": {"source": "a.md"}},
+                {"page_content": "b", "metadata": {"source": "b.md"}},
+            ],
+            file,
+        )
+    np.save(snapshot_dir / "embeddings.npy", np.zeros((2, 4), dtype=np.float32))
+    index = faiss.IndexFlatL2(4)
+    index.add(np.zeros((2, 4), dtype=np.float32))
+    faiss.write_index(index, str(snapshot_dir / "semantic.index"))
+    (snapshot_dir / "stats.json").write_text(json.dumps({"chunk_count": 2}), encoding="utf-8")
+    with (snapshot_dir / "lexical.index").open("wb") as file:
+        pickle.dump([{"t": 1}, {"t": 2}], file)
+
+
+def test_snapshot_id_resolving_outside_root_is_rejected(run_config, tmp_path):
+    """解析后落在快照根之外的 id（符号链接环）必须报错，不能静默通过。"""
+    import os
+
+    root = Path(run_config.snapshot_root)
+    root.mkdir(parents=True, exist_ok=True)
+    os.symlink(str(root), str(root / "loop"))
+    repository = SnapshotRepository(run_config)
+
+    with pytest.raises(ValueError, match="不在快照根目录"):
+        repository._require_snapshot_id_within_root("loop", source="test")
+
+
+@pytest.mark.parametrize(
+    "corrupt_file",
+    [
+        pytest.param("manifest.toml", id="manifest-truncated"),
+        pytest.param("embeddings.npy", id="embeddings-truncated"),
+        pytest.param("stats.json", id="stats-truncated"),
+        pytest.param("semantic.index", id="semantic-truncated"),
+        pytest.param("lexical.index", id="lexical-truncated"),
+    ],
+)
+def test_validate_snapshot_dir_reports_truncated_files_as_value_error(
+    run_config,
+    corrupt_file,
+):
+    """任一文件被截断都必须报「快照不自洽」的 ``ValueError``。
+
+    删除守卫后分别是：manifest 静默通过、其余四个抛裸 ``UnboundLocalError``。
+    """
+    snapshot_dir = _build_self_consistent_snapshot(run_config.snapshot_root)
+    (snapshot_dir / corrupt_file).write_bytes(b"truncated")
+    repository = SnapshotRepository(run_config)
+
+    with pytest.raises(ValueError, match="无法解析"):
+        repository.validate_snapshot_dir(snapshot_dir)
+
+
+def _write_pickled(snapshot_dir, filename, value):
+    with (snapshot_dir / filename).open("wb") as file:
+        pickle.dump(value, file)
+
+
+@pytest.mark.parametrize(
+    "corrupt_file,writer,payload,pattern",
+    [
+        pytest.param(
+            "chunks.pkl", _write_pickled, 42, "chunks.pkl 的顶层不是列表", id="chunks-int"
+        ),
+        pytest.param(
+            "chunks.pkl", _write_pickled, {"a": 1}, "chunks.pkl 的顶层不是列表", id="chunks-dict"
+        ),
+        pytest.param(
+            "stats.json",
+            lambda d, f, v: (d / f).write_text(v, encoding="utf-8"),
+            "[2, 2]",
+            "stats.json 的顶层不是对象",
+            id="stats-list",
+        ),
+        pytest.param(
+            "lexical.index", _write_pickled, 42, "lexical.index 的顶层不是列表", id="lexical-int"
+        ),
+        pytest.param(
+            "lexical.index", _write_pickled, "ab", "lexical.index 的顶层不是列表", id="lexical-str"
+        ),
+    ],
+)
+def test_validate_snapshot_dir_rejects_wrong_top_level_shapes(
+    run_config,
+    corrupt_file,
+    writer,
+    payload,
+    pattern,
+):
+    """顶层形态错误必须报带文件名与形态的 ``ValueError``，不是裸 TypeError/AttributeError。"""
+    snapshot_dir = _build_self_consistent_snapshot(run_config.snapshot_root)
+    writer(snapshot_dir, corrupt_file, payload)
+    repository = SnapshotRepository(run_config)
+
+    with pytest.raises(ValueError, match=pattern):
+        repository.validate_snapshot_dir(snapshot_dir)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param((4,), id="one-dimensional"),
+        pytest.param((2, 2, 2), id="three-dimensional"),
+    ],
+)
+def test_validate_snapshot_dir_rejects_non_matrix_embeddings(run_config, shape):
+    """``embeddings.npy`` 非二维必须报「不是二维数组」，不能退化成行数不一致。"""
+    import numpy as np
+
+    snapshot_dir = _build_self_consistent_snapshot(run_config.snapshot_root)
+    np.save(snapshot_dir / "embeddings.npy", np.zeros(shape, dtype=np.float32))
+    repository = SnapshotRepository(run_config)
+
+    with pytest.raises(ValueError, match="不是二维数组"):
+        repository.validate_snapshot_dir(snapshot_dir)

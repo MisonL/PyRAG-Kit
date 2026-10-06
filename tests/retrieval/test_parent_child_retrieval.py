@@ -554,3 +554,64 @@ def test_validate_rerank_output_rejects_scores_beyond_double_range(score):
     """超出双精度范围的 score 必须报成 ``RuntimeError``，不是 ``OverflowError``。"""
     with pytest.raises(RuntimeError, match="超出双精度范围"):
         RetrievalService._validate_rerank_output([0], [score], document_count=2)
+
+
+# ── 向量存储接口缺失与 rerank 返回值形态的覆盖缺口 ──
+#
+# 下列判据在整套测试里从未执行（行覆盖 + 变异扫描双证；把它们的 ``raise`` 换成
+# ``pass`` 后全量 3725 条仍全绿）。删除后行为确实改变（实测，均经真实入口）：
+# * 742 ``_call_vector_store`` 的「store 未实现该接口」→ 裸
+#   ``TypeError: 'NoneType' object is not callable``（拿 ``None`` 当方法调），
+#   而调用方按 ``NotImplementedError`` 分类；
+# * 753 ``_legacy_search`` 的「store 既没有 asearch 也没有 search」→ 同样
+#   退化成裸 ``TypeError``；
+# * 1015 ``_validate_rerank_output`` 的「provider 返回不可迭代」→ 裸
+#   ``UnboundLocalError: normalized_indices``（变量未绑定）；
+# * 1045 同一函数的 ``float(score)`` 失败分支 → ``None`` 这类取值裸
+#   ``UnboundLocalError: normalized_score``。
+#
+# 既有的 ``test_validate_rerank_output_rejects_invalid_provider_results`` 覆盖
+# 的是 ``bool``／越界／重复 index 等**取值**判据，两条**形态**判据从未被反向覆盖。
+def test_call_vector_store_reports_missing_interface_readably():
+    """store 未实现该接口时必须抛 ``NotImplementedError``，不是裸 ``TypeError``。"""
+
+    class BareStore:
+        pass
+
+    service = object.__new__(RetrievalService)
+    service.vector_store = BareStore()
+
+    with pytest.raises(NotImplementedError, match="未实现 semantic_search 接口"):
+        asyncio.run(service._call_vector_store("semantic_search", None))
+
+
+def test_legacy_search_reports_missing_interface_readably():
+    """store 既无 asearch 也无 search 时必须抛 ``NotImplementedError``。"""
+
+    class BareStore:
+        pass
+
+    service = object.__new__(RetrievalService)
+    service.vector_store = BareStore()
+
+    with pytest.raises(NotImplementedError, match="未实现兼容 search 接口"):
+        asyncio.run(service._legacy_search("query", 1, "semantic"))
+
+
+def test_validate_rerank_output_rejects_non_iterable_result():
+    """provider 返回不可迭代的取值时必须抛 ``RuntimeError``，不是裸 ``UnboundLocalError``。"""
+    with pytest.raises(RuntimeError, match="必须是可迭代的索引和分数"):
+        RetrievalService._validate_rerank_output(5, 5, document_count=3)
+
+
+@pytest.mark.parametrize(
+    "bad_score",
+    [
+        pytest.param(None, id="none"),
+        pytest.param([0.5], id="list"),
+    ],
+)
+def test_validate_rerank_output_rejects_unconvertible_score(bad_score):
+    """``float(score)`` 转换失败的取值必须抛 ``RuntimeError``，不是裸 ``UnboundLocalError``。"""
+    with pytest.raises(RuntimeError, match="score 无效"):
+        RetrievalService._validate_rerank_output([0], [bad_score], document_count=3)

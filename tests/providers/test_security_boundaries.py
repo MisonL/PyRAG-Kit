@@ -842,3 +842,37 @@ def test_security_keeps_non_private_pem_and_ordinary_text(text):
     它们不是凭证，脱敏掉会让用户拿不到有用的上下文。
     """
     assert redact_sensitive_text(text) == text
+
+
+# ── 资源参数与路径形态判据的覆盖缺口 ──
+#
+# 下列判据在整套测试里从未执行（行覆盖 + 变异扫描双证；把它们的 ``raise`` 换成
+# ``pass`` 后全量 3725 条仍全绿）。删除后行为确实改变（实测，经真实入口）：
+# * 868 ``validate_secret_free_resource_args`` 的「位置参数必须是元组」→
+#   **静默接受** 字符串 ``"abc"``（字符串是合法可迭代对象，逐字符遍历后
+#   每个字符被当作一个独立参数）；
+# * 794 ``validate_secret_free_resource_kwargs`` 的「键必须是字符串」→ 消息
+#   退化成下一层的「键必须是字符串」——同样是 ``ValueError``，但不再点名
+#   ``资源参数`` 这个来源；
+# * 715 ``validate_secret_free_options`` 的「options 必须是对象」→ 裸
+#   ``TypeError: 'int' object is not iterable``（``set(5)``）。
+def test_resource_args_reject_non_tuple_sequence():
+    """位置参数必须是元组；字符串是合法可迭代对象，必须显式拒绝。"""
+    from src.utils.security import validate_secret_free_resource_args
+
+    with pytest.raises(ValueError, match="资源位置参数必须是元组"):
+        validate_secret_free_resource_args("abc", "OpenAI 资源")
+
+
+def test_resource_kwargs_reject_non_mapping():
+    """关键字参数必须是映射，不能静默接受列表。"""
+    from src.utils.security import validate_secret_free_resource_kwargs
+
+    with pytest.raises(ValueError, match="资源参数必须是对象"):
+        validate_secret_free_resource_kwargs([1], "OpenAI 资源")
+
+
+def test_options_must_be_a_mapping():
+    """``options`` 非对象必须给带 provider 名的 ``ValueError``，不是裸 ``TypeError``。"""
+    with pytest.raises(ValueError, match="options 必须是对象"):
+        validate_secret_free_options(5, "Anthropic")
