@@ -7,10 +7,12 @@
 """
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
 from src.providers.__base__.model_provider import (
+    CompletionRequest,
     StreamEvent,
     _guard_provider_resource_method,
     _responses_content_part,
@@ -461,3 +463,362 @@ def test_guard_provider_resource_method_is_idempotent():
 
     guarded = _guard_provider_resource_method(plain)
     assert _guard_provider_resource_method(guarded) is guarded
+
+
+# --- 收口批：轮询、文件内容、消息转换、异步流与流终止去重 -------------------
+
+
+def test_openai_background_poll_returns_terminal_response_without_id():
+    """终态响应没有 ``id`` 时原样返回（不进入轮询、也不需要 id）。
+
+    删除守卫后终态响应落到「缺少 id，无法轮询」的 ``RuntimeError``——网关
+    返回 ``status=completed`` 但省略 id 时，本来已完成的响应被当成错误。
+    """
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._provider = None
+    terminal = {"status": "completed"}
+    assert provider._poll_background_response(terminal, {}) is terminal
+    assert asyncio.run(provider._poll_background_response_async(terminal, {})) is terminal
+
+
+def test_openai_retrieve_file_content_uses_sdk_method_when_available():
+    """SDK 提供 ``files.retrieve_content`` 时走 SDK 资源通道。
+
+    删除守卫后直接落到 ``file_content``（SDK 无该资源时抛
+    ``NotImplementedError``），已挂载的 SDK 方法被绕过。
+    """
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._provider = None
+    calls = []
+
+    def fake_call(method, args=(), kwargs=None, operation=""):
+        calls.append(operation)
+        return "sdk-result"
+
+    async def fake_async_call(method, args=(), kwargs=None, operation=""):
+        calls.append(operation)
+        return "sdk-result"
+
+    provider._call_sdk_resource = fake_call
+    provider._call_async_sdk_resource = fake_async_call
+    provider._get_client = lambda: _files_client()
+    provider._get_aclient = _files_client
+    assert provider.retrieve_file_content("file_1") == "sdk-result"
+    assert asyncio.run(provider.async_retrieve_file_content("file_1")) == "sdk-result"
+    assert calls == ["OpenAI 文件文本读取", "OpenAI 文件文本读取"]
+
+
+def _files_client():
+    import types
+
+    return types.SimpleNamespace(
+        files=types.SimpleNamespace(retrieve_content=lambda *args, **kwargs: "sdk")
+    )
+
+
+def test_anthropic_convert_messages_skips_system_messages():
+    """``role=system`` 的消息不进入 messages（system 走独立参数）。
+
+    删除守卫后系统提示被转换成 user 消息，与 ``system`` 参数里的提示重复，
+    模型收到两份系统指令。
+    """
+    converted = AnthropicProvider._convert_messages(
+        [{"role": "system", "content": "系统提示"}, {"role": "user", "content": "hi"}]
+    )
+    assert converted == [{"role": "user", "content": "hi"}]
+
+
+def test_anthropic_async_iter_invoke_stream_skips_non_text_events():
+    """异步流同样跳过 ``ping`` 等非文本事件。
+
+    删除守卫后 ``converted.type`` 在 ``None`` 上抛裸 ``AttributeError``。
+    """
+
+    class AsyncStream:
+        def __aiter__(self):
+            async def events():
+                yield {"type": "ping"}
+                yield {
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": "你好"},
+                }
+                yield {"type": "message_stop"}
+
+            return events()
+
+    async def consume():
+        return [text async for text in AnthropicProvider._aiter_invoke_stream_text(AsyncStream())]
+
+    assert asyncio.run(consume()) == ["你好"]
+
+
+def test_google_validate_http_options_allows_none_and_none_valued_sensitive_keys():
+    """``http_options=None`` 通过校验；值为 None 的敏感键不算凭证。
+
+    删除 502 的守卫后 None 落到「必须是对象表或 HttpOptions」的
+    ``ValueError``；删除 590 的守卫后 ``{"api_key": None}`` 被判成携带凭证
+    ——None 值没有可泄露的内容，占位形态应当放行。
+    """
+    GoogleProvider._validate_http_options(None)
+    GoogleProvider._validate_http_options({"api_key": None})
+    with pytest.raises(ValueError, match="不允许包含凭证"):
+        GoogleProvider._validate_http_options({"api_key": "sk-1"})
+
+
+def test_ark_normalize_verified_protocols_none_returns_empty_set():
+    """Ark 的 ``server_verified_protocols`` 未配置时返回空集。
+
+    删除守卫后 None 落到「必须是字符串或协议序列」的 ``ValueError``。
+    """
+    assert VolcengineProvider._normalize_verified_protocols(None) == frozenset()
+
+
+def _responses_stream_client(events):
+    import types
+
+    class Responses:
+        def create(self, **request):
+            return iter(events)
+
+    return types.SimpleNamespace(responses=Responses())
+
+
+def test_openai_responses_stream_ignores_events_after_terminal():
+    """``response.completed`` 之后的事件被跳过（流排空阶段不重复发 finish）。
+
+    删除守卫后重复的终止事件会再次转换成 finish 事件——SDK 排空阶段重复
+    送达的终止块让调用方收到两个 finish。
+    """
+    import types
+
+    terminal = types.SimpleNamespace(
+        type="response.completed", response=types.SimpleNamespace(status="completed")
+    )
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "m"
+    provider._provider = "openai"
+    provider._protocol = "responses"
+    provider._options = {"server_verified_protocols": ["responses"]}
+    provider._get_client = lambda: _responses_stream_client([terminal, terminal])
+    events = list(provider.stream_events(CompletionRequest(prompt="hi")))
+    assert [event.type for event in events].count("finish") == 1
+
+
+def test_ark_responses_stream_ignores_events_after_terminal():
+    """Ark 的 Responses 流同样跳过终止后的事件。"""
+    import types
+
+    terminal = types.SimpleNamespace(
+        type="response.completed", response=types.SimpleNamespace(status="completed")
+    )
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "m"
+    provider._provider = "volcengine"
+    provider._protocol = "responses"
+    provider._options = {"server_verified_protocols": ["responses"]}
+    provider._get_client = lambda: _responses_stream_client([terminal, terminal])
+    events = list(provider.stream_events(CompletionRequest(prompt="hi")))
+    assert [event.type for event in events].count("finish") == 1
+
+
+def test_anthropic_async_stream_deduplicates_finish_events():
+    """异步流的 message_delta(finish) 与 message_stop 只产生一个 finish。
+
+    删除守卫后两个事件各转换一次 finish，调用方收到重复的终止事件。
+    """
+
+    class AsyncStreamManager:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def __aiter__(self):
+            async def events():
+                yield SimpleNamespace(
+                    type="message_delta",
+                    delta=SimpleNamespace(stop_reason="end_turn"),
+                    usage=SimpleNamespace(output_tokens=1),
+                )
+                yield SimpleNamespace(type="message_stop")
+
+            return events()
+
+    provider = object.__new__(AnthropicProvider)
+    provider._model_name = "claude-test"
+    provider._options = {}
+    provider._get_aclient = lambda: SimpleNamespace(
+        messages=SimpleNamespace(stream=lambda **_kwargs: AsyncStreamManager())
+    )
+
+    async def consume():
+        return [event async for event in provider.astream_events(CompletionRequest(prompt="hello"))]
+
+    events = asyncio.run(consume())
+    assert [event.type for event in events].count("finish") == 1
+
+
+def test_google_stream_deduplicates_completed_tool_calls():
+    """同一工具调用的完成事件只交付一次（重复块被跳过）。
+
+    删除守卫后重复的 function_call 块再次交付 ``tool_call_completed``——
+    同一轮工具调用被执行两次。
+    """
+    import types
+
+    function_call = types.SimpleNamespace(
+        id="call-1", name="lookup", args='{"id":1}', will_continue=False
+    )
+    chunk = types.SimpleNamespace(
+        response_id="response-1",
+        candidates=[
+            types.SimpleNamespace(
+                content=types.SimpleNamespace(
+                    parts=[types.SimpleNamespace(function_call=function_call)]
+                ),
+                finish_reason=None,
+            )
+        ],
+    )
+    provider = object.__new__(GoogleProvider)
+    provider._model_name = "gemini"
+    provider._options = {}
+    terminal = types.SimpleNamespace(
+        response_id="response-1",
+        candidates=[
+            types.SimpleNamespace(content=types.SimpleNamespace(parts=[]), finish_reason="STOP")
+        ],
+    )
+    provider._get_client = lambda: types.SimpleNamespace(
+        models=types.SimpleNamespace(
+            generate_content_stream=lambda **_kwargs: iter([chunk, chunk, terminal])
+        )
+    )
+    events = list(provider.stream_events(CompletionRequest(prompt="hi")))
+    completed = [event for event in events if event.type == "tool_call_completed"]
+    assert len(completed) == 1
+
+
+def _async_responses_client(events):
+    import types
+
+    class Stream:
+        def __init__(self):
+            self._events = iter(events)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._events)
+            except StopIteration as exc:
+                raise StopAsyncIteration from exc
+
+        async def close(self):
+            return None
+
+    class Responses:
+        async def create(self, **_request):
+            return Stream()
+
+    return types.SimpleNamespace(responses=Responses())
+
+
+def test_openai_async_responses_stream_ignores_events_after_terminal():
+    """异步流的终止后事件同样被跳过。"""
+    import types
+
+    terminal = types.SimpleNamespace(
+        type="response.completed", response=types.SimpleNamespace(status="completed")
+    )
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "m"
+    provider._provider = "openai"
+    provider._protocol = "responses"
+    provider._options = {"server_verified_protocols": ["responses"]}
+    provider._get_aclient = lambda: _async_responses_client([terminal, terminal])
+
+    async def consume():
+        return [event async for event in provider.astream_events(CompletionRequest(prompt="hi"))]
+
+    events = asyncio.run(consume())
+    assert [event.type for event in events].count("finish") == 1
+
+
+def test_ark_async_responses_stream_ignores_events_after_terminal():
+    """Ark 异步流的终止后事件同样被跳过。"""
+    import types
+
+    terminal = types.SimpleNamespace(
+        type="response.completed", response=types.SimpleNamespace(status="completed")
+    )
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "m"
+    provider._provider = "volcengine"
+    provider._protocol = "responses"
+    provider._options = {"server_verified_protocols": ["responses"]}
+    provider._get_aclient = lambda: _async_responses_client([terminal, terminal])
+
+    async def consume():
+        return [event async for event in provider.astream_events(CompletionRequest(prompt="hi"))]
+
+    events = asyncio.run(consume())
+    assert [event.type for event in events].count("finish") == 1
+
+
+def test_google_async_stream_deduplicates_completed_tool_calls():
+    """Google 异步流同样只交付一次工具调用完成事件。"""
+    import types
+
+    function_call = types.SimpleNamespace(
+        id="call-1", name="lookup", args='{"id":1}', will_continue=False
+    )
+    chunk = types.SimpleNamespace(
+        response_id="response-1",
+        candidates=[
+            types.SimpleNamespace(
+                content=types.SimpleNamespace(
+                    parts=[types.SimpleNamespace(function_call=function_call)]
+                ),
+                finish_reason=None,
+            )
+        ],
+    )
+    terminal = types.SimpleNamespace(
+        response_id="response-1",
+        candidates=[
+            types.SimpleNamespace(content=types.SimpleNamespace(parts=[]), finish_reason="STOP")
+        ],
+    )
+
+    class AsyncStream:
+        def __init__(self):
+            self._events = iter([chunk, chunk, terminal])
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._events)
+            except StopIteration as exc:
+                raise StopAsyncIteration from exc
+
+    provider = object.__new__(GoogleProvider)
+    provider._model_name = "gemini"
+    provider._provider = "google"
+    provider._options = {}
+    aio = types.SimpleNamespace(
+        models=types.SimpleNamespace(generate_content_stream=lambda **_kwargs: AsyncStream())
+    )
+    provider._client = types.SimpleNamespace(aio=aio)
+    provider._get_aclient = lambda: provider._client
+
+    async def consume():
+        return [event async for event in provider.astream_events(CompletionRequest(prompt="hi"))]
+
+    events = asyncio.run(consume())
+    completed = [event for event in events if event.type == "tool_call_completed"]
+    assert len(completed) == 1

@@ -281,3 +281,194 @@ def test_local_hash_normalize_zero_vector_is_returned_unchanged():
     """
     assert normalize_vector([0.0, 0.0, 0.0]) == [0.0, 0.0, 0.0]
     assert normalize_vector([3.0, 4.0]) == [0.6, 0.8]
+
+
+# --- 收口批：检索、配置校验器、快照与 UI -----------------------------------
+
+
+def test_faiss_resolve_parent_content_tolerates_none_valued_entries():
+    """``parent_documents`` 中的 None 值条目返回 None 而不是崩溃。
+
+    删除守卫后 ``None.get("content")`` 抛裸 ``AttributeError``——载入期
+    归一化只保证 dict 形态，外部写入或旧快照可能留下 None 值。
+    """
+    store = object.__new__(FaissStore)
+    store.parent_documents = {"k1": {"content": "父块正文"}, "k2": None}
+    assert store.resolve_parent_content("k1") == "父块正文"
+    assert store.resolve_parent_content("k2") is None
+    assert store.resolve_parent_content("missing") is None
+    assert store.resolve_parent_content("") is None
+
+
+def test_resource_proxy_children_cache_short_circuits_getattr():
+    """``_children`` 中已缓存的子资源直接返回，不落到被包装对象上。
+
+    删除守卫后 ``__getattr__`` 绕过缓存走 ``getattr(self._value, name)``——
+    缓存项（如占位包装）被真实属性覆盖，甚至在被包装对象没有该属性时抛
+    ``AttributeError``。
+    """
+    from src.providers import resources as resources_module
+
+    class Inner:
+        pass
+
+    class FakeProvider:
+        pass
+
+    proxy = resources_module._NativeResourceProxy(Inner(), FakeProvider(), "p")
+    proxy._children["x"] = "cached"
+    assert proxy.x == "cached"
+
+
+def test_choice_default_returns_active_value_when_present():
+    """激活项在候选集合里时返回它本身。
+
+    删除守卫后始终返回 None——questionary 的默认选中项丢失，菜单回落到
+    未作答状态。
+    """
+    from src.ui.config_menu import _choice_default
+
+    class Choice:
+        def __init__(self, value):
+            self.value = value
+
+    assert _choice_default([Choice("a"), Choice("b")], "b") == "b"
+    assert _choice_default([Choice("a")], "z") is None
+
+
+def test_model_detail_validate_options_none_returns_empty_mapping():
+    """``options=None`` 归一成空字典而不是抛错。
+
+    删除守卫后 None 落到「必须是 TOML 表或字典」的 ``ValueError``——未配置
+    options 的模型条目无法构造。
+    """
+    import types
+
+    from src.utils.config import ModelDetail
+
+    info = types.SimpleNamespace(data={"provider": "openai"}, field_name="options")
+    validator = ModelDetail.__pydantic_decorators__.field_validators["validate_options"].func
+    assert validator(None, info) == {}
+    assert validator({"temperature": 1}, info) == {"temperature": 1}
+
+
+def test_validate_retrieval_method_maps_member_names_and_values_to_enum():
+    """成员名（``HYBRID_SEARCH``）与取值（``混合检索``）都归一成枚举。
+
+    删除 1161 的守卫后成员名形态原样返回字符串；删除 1165 的守卫后取值
+    形态原样返回字符串——下游按枚举比较时静默失配。
+    """
+    from src.utils.config import RetrievalMethod, Settings
+
+    validator = Settings.__pydantic_decorators__.field_validators["validate_retrieval_method"].func
+    assert validator("HYBRID_SEARCH") is RetrievalMethod.HYBRID_SEARCH
+    assert validator("混合检索") is RetrievalMethod.HYBRID_SEARCH
+    assert validator(RetrievalMethod.HYBRID_SEARCH) is RetrievalMethod.HYBRID_SEARCH
+
+
+def test_snapshot_repository_empty_marker_returns_none():
+    """``ACTIVE_SNAPSHOT`` 为空时返回 None（未激活），而不是抛校验错误。
+
+    删除守卫后空标记落到「快照 id 不合法」的 ``ValueError``——首次构建前的
+    空标记文件让启动流程以校验错误收场。
+    """
+    import types
+
+    from src.retrieval.snapshot_repository import SnapshotRepository
+
+    root = tmp_path_factory_dir()
+    marker = root / "ACTIVE_SNAPSHOT"
+    repository = object.__new__(SnapshotRepository)
+    repository.run_config = types.SimpleNamespace(active_snapshot_marker=marker)
+    marker.write_text("")
+    assert repository.get_active_snapshot_id() is None
+
+
+def tmp_path_factory_dir():
+    import pathlib
+    import tempfile
+
+    return pathlib.Path(tempfile.mkdtemp())
+
+
+def test_get_vector_store_method_excludes_base_stub():
+    """只有基类桩实现的方法返回 None（未实现），真实覆写返回方法。
+
+    删除守卫后基类桩也被当成已实现，调用方拿到 ``NotImplementedError`` 桩
+    而不是走回退路径。
+    """
+    from src.retrieval.vdb.base import VectorStoreBase
+    from src.services.retrieval_service import RetrievalService
+
+    class Full(VectorStoreBase):
+        def add_documents(self, *args, **kwargs):
+            return None
+
+        def aadd_documents(self, *args, **kwargs):
+            return None
+
+        def search(self, *args, **kwargs):
+            return []
+
+        async def asearch(self, *args, **kwargs):
+            return []
+
+        def get_embedding_model(self, *args, **kwargs):
+            return None
+
+        def load(self, *args, **kwargs):
+            return None
+
+        def save(self, *args, **kwargs):
+            return None
+
+    service = object.__new__(RetrievalService)
+    stub = Full()
+    Full.semantic_search = VectorStoreBase.semantic_search
+    service.vector_store = stub
+    assert service._get_vector_store_method("semantic_search") is None
+
+    class Impl:
+        def semantic_search(self, query, top_k):
+            return []
+
+    service.vector_store = Impl()
+    assert service._get_vector_store_method("semantic_search") is not None
+
+
+def test_legacy_search_prefers_async_search_implementation():
+    """向量存储提供 ``asearch`` 时走异步实现，不回退到同步 ``search``。
+
+    删除守卫后异步实现被跳过，直接找 ``search``——只有 ``asearch`` 的
+    存储抛 ``NotImplementedError``。
+    """
+    from src.services.retrieval_service import RetrievalService
+
+    class AsyncSearcher:
+        async def asearch(self, query, top_k, search_type=None):
+            return ["async"]
+
+    service = object.__new__(RetrievalService)
+    service.vector_store = AsyncSearcher()
+    assert asyncio.run(service._legacy_search("q", 1, "semantic")) == ["async"]
+
+
+def test_aclose_closes_duplicate_provider_once():
+    """异步关闭时同一 provider 对象在多个槽位中只关一次。
+
+    删除守卫后按槽位逐个 ``aclose``，同一对象被关闭两次。
+    """
+
+    class AsyncProvider:
+        def __init__(self):
+            self.closed = 0
+
+        async def aclose(self):
+            self.closed += 1
+
+    service = object.__new__(RetrievalService)
+    provider = AsyncProvider()
+    service._rerank_providers = {"a": provider, "b": provider}
+    service.embedding_service = None
+    asyncio.run(service.aclose())
+    assert provider.closed == 1
