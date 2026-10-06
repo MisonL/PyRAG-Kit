@@ -717,3 +717,22 @@ def test_get_provider_class_reports_import_failures_readably(module, class_name,
 
     message = str(excinfo.value)
     assert module in message or class_name in message
+
+
+# ── `get_llm_provider` 的 `except` 末尾裸 `raise` ──
+#
+# `get_llm_provider` 的 `except Exception` 块在记日志之后以裸 `raise` 重抛。这条
+# 判据在整套测试里从未执行（行覆盖 + 变异扫描双证；把它换成 `pass` 后全量 3698
+# 条仍全绿）。删除后行为确实改变（实测）：`_create_provider` 抛出的异常被
+# **静默吞掉**，`get_llm_provider` 返回 `None`——调用方拿到 `None` 当 provider 用，
+# 崩在更远处；而三个兄弟 getter（`get_embedding_provider`／`get_rerank_provider`）
+# 的同一条重抛都已被覆盖，只有这一条没有（sibling 缺口）。
+#
+# 用真实入口：`provider` 填一个 `_provider_map` 里没有的名字，`_create_provider`
+# 会抛带指引的 `ValueError`，本条判据负责让它继续向上传播。
+def test_get_llm_provider_propagates_creation_failure():
+    """`_create_provider` 失败时 `get_llm_provider` 必须向上抛，不能返回 `None`。"""
+    configurations = {"k": ModelDetail(provider="nonexistent", model_name="m")}
+
+    with pytest.raises(ValueError, match="不支持的模型提供商"):
+        ModelProviderFactory.get_llm_provider("k", configurations)

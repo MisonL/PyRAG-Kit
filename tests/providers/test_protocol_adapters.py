@@ -5385,3 +5385,182 @@ def test_google_close_reports_first_error(async_mode):
             asyncio.run(provider.aclose())
         else:
             provider.close()
+
+
+# ── anthropic / model_provider / resources / local_hash 的覆盖缺口 ──
+#
+# 下列判据在整套测试里从未执行（行覆盖 + 变异扫描双证；把它们的 ``raise`` 换成
+# ``pass`` 后全量 3698 条仍全绿）。删除后行为确实改变（实测，均经真实入口）：
+# * anthropic 192 构造期缺 ``ANTHROPIC_API_KEY`` → **静默构造**出无凭证的
+#   provider（``logger.error`` 已打，但对象照样返回给调用方）；
+# * anthropic 279 ``supports_sampling_option`` 收到未知字段 → **静默返回
+#   ``False``**，把「这个字段名本身是非法的」说成「这个模型不支持该字段」；
+#   调用方（``chat_service._temperature_kwargs``／``chat.core``）只按真假值
+#   分支，于是非法字段名被静默吞掉；
+# * anthropic 2204 ``aclose`` 首个关闭异常 → **静默吞掉**（同步 ``close``
+#   有覆盖，异步侧没有——sibling 缺口）；
+# * anthropic 1419 流错误事件（``type`` 以 ``.error`` 结尾但**无** ``error``
+#   子对象，如 ``overloaded.error``）→ ``raise_for_stream_error_event`` 不拦
+#   这一形态，本条是唯一的报错点；删除后该事件被**静默返回 None**，错误信号
+#   在流里消失；
+# * model_provider 1126／1143 Responses 的 ``tool_calls`` 容器／元素形态 →
+#   上游 ``normalize_messages``（466／470 行）先以同族消息拦住，两条不可达
+#   （等价变异，见下）；
+# * resources 236 ``_delegated_resource`` SDK 抛 ``AttributeError`` →
+#   **裸 ``UnboundLocalError``**（``value`` 未绑定）；240 资源值为 ``None`` →
+#   **静默返回 None**，调用方拿 None 当资源用、在更远处才崩；
+# * resources 282 dunder 探针 → 经真实入口仍以 ``AttributeError`` 收场
+#   （等价变异，见下）；
+# * local_hash 87 Embedding 请求参数 → **静默接受**并原样丢弃。
+#
+# 同批经甄别不补测试的：model_provider 1771／1785（tenacity 的 ``reraise=True``
+# 保证重试耗尽时抛原异常，末尾两条 ``RuntimeError`` 不可达）、2155（``client_getter()``
+# 返回 None 时随即被下游以同一条消息拦住）、anthropic 335（三条同消息判据中的
+# 第一条：bool／非数值落到 337 的 ``is_double_convertible``，收场同一条消息）、
+# resources 282（``__getattr__`` 里的 dunder 探针：本函数的三条 ``AttributeError``
+# 消息逐字相同，删除任一条仍以同一条消息收场）。
+
+
+def _anthropic_provider_with_settings(monkeypatch, **settings):
+    """经真实 ``__init__`` 构造 AnthropicProvider。
+
+    不能用字符串形式 ``monkeypatch.setattr("src.providers.anthropic.get_settings", ...)``：
+    ``tests/providers/test_factory.py`` 会把该模块从 ``sys.modules`` 删掉再重新导入，
+    字符串形式解析到的是**新**模块，而 ``__init__`` 仍从**旧**模块字典取
+    ``get_settings``——patch 静默落空。单跑本文件不触发，只有全量运行才暴露。
+    """
+    monkeypatch.setitem(
+        AnthropicProvider.__init__.__globals__,
+        "get_settings",
+        lambda: SimpleNamespace(**settings),
+    )
+    return AnthropicProvider("claude-sonnet-4-6")
+
+
+def test_anthropic_constructor_requires_api_key(monkeypatch):
+    """缺 API Key 必须在构造期拒绝，不能静默构造出无凭证的 provider。"""
+    with pytest.raises(ValueError, match="ANTHROPIC_API_KEY is required"):
+        _anthropic_provider_with_settings(monkeypatch, anthropic_api_key=None)
+
+
+def test_anthropic_supports_sampling_option_rejects_unknown_field(monkeypatch):
+    """未知采样字段名必须报错，不能静默返回 ``False``。
+
+    ``False`` 与「模型不支持该字段」在调用方（``chat_service._temperature_kwargs``）
+    那里无法区分——非法字段名会被静默吞掉。
+    """
+    provider = _anthropic_provider_with_settings(monkeypatch, anthropic_api_key="k")
+
+    with pytest.raises(ValueError, match="不支持的采样字段: bogus"):
+        provider.supports_sampling_option("bogus")
+
+
+def test_anthropic_aclose_reports_first_error():
+    """``aclose`` 首个关闭异常必须向上报告，不能静默吞掉。
+
+    与同步 ``close`` 对称：Google／Volcengine 的两个入口都有覆盖，Anthropic
+    只有同步侧。
+    """
+
+    class _BadClose:
+        def close(self):
+            raise RuntimeError("close 失败")
+
+    provider = object.__new__(AnthropicProvider)
+    provider._client = _BadClose()
+    provider._aclient = None
+
+    with pytest.raises(RuntimeError, match="close 失败"):
+        asyncio.run(provider.aclose())
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        pytest.param({"type": "overloaded.error"}, id="suffix-only"),
+        pytest.param({"type": "rate_limit_error.error"}, id="dotted"),
+    ],
+    ids=lambda e: e["type"],
+)
+def test_anthropic_stream_error_event_without_embedded_error_is_reported(event):
+    """``type`` 以 ``.error`` 结尾的流事件必须报错，不能静默返回 ``None``。
+
+    这类事件**没有** ``error`` 子对象，``raise_for_stream_error_event`` 按
+    ``embedded_error is None`` 放行——本条是该形态唯一的报错点。删除后错误信号
+    在流里消失：调用方继续消费后续事件，把半截响应当成完整答案。
+    """
+    with pytest.raises(RuntimeError, match="流返回错误"):
+        AnthropicProvider._stream_event(event, "rid")
+
+
+def _resources_facade(**client_attrs):
+    from src.providers import resources as resources_module
+
+    provider = SimpleNamespace(
+        _provider="openai",
+        sdk_client=SimpleNamespace(**client_attrs),
+    )
+    return resources_module.OpenAIResources(provider)
+
+
+def test_resources_delegated_resource_reports_missing_sdk_resource():
+    """SDK 没有该资源节点时必须报 ``NotImplementedError``，不是裸 ``UnboundLocalError``。"""
+    facade = _resources_facade()
+
+    with pytest.raises(NotImplementedError, match="SDK 未提供 beta 资源"):
+        facade._delegated_resource("beta")
+
+
+def test_resources_delegated_resource_rejects_none_resource():
+    """资源节点存在但为 ``None`` 时必须报错，不能静默返回 ``None``。"""
+    facade = _resources_facade(beta=None)
+
+    with pytest.raises(NotImplementedError, match="SDK 未提供 beta 资源"):
+        facade._delegated_resource("beta")
+
+
+def test_resources_native_facade_proxies_present_resource():
+    """反向守卫：真实存在的资源照常代理。"""
+    facade = _resources_facade(beta=SimpleNamespace(create=lambda **kw: kw))
+
+    assert facade._delegated_resource("beta") is not None
+
+
+def test_resources_native_getattr_rejects_none_resource():
+    """``__getattr__`` 的动态资源为 ``None`` 时必须 ``AttributeError``，不能返回 ``None``。
+
+    与 ``_delegated_resource`` 是两条独立路径：本函数在 dunder 探针、非原生渠道
+    之后还有一道「值为 ``None``」的判据，删除后 ``getattr(facade, name)`` 返回
+    ``None``——调用方按属性访问的惯例会继续用，崩在更远处。
+    """
+    facade = _resources_facade(some_resource=None)
+
+    with pytest.raises(AttributeError, match="some_resource"):
+        _ = facade.some_resource
+
+
+def test_resources_native_facade_dunder_probe_is_rejected_before_delegation():
+    """dunder 探针必须在触达 SDK 之前被拒，否则 ``deepcopy`` 会无限递归。
+
+    ``copy``／``pickle`` 的协议在重建对象时会先 ``hasattr(y, '__setstate__')``
+    之类地探测 dunder——此时新实例的属性还没填充，``__getattr__`` 里的
+    ``self.provider`` 本身又走 ``__getattr__``，没有这道判据就无限递归
+    （实测删掉守卫后 ``copy.deepcopy(facade)`` 抛 ``RecursionError``）。
+    """
+    import copy
+
+    facade = _resources_facade(beta="REAL")
+
+    copied = copy.deepcopy(facade)
+
+    assert type(copied) is type(facade)
+
+
+def test_local_hash_embedding_rejects_unsupported_kwargs():
+    """LocalHash Embedding 的请求参数必须报错，不能静默接受并丢弃。"""
+    from src.providers.local_hash import LocalHashEmbeddingProvider
+
+    provider = LocalHashEmbeddingProvider("local-hash-32")
+
+    with pytest.raises(ValueError, match="不支持请求参数: bogus"):
+        provider.embed_documents(["文本"], bogus=1)

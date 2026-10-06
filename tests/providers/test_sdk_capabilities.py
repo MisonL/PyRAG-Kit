@@ -10573,3 +10573,114 @@ def test_volcengine_close_reports_first_error(async_mode):
             asyncio.run(provider.aclose())
         else:
             provider.close()
+
+
+# ── OpenAICompatibleProvider Responses 扩展字段重复 / close 的覆盖缺口 ──
+#
+# 下列判据在整套测试里从未执行（行覆盖 + 变异扫描双证；把它们的 ``raise`` 换成
+# ``pass`` 后全量 3698 条仍全绿）。删除后行为确实改变（实测，经
+# ``_build_responses_request`` 真实入口）：
+# * 1415 ``options.stop``／``options.seed`` 与 ``extra_body`` 重复 → 消息从
+#   「Responses options.X 与 extra_body 重复」退化成下游
+#   ``_merge_extra_body`` 的「模型 options 的扩展字段重复」：同一个重复被报两次，
+#   但**点名的是合并器而不是字段来源**，调用方按消息定位要改的地方会改错；
+# * 1553 ``options.reasoning_effort`` 与 ``extra_body.reasoning`` 重复 → 消息
+#   退化成「extra_body 不允许覆盖请求字段: reasoning」，把「两个来源配了同一个
+#   意图」说成「extra_body 越权覆盖请求字段」；
+# * 5678／5699 ``close``／``aclose`` 首个关闭异常 → **静默吞掉**（Google 与
+#   Volcengine 的两个入口都有覆盖，OpenAI 兼容渠道没有——sibling 缺口）。
+def _responses_provider(**options):
+    provider = _openai_compatible_provider(**options)
+    provider._server_verified_protocols = frozenset({"responses"})
+    return provider
+
+
+@pytest.mark.parametrize("field,value", [("stop", ["x"]), ("seed", 7)])
+def test_openai_compatible_responses_rejects_option_duplicated_in_extra_body(field, value):
+    """``options`` 的 stop／seed 与 ``extra_body`` 重复时必须点名是哪个字段重复。
+
+    只覆盖 ``configured_options`` 那一半：``_compat_extra_options()`` 里的
+    ``top_k``／``repetition_penalty`` 走的是下游 ``_merge_extra_body``，报的是
+    「模型 options 的扩展字段重复」，与本条不是同一判据。
+    """
+    provider = _responses_provider(**{field: value, "extra_body": {field: "other"}})
+
+    with pytest.raises(ValueError, match=rf"Responses options\.{field} 与 extra_body 重复"):
+        provider._build_responses_request(prompt="hi")
+
+
+def test_openai_compatible_responses_rejects_reasoning_effort_duplicated_in_extra_body():
+    """``reasoning_effort`` 与 ``extra_body.reasoning`` 重复时必须点名来源。"""
+    provider = _responses_provider(
+        reasoning_effort="high", extra_body={"reasoning": {"effort": "low"}}
+    )
+
+    with pytest.raises(
+        ValueError, match="Responses reasoning_effort 与模型 options.extra_body 重复"
+    ):
+        provider._build_responses_request(prompt="hi")
+
+
+class _BadOpenAIClose:
+    def close(self):
+        raise RuntimeError("close 失败")
+
+
+@pytest.mark.parametrize("method_name", ["close", "aclose"])
+def test_openai_compatible_close_reports_first_error(method_name):
+    """``close``／``aclose`` 首个关闭异常必须向上报告，不能静默吞掉。"""
+    provider = _openai_compatible_provider()
+    provider._client = _BadOpenAIClose() if method_name == "close" else None
+    provider._aclient = _BadOpenAIClose() if method_name == "aclose" else None
+
+    with pytest.raises(RuntimeError, match="close 失败"):
+        result = getattr(provider, method_name)()
+        if method_name == "aclose":
+            asyncio.run(result)
+
+
+# ── VolcengineProvider Ark SDK 缺失时的报错形态 ──
+#
+# ``_load_ark_clients`` 在导入失败时抛带指引的 ``RuntimeError``。这条判据在整套
+# 测试里从未执行（行覆盖 + 变异扫描双证；把 ``raise`` 换成 ``pass`` 后全量 3698
+# 条仍全绿）——SDK 在开发机与 CI 上都已安装，这条分支只在缺依赖的部署里走到。
+# 删除后行为确实改变（实测）：``Ark`` 未绑定，收场从
+# ``RuntimeError: 未安装 volcengine-python-sdk[ark]...`` 变成裸
+# ``UnboundLocalError: cannot access local variable 'Ark'``——调用方按
+# ``RuntimeError`` 分类，接不住。
+class _ArkSdkImportBlocker:
+    """拦截 ``volcenginesdkarkruntime`` 顶层包的导入。"""
+
+    _TARGET = "volcenginesdkarkruntime"
+
+    def find_spec(self, name, path=None, target=None):
+        if name == self._TARGET:
+            raise ImportError(f"No module named {name!r}")
+
+
+def _with_blocked_ark_sdk_import(call):
+    # 同 ``_with_blocked_classification_import``：先逐出缓存再装拦截器，否则
+    # ``from volcenginesdkarkruntime import ...`` 直接命中 ``sys.modules``、
+    # 拦截器形同虚设。顶层包与全部子模块都要逐出——``from X import Y`` 命中
+    # 缓存时走的是 ``X`` 本身。
+    target = _ArkSdkImportBlocker._TARGET
+    cached = {
+        name: sys.modules.pop(name)
+        for name in list(sys.modules)
+        if name == target or name.startswith(target + ".")
+    }
+    blocker = _ArkSdkImportBlocker()
+    sys.meta_path.insert(0, blocker)
+    try:
+        return call()
+    finally:
+        sys.meta_path.remove(blocker)
+        sys.modules.update(cached)
+
+
+def test_volcengine_ark_sdk_missing_reports_readably():
+    """缺 Ark SDK 时必须报带安装指引的 ``RuntimeError``，不是裸 ``UnboundLocalError``。"""
+    import src.providers.volcengine as volcengine_module
+
+    with pytest.raises(RuntimeError, match=r"未安装 volcengine-python-sdk\[ark\]"):
+        _with_blocked_ark_sdk_import(volcengine_module._load_ark_clients)

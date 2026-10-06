@@ -442,3 +442,90 @@ def test_rerank_response_must_be_json_object(provider_type, monkeypatch):
         ):
             with pytest.raises(RuntimeError, match="响应必须是 JSON 对象"):
                 run(provider)
+
+
+# ── 构造期与 payload 构造的覆盖缺口（Jina / SiliconFlow 兄弟对） ──
+#
+# 下列判据在整套测试里从未执行（行覆盖 + 变异扫描双证；把它们的 ``raise`` 换成
+# ``pass`` 后全量 3698 条仍全绿）。删除后行为确实改变（实测，均经真实入口）：
+# * 61／51 ``options`` 含未知字段 → **静默构造**出带未知字段的 provider，
+#   非法配置一路带进请求体；
+# * 66／58 缺 ``JINA_API_KEY``／``SILICONFLOW_API_KEY`` → **静默构造**出无
+#   凭证的 provider，请求发出时才 401；
+# * 61（SiliconFlow）缺 ``SILICONFLOW_BASE_URL`` → **静默构造**，``_base_url``
+#   落成 ``None``；
+# * 96／90 ``options`` 与 ``options.extra_body`` 重复 → **静默产出** payload，
+#   其中一个取值被无声丢弃（``truncate`` 被 extra_body 覆盖）；
+# * 101／96 ``options.extra_body`` 覆盖请求字段 → **静默产出**
+#   ``payload["model"]="hijack"``，把请求的模型整个换掉。
+#
+# 构造期判据必须经真实 ``__init__`` 才能覆盖，而 ``tests/providers/test_factory.py``
+# 会从 ``sys.modules`` 删除这两个模块再重新导入——字符串形式的 ``monkeypatch``
+# 会打到**新**模块，本文件顶层绑定的仍是**旧**类。因此与
+# ``test_sdk_capabilities.py`` 的 anthropic 助手同法：把 ``get_settings`` 打到
+# 类自己的 ``__init__.__globals__`` 上。
+def _rerank_settings_patch(provider_type, monkeypatch, **settings):
+    monkeypatch.setitem(
+        provider_type.__init__.__globals__, "get_settings", lambda: SimpleNamespace(**settings)
+    )
+
+
+_RERANK_SETTINGS = {
+    JinaProvider: {"jina_api_key": "k"},
+    SiliconflowRerankProvider: {"siliconflow_api_key": "k", "siliconflow_base_url": "https://x/v1"},
+}
+
+
+@pytest.mark.parametrize("provider_type", [JinaProvider, SiliconflowRerankProvider])
+def test_rerank_constructor_rejects_unknown_option_field(provider_type, monkeypatch):
+    """``options`` 里的未知字段必须在构造期拒绝，不能静默带进请求体。"""
+    _rerank_settings_patch(provider_type, monkeypatch, **_RERANK_SETTINGS[provider_type])
+
+    with pytest.raises(ValueError, match="包含不支持的字段: bogus_field"):
+        provider_type("m", {"bogus_field": 1})
+
+
+@pytest.mark.parametrize("provider_type", [JinaProvider, SiliconflowRerankProvider])
+def test_rerank_constructor_requires_api_key(provider_type, monkeypatch):
+    """缺 API Key 必须在构造期拒绝，不能静默构造出无凭证的 provider。"""
+    settings = dict(_RERANK_SETTINGS[provider_type])
+    settings["jina_api_key" if provider_type is JinaProvider else "siliconflow_api_key"] = None
+    _rerank_settings_patch(provider_type, monkeypatch, **settings)
+
+    with pytest.raises(ValueError, match="API_KEY is required"):
+        provider_type("m")
+
+
+def test_siliconflow_constructor_requires_base_url(monkeypatch):
+    """缺 ``SILICONFLOW_BASE_URL`` 必须在构造期拒绝（Jina 的 base_url 硬编码，无此判据）。"""
+    _rerank_settings_patch(
+        SiliconflowRerankProvider,
+        monkeypatch,
+        siliconflow_api_key="k",
+        siliconflow_base_url=None,
+    )
+
+    with pytest.raises(ValueError, match="SILICONFLOW_BASE_URL is required"):
+        SiliconflowRerankProvider("m")
+
+
+@pytest.mark.parametrize("provider_type", [JinaProvider, SiliconflowRerankProvider])
+def test_rerank_rejects_option_duplicated_in_extra_body(provider_type):
+    """``options`` 与 ``options.extra_body`` 重复时必须报错，不能静默丢弃其中一个。"""
+    provider = object.__new__(provider_type)
+    provider._model_name = "m"
+    provider._options = {"truncate": True, "extra_body": {"truncate": False}}
+
+    with pytest.raises(ValueError, match="与 options.extra_body 重复: truncate"):
+        provider._prepare_payload("q", ["d"], 1)
+
+
+@pytest.mark.parametrize("provider_type", [JinaProvider, SiliconflowRerankProvider])
+def test_rerank_rejects_extra_body_override_of_request_field(provider_type):
+    """``options.extra_body`` 覆盖请求字段时必须报错，不能静默换掉 ``model``。"""
+    provider = object.__new__(provider_type)
+    provider._model_name = "m"
+    provider._options = {"extra_body": {"model": "hijack"}}
+
+    with pytest.raises(ValueError, match="extra_body 不允许覆盖请求字段: model"):
+        provider._prepare_payload("q", ["d"], 1)
