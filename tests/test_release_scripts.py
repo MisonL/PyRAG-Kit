@@ -409,3 +409,84 @@ def test_registered_provider_modules_have_no_static_import_path():
         hits = [line for line in result.stdout.splitlines() if "factory.py" not in line]
         assert not hits, f"{module} 出现了静态导入，HIDDEN_IMPORTS 不再是它唯一的发现途径: {hits}"
     assert re.search(r"importlib\.import_module", Path("src/providers/factory.py").read_text())
+
+
+# ── 发布脚本四条判据的覆盖缺口 ──
+#
+# 下列判据在整套测试里从未执行（行覆盖 + 变异扫描双证；把它们的 ``raise`` 换成
+# ``pass`` 后全量 3790 条仍全绿）。删除后行为确实改变（实测，均经真实入口）：
+# * 102 未知发布目标 → ``expected is None`` 后解包，抛裸
+#   ``TypeError: cannot unpack non-iterable NoneType object``；
+# * 295 联网下载 BPE 失败 → **静默返回 None**，随后 ``sha256(None)`` 在更远处
+#   抛 ``TypeError``，与「构建环境无外网」这个真实原因无关；
+# * 377 自检输出不含 "smoke test ok" → 消息退化成「自报版本与 pyproject.toml
+#   的 1.4.0 不一致」——把「自检根本没跑通」说成「版本号写错了」，指向完全
+#   错误的排查方向；
+# * 383 自检输出带**错误版本号** → **静默通过**，旧版本产物冒充新版本发布。
+def test_validate_target_environment_rejects_unknown_target():
+    """未知发布目标必须报 ``ValueError``，不是解包 None 的裸 ``TypeError``。"""
+    with pytest.raises(ValueError, match="不支持的发布目标"):
+        validate_target_environment("bogus-target")
+
+
+def test_download_tiktoken_blob_reports_network_failure(monkeypatch):
+    """联网下载失败必须报带上下文的 ``RuntimeError``，不能静默返回 None。"""
+    import urllib.error
+    import urllib.request
+
+    from scripts.build_binary_release import _download_tiktoken_blob
+
+    def failing_urlopen(*args, **kwargs):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(urllib.request, "urlopen", failing_urlopen)
+
+    with pytest.raises(RuntimeError, match="无法获取 cl100k_base"):
+        _download_tiktoken_blob()
+
+
+def test_validate_bundle_reports_missing_smoke_marker(monkeypatch, tmp_path):
+    """自检输出不含 "smoke test ok" 时必须点名这一条，不能报成版本不一致。"""
+    bundle_root = tmp_path / "bundle"
+    app_dir = bundle_root / "PyRAG-Kit"
+    app_dir.mkdir(parents=True)
+    executable = app_dir / "PyRAG-Kit"
+    executable.write_text("", encoding="utf-8")
+
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(command, 0, stdout="some other output\n", stderr="")
+
+    monkeypatch.setattr("scripts.build_binary_release.subprocess.run", fake_run)
+
+    with pytest.raises(RuntimeError, match="自检输出不符合预期"):
+        validate_bundle(bundle_root)
+
+
+def test_validate_bundle_rejects_mismatched_version(monkeypatch, tmp_path):
+    """自检输出带错误版本号时必须拒绝，不能静默放行。"""
+    bundle_root = tmp_path / "bundle"
+    app_dir = bundle_root / "PyRAG-Kit"
+    app_dir.mkdir(parents=True)
+    executable = app_dir / "PyRAG-Kit"
+    executable.write_text("", encoding="utf-8")
+
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(
+            command, 0, stdout="PyRAG-Kit 0.0.1-wrong smoke test ok\n", stderr=""
+        )
+
+    monkeypatch.setattr("scripts.build_binary_release.subprocess.run", fake_run)
+
+    with pytest.raises(RuntimeError, match="自报版本与 pyproject.toml"):
+        validate_bundle(bundle_root)
+
+
+def test_extract_section_reports_missing_version():
+    """请求的版本不在 CHANGELOG 中时必须报 ``ValueError``。
+
+    删除守卫后 ``start_index`` 保持 ``None``，切片 ``lines[None:end]`` 会
+    **静默返回整份 CHANGELOG 的开头**——发布说明里出现「更新日志」总标题与
+    Unreleased 段，看起来像一份正常的文件。
+    """
+    with pytest.raises(ValueError, match="未找到版本"):
+        extract_section("99.99.99")

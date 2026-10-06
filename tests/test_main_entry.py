@@ -306,3 +306,31 @@ def test_smoke_test_asserts_every_provider_module_is_importable():
 
     # 断言这条守卫确实覆盖了注册表里的每个模块，而不是只挑了几个
     assert len(ModelProviderFactory._provider_map) >= 13
+
+
+# ── 回归：分片器自检必须校验产出非空 ──
+#
+# ``_assert_splitter_encoding_available`` 是 ``--smoke-test`` 用来确认 tiktoken
+# 编码在冻结环境里可用的守卫。原实现只调 ``splitter.split(...)`` 并丢弃返回值：
+# 编码缺失导致分片器静默产出空列表时，自检照样报 "smoke test ok"，构建脚本据
+# 此放行发布包。删除 ``if not chunks: raise`` 后全量 3790 条仍全绿（变异扫描
+# 确认），因此补这条反向用例。
+
+
+def test_splitter_self_check_rejects_empty_chunks(monkeypatch):
+    """分片器产出空列表时自检必须报错，而不是静默通过。"""
+    import src.etl.splitters.recursive_text_splitter as splitter_module
+
+    class EmptySplitter:
+        def split(self, documents):
+            return []
+
+    monkeypatch.setattr(splitter_module, "RecursiveTextSplitter", EmptySplitter)
+
+    with pytest.raises(RuntimeError, match="分片器自检未产出任何分片"):
+        main._assert_splitter_encoding_available()
+
+
+def test_splitter_self_check_passes_in_real_environment():
+    """正常环境下真实分片器必须产出分片（守卫的绿色一侧）。"""
+    main._assert_splitter_encoding_available()
