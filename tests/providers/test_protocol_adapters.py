@@ -198,6 +198,20 @@ def test_anthropic_rejects_malformed_tool_choices(tool_choice):
         AnthropicProvider._convert_tool_choice(tool_choice)
 
 
+def test_anthropic_unknown_tool_choice_string_names_the_value():
+    """未知字符串必须点名取值，不能退化成通用兜底消息。
+
+    删除守卫后 ``"bogus"`` 落到最后一条通用 ``ValueError``——它不再包含出错的
+    取值，排查时无法分辨是「值不认识」还是「形态写错了」。变异扫描证实该守卫
+    在整套测试里没有反向覆盖（删掉后全量仍绿）。
+    """
+    with pytest.raises(ValueError, match=r"不支持 tool_choice: bogus"):
+        AnthropicProvider._convert_tool_choice("bogus")
+
+    # 合法取值不受影响
+    assert AnthropicProvider._convert_tool_choice("auto") == {"type": "auto"}
+
+
 # `_convert_tools` 与 `_convert_tool_choice` 各有四条以上判据，上面两条用例只
 # 覆盖了其中一部分：`test_anthropic_rejects_malformed_tool_definitions` 覆盖
 # 「元素非对象」「function 非对象」「parameters 非对象」，但工具**缺 name** 与
@@ -641,7 +655,13 @@ def test_google_tool_call_message_with_null_content_does_not_emit_text():
 
 
 def test_google_rejects_malformed_function_tool_choice():
-    with pytest.raises(ValueError, match="function.name"):
+    """缺 name 必须是带指引的 ``ValueError``，不能退化成 pydantic ``ValidationError``。
+
+    ``match`` 必须钉住「缺少」前缀：删除守卫后落进 pydantic 校验，其消息里的
+    ``allowed_function_names`` 恰好满足宽松正则 ``function.name``（``.`` 匹配
+    ``_``），旧断言在变异后仍然变绿——变异扫描证实过这一盲区。
+    """
+    with pytest.raises(ValueError, match="缺少 function.name"):
         GoogleProvider._convert_tool_choice({"type": "function", "function": {}})
 
 

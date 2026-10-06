@@ -668,6 +668,18 @@ def test_require_token_count_reports_malformed_values(value, label):
     assert "total_tokens" in message, label
 
 
+def test_require_token_count_none_reports_missing_field():
+    """``None`` 是「字段缺失」，不是「值不是整数」——两者指向不同的排查方向。
+
+    删除首条守卫后 ``None`` 落进 else 分支，消息变成「不是整数（NoneType）」：
+    丢了「响应里根本没有这个字段」这一语义，调用方会去查值损坏而不是查网关
+    响应形状。既有参数化用例对 ``None`` 只匹配 provider 与字段名，两条消息都
+    含它们，变异后仍然变绿（变异扫描证实），必须钉住「缺少」前缀。
+    """
+    with pytest.raises(RuntimeError, match="Test token count 响应缺少 total_tokens"):
+        require_token_count(None, "Test", "total_tokens")
+
+
 @pytest.mark.parametrize(
     "value,expected",
     [(0, 0), (12, 12), (12.0, 12), ("12", 12), ("0", 0)],

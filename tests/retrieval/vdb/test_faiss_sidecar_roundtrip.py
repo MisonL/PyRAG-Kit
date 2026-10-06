@@ -1289,6 +1289,24 @@ def test_load_rejects_string_trusted_paths_instead_of_splitting_it(tmp_path):
         FaissStore(file_path=None).load(str(legacy), trusted_paths=str(tmp_path))
 
 
+def test_ensure_trusted_source_rejects_non_path_element_in_mixed_roots(tmp_path):
+    """信任根列表含非路径元素时必须整组拒绝，不能静默跳过该元素。
+
+    ``Path(root)`` 对 ``5``／``None`` 抛裸 ``TypeError``，守卫本应把它收敛成带
+    label 的 ``ValueError``（「受信来源必须是路径，但得到 int」）。删除守卫后
+    ``except TypeError`` 变成空跳过：``[tmp_path, 5]`` 里坏元素被无声丢弃、好
+    元素照常生效，**静默通过**（变异扫描 + 实测）——配置写错了一半，信任边界
+    却看似成立，直到运行方以为「整组根都校验过」。
+    """
+    from src.utils.security import ensure_trusted_source
+
+    with pytest.raises(ValueError, match="受信来源必须是路径，但得到 int"):
+        ensure_trusted_source(tmp_path / "snapshot", [tmp_path, 5], label="快照目录")
+
+    # 收紧不能误伤：全部元素合法时照常工作
+    assert ensure_trusted_source(tmp_path / "snapshot", [tmp_path], label="快照目录") is not None
+
+
 # ── 回归：``ensure_trusted_source`` 的 ``trusted_roots`` 非可迭代时要给可读异常 ──
 #
 # 该函数已显式排除 ``str``／``bytes``／``bytearray``（它们是可迭代但会被逐字符

@@ -148,6 +148,32 @@ def test_validate_snapshot_dir_rejects_chunk_embedding_row_mismatch(tmp_path):
         repository.validate_snapshot_dir(snapshot_dir)
 
 
+def test_validate_snapshot_dir_rejects_embedding_row_gap_when_index_aligned(tmp_path):
+    """``embeddings`` 行数与分块数不一致、索引却对齐时必须拒绝。
+
+    既有 ``row_mismatch`` 用例的 ``semantic.index`` 与 ``embeddings`` 同步缺行，
+    删除 422 的行数判据后由下游 516 的「向量索引条数与分块数不一致」兜住，
+    用例仍然变绿——变异扫描证实 422 因此在整套测试里存活。本用例把索引行数
+    固定为与分块一致（``index_rows=chunk_count``），让 422 成为唯一防线：
+    删除后**静默通过**（实测），行数不一致的快照被 finalize 成活动快照，此后
+    ``semantic_search`` 拿 ``indices`` 去索引 ``self.documents`` 才会越界。
+    """
+    from src.retrieval.snapshot_repository import SnapshotRepository
+    from src.utils.config import get_settings
+
+    repository = SnapshotRepository(build_run_config(get_settings()))
+    snapshot_dir = _write_row_counts_snapshot(
+        repository.root,
+        "kb-gap-embedding-rows",
+        chunk_count=3,
+        embedding_rows=2,
+        index_rows=3,
+    )
+
+    with pytest.raises(ValueError, match="分块数与向量数不一致"):
+        repository.validate_snapshot_dir(snapshot_dir)
+
+
 def test_validate_snapshot_dir_rejects_stats_chunk_count_mismatch(tmp_path):
     """``stats.json`` 声明的 chunk_count 与实际分块数不符也必须拒绝。"""
     from src.retrieval.snapshot_repository import SnapshotRepository

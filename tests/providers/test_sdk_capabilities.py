@@ -3862,11 +3862,19 @@ def test_anthropic_extra_body_sampling_conflicts_are_explicit():
 
 
 def test_anthropic_beta_tool_runner_rejects_unsupported_compaction_control():
+    """不支持的 ``compaction_control`` 必须报「SDK 不支持」，不能误报成参数混用。
+
+    删除守卫后 ``compaction_control`` 被透传给 ``coerce_completion_request``，
+    消息变成「不能同时传 request 和关键字参数」（或「SDK 参数不匹配」）——把
+    「Beta tool_runner 不支持这个能力」说成「你调用的方式不对」，用户改调用形态
+    也解决不了。旧断言只匹配 ``compaction_control`` 子串，两条消息都含它，变异
+    后仍然变绿（变异扫描证实），必须钉住「当前 SDK 不支持」前缀。
+    """
     provider = object.__new__(AnthropicProvider)
     provider._model_name = "claude"
     provider._options = {}
 
-    with pytest.raises(ValueError, match="compaction_control"):
+    with pytest.raises(ValueError, match="当前 SDK 不支持 compaction_control"):
         provider.beta_tool_runner([], prompt="hi", compaction_control={"enabled": True})
 
 
@@ -3883,11 +3891,19 @@ def test_anthropic_output_format_follows_create_and_stream_sdk_shapes():
 
 
 def test_anthropic_beta_create_rejects_output_format():
+    """Beta 入口必须报 Beta 的消息，不能退化成下游普通 ``create`` 的指引。
+
+    删除 ``beta_create`` 的前置守卫后落到 ``_build_message_params`` 里的判据，
+    消息变成「Anthropic Messages.create 不支持 output_format；请使用 parse 或
+    stream。」——指引指向的 ``beta_parse``/``beta_stream`` 被换成普通入口，用户
+    按提示改会再次撞墙。变异扫描证实宽松的 ``match="create 不支持"`` 在变异后
+    仍然变绿（两条消息都含该子串）。
+    """
     provider = object.__new__(AnthropicProvider)
     provider._model_name = "claude"
     provider._options = {}
 
-    with pytest.raises(ValueError, match="create 不支持 output_format"):
+    with pytest.raises(ValueError, match=r"Beta Messages\.create 不支持 output_format"):
         provider.beta_create(CompletionRequest(prompt="hi", output_format={"type": "json_schema"}))
 
 
@@ -3904,7 +3920,9 @@ def test_anthropic_async_beta_create_rejects_output_format_before_sdk_call():
 
     provider._get_aclient = lambda: SimpleNamespace(beta=SimpleNamespace(messages=Messages()))
 
-    with pytest.raises(ValueError, match="create 不支持 output_format"):
+    # 异步侧是**另一处**守卫（async_beta_create 各自判一次），必须单独钉住 Beta
+    # 消息：同步用例打不到这里，删除后同样退化成下游普通 ``create`` 的指引。
+    with pytest.raises(ValueError, match=r"Beta Messages\.create 不支持 output_format"):
         asyncio.run(
             provider.async_beta_create(
                 CompletionRequest(prompt="hi", output_format={"type": "json_schema"})
@@ -4374,6 +4392,28 @@ def test_dynamic_native_resource_proxy_rejects_sensitive_positional_arguments():
     ):
         with pytest.raises(ValueError, match="位置参数.*凭证"):
             provider.resources.responses.connect(*args)
+
+
+def test_call_sdk_resource_contracts_signature_mismatch_to_valueerror():
+    """签名 ``bind`` 失败必须收敛成带渠道名的 ``ValueError``，不能透出裸 ``TypeError``。
+
+    删除守卫后未知关键字参数直接打到 ``method(...)``，抛的是裸
+    ``TypeError: ... unexpected keyword argument``——与本模块承诺的
+    「SDK 参数不匹配」错误分类不一致。变异扫描证实该守卫经
+    ``_call_sdk_resource`` 真实转发路径没有反向覆盖。
+    """
+
+    def method(a, b):
+        return a, b
+
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._provider = "openai"
+
+    with pytest.raises(ValueError, match=r"chat\.create SDK 参数不匹配: "):
+        provider._call_sdk_resource(method, (), {"zzz": 1}, "chat.create")
+
+    # 收紧不能误伤：签名匹配的调用照常转发
+    assert provider._call_sdk_resource(method, (), {"a": 1, "b": 2}, "chat.create") == (1, 2)
 
 
 def test_direct_openai_resource_call_rejects_sensitive_positional_arguments():
@@ -10471,6 +10511,18 @@ def test_ark_responses_incomplete_status_is_rejected():
         )
 
 
+def test_ark_responses_cancelled_status_is_rejected():
+    """状态 ``cancelled`` 必须报错，不能静默返回 None。
+
+    删除守卫后 ``status == "cancelled"`` 的响应不再抛错，调用方把「请求已取消」
+    当成成功响应继续用（``_raise_for_response_error`` 静默返回 ``None``）。
+    变异扫描证实该守卫在整套测试里没有反向覆盖（既有 ``cancelled`` 用例打的是
+    流式事件路径 ``_responses_stream_event``，不是本函数）。
+    """
+    with pytest.raises(RuntimeError, match="已取消"):
+        VolcengineProvider._raise_for_response_error({"status": "cancelled"})
+
+
 def test_ark_responses_incomplete_reason_with_huge_int_reports_readably():
     """``incomplete`` 原因是大整数时消息不得抛位数超限的 ``ValueError``。"""
     with pytest.raises(RuntimeError) as excinfo:
@@ -10619,6 +10671,22 @@ def test_openai_compatible_responses_rejects_reasoning_effort_duplicated_in_extr
         ValueError, match="Responses reasoning_effort 与模型 options.extra_body 重复"
     ):
         provider._build_responses_request(prompt="hi")
+
+
+def test_openai_responses_rejects_reasoning_duplicating_model_extra_body():
+    """显式 ``reasoning`` 与 ``extra_body.reasoning`` 重复时必须点名来源。
+
+    ``_build_chat_request`` 的同名判据早有覆盖，但 Responses 路径（1549）是
+    **另一处**独立判据，变异扫描证实它在整套测试里存活：删除后消息退化成
+    ``_validated_extra_body`` 的「不允许覆盖请求字段: reasoning」——只说
+    「冲突」，不再指出冲突的是「模型 options 里的 extra_body」，用户不知道该
+    去改配置文件还是改调用参数。同函数 1553 的 ``reasoning_effort`` 分支已有
+    用例钉住（变异后变红），本条补对称的 ``reasoning`` 分支。
+    """
+    provider = _responses_provider(extra_body={"reasoning": {"effort": "low"}})
+
+    with pytest.raises(ValueError, match="Responses reasoning 与模型 options.extra_body 重复"):
+        provider._build_responses_request(prompt="hi", reasoning={"effort": "high"})
 
 
 class _BadOpenAIClose:
