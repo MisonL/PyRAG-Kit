@@ -472,3 +472,55 @@ def test_aclose_closes_duplicate_provider_once():
     service.embedding_service = None
     asyncio.run(service.aclose())
     assert provider.closed == 1
+
+
+def test_run_retrieval_test_skips_empty_query(monkeypatch):
+    """空查询被跳过，不进入检索。
+
+    删除守卫后空串会传给 ``retrieve``——交互循环里回车即触发一次无意义
+    检索（或错误）。
+    """
+    from src.retrieval_test import core as retrieval_core
+
+    calls = []
+
+    class FakePromptSession:
+        def __init__(self, responses):
+            self._responses = iter(responses)
+
+        async def prompt_async(self, *_args, **_kwargs):
+            return next(self._responses)
+
+    class RecordingService:
+        def __init__(self, *_args, **_kwargs):
+            return None
+
+        async def retrieve(self, query, *_args, **_kwargs):
+            calls.append(query)
+            return []
+
+    monkeypatch.setattr(retrieval_core, "PromptSession", lambda: FakePromptSession(["", "/quit"]))
+    monkeypatch.setattr(retrieval_core, "RetrievalService", RecordingService)
+    monkeypatch.setattr(retrieval_core, "EmbeddingService", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        retrieval_core.VectorStoreFactory, "get_default_vector_store", lambda: object()
+    )
+    monkeypatch.setattr(retrieval_core, "ExcelLogger", lambda: None)
+    asyncio.run(retrieval_core.run_retrieval_test_async())
+    assert calls == []
+
+
+def test_aclose_quietly_returns_without_closable_service(caplog):
+    """服务没有 ``aclose``/``close`` 时安静返回，不产生警告。
+
+    删除守卫后 ``close()`` 在 None 上抛 ``TypeError``，虽被外层 except 吞掉，
+    但会多打一条「释放检索服务失败」警告——「没有可关闭资源」不是失败，
+    警告会误导排查。
+    """
+    import logging
+
+    from src.retrieval_test.core import _aclose_quietly
+
+    with caplog.at_level(logging.WARNING, logger="src.retrieval_test.core"):
+        asyncio.run(_aclose_quietly(object()))
+    assert "释放检索服务失败" not in caplog.text
