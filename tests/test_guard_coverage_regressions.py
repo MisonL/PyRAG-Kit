@@ -8,6 +8,7 @@
 import asyncio
 
 import numpy as np
+import pytest
 
 from src.providers.local_hash import _normalize as normalize_vector
 from src.retrieval.vdb.faiss_store import FaissStore
@@ -524,3 +525,394 @@ def test_aclose_quietly_returns_without_closable_service(caplog):
     with caplog.at_level(logging.WARNING, logger="src.retrieval_test.core"):
         asyncio.run(_aclose_quietly(object()))
     assert "释放检索服务失败" not in caplog.text
+
+
+# --- 收口批：吞掉型 except 的静默降级契约 ----------------------------------
+
+
+def test_copy_nested_falls_back_when_model_copy_fails():
+    """``model_copy`` 抛错时回退到 deepcopy，而不是把异常放出去。
+
+    ``_copy_nested`` 的契约是「拿到一份副本，绝不因复制失败中断调用方」。
+    删除两处吞掉后，``model_copy``/``deepcopy`` 的异常都会冒泡。
+    """
+
+    from src.utils.security import _copy_nested
+
+    class BadModelCopy:
+        def __init__(self):
+            self.x = 1
+
+        def model_copy(self, **kwargs):
+            raise RuntimeError("model_copy 失败")
+
+    copied = _copy_nested(BadModelCopy())
+    assert copied is not None
+
+    class BadDeepcopy:
+        def __deepcopy__(self, memo):
+            raise RuntimeError("deepcopy 失败")
+
+    obj = BadDeepcopy()
+    assert _copy_nested(obj) is obj
+
+
+def test_model_dump_mapping_retries_without_kwargs_and_fails_open():
+    """``model_dump`` 的三种失败形态都收敛为「读不到」。
+
+    * 不接受 ``exclude_none`` 关键字 → 无参重试（实测 SDK 旧版本）；
+    * 无参重试也抛错 → 返回 None（fail-open，见 docstring）；
+    * 首次调用抛非 ``TypeError`` → 同样返回 None。
+    """
+
+    from src.utils.security import _model_dump_mapping
+
+    class NoKwargs:
+        def model_dump(self, **kwargs):
+            if kwargs:
+                raise TypeError("不接受参数")
+            return {"a": 1}
+
+    assert _model_dump_mapping(NoKwargs()) == {"a": 1}
+
+    class AlwaysBoom:
+        def model_dump(self, **kwargs):
+            if kwargs:
+                raise TypeError("不接受参数")
+            raise RuntimeError("无参也崩")
+
+    assert _model_dump_mapping(AlwaysBoom()) is None
+
+    class Boom:
+        def model_dump(self, **kwargs):
+            raise RuntimeError("dump 崩")
+
+    assert _model_dump_mapping(Boom()) is None
+
+
+def test_require_retrieval_method_reports_guidance_for_broken_value_attribute():
+    """取值属性抛错的输入落到带指引的 ``ValueError``，而不是把原异常放出去。
+
+    删除吞掉后 ``Weird.value`` 的 ``RuntimeError`` 直接冒泡——调用方拿到
+    的是与配置校验无关的异常。
+    """
+
+    from src.utils.config import require_retrieval_method
+
+    class Weird:
+        @property
+        def value(self):
+            raise RuntimeError("取值失败")
+
+    with pytest.raises(ValueError, match="retrieval_method 必须是"):
+        require_retrieval_method(Weird())
+
+
+def test_get_relative_path_returns_input_for_empty_string():
+    """空字符串路径原样返回而不是抛 ``ValueError``。
+
+    删除吞掉后 ``Path("").relative_to`` 的 ``ValueError: no path specified``
+    冒泡——展示层因一条空路径整表渲染失败。
+    """
+
+    from src.ui.display_utils import get_relative_path
+
+    assert get_relative_path("") == ""
+
+
+def test_get_chat_logger_degrades_to_console_when_log_dir_unusable(caplog):
+    """日志目录不可写时降级为仅控制台并告警一次，不中断启动。
+
+    删除吞掉后 ``_build_rotating_handler`` 的 ``OSError`` 冒泡——日志目录
+    指向一个已存在的普通文件时，查询直接崩在日志初始化。
+    """
+    import logging
+
+    from src.utils import log_manager
+
+    blocked_dir = tmp_path_factory_dir() / "blocked"
+    blocked_dir.write_text("我是文件不是目录")
+
+    class FakeSettings:
+        log_path = str(blocked_dir)
+        log_level = "INFO"
+
+    original = log_manager.get_settings
+    log_manager.get_settings = lambda: FakeSettings()
+    # chat_logger 是模块级单例：别的用例可能已经给它配置过 handlers，
+    # 而配置分支只在「还没有 handler」时执行。先清空再断言。
+    chat_logger = logging.getLogger("chat_logger")
+    saved_handlers = chat_logger.handlers
+    chat_logger.handlers = []
+    try:
+        with caplog.at_level(logging.WARNING, logger="src.utils.log_manager"):
+            logger = log_manager.get_chat_logger()
+        assert logger.name == "chat_logger"
+        assert "无法写入日志目录" in caplog.text
+    finally:
+        for handler in logger.handlers:
+            if handler not in saved_handlers:
+                handler.close()
+        chat_logger.handlers = saved_handlers
+        log_manager.get_settings = original
+
+
+def test_cleanup_old_logs_continues_when_one_file_cannot_be_removed(caplog):
+    """单个旧日志删除失败只记日志、继续清理，不让异常打断退出钩子。
+
+    删除吞掉后 ``os.remove`` 的 ``PermissionError`` 冒泡——退出路径以
+    裸 traceback 终止。
+    """
+    import logging
+    import os
+
+    from src.utils import log_manager
+
+    log_dir = tmp_path_factory_dir()
+    old = log_dir / "app_log_2020-01-01.log"
+    old.write_text("x")
+    fresh = log_dir / "app_log_2026-10-07.log"
+    fresh.write_text("y")
+    os.chmod(old, 0o500)
+    os.chmod(log_dir, 0o500)
+
+    class FakeSettings:
+        log_path = str(log_dir)
+        log_retention_days = 1
+        log_level = "INFO"
+
+    original = log_manager.get_settings
+    log_manager.get_settings = lambda: FakeSettings()
+    try:
+        with caplog.at_level(logging.ERROR, logger="src.utils.log_manager"):
+            log_manager.cleanup_old_logs()
+        assert "清理日志文件" in caplog.text
+    finally:
+        log_manager.get_settings = original
+        os.chmod(log_dir, 0o700)
+
+
+def test_reject_unsafe_cache_dir_skips_unresolvable_protected_paths():
+    """``protected_paths`` 里的链接环被跳过，其余项仍参与判定。
+
+    删除吞掉后 ``Path.resolve()`` 的 ``RuntimeError: Symlink loop`` 冒泡——
+    而本函数在 atexit 里被调用，异常让清理完全没做。
+    """
+    import pathlib
+
+    from src.utils.cleanup import _reject_unsafe_cache_dir
+
+    root = tmp_path_factory_dir()
+    loop = root / "loop"
+    loop.symlink_to(loop)
+    cache_dir = root / "cache"
+    cache_dir.mkdir()
+    reason = _reject_unsafe_cache_dir(str(cache_dir), [loop, pathlib.Path(cache_dir)])
+    assert reason is not None and "覆盖了应用自身路径" in reason
+
+
+def test_rerank_provider_fingerprint_falls_back_for_unserializable_options(monkeypatch):
+    """``options`` 含超大整数时回退到 ``_stable_fingerprint`` 而不是崩溃。
+
+    ``json.dumps`` 对 ``10**4301`` 抛 ``ValueError``（整数位数上限）；
+    删除吞掉后每次检索都在构造缓存键处崩。
+    """
+    from types import SimpleNamespace
+
+    from src.services.retrieval_service import RetrievalService
+
+    service = object.__new__(RetrievalService)
+    service._rerank_providers = {}
+    sentinel = object()
+    monkeypatch.setattr(
+        "src.services.retrieval_service.ModelProviderFactory.get_rerank_provider",
+        lambda *_args, **_kwargs: sentinel,
+    )
+    detail = SimpleNamespace(provider="jina", model_name="m", options={"x": 10**4301})
+    provider = service._get_rerank_provider("k", {"k": detail})
+    assert provider is sentinel
+
+
+def test_run_retrieval_test_reports_excel_logger_failure_and_continues(monkeypatch):
+    """ExcelLogger 初始化失败时打印提示并继续运行。
+
+    删除吞掉后初始化异常冒泡——召回测试（唯一产出是 Excel 日志）直接退出，
+    用户不知道记录没有落盘。
+    """
+    from src.retrieval_test import core as retrieval_core
+
+    printed = []
+
+    class FakePromptSession:
+        def __init__(self, responses):
+            self._responses = iter(responses)
+
+        async def prompt_async(self, *_args, **_kwargs):
+            return next(self._responses)
+
+    class BoomLogger:
+        def __init__(self):
+            raise RuntimeError("初始化失败")
+
+    monkeypatch.setattr(retrieval_core, "PromptSession", lambda: FakePromptSession(["/quit"]))
+    monkeypatch.setattr(retrieval_core, "ExcelLogger", BoomLogger)
+    monkeypatch.setattr(retrieval_core, "RetrievalService", lambda *_a, **_k: object())
+    monkeypatch.setattr(retrieval_core, "EmbeddingService", lambda *_a, **_k: object())
+    monkeypatch.setattr(
+        retrieval_core.VectorStoreFactory, "get_default_vector_store", lambda: object()
+    )
+    monkeypatch.setattr(retrieval_core.console, "print", lambda *a, **k: printed.append(str(a)))
+    asyncio.run(retrieval_core.run_retrieval_test_async())
+    assert any("Excel 日志初始化失败" in message for message in printed)
+
+
+def test_run_retrieval_test_reports_database_load_failure(monkeypatch):
+    """数据库加载失败时打印提示并返回，不抛异常。
+
+    删除吞掉后初始化异常冒泡——用户拿到裸 traceback 而不是可读的失败原因。
+    """
+    from src.retrieval_test import core as retrieval_core
+
+    printed = []
+
+    def boom():
+        raise RuntimeError("加载失败")
+
+    monkeypatch.setattr(retrieval_core, "PromptSession", lambda: object())
+    monkeypatch.setattr(retrieval_core, "ExcelLogger", lambda: None)
+    monkeypatch.setattr(retrieval_core.VectorStoreFactory, "get_default_vector_store", boom)
+    monkeypatch.setattr(retrieval_core.console, "print", lambda *a, **k: printed.append(str(a)))
+    asyncio.run(retrieval_core.run_retrieval_test_async())
+    assert any("数据库加载失败" in message for message in printed)
+
+
+def test_run_retrieval_test_breaks_on_keyboard_interrupt(monkeypatch):
+    """交互循环里 Ctrl-C 干净退出，不作为异常抛出。
+
+    删除吞掉后 ``KeyboardInterrupt`` 冒泡——退出交互模式变成一次崩溃。
+    """
+    from src.retrieval_test import core as retrieval_core
+
+    class InterruptingSession:
+        async def prompt_async(self, *_args, **_kwargs):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(retrieval_core, "PromptSession", InterruptingSession)
+    monkeypatch.setattr(retrieval_core, "ExcelLogger", lambda: None)
+    monkeypatch.setattr(retrieval_core, "RetrievalService", lambda *_a, **_k: object())
+    monkeypatch.setattr(retrieval_core, "EmbeddingService", lambda *_a, **_k: object())
+    monkeypatch.setattr(
+        retrieval_core.VectorStoreFactory, "get_default_vector_store", lambda: object()
+    )
+    asyncio.run(retrieval_core.run_retrieval_test_async())
+
+
+def test_excel_logger_reports_original_error_when_placeholder_cleanup_fails(caplog, monkeypatch):
+    """构造失败时：占位文件回收失败只记日志，抛出的仍是**原始**失败。
+
+    删除吞掉后回收占位文件的 ``OSError`` 顶替原始失败——用户看到的失败
+    原因与实际不符。
+    """
+    import logging
+
+    from src.retrieval_test import excel_logger
+
+    class BoomWorkbook:
+        def __init__(self):
+            raise RuntimeError("工作簿构造失败")
+
+    log_dir = tmp_path_factory_dir()
+    placeholder_dir = log_dir / "placeholder.xlsx"
+    placeholder_dir.mkdir()
+
+    monkeypatch.setattr(
+        excel_logger.ExcelLogger,
+        "_reserve_log_path",
+        staticmethod(lambda *_a, **_k: placeholder_dir),
+    )
+    monkeypatch.setattr(excel_logger, "Workbook", BoomWorkbook)
+    with (
+        caplog.at_level(logging.DEBUG, logger="src.retrieval_test.excel_logger"),
+        pytest.raises(RuntimeError, match="工作簿构造失败"),
+    ):
+        excel_logger.ExcelLogger(log_dir=str(log_dir))
+    assert "回收占位日志文件失败" in caplog.text
+
+
+def test_reject_unsafe_cache_dir_treats_unresolvable_home_as_absent():
+    """``Path.home()`` 不可得时视为「没有家目录」而不是让函数整体崩溃。
+
+    删除吞掉后 ``RuntimeError`` 冒泡——本函数在 atexit 里被调用，异常让
+    清理完全没做。
+    """
+    import pathlib
+
+    from src.utils.cleanup import _reject_unsafe_cache_dir
+
+    cache_dir = tmp_path_factory_dir() / "cache"
+    cache_dir.mkdir()
+
+    original_home = pathlib.Path.home
+
+    def boom():
+        raise RuntimeError("无家目录")
+
+    pathlib.Path.home = staticmethod(boom)
+    try:
+        assert _reject_unsafe_cache_dir(str(cache_dir)) is None
+    finally:
+        pathlib.Path.home = original_home
+
+
+def test_aclose_quietly_logs_and_swallows_close_failure(caplog):
+    """关闭失败只记警告，不让异常打断退出流程。
+
+    删除吞掉后 ``aclose`` 的异常冒泡——退出清理路径上的失败变成了崩溃。
+    """
+    import logging
+
+    from src.retrieval_test.core import _aclose_quietly
+
+    class Bad:
+        async def aclose(self):
+            raise RuntimeError("关闭失败")
+
+    with caplog.at_level(logging.WARNING, logger="src.retrieval_test.core"):
+        asyncio.run(_aclose_quietly(Bad()))
+    assert "释放检索服务失败" in caplog.text
+
+
+def test_excel_logger_log_results_swallows_save_failure(caplog):
+    """写 Excel 失败只记日志，不打断召回循环。
+
+    删除吞掉后 ``log_results`` 抛 ``FileNotFoundError``——一次写盘失败让
+    整个召回测试退出，已展示的结果全部丢失。
+    """
+    import logging
+
+    from src.retrieval_test import excel_logger
+
+    log_dir = tmp_path_factory_dir()
+    logger = excel_logger.ExcelLogger(str(log_dir))
+    logger.filepath = log_dir / "no-such-dir" / "x.xlsx"
+    with caplog.at_level(logging.ERROR, logger="src.retrieval_test.excel_logger"):
+        logger.log_results("q", [{"content": "c", "source": "s", "score": 1.0}])
+    assert "保存 Excel 日志文件失败" in caplog.text
+
+
+def test_capability_report_returns_none_for_missing_sdk_package(monkeypatch):
+    """SDK 包未安装时 version 报 None，报告本身照常生成。
+
+    删除吞掉后 ``PackageNotFoundError`` 冒泡——能力报告对任何未安装可选
+    依赖的渠道直接失败。
+    """
+    from importlib import metadata
+
+    from src.providers.factory import ModelProviderFactory
+
+    def boom(name):
+        raise metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr("src.providers.factory.package_version", boom)
+    report = ModelProviderFactory.capability_report("google", "llm")
+    assert report["sdk"]["version"] is None

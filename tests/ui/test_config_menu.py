@@ -536,3 +536,43 @@ def test_fusion_default_keeps_normalized_value(monkeypatch):
     config_menu.edit_retrieval_params(chat_config)
 
     assert seen == ["rrf"]
+
+
+def test_weight_validator_rejects_non_numeric_and_out_of_range(monkeypatch):
+    """权重校验器：非数值与越界返回 False，合法值返回 True。
+
+    删除 ``except ValueError: return False`` 后，``float("abc")`` 的
+    ``ValueError`` 冒泡到 questionary 的 ``buffer.validate_and_handle``
+    ——输入一个非数字会让整个菜单崩溃，而校验器的契约是「返回 False
+    表示输入无效」。
+    """
+    from src.ui import config_menu
+
+    captured = {}
+
+    def text(prompt, validate=None, default=None, **_kwargs):
+        if "向量权重" in prompt:
+            captured["validate"] = validate
+        return _Choice(None)
+
+    monkeypatch.setattr(config_menu.questionary, "text", text)
+    monkeypatch.setattr(config_menu.questionary, "select", _fake_select(["weights", "back"]))
+    chat_config = {
+        "retrieval_method": RetrievalMethod.HYBRID_SEARCH,
+        "hybrid_fusion_strategy": "rrf",
+        "retrieval_candidate_multiplier": 3,
+        "top_k": 5,
+        "vector_weight": 0.5,
+        "keyword_weight": 0.5,
+        "rerank_enabled": False,
+    }
+    config_menu.edit_retrieval_params(chat_config)
+
+    validate = captured["validate"]
+    assert validate("0.5") is True
+    assert validate("0") is True
+    assert validate("1") is True
+    assert validate("1.5") is False
+    assert validate("-0.1") is False
+    assert validate("abc") is False
+    assert validate("") is False

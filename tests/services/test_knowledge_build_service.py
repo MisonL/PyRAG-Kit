@@ -424,3 +424,50 @@ def test_build_reports_missing_active_snapshot_after_finalize(tmp_path, monkeypa
 
     with pytest.raises(RuntimeError, match="活动知识快照切换失败"):
         asyncio.run(service.build("standard"))
+
+
+def test_build_reports_original_error_when_temp_cleanup_fails(tmp_path, monkeypatch, caplog):
+    """临时快照清理失败时，抛出的仍是**原始**失败原因，且清理失败被记录。
+
+    删除吞掉后 ``cleanup_temp_snapshot_dir`` 的异常顶替原始失败——用户
+    看到的失败与实际根因不符。
+    """
+    import logging
+
+    knowledge_base = tmp_path / "knowledge_base"
+    knowledge_base.mkdir()
+    (knowledge_base / "article.md").write_text("内容", encoding="utf-8")
+
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_root.mkdir()
+
+    run_config = _RunConfig(knowledge_base, snapshot_root)
+    repository = SnapshotRepository(run_config)
+    monkeypatch.setattr(repository, "generate_snapshot_id", lambda: "kb-cleanup-fail")
+    monkeypatch.setattr(
+        "src.services.knowledge_build_service.Pipeline.from_file_path",
+        lambda *args, **kwargs: _EmptyPipeline(),
+    )
+
+    def failing_cleanup(_snapshot_id):
+        raise RuntimeError("清理本身失败")
+
+    monkeypatch.setattr(repository, "cleanup_temp_snapshot_dir", failing_cleanup)
+
+    embedding_service = SimpleNamespace(
+        embedding_provider_key="local-hash",
+        embedding_model_detail=SimpleNamespace(model_name="local-hash-32"),
+    )
+    service = KnowledgeBuildService(
+        run_config,
+        _IncompleteVectorStore(),
+        embedding_service,
+        repository,
+    )
+
+    with (
+        caplog.at_level(logging.ERROR, logger="src.services.knowledge_build_service"),
+        pytest.raises(FileNotFoundError, match="知识快照不完整"),
+    ):
+        asyncio.run(service.build("standard"))
+    assert "清理临时知识快照失败" in caplog.text

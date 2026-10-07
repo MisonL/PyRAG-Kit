@@ -454,3 +454,60 @@ def test_legacy_import_rejects_non_path_legacy_pkl_path(tmp_path, bad_path):
 
     with pytest.raises(ValueError, match="legacy"):
         RealFactory._load_existing_state(_StubStore(), run_config)
+
+
+def test_legacy_import_reports_original_error_when_cleanup_fails(tmp_path, monkeypatch, caplog):
+    """临时快照清理失败时，抛出的仍是**原始**失败原因，而不是清理异常。
+
+    删除吞掉后 ``cleanup_temp_snapshot_dir`` 的异常顶替原始失败——用户
+    看到的失败与实际根因不符（``vdb/factory`` 与 ``knowledge_build_service``
+    两处同判据）。
+    """
+    import logging
+    import pickle
+    from pathlib import Path
+
+    import src.retrieval.vdb.factory as vdb_factory
+
+    class FailingCleanupRepository:
+        def __init__(self, _config):
+            pass
+
+        def generate_snapshot_id(self, prefix="kb"):
+            return f"{prefix}-cleanup-fail"
+
+        def create_temp_snapshot_dir(self, snapshot_id):
+            path = tmp_path / f".tmp-{snapshot_id}"
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+
+        def cleanup_temp_snapshot_dir(self, snapshot_id):
+            raise RuntimeError("清理本身失败")
+
+        def get_active_snapshot_dir(self):
+            return None
+
+    class FailingStore:
+        def load(self, path, *, trusted_paths=None):
+            return None
+
+        def save_snapshot(self, snapshot_dir):
+            raise RuntimeError("保存失败")
+
+    from src.runtime.contracts import build_run_config
+    from src.utils.config import get_settings
+
+    settings = get_settings()
+    legacy_path = Path(settings.pkl_path)
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    with legacy_path.open("wb") as file:
+        pickle.dump({"documents": [], "embeddings": None}, file)
+    run_config = build_run_config(settings)
+    monkeypatch.setattr(vdb_factory, "SnapshotRepository", FailingCleanupRepository)
+
+    with (
+        caplog.at_level(logging.ERROR, logger="src.retrieval.vdb.factory"),
+        pytest.raises(RuntimeError, match="保存失败"),
+    ):
+        vdb_factory.VectorStoreFactory._load_existing_state(FailingStore(), run_config)
+    assert "清理临时知识快照失败" in caplog.text
