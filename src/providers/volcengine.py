@@ -1,4 +1,5 @@
 import inspect
+import time
 from collections.abc import AsyncGenerator, Collection, Generator, Mapping
 from typing import Any
 
@@ -41,7 +42,7 @@ from src.providers.openai_compatible import OpenAICompatibleProvider
 from src.providers.resources import ArkResources, AsyncArkResources
 from src.utils.config import get_settings, is_double_convertible, require_model_name, safe_repr
 from src.utils.log_manager import get_module_logger
-from src.utils.security import validate_secret_free_payload
+from src.utils.security import safe_exception_text, validate_secret_free_payload
 
 logger = get_module_logger(__name__)
 
@@ -2071,92 +2072,110 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         extra_body: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> Generator[str, None, None]:
-        request = CompletionRequest(
-            prompt=prompt,
-            system_prompt=system_prompt,
-            messages=messages,
-            tools=tools,
-            stream=stream,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            top_p=top_p,
-            stop=stop,
-            response_format=response_format,
-            tool_choice=tool_choice,
-            extra_body=extra_body,
-            **kwargs,
+        logger.info(
+            f"调用 {getattr(self, '_provider', 'volcengine')} LLM ({self._model_name})，流式: {stream}"
         )
-        if self._protocol == "responses":
-            self._require_responses_resource("invoke")
-            if tools:
-                raise ValueError(
-                    "Ark Responses invoke 仅返回文本，不支持 tools；"
-                    "请使用 complete 或 stream_events 获取工具调用。"
-                )
+        start_time = time.perf_counter()
+        try:
+            request = CompletionRequest(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                messages=messages,
+                tools=tools,
+                stream=stream,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                top_p=top_p,
+                stop=stop,
+                response_format=response_format,
+                tool_choice=tool_choice,
+                extra_body=extra_body,
+                **kwargs,
+            )
+            if self._protocol == "responses":
+                self._require_responses_resource("invoke")
+                if tools:
+                    raise ValueError(
+                        "Ark Responses invoke 仅返回文本，不支持 tools；"
+                        "请使用 complete 或 stream_events 获取工具调用。"
+                    )
+                if stream:
+                    terminal_seen = False
+                    for event in retry_sync_stream(
+                        lambda: self._get_client().responses.create(
+                            **self._build_responses_request(request)
+                        ),
+                        lambda event: raise_for_stream_error_event(event, "Ark Responses"),
+                    ):
+                        raise_for_stream_error_event(event, "Ark Responses")
+                        converted = self._responses_stream_event(event)
+                        if field(event, "type") == "response.completed":
+                            terminal_seen = True
+                        if converted and converted.type == "refusal_delta" and converted.refusal:
+                            raise RuntimeError(f"Ark Responses 返回拒答: {converted.refusal}")
+                        if converted and converted.text:
+                            yield converted.text
+                    if not terminal_seen:
+                        raise RuntimeError("Ark Responses 流在 response.completed 之前结束。")
+                else:
+                    response = retry_sync_call(
+                        lambda: self._get_client().responses.create(
+                            **self._build_responses_request(request)
+                        )
+                    )
+                    self._raise_for_response_error(response)
+                    result = self._extract_result(response)
+                    if result.refusal:
+                        raise RuntimeError(f"Ark Responses 返回拒答: {result.refusal}")
+                    if result.text:
+                        yield result.text
+                return
             if stream:
                 terminal_seen = False
-                for event in retry_sync_stream(
-                    lambda: self._get_client().responses.create(
-                        **self._build_responses_request(request)
+                for chunk in retry_sync_stream(
+                    lambda: self._get_client().chat.completions.create(
+                        **self._build_chat_request(**request.to_invoke_kwargs())
                     ),
-                    lambda event: raise_for_stream_error_event(event, "Ark Responses"),
+                    lambda chunk: raise_for_stream_error_event(chunk, "Ark Chat Completions"),
                 ):
-                    raise_for_stream_error_event(event, "Ark Responses")
-                    converted = self._responses_stream_event(event)
-                    if field(event, "type") == "response.completed":
-                        terminal_seen = True
-                    if converted and converted.type == "refusal_delta" and converted.refusal:
-                        raise RuntimeError(f"Ark Responses 返回拒答: {converted.refusal}")
-                    if converted and converted.text:
-                        yield converted.text
+                    raise_for_stream_error_event(chunk, "Ark Chat Completions")
+                    for event in self._chat_stream_events(chunk):
+                        if event.type == "finish":
+                            terminal_seen = True
+                        if event.type == "refusal_delta" and event.refusal:
+                            raise RuntimeError(f"Ark Chat Completions 返回拒答: {event.refusal}")
+                        if event.type == "text_delta" and event.text:
+                            yield event.text
                 if not terminal_seen:
-                    raise RuntimeError("Ark Responses 流在 response.completed 之前结束。")
+                    raise RuntimeError("Ark Chat Completions 流在 finish 事件之前结束。")
             else:
                 response = retry_sync_call(
-                    lambda: self._get_client().responses.create(
-                        **self._build_responses_request(request)
+                    lambda: self._get_client().chat.completions.create(
+                        **self._build_chat_request(**request.to_invoke_kwargs())
                     )
                 )
-                self._raise_for_response_error(response)
+                OpenAICompatibleProvider._raise_for_chat_response_error(
+                    response,
+                    provider="Ark Chat Completions",
+                )
                 result = self._extract_result(response)
                 if result.refusal:
-                    raise RuntimeError(f"Ark Responses 返回拒答: {result.refusal}")
+                    raise RuntimeError(f"Ark Chat Completions 返回拒答: {result.refusal}")
                 if result.text:
                     yield result.text
-            return
-        if stream:
-            terminal_seen = False
-            for chunk in retry_sync_stream(
-                lambda: self._get_client().chat.completions.create(
-                    **self._build_chat_request(**request.to_invoke_kwargs())
-                ),
-                lambda chunk: raise_for_stream_error_event(chunk, "Ark Chat Completions"),
-            ):
-                raise_for_stream_error_event(chunk, "Ark Chat Completions")
-                for event in self._chat_stream_events(chunk):
-                    if event.type == "finish":
-                        terminal_seen = True
-                    if event.type == "refusal_delta" and event.refusal:
-                        raise RuntimeError(f"Ark Chat Completions 返回拒答: {event.refusal}")
-                    if event.type == "text_delta" and event.text:
-                        yield event.text
-            if not terminal_seen:
-                raise RuntimeError("Ark Chat Completions 流在 finish 事件之前结束。")
-        else:
-            response = retry_sync_call(
-                lambda: self._get_client().chat.completions.create(
-                    **self._build_chat_request(**request.to_invoke_kwargs())
-                )
+            duration = time.perf_counter() - start_time
+            logger.info(
+                f"{getattr(self, '_provider', 'volcengine')} LLM ({self._model_name}) 调用完成，耗时: {duration:.2f}s"
             )
-            OpenAICompatibleProvider._raise_for_chat_response_error(
-                response,
-                provider="Ark Chat Completions",
+        except Exception as e:
+            error_text = safe_exception_text(e)
+            logger.exception(
+                "%s LLM (%s) 出错: %s",
+                getattr(self, "_provider", "volcengine"),
+                self._model_name,
+                error_text,
             )
-            result = self._extract_result(response)
-            if result.refusal:
-                raise RuntimeError(f"Ark Chat Completions 返回拒答: {result.refusal}")
-            if result.text:
-                yield result.text
+            raise
 
     async def ainvoke(
         self,
@@ -2167,85 +2186,103 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         temperature: float | None = _UNSET_TEMPERATURE,  # type: ignore[assignment]
         **kwargs: Any,
     ) -> AsyncGenerator[str, None]:
-        if prompt is not None:
-            kwargs["prompt"] = prompt
-        kwargs["system_prompt"] = system_prompt
-        if tools is not None:
-            kwargs["tools"] = tools
-        kwargs["stream"] = stream
-        kwargs["temperature"] = temperature
-        request = CompletionRequest(**kwargs)
-        if self._protocol == "responses":
-            self._require_responses_resource("ainvoke")
-            if request.tools:
-                raise ValueError(
-                    "Ark Responses ainvoke 仅返回文本，不支持 tools；"
-                    "请使用 acomplete 或 astream_events 获取工具调用。"
-                )
+        logger.info(
+            f"调用 {getattr(self, '_provider', 'volcengine')} LLM ({self._model_name})，流式: {stream}"
+        )
+        start_time = time.perf_counter()
+        try:
+            if prompt is not None:
+                kwargs["prompt"] = prompt
+            kwargs["system_prompt"] = system_prompt
+            if tools is not None:
+                kwargs["tools"] = tools
+            kwargs["stream"] = stream
+            kwargs["temperature"] = temperature
+            request = CompletionRequest(**kwargs)
+            if self._protocol == "responses":
+                self._require_responses_resource("ainvoke")
+                if request.tools:
+                    raise ValueError(
+                        "Ark Responses ainvoke 仅返回文本，不支持 tools；"
+                        "请使用 acomplete 或 astream_events 获取工具调用。"
+                    )
+                if request.stream:
+                    terminal_seen = False
+                    async for event in retry_async_stream(
+                        lambda: self._get_aclient().responses.create(
+                            **self._build_responses_request(request)
+                        ),
+                        lambda event: raise_for_stream_error_event(event, "Ark Responses"),
+                    ):
+                        raise_for_stream_error_event(event, "Ark Responses")
+                        converted = self._responses_stream_event(event)
+                        if field(event, "type") == "response.completed":
+                            terminal_seen = True
+                        if converted and converted.type == "refusal_delta" and converted.refusal:
+                            raise RuntimeError(f"Ark Responses 返回拒答: {converted.refusal}")
+                        if converted and converted.text:
+                            yield converted.text
+                    if not terminal_seen:
+                        raise RuntimeError("Ark Responses 异步流在 response.completed 之前结束。")
+                else:
+                    response = await retry_async_call(
+                        lambda: self._get_aclient().responses.create(
+                            **self._build_responses_request(request)
+                        )
+                    )
+                    self._raise_for_response_error(response)
+                    result = self._extract_result(response)
+                    if result.refusal:
+                        raise RuntimeError(f"Ark Responses 返回拒答: {result.refusal}")
+                    if result.text:
+                        yield result.text
+                return
             if request.stream:
                 terminal_seen = False
-                async for event in retry_async_stream(
-                    lambda: self._get_aclient().responses.create(
-                        **self._build_responses_request(request)
+                async for chunk in retry_async_stream(
+                    lambda: self._get_aclient().chat.completions.create(
+                        **self._build_chat_request(**request.to_invoke_kwargs())
                     ),
-                    lambda event: raise_for_stream_error_event(event, "Ark Responses"),
+                    lambda chunk: raise_for_stream_error_event(chunk, "Ark Chat Completions"),
                 ):
-                    raise_for_stream_error_event(event, "Ark Responses")
-                    converted = self._responses_stream_event(event)
-                    if field(event, "type") == "response.completed":
-                        terminal_seen = True
-                    if converted and converted.type == "refusal_delta" and converted.refusal:
-                        raise RuntimeError(f"Ark Responses 返回拒答: {converted.refusal}")
-                    if converted and converted.text:
-                        yield converted.text
+                    raise_for_stream_error_event(chunk, "Ark Chat Completions")
+                    for event in self._chat_stream_events(chunk):
+                        if event.type == "finish":
+                            terminal_seen = True
+                        if event.type == "refusal_delta" and event.refusal:
+                            raise RuntimeError(f"Ark Chat Completions 返回拒答: {event.refusal}")
+                        if event.type == "text_delta" and event.text:
+                            yield event.text
                 if not terminal_seen:
-                    raise RuntimeError("Ark Responses 异步流在 response.completed 之前结束。")
+                    raise RuntimeError("Ark Chat Completions 异步流在 finish 事件之前结束。")
             else:
                 response = await retry_async_call(
-                    lambda: self._get_aclient().responses.create(
-                        **self._build_responses_request(request)
+                    lambda: self._get_aclient().chat.completions.create(
+                        **self._build_chat_request(**request.to_invoke_kwargs())
                     )
                 )
-                self._raise_for_response_error(response)
+                OpenAICompatibleProvider._raise_for_chat_response_error(
+                    response,
+                    provider="Ark Chat Completions",
+                )
                 result = self._extract_result(response)
                 if result.refusal:
-                    raise RuntimeError(f"Ark Responses 返回拒答: {result.refusal}")
+                    raise RuntimeError(f"Ark Chat Completions 返回拒答: {result.refusal}")
                 if result.text:
                     yield result.text
-            return
-        if request.stream:
-            terminal_seen = False
-            async for chunk in retry_async_stream(
-                lambda: self._get_aclient().chat.completions.create(
-                    **self._build_chat_request(**request.to_invoke_kwargs())
-                ),
-                lambda chunk: raise_for_stream_error_event(chunk, "Ark Chat Completions"),
-            ):
-                raise_for_stream_error_event(chunk, "Ark Chat Completions")
-                for event in self._chat_stream_events(chunk):
-                    if event.type == "finish":
-                        terminal_seen = True
-                    if event.type == "refusal_delta" and event.refusal:
-                        raise RuntimeError(f"Ark Chat Completions 返回拒答: {event.refusal}")
-                    if event.type == "text_delta" and event.text:
-                        yield event.text
-            if not terminal_seen:
-                raise RuntimeError("Ark Chat Completions 异步流在 finish 事件之前结束。")
-        else:
-            response = await retry_async_call(
-                lambda: self._get_aclient().chat.completions.create(
-                    **self._build_chat_request(**request.to_invoke_kwargs())
-                )
+            duration = time.perf_counter() - start_time
+            logger.info(
+                f"{getattr(self, '_provider', 'volcengine')} LLM ({self._model_name}) 异步调用完成，耗时: {duration:.2f}s"
             )
-            OpenAICompatibleProvider._raise_for_chat_response_error(
-                response,
-                provider="Ark Chat Completions",
+        except Exception as e:
+            error_text = safe_exception_text(e)
+            logger.exception(
+                "%s LLM (%s) 异步出错: %s",
+                getattr(self, "_provider", "volcengine"),
+                self._model_name,
+                error_text,
             )
-            result = self._extract_result(response)
-            if result.refusal:
-                raise RuntimeError(f"Ark Chat Completions 返回拒答: {result.refusal}")
-            if result.text:
-                yield result.text
+            raise
 
     @retry(
         stop=stop_after_attempt(3),
@@ -2258,41 +2295,60 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         if overlap:
             raise ValueError(f"Ark Embedding 不允许覆盖请求字段: {', '.join(overlap)}")
         texts = require_text_list(texts, "Ark")
-        request: dict[str, Any] = {"input": texts, "model": self._model_name}
-        configured_options = self._embedding_options()
-        configured_extra_body = self._validated_extra_body(
-            configured_options.pop("extra_body", None),
-            "Ark Embedding",
-            set(request).union(configured_options),
+        logger.info(
+            f"调用 {getattr(self, '_provider', 'volcengine')} 嵌入 ({self._model_name})，数量: {len(texts)}"
         )
-        request_options = dict(kwargs)
-        self._validate_resource_kwargs(
-            "Embedding",
-            request_options,
-            {
-                "encoding_format",
-                "dimensions",
-                "user",
-                "extra_body",
-                "extra_headers",
-                "extra_query",
-                "timeout",
-            },
-        )
-        request_extra_body = self._validated_extra_body(
-            request_options.pop("extra_body", None),
-            "Ark Embedding",
-            set(request).union(configured_options).union(request_options),
-        )
-        request.update(configured_options)
-        request.update(request_options)
-        merged_extra_body = self._merge_extra_body(
-            configured_extra_body, request_extra_body, "Ark Embedding"
-        )
-        if merged_extra_body:
-            request["extra_body"] = merged_extra_body
-        response = self._get_client().embeddings.create(**request)
-        return [normalize_embedding_vector(item.embedding) for item in response.data]
+        start_time = time.perf_counter()
+        try:
+            request: dict[str, Any] = {"input": texts, "model": self._model_name}
+            configured_options = self._embedding_options()
+            configured_extra_body = self._validated_extra_body(
+                configured_options.pop("extra_body", None),
+                "Ark Embedding",
+                set(request).union(configured_options),
+            )
+            request_options = dict(kwargs)
+            self._validate_resource_kwargs(
+                "Embedding",
+                request_options,
+                {
+                    "encoding_format",
+                    "dimensions",
+                    "user",
+                    "extra_body",
+                    "extra_headers",
+                    "extra_query",
+                    "timeout",
+                },
+            )
+            request_extra_body = self._validated_extra_body(
+                request_options.pop("extra_body", None),
+                "Ark Embedding",
+                set(request).union(configured_options).union(request_options),
+            )
+            request.update(configured_options)
+            request.update(request_options)
+            merged_extra_body = self._merge_extra_body(
+                configured_extra_body, request_extra_body, "Ark Embedding"
+            )
+            if merged_extra_body:
+                request["extra_body"] = merged_extra_body
+            response = self._get_client().embeddings.create(**request)
+            embeddings = [normalize_embedding_vector(item.embedding) for item in response.data]
+            duration = time.perf_counter() - start_time
+            logger.info(
+                f"{getattr(self, '_provider', 'volcengine')} 嵌入 ({self._model_name}) 完成，耗时: {duration:.2f}s"
+            )
+            return embeddings
+        except Exception as e:
+            error_text = safe_exception_text(e)
+            logger.exception(
+                "%s 嵌入 (%s) 出错: %s",
+                getattr(self, "_provider", "volcengine"),
+                self._model_name,
+                error_text,
+            )
+            raise
 
     @retry(
         stop=stop_after_attempt(3),
@@ -2305,43 +2361,62 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         if overlap:
             raise ValueError(f"Ark Embedding 不允许覆盖请求字段: {', '.join(overlap)}")
         texts = require_text_list(texts, "Ark")
-        request: dict[str, Any] = {"input": texts, "model": self._model_name}
-        configured_options = self._embedding_options()
-        configured_extra_body = self._validated_extra_body(
-            configured_options.pop("extra_body", None),
-            "Ark Embedding",
-            set(request).union(configured_options),
+        logger.info(
+            f"调用 {getattr(self, '_provider', 'volcengine')} 嵌入 ({self._model_name})，数量: {len(texts)}"
         )
-        request_options = dict(kwargs)
-        self._validate_resource_kwargs(
-            "Embedding",
-            request_options,
-            {
-                "encoding_format",
-                "dimensions",
-                "user",
-                "extra_body",
-                "extra_headers",
-                "extra_query",
-                "timeout",
-            },
-        )
-        request_extra_body = self._validated_extra_body(
-            request_options.pop("extra_body", None),
-            "Ark Embedding",
-            set(request).union(configured_options).union(request_options),
-        )
-        request.update(configured_options)
-        request.update(request_options)
-        merged_extra_body = self._merge_extra_body(
-            configured_extra_body, request_extra_body, "Ark Embedding"
-        )
-        if merged_extra_body:
-            request["extra_body"] = merged_extra_body
-        response = await self._resolve_async_result(
-            self._get_aclient().embeddings.create(**request)
-        )
-        return [normalize_embedding_vector(item.embedding) for item in response.data]
+        start_time = time.perf_counter()
+        try:
+            request: dict[str, Any] = {"input": texts, "model": self._model_name}
+            configured_options = self._embedding_options()
+            configured_extra_body = self._validated_extra_body(
+                configured_options.pop("extra_body", None),
+                "Ark Embedding",
+                set(request).union(configured_options),
+            )
+            request_options = dict(kwargs)
+            self._validate_resource_kwargs(
+                "Embedding",
+                request_options,
+                {
+                    "encoding_format",
+                    "dimensions",
+                    "user",
+                    "extra_body",
+                    "extra_headers",
+                    "extra_query",
+                    "timeout",
+                },
+            )
+            request_extra_body = self._validated_extra_body(
+                request_options.pop("extra_body", None),
+                "Ark Embedding",
+                set(request).union(configured_options).union(request_options),
+            )
+            request.update(configured_options)
+            request.update(request_options)
+            merged_extra_body = self._merge_extra_body(
+                configured_extra_body, request_extra_body, "Ark Embedding"
+            )
+            if merged_extra_body:
+                request["extra_body"] = merged_extra_body
+            response = await self._resolve_async_result(
+                self._get_aclient().embeddings.create(**request)
+            )
+            embeddings = [normalize_embedding_vector(item.embedding) for item in response.data]
+            duration = time.perf_counter() - start_time
+            logger.info(
+                f"{getattr(self, '_provider', 'volcengine')} 嵌入 ({self._model_name}) 异步完成，耗时: {duration:.2f}s"
+            )
+            return embeddings
+        except Exception as e:
+            error_text = safe_exception_text(e)
+            logger.exception(
+                "%s 嵌入 (%s) 异步出错: %s",
+                getattr(self, "_provider", "volcengine"),
+                self._model_name,
+                error_text,
+            )
+            raise
 
     def upload_file(self, file: Any, purpose: str, **kwargs: Any) -> Any:
         purpose = self._require_non_empty_string(purpose, "Ark 文件 purpose")

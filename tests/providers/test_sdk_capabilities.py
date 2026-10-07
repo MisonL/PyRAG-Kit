@@ -10752,3 +10752,63 @@ def test_volcengine_ark_sdk_missing_reports_readably():
 
     with pytest.raises(RuntimeError, match=r"未安装 volcengine-python-sdk\[ark\]"):
         _with_blocked_ark_sdk_import(volcengine_module._load_ark_clients)
+
+
+def _ark_provider_for_logging_tests():
+    """构造一个最小可用的 Ark provider（不发真实请求）。"""
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "doubao"
+    provider._options = {}
+    provider._protocol = "chat_completions"
+    return provider
+
+
+@pytest.mark.parametrize(
+    "method_name, is_async",
+    [
+        pytest.param("invoke", False, id="invoke"),
+        pytest.param("ainvoke", True, id="ainvoke"),
+        pytest.param("embed_documents", False, id="embed_documents"),
+        pytest.param("aembed_documents", True, id="aembed_documents"),
+    ],
+)
+def test_ark_call_paths_log_failures_before_reraising(caplog, method_name, is_async):
+    """Ark 的四条调用路径失败时必须留下日志。
+
+    另外三家（anthropic/google/openai_compatible）的 ``invoke``/``ainvoke``／
+    ``embed_documents``/``aembed_documents`` 都有同一层包装：
+    ``except Exception: logger.exception(...); raise``——记日志后**重新抛出**，
+    不吞掉异常。Ark 是同一批适配器里的第四个渠道，四处全部缺失：失败时零日志，
+    用户只看到异常，排查无从下手（``safe_exception_text`` 的脱敏与截断也一并失效）。
+    """
+    import logging
+
+    provider = _ark_provider_for_logging_tests()
+
+    class _Boom:
+        def __getattr__(self, name):
+            raise RuntimeError("Ark 调用失败")
+
+    provider._get_client = lambda: _Boom()
+    provider._get_aclient = lambda: _Boom()
+
+    with (
+        caplog.at_level(logging.ERROR, logger="src.providers.volcengine"),
+        pytest.raises(RuntimeError, match="Ark 调用失败"),
+    ):
+        if is_async:
+            if method_name == "ainvoke":
+                asyncio.run(_consume_async(provider.ainvoke(prompt="hi")))
+            else:
+                asyncio.run(provider.aembed_documents(["文本"]))
+        else:
+            if method_name == "invoke":
+                list(provider.invoke(prompt="hi"))
+            else:
+                provider.embed_documents(["文本"])
+    assert caplog.records, f"{method_name} 失败时没有留下任何日志"
+
+
+async def _consume_async(agen):
+    async for _ in agen:
+        pass
