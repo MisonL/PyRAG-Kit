@@ -859,14 +859,24 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             )
         if response_format.get("type") == "json_schema":
             schema = response_format.get("json_schema", response_format)
-            if not isinstance(schema, dict):
+            if not isinstance(schema, Mapping):
                 raise ValueError("Ark Responses 的 json_schema 必须是对象。")
+            # 无 schema 时不能回退成 ``{}``：那会伪造出一个空 JSON Schema 发给
+            # 服务端，客户端以为拿到了结构化输出约束，实际没有。与
+            # ``openai_compatible._convert_responses_format`` 同一判据——那份
+            # 副本已在 453d096 修过，本副本是同一转换逻辑的 Ark 分支，同批漏修。
+            json_schema = schema.get("schema")
+            if not isinstance(json_schema, Mapping) or not json_schema:
+                raise ValueError(
+                    "Ark Responses 的 json_schema 缺少 schema 字段；"
+                    "请提供 {'type': 'json_schema', 'json_schema': {'name': ..., 'schema': {...}}}。"
+                )
             return {
                 "format": {
                     "type": "json_schema",
                     "json_schema": {
                         "name": schema.get("name", "response"),
-                        "schema": schema.get("schema", response_format.get("schema", {})),
+                        "schema": json_schema,
                         "strict": schema.get("strict", True),
                     },
                 }

@@ -4332,19 +4332,44 @@ def test_ark_responses_tool_choice_rejects_unsupported_shapes(tool_choice):
 
 
 def test_ark_responses_format_still_accepts_supported_shapes():
-    """反向守卫：``json_schema``／``json_object``／已带 ``format`` 的形态照常转换。"""
+    """反向守卫：``json_schema``（完整形态）／``json_object``／已带 ``format`` 照常转换。"""
     assert VolcengineProvider._convert_responses_format({"type": "json_object"}) == {
         "format": {"type": "json_object"}
     }
-    assert VolcengineProvider._convert_responses_format({"type": "json_schema"}) == {
+    assert VolcengineProvider._convert_responses_format(
+        {"type": "json_schema", "json_schema": {"schema": {"type": "object"}}}
+    ) == {
         "format": {
             "type": "json_schema",
-            "json_schema": {"name": "response", "schema": {}, "strict": True},
+            "json_schema": {"name": "response", "schema": {"type": "object"}, "strict": True},
         }
     }
     assert VolcengineProvider._convert_responses_format({"format": {"type": "text"}}) == {
         "format": {"type": "text"}
     }
+
+
+@pytest.mark.parametrize(
+    "response_format",
+    [
+        {"type": "json_schema"},
+        {"type": "json_schema", "json_schema": {"name": "r"}},
+        {"type": "json_schema", "json_schema": {"schema": {}}},
+        {"type": "json_schema", "json_schema": {"schema": []}},
+    ],
+    ids=["no-json_schema", "name-only", "empty-schema", "schema-not-mapping"],
+)
+def test_ark_responses_json_schema_requires_schema(response_format):
+    """缺 schema 不能回退成 ``{}``——与 ``openai_compatible`` 同判据。
+
+    ``openai_compatible`` 的同处缺陷已在 ``453d096`` 修复（伪造 schema：客户端
+    以为拿到了结构化输出约束，实际服务端收到 ``schema: {}``），而本函数是
+    同一转换逻辑的 Ark 副本，漏修了同一判据。google 的
+    ``_response_format_values`` 对同一输入同样拒绝——三份实现里两份拒绝、
+    一份放行，且放行的那一份被反向守卫钉成了「照常转换」。
+    """
+    with pytest.raises(ValueError, match="缺少 schema"):
+        VolcengineProvider._convert_responses_format(response_format)
 
 
 def test_ark_responses_tool_choice_still_accepts_supported_values():
