@@ -1092,3 +1092,319 @@ def test_background_poll_times_out_when_remaining_is_exactly_zero(monkeypatch):
     with pytest.raises(TimeoutError):
         asyncio.run(consume())
     assert async_calls == [], "remaining == 0 即超时，不得再发起 retrieve"
+
+
+# --- 布尔运算符互换：and/or 互换后仍绿的存活点 -----------------------------
+#
+# 来源：把守卫里的 and↔or 互换后全量仍绿的存活点。存活即说明「只满足第一个
+# 条件」或「只满足第二个条件」的组合从未被测试覆盖。逐条用探针确认行为改变
+# 后按守卫存在时的行为写断言。
+
+
+def test_anthropic_output_format_requires_beta_for_tool_runner_only():
+    """只开 ``for_tool_runner``（beta=False）时 output_format 仍被拒绝。
+
+    ``beta and for_tool_runner`` 改 ``or`` 后，只开 tool_runner 的组合会被
+    误放行，output_format 静默进请求。
+    """
+    provider = object.__new__(AnthropicProvider)
+    provider._options = {}
+    provider._model_name = "claude-sonnet-4-5"
+    with pytest.raises(ValueError, match="不支持 output_format"):
+        provider._build_message_params(
+            prompt="hi", output_format=str, stream=False, beta=False, for_tool_runner=True
+        )
+    # 两个都开时照常放行。
+    params = provider._build_message_params(
+        prompt="hi", output_format=str, stream=False, beta=True, for_tool_runner=True
+    )
+    assert "output_format" in params
+
+
+def test_anthropic_stream_ignores_empty_refusal_delta():
+    """空 refusal 的 ``refusal_delta`` 事件不得报成拒答（``and`` 不是 ``or``）。
+
+    ``content_block_start``（type=refusal、无文本）转换出 ``refusal=''`` 的
+    事件；收窄成 ``or`` 后把它误报为拒答，用户看到空拒答消息。
+    """
+
+    def gen():
+        yield {"type": "content_block_start", "index": 0, "content_block": {"type": "refusal"}}
+        yield {"type": "message_stop"}
+
+    class _Resp:
+        def __iter__(self):
+            return gen()
+
+    assert list(AnthropicProvider._iter_invoke_stream_text(_Resp())) == []
+
+
+def test_anthropic_async_stream_ignores_empty_refusal_delta():
+    """异步分支同判据。"""
+
+    async def agen():
+        yield {"type": "content_block_start", "index": 0, "content_block": {"type": "refusal"}}
+        yield {"type": "message_stop"}
+
+    class _Resp:
+        def __aiter__(self):
+            return agen()
+
+    async def collect():
+        return [t async for t in AnthropicProvider._aiter_invoke_stream_text(_Resp())]
+
+    assert asyncio.run(collect()) == []
+
+
+def test_google_generation_config_accepts_only_max_output_tokens():
+    """只设 ``max_output_tokens``（不设 ``max_tokens``）时不得报重复。
+
+    ``and`` 改 ``or`` 后只设一个别名也会触发「重复」误报。
+    """
+    provider = object.__new__(GoogleProvider)
+    provider._options = {"max_output_tokens": 100}
+    provider._model_name = "gemini-2.0-flash"
+    config = provider._build_generation_config(None, None, None)
+    assert getattr(config, "max_output_tokens", None) == 100
+
+
+def test_google_count_tokens_devapi_without_system_prompt_proceeds():
+    """Developer API 且**未**提供 system prompt 时不得报「不支持 system_prompt」。
+
+    ``vertexai is False and effective_system`` 改 ``or`` 后，只要走 Developer
+    API 就误报——普通 token 计数直接失败。
+    """
+    from types import SimpleNamespace
+
+    from src.providers.__base__.model_provider import CompletionRequest
+
+    provider = object.__new__(GoogleProvider)
+    provider._options = {}
+    provider._model_name = "gemini-2.0-flash"
+    provider._effective_vertex_mode = lambda _client: False
+    provider._token_count_system_prompt = lambda _request: None
+    provider._validate_token_count_fields = lambda _request: None
+    models = SimpleNamespace(count_tokens=lambda **_kw: SimpleNamespace(total_tokens=5))
+    provider._get_client = lambda: SimpleNamespace(models=models)
+    assert provider.count_tokens(CompletionRequest(prompt="hi")) == 5
+
+
+def test_google_count_tokens_devapi_without_tools_proceeds():
+    """Developer API 且未提供 tools 时不得报「不支持 tools」。"""
+    from types import SimpleNamespace
+
+    from src.providers.__base__.model_provider import CompletionRequest
+
+    provider = object.__new__(GoogleProvider)
+    provider._options = {}
+    provider._model_name = "gemini-2.0-flash"
+    provider._effective_vertex_mode = lambda _client: False
+    provider._token_count_system_prompt = lambda _request: None
+    provider._validate_token_count_fields = lambda _request: None
+    models = SimpleNamespace(count_tokens=lambda **_kw: SimpleNamespace(total_tokens=7))
+    provider._get_client = lambda: SimpleNamespace(models=models)
+    assert provider.count_tokens(CompletionRequest(prompt="hi")) == 7
+
+
+def test_google_compute_tokens_vertex_without_system_prompt_proceeds():
+    """Vertex 模式且未提供 system prompt 时不得报「不支持 system_prompt」。"""
+    from types import SimpleNamespace
+
+    from src.providers.__base__.model_provider import CompletionRequest
+
+    provider = object.__new__(GoogleProvider)
+    provider._options = {}
+    provider._model_name = "gemini-2.0-flash"
+    provider._effective_vertex_mode = lambda _client: True
+    provider._token_count_system_prompt = lambda _request: None
+    provider._validate_compute_token_fields = lambda _request: None
+    sentinel = SimpleNamespace(total_tokens=9)
+    models = SimpleNamespace(compute_tokens=lambda **_kw: sentinel)
+    provider._get_client = lambda: SimpleNamespace(models=models)
+    assert provider.compute_tokens(CompletionRequest(prompt="hi")) is sentinel
+
+
+def test_google_async_count_tokens_devapi_without_system_prompt_proceeds():
+    """异步 count_tokens 同判据。"""
+    from types import SimpleNamespace
+
+    from src.providers.__base__.model_provider import CompletionRequest
+
+    provider = object.__new__(GoogleProvider)
+    provider._options = {}
+    provider._model_name = "gemini-2.0-flash"
+    provider._effective_vertex_mode = lambda _client: False
+    provider._token_count_system_prompt = lambda _request: None
+    provider._validate_token_count_fields = lambda _request: None
+
+    async def count_tokens(**_kw):
+        return SimpleNamespace(total_tokens=11)
+
+    models = SimpleNamespace(count_tokens=count_tokens)
+    provider._get_client = lambda: SimpleNamespace(
+        aio=SimpleNamespace(models=models), models=models
+    )
+
+    async def run():
+        return await provider.async_count_tokens(CompletionRequest(prompt="hi"))
+
+    assert asyncio.run(run()) == 11
+
+
+def test_google_async_compute_tokens_vertex_without_system_prompt_proceeds():
+    """异步 compute_tokens 同判据。"""
+    from types import SimpleNamespace
+
+    from src.providers.__base__.model_provider import CompletionRequest
+
+    provider = object.__new__(GoogleProvider)
+    provider._options = {}
+    provider._model_name = "gemini-2.0-flash"
+    provider._effective_vertex_mode = lambda _client: True
+    provider._token_count_system_prompt = lambda _request: None
+    provider._validate_compute_token_fields = lambda _request: None
+
+    sentinel = SimpleNamespace(total_tokens=13)
+
+    async def compute_tokens(**_kw):
+        return sentinel
+
+    models = SimpleNamespace(compute_tokens=compute_tokens)
+    provider._get_client = lambda: SimpleNamespace(
+        aio=SimpleNamespace(models=models), models=models
+    )
+
+    async def run():
+        return await provider.async_compute_tokens(CompletionRequest(prompt="hi"))
+
+    assert asyncio.run(run()) is sentinel
+
+
+def test_google_validate_tuning_reward_accepts_only_composite_config():
+    """只传 ``composite_reward_config`` 时不得报「不能同时传入」。"""
+    from types import SimpleNamespace
+
+    provider = object.__new__(GoogleProvider)
+    provider._options = {}
+    provider._get_client = lambda: object()
+    tunings = SimpleNamespace(validate_reward=lambda **_kw: "ok")
+    provider._require_resource = lambda *_a, **_kw: tunings
+    provider._resource_config_kwargs = lambda _cls, _config, _kwargs: {}
+    assert (
+        provider.validate_tuning_reward(
+            "t1", sample_response={}, example={}, composite_reward_config={"b": 2}
+        )
+        == "ok"
+    )
+
+
+def test_google_async_validate_tuning_reward_accepts_only_composite_config():
+    """异步分支同判据。"""
+    from types import SimpleNamespace
+
+    provider = object.__new__(GoogleProvider)
+    provider._options = {}
+    provider._get_client = lambda: SimpleNamespace(aio=object())
+
+    async def validate_reward(**_kw):
+        return "ok-async"
+
+    tunings = SimpleNamespace(validate_reward=validate_reward)
+    provider._require_resource = lambda *_a, **_kw: tunings
+    provider._resource_config_kwargs = lambda _cls, _config, _kwargs: {}
+
+    async def run():
+        return await provider.async_validate_tuning_reward(
+            "t1", sample_response={}, example={}, composite_reward_config={"b": 2}
+        )
+
+    assert asyncio.run(run()) == "ok-async"
+
+
+def test_openai_responses_format_rejects_empty_schema():
+    """``json_schema.schema`` 为空对象时必须拒绝（``not json_schema`` 不可省）。
+
+    ``or`` 改 ``and`` 后空 schema 被静默接受——客户端以为拿到了结构化输出
+    约束，实际发的是空约束（与 Ark 副本修复前同一缺陷形态）。
+    """
+    with pytest.raises(ValueError, match="缺少 schema 字段"):
+        OpenAICompatibleProvider._convert_responses_format(
+            {"type": "json_schema", "json_schema": {"name": "x", "schema": {}}}
+        )
+
+
+def test_facade_getattr_allows_dunder_suffix_without_prefix():
+    """只以 ``__`` 结尾（不以 ``__`` 开头）的属性名照常转发。
+
+    ``startswith('__') and endswith('__')`` 改 ``or`` 后，``beta__`` 这类
+    正常资源名被误判成 dunder 探测而拒绝。
+    """
+    import src.providers.resources as resources_module
+
+    facade_cls = next(
+        cls
+        for name in dir(resources_module)
+        if isinstance(cls := getattr(resources_module, name), type)
+        and getattr(cls, "_delegate_native", False)
+        and "OpenAI" in name
+    )
+
+    class _Client:
+        beta__ = "ok"
+
+    class _Provider:
+        sdk_client = _Client()
+        async_sdk_client = _Client()
+
+        def __init__(self):
+            self._provider = "openai"
+
+    facade = object.__new__(facade_cls)
+    object.__setattr__(facade, "provider", _Provider())
+    assert facade.beta__ == "ok"
+
+
+def test_volcengine_chat_request_accepts_only_max_completion_tokens():
+    """只设 ``max_completion_tokens`` 时不得报「不能同时设置」。"""
+    provider = object.__new__(VolcengineProvider)
+    provider._options = {}
+    provider._model_name = "doubao"
+    provider._protocol = "chat_completions"
+    provider._request_options = lambda: {"max_completion_tokens": 20}
+    request = provider._build_chat_request(prompt="hi", stream=False)
+    assert request["max_completion_tokens"] == 20
+
+
+def test_volcengine_chat_request_top_k_param_without_extra_body():
+    """请求级 ``top_k``（模型 options 未设）时不得报重复。"""
+    provider = object.__new__(VolcengineProvider)
+    provider._options = {}
+    provider._model_name = "doubao"
+    provider._protocol = "chat_completions"
+    provider._request_options = dict
+    request = provider._build_chat_request(prompt="hi", stream=False, top_k=5)
+    assert request["extra_body"]["top_k"] == 5
+
+
+def test_volcengine_chat_request_seed_param_without_extra_body():
+    """请求级 ``seed``（模型 options 未设）时不得报重复。"""
+    provider = object.__new__(VolcengineProvider)
+    provider._options = {}
+    provider._model_name = "doubao"
+    provider._protocol = "chat_completions"
+    provider._request_options = dict
+    request = provider._build_chat_request(prompt="hi", stream=False, seed=7)
+    assert request["extra_body"]["seed"] == 7
+
+
+def test_volcengine_responses_request_seed_param_without_extra_body():
+    """Responses 请求级 ``seed`` 同判据。"""
+    provider = object.__new__(VolcengineProvider)
+    provider._options = {}
+    provider._model_name = "doubao"
+    provider._protocol = "responses"
+    provider._request_options = dict
+    from src.providers.__base__.model_provider import CompletionRequest
+
+    request = provider._build_responses_request(CompletionRequest(prompt="hi", seed=7))
+    assert request["extra_body"]["seed"] == 7

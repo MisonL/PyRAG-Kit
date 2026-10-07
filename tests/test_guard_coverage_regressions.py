@@ -1309,3 +1309,43 @@ def test_overlap_accepts_one_below_the_maximum():
     assert Settings.validate_non_negative_overlap(999999) == 999999
     with pytest.raises(ValueError, match="必须小于"):
         Settings.validate_non_negative_overlap(1000000)
+
+
+def test_save_snapshot_rejects_when_only_faiss_index_is_missing():
+    """``faiss_index is None``（embeddings 非空）时也要拒绝保存（``or`` 不是 ``and``）。
+
+    ``or`` 改 ``and`` 后只有两者**同时**为空才拒绝，单缺索引时静默写出不完整
+    快照——重载后语义检索不可用。
+    """
+    import tempfile
+
+    store = object.__new__(FaissStore)
+    store.faiss_index = None
+    store.embeddings = np.zeros((2, 4), dtype=np.float32)
+    store.documents = []
+    store.parent_documents = {}
+    store.bm25_index = None
+    store._tokenized_docs_cache = None
+    with pytest.raises(RuntimeError, match="语义索引为空"):
+        store.save_snapshot(tempfile.mkdtemp())
+
+
+def test_session_config_accepts_one_zero_weight():
+    """只有一个权重为 0 时接受（``and`` 不是 ``or``）。"""
+    config = build_session_config(get_settings())
+    config.set_many({"vector_weight": 0.5, "keyword_weight": 0.0})
+    assert config.keyword_weight == 0.0
+    with pytest.raises(ValueError, match="不能同时为 0"):
+        config.set_many({"vector_weight": 0.0, "keyword_weight": 0.0})
+
+
+def test_unit_weight_rejects_bool_with_numeric_message():
+    """``bool`` 权重报「必须是数值」，而不是「必须是有限数值」。
+
+    ``or`` 改 ``and`` 后 ``True`` 落到有限性判据，消息把「类型不对」说成
+    「取值不对」。
+    """
+    from src.runtime.contracts import SessionConfig
+
+    with pytest.raises(ValueError, match="必须是数值"):
+        SessionConfig._validate_unit_weight(True, "权重")
