@@ -34,3 +34,55 @@ def test_chat_session_breaks_cleanly_on_interrupt(monkeypatch):
     )
     monkeypatch.setattr(chat_core, "display_chat_config", lambda *_a, **_k: None)
     asyncio.run(start_chat_session_async())
+
+
+# --- except 元组收窄：第二类型（KeyError / EOFError）必须被触发 -------------
+
+
+def test_start_chat_session_survives_keyerror_from_config_update(monkeypatch):
+    """``apply_config_update`` 抛 ``KeyError`` 时留在会话里，而不是终止。
+
+    内层 ``except (ValueError, KeyError)`` 的 ``KeyError`` 此前无测试触发——
+    收窄成 ``except ValueError`` 后，配置更新里的缺键异常穿透到 ``finally``，
+    用户被丢出会话。
+    """
+    import asyncio
+
+    from tests.chat.test_core import FakeChatbot, FakePromptSession
+
+    class KeyErrorChatbot(FakeChatbot):
+        def apply_config_update(self, updated_config, llm_needs_reload):
+            raise KeyError("active_llm_configuration")
+
+    monkeypatch.setattr("src.chat.core.Chatbot", KeyErrorChatbot)
+    monkeypatch.setattr(
+        "src.chat.core.PromptSession",
+        lambda: FakePromptSession(["/config", "/quit"]),
+    )
+    monkeypatch.setattr("src.chat.core.display_chat_config", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "src.chat.core.launch_config_editor",
+        lambda chat_config: (False, dict(chat_config)),
+    )
+    # 不抛异常即表示会话存活到 /quit。
+    asyncio.run(__import__("src.chat.core", fromlist=["x"]).start_chat_session_async())
+
+
+def test_start_chat_session_exits_cleanly_on_eof(monkeypatch):
+    """``prompt_async`` 抛 ``EOFError`` 时干净退出，而不是冒泡。
+
+    收窄成 ``except KeyboardInterrupt`` 后 ``EOFError`` 穿透——非交互输入
+    （管道、CI）下会话以未捕获异常终止。
+    """
+    import asyncio
+
+    from tests.chat.test_core import FakeChatbot, FakePromptSession
+
+    class EofSession(FakePromptSession):
+        async def prompt_async(self, *args, **kwargs):
+            raise EOFError()
+
+    monkeypatch.setattr("src.chat.core.Chatbot", FakeChatbot)
+    monkeypatch.setattr("src.chat.core.PromptSession", lambda: EofSession([]))
+    monkeypatch.setattr("src.chat.core.display_chat_config", lambda *_a, **_k: None)
+    asyncio.run(__import__("src.chat.core", fromlist=["x"]).start_chat_session_async())

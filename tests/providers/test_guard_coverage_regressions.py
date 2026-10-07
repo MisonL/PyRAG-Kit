@@ -822,3 +822,218 @@ def test_google_async_stream_deduplicates_completed_tool_calls():
     events = asyncio.run(consume())
     completed = [event for event in events if event.type == "tool_call_completed"]
     assert len(completed) == 1
+
+
+# --- except 元组收窄：声称捕获的第二类型必须有测试触发 ----------------------
+#
+# 来源：把 ``except (A, B, ...)`` 收窄成 ``except A``（只留第一个类型）后
+# 全量测试仍绿的存活点。逐条用探针确认「命中被丢弃类型时行为确实改变」，
+# 再按守卫存在时的行为写成断言。等价变异（被丢弃类型与第一个类型收场逐字
+# 相同）与不可达类型不在此列。
+
+
+def test_sanitize_resource_call_skips_valueerror_from_signature_property():
+    """``__signature__`` 抛 ``ValueError`` 时同样跳过校验，而不是让异常冒泡。
+
+    测试替身此前没有 ``__call__``，``inspect.signature`` 对它抛的是
+    ``TypeError``——docstring 声称覆盖的 ``ValueError`` 分支从未被走到。
+    收窄成 ``except TypeError`` 后本用例变红。
+    """
+
+    from src.providers.__base__.model_provider import _sanitize_resource_call
+
+    class _NoSignature:
+        @property
+        def __signature__(self):
+            raise ValueError("无签名")
+
+        def __call__(self):  # 有 __call__ 才会走到 ValueError 分支
+            pass
+
+    args, kwargs = _sanitize_resource_call(_NoSignature(), object(), (1,), {"model": "m"})
+    assert args == (1,)
+    assert kwargs == {"model": "m"}
+
+
+def test_openai_validate_sdk_resource_call_skips_valueerror_from_signature_property():
+    """``__signature__`` 抛 ``ValueError`` 时跳过校验而不是抛错。"""
+
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._provider = None
+
+    class _NoSignature:
+        @property
+        def __signature__(self):
+            raise ValueError("无签名")
+
+        def __call__(self):
+            pass
+
+    provider._validate_sdk_resource_call(_NoSignature(), (), {}, "op")
+
+
+def test_responses_json_text_reports_circular_reference_as_json_error():
+    """循环引用的取值收敛成「必须可序列化为 JSON」，而不是裸 ``ValueError``。
+
+    删除 ``except`` 里的 ``ValueError``（``json.dumps`` 对环抛
+    ``ValueError: Circular reference detected``）后，消息变成 SDK 内部文本。
+    """
+    cyclic: list = []
+    cyclic.append(cyclic)
+    with pytest.raises(ValueError, match="必须可序列化为 JSON"):
+        _responses_json_text(cyclic, "参数")
+
+
+@pytest.mark.parametrize("payload", ["中文", "é"])
+def test_normalize_embedding_vector_reports_non_ascii_base64_readably(payload):
+    """非 ASCII 字符串让 ``b64decode`` 抛 ``ValueError``，收敛成本模块的消息。
+
+    收窄成 ``except binascii.Error`` 后，消息变成
+    ``string argument should contain only ASCII characters``。
+    """
+    from src.providers.__base__.model_provider import normalize_embedding_vector
+
+    with pytest.raises(ValueError, match="Embedding base64 内容无效"):
+        normalize_embedding_vector(payload)
+
+
+def test_anthropic_convert_content_reports_non_ascii_base64_readably():
+    """Anthropic 图片 data URI 的非 ASCII base64 收敛成本模块的消息。"""
+    with pytest.raises(ValueError, match="Anthropic 图片 data URI 不是有效 Base64"):
+        AnthropicProvider._convert_content(
+            [{"type": "image_url", "image_url": {"url": "data:image/png;base64,中文"}}]
+        )
+
+
+def test_google_decode_data_uri_reports_non_ascii_base64_readably():
+    """Google data URI 的非 ASCII base64 收敛成本模块的消息。"""
+    with pytest.raises(ValueError, match="data URI 不是有效 Base64"):
+        GoogleProvider._decode_data_uri("data:image/png;base64,中文", "图片")
+
+
+def test_anthropic_snapshot_refusal_probe_tolerates_notimplementederror():
+    """``current_message_snapshot`` 抛 ``NotImplementedError`` 时静默返回。
+
+    收窄成 ``except AttributeError`` 后，未实现该属性的 SDK 响应对象会让流
+    消费在第一次探测时崩溃。
+    """
+
+    class _Resp:
+        @property
+        def current_message_snapshot(self):
+            raise NotImplementedError("SDK 未实现")
+
+    AnthropicProvider._raise_for_stream_snapshot_refusal(_Resp())
+
+
+def test_google_require_resource_converts_notimplementederror_property():
+    """资源属性抛 ``NotImplementedError`` 时转成统一的能力错误。"""
+
+    class _Client:
+        @property
+        def models(self):
+            raise NotImplementedError("SDK 未实现")
+
+    with pytest.raises(NotImplementedError, match="当前 google-genai SDK 未提供"):
+        GoogleProvider._require_resource(_Client(), "models", "模型")
+
+
+def test_delegated_resource_converts_notimplementederror_to_capability_error():
+    """动态资源属性抛 ``NotImplementedError`` 时转成带 provider 名的能力错误。
+
+    收窄成 ``except AttributeError`` 后，SDK 版本未实现该资源时
+    ``NotImplementedError`` 冒泡，消息从「openai SDK 未提供 beta 资源」
+    退化成 SDK 内部文本。
+    """
+    import src.providers.resources as resources_module
+
+    facade_cls = next(
+        cls
+        for name in dir(resources_module)
+        if isinstance(cls := getattr(resources_module, name), type)
+        and getattr(cls, "_delegate_native", False)
+        and "OpenAI" in name
+    )
+
+    class _BadClient:
+        @property
+        def beta(self):
+            raise NotImplementedError("SDK 未实现")
+
+    class _Provider:
+        sdk_client = _BadClient()
+        async_sdk_client = _BadClient()
+
+        def __init__(self):
+            self._provider = "openai"
+
+    facade = object.__new__(facade_cls)
+    object.__setattr__(facade, "provider", _Provider())
+    with pytest.raises(NotImplementedError, match="SDK 未提供 beta 资源"):
+        facade.beta  # noqa: B018 - 触发属性访问即目的
+
+
+def test_facade_getattr_converts_notimplementederror_to_attributeerror():
+    """动态节点属性抛 ``NotImplementedError`` 时收敛成 ``AttributeError``。
+
+    收窄成 ``except AttributeError`` 后，``NotImplementedError`` 冒泡——
+    动态资源探测（``getattr`` 探测新资源）把它当成「资源存在但失败」。
+    """
+    import src.providers.resources as resources_module
+
+    facade_cls = next(
+        cls
+        for name in dir(resources_module)
+        if isinstance(cls := getattr(resources_module, name), type)
+        and getattr(cls, "_delegate_native", False)
+        and "OpenAI" in name
+    )
+
+    class _BadClient:
+        @property
+        def brand_new_resource(self):
+            raise NotImplementedError("SDK 未实现")
+
+    class _Provider:
+        sdk_client = _BadClient()
+        async_sdk_client = _BadClient()
+
+        def __init__(self):
+            self._provider = "openai"
+
+    facade = object.__new__(facade_cls)
+    object.__setattr__(facade, "provider", _Provider())
+    with pytest.raises(AttributeError, match="brand_new_resource"):
+        facade.brand_new_resource  # noqa: B018 - 触发属性访问即目的
+
+
+def test_google_require_provider_resource_converts_async_notimplementederror():
+    """``client.aio`` 抛 ``NotImplementedError`` 时转成带资源名的能力错误。
+
+    收窄成 ``except AttributeError`` 后，SDK 未提供异步通道时
+    ``NotImplementedError`` 冒泡，消息退化成 SDK 内部文本。
+    """
+    provider = object.__new__(GoogleProvider)
+
+    class _Client:
+        @property
+        def aio(self):
+            raise NotImplementedError("SDK 未实现")
+
+    provider._client = _Client()
+    with pytest.raises(NotImplementedError, match="当前 google-genai SDK 未提供异步 Webhooks"):
+        provider._require_provider_resource("async_webhooks")
+
+
+def test_google_connect_live_converts_async_notimplementederror():
+    """``connect_live`` 对 ``client.aio`` 抛 ``NotImplementedError`` 时转成能力错误。"""
+    provider = object.__new__(GoogleProvider)
+
+    class _Client:
+        @property
+        def aio(self):
+            raise NotImplementedError("SDK 未实现")
+
+    provider._client = _Client()
+    with pytest.raises(NotImplementedError, match="当前 google-genai SDK 未提供异步 Live"):
+        provider.connect_live(model="m")

@@ -10295,15 +10295,22 @@ def _volcengine_provider(**options):
 
 
 def _volcengine_init(settings):
-    """用给定 settings 跑一遍真实构造路径（构造期凭证判据在 ``get_settings`` 之后）。"""
-    import src.providers.volcengine as volcengine_module
+    """用给定 settings 跑一遍真实构造路径（构造期凭证判据在 ``get_settings`` 之后）。
 
-    original = volcengine_module.get_settings
-    volcengine_module.get_settings = lambda: settings
+    补丁打在 ``VolcengineProvider`` 所属类的 ``__globals__`` 上，而**不是**
+    重新 ``import src.providers.volcengine``：``tests/providers/test_factory.py``
+    的 autouse 夹具会把该模块从 ``sys.modules`` 删除并重新导入，此时
+    ``import ... as m`` 拿到的是**新模块对象**，而类仍从**旧模块字典**取全局名
+    ——补丁会静默落空，走真实 ``get_settings``（全量套件下才复现）。
+    """
+    module_globals = VolcengineProvider.__init__.__globals__
+
+    original = module_globals["get_settings"]
+    module_globals["get_settings"] = lambda: settings
     try:
         return VolcengineProvider("m", protocol="ark", options={})
     finally:
-        volcengine_module.get_settings = original
+        module_globals["get_settings"] = original
 
 
 async def _async_value(value):
@@ -10812,3 +10819,90 @@ def test_ark_call_paths_log_failures_before_reraising(caplog, method_name, is_as
 async def _consume_async(agen):
     async for _ in agen:
         pass
+
+
+def test_volcengine_init_partial_credentials_names_both_keys():
+    """只配一半 VOLC 凭证时必须点名缺的另一半，而不是泛化消息。
+
+    ``except`` 前的分支区分「完全没有凭证」与「只配了一半」：前者提示
+    ``ARK_API_KEY``，后者提示「需要同时配置 VOLC_ACCESS_KEY 和
+    VOLC_SECRET_KEY」。删除部分凭证分支后两者共用泛化消息，用户按提示
+    再配一个 ARK key 仍然报同样的错。
+    """
+    settings = SimpleNamespace(
+        volc_access_key="ak", volc_secret_key=None, ark_api_key=None, volc_base_url=None
+    )
+
+    with pytest.raises(ValueError, match="需要同时配置 VOLC_ACCESS_KEY 和 VOLC_SECRET_KEY"):
+        _volcengine_init(settings)
+
+
+class _ClassificationAttributeErrorBlocker:
+    """让 ``classification`` 模块**导入成功但模块体抛 AttributeError**。
+
+    与 ``_ClassificationImportBlocker`` 的区别：那个在 ``find_spec`` 抛
+    ``ImportError``，覆盖的是「模块不存在」；这个在 ``exec_module`` 抛
+    ``AttributeError``，覆盖的是「模块存在但初始化引用了缺失属性」——
+    真实的 SDK 版本错配常是后者。
+    """
+
+    _TARGET = "volcenginesdkarkruntime.resources.classification"
+
+    class _Loader:
+        def create_module(self, spec):
+            return None
+
+        def exec_module(self, module):
+            raise AttributeError("模块体引用了缺失属性")
+
+    def find_spec(self, name, path=None, target=None):
+        if name == self._TARGET:
+            import importlib.util
+
+            return importlib.util.spec_from_loader(name, self._Loader())
+        return None
+
+
+def _with_classification_attribute_error(call):
+    import sys
+
+    target = _ClassificationAttributeErrorBlocker._TARGET
+    cached = sys.modules.pop(target, None)
+    blocker = _ClassificationAttributeErrorBlocker()
+    sys.meta_path.insert(0, blocker)
+    try:
+        return call()
+    finally:
+        sys.meta_path.remove(blocker)
+        if cached is not None:
+            sys.modules[target] = cached
+
+
+def test_ark_classification_attribute_error_reports_readably():
+    """模块体抛 ``AttributeError`` 时同样收敛成 ``NotImplementedError``。
+
+    ``except (ImportError, AttributeError)`` 的 ``AttributeError`` 此前无测试
+    触发——收窄成 ``except ImportError`` 后，模块体 AttributeError 冒泡，
+    用户拿到的是 SDK 内部错误而不是能力缺失提示。
+    """
+    provider = _volcengine_provider()
+    provider._protocol = "responses"
+    provider._classification_resource = None
+    provider._get_client = lambda: SimpleNamespace()
+
+    with pytest.raises(NotImplementedError, match="Ark Classification 资源"):
+        _with_classification_attribute_error(provider._get_classification_resource)
+
+
+def test_ark_async_classification_attribute_error_reports_readably():
+    """异步分支同判据。"""
+    provider = _volcengine_provider()
+    provider._protocol = "responses"
+    provider._async_classification_resource = None
+    provider._get_aclient = lambda: SimpleNamespace()
+
+    async def run():
+        return await provider._get_async_classification_resource()
+
+    with pytest.raises(NotImplementedError, match="Ark Async Classification 资源"):
+        _with_classification_attribute_error(lambda: asyncio.run(run()))

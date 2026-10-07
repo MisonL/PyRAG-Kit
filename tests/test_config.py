@@ -1220,14 +1220,14 @@ def test_retrieval_candidate_multiplier_rejects_non_finite(bad_value):
 
 
 def test_retrieval_candidate_multiplier_rejects_decimal_infinity():
-    """非 ``float`` 的非有限数值（``Decimal``）必须走 ``int()`` 的
-    ``OverflowError`` 分支，而不是裸崩。
+    """非 ``float`` 的非有限数值（``Decimal``）必须收敛成脱敏的 ``ValueError``。
 
-    这是 ``inf`` 的第二条入口：它绕过 ``isinstance(v, float) and not
-    math.isfinite(v)`` 前置守卫（``Decimal`` 不是 ``float``），由 ``int()``
-    抛 ``OverflowError``——``ArithmeticError`` 子类而**不是** ``ValueError``。
-    ``except`` 里若不显式列出它，异常会穿透 ``get_settings`` 的全部三个
-    handler，变成未脱敏的裸 traceback。删掉 ``OverflowError`` 会让这条测试变红。
+    ``Decimal('Infinity')`` 绕过 ``isinstance(v, float) and not
+    math.isfinite(v)`` 前置守卫（``Decimal`` 不是 ``float``），由
+    ``_coerce_number`` 的类型兜底拒绝，给出「必须是数值，但得到 Decimal」。
+    （历史实现此处直接 ``int(v)``，才需要 ``except`` 里的 ``OverflowError``；
+    改用 ``_coerce_number`` 后该入口已前移。）这条钉住的是「不裸崩、且消息
+    可定位」，不绑定到某一条守卫。
     """
     import decimal
 
@@ -1236,12 +1236,12 @@ def test_retrieval_candidate_multiplier_rejects_decimal_infinity():
 
 
 def test_retrieval_candidate_multiplier_inf_guard_message_names_the_field():
-    """``isfinite`` 守卫必须给出可定位到字段的消息，而不是泛化的转换失败。
+    """``config.toml`` 写 ``inf`` 时必须报可定位到字段的「必须是整数」。
 
-    只留 ``OverflowError`` 兜底时，``config.toml`` 写 ``inf`` 会走到
-    ``int()`` 并报「无法将检索候选倍率 'inf' 转换为整数」——消息仍然脱敏、
-    仍然不崩，但把「字段不该是非有限值」说成了「转换失败」。删掉
-    ``isfinite`` 守卫会让这条断言变红。
+    历史版本缺 ``isfinite`` 守卫时 ``inf`` 落到 ``int()`` 并报泛化的「转换
+    失败」。现版本前置守卫与 ``is_integer`` 收敛给出同一条消息（实测删掉
+    前置守卫本断言仍绿——两条路径已同文案），因此这里断言的是**消息内容**
+    这个对外契约，不绑定到某一条守卫的存在。
     """
     with pytest.raises(ValidationError) as excinfo:
         Settings(retrieval_candidate_multiplier=float("inf"))
@@ -1522,3 +1522,21 @@ def test_settings_reports_overlap_equal_to_size_with_its_own_message():
     """``overlap == size`` 必须报「必须小于」，不能退化成「不能超过一半」。"""
     with pytest.raises(ValidationError, match="必须小于 kb_chunk_size"):
         Settings(kb_chunk_size=100, kb_chunk_overlap=100, _env_file=None)
+
+
+def test_retrieval_candidate_multiplier_rejects_numeric_subclass_with_failing_int():
+    """覆写 ``__int__`` 的数值子类必须收敛成脱敏 ``ValueError``，而不是裸崩。
+
+    ``_coerce_number`` 之后 ``number`` 已是 ``int``／整值 ``float``，``int()``
+    对它们不会失败；唯一能走到该 ``except`` 的是 ``int``／``float`` 的派生类
+    （只能从 Python 调用方传入），其 ``__int__`` 可能抛 ``OverflowError``——
+    ``ArithmeticError`` 子类而**不是** ``ValueError``，不显式列出就会穿透
+    ``get_settings`` 的三个 handler。删掉 ``OverflowError`` 会让这条变红。
+    """
+
+    class _EvilFloat(float):
+        def __int__(self):
+            raise OverflowError("模拟派生类")
+
+    with pytest.raises((ValueError, ValidationError)):
+        Settings(retrieval_candidate_multiplier=_EvilFloat(2.0))

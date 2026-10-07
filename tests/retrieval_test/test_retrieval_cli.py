@@ -821,3 +821,28 @@ def test_excel_logger_reports_exhausted_name_attempts(tmp_path, monkeypatch):
 
     with pytest.raises(RuntimeError, match="无法再创建新文件"):
         ExcelLogger._reserve_log_path(str(tmp_path), timestamp)
+
+
+def test_run_retrieval_test_async_exits_cleanly_on_eof(monkeypatch):
+    """``prompt_async`` 抛 ``EOFError`` 时干净退出，而不是冒泡。
+
+    ``except (KeyboardInterrupt, EOFError)`` 的 ``EOFError`` 此前无测试触发——
+    收窄成 ``except KeyboardInterrupt`` 后，非交互输入（管道、CI）下 EOF
+    让测试循环以未捕获异常终止。
+    """
+
+    class EofPromptSession:
+        async def prompt_async(self, *_args, **_kwargs):
+            raise EOFError()
+
+    monkeypatch.setattr(
+        "src.retrieval_test.core.PromptSession",
+        lambda: EofPromptSession(),
+    )
+    monkeypatch.setattr(
+        "src.retrieval_test.core.VectorStoreFactory.get_default_vector_store",
+        lambda: object(),
+    )
+    monkeypatch.setattr("src.retrieval_test.core.ExcelLogger", lambda: None)
+
+    asyncio.run(run_retrieval_test_async())

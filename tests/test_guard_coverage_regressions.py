@@ -916,3 +916,161 @@ def test_capability_report_returns_none_for_missing_sdk_package(monkeypatch):
     monkeypatch.setattr("src.providers.factory.package_version", boom)
     report = ModelProviderFactory.capability_report("google", "llm")
     assert report["sdk"]["version"] is None
+
+
+# --- except 元组收窄：声称捕获的第二类型必须有测试触发 ----------------------
+#
+# 来源：把 ``except (A, B, ...)`` 收窄成 ``except A`` 后全量测试仍绿的存活点。
+# 逐条用探针确认「命中被丢弃类型时行为确实改变」，再按守卫存在时的行为写断言。
+
+
+def test_safe_repr_reports_custom_repr_failure_as_magnitude():
+    """``repr()`` 抛 ``RuntimeError`` 时退回量级描述而不是冒泡。
+
+    收窄成 ``except ValueError`` 后，自定义 ``__repr__`` 失败的对象会让校验
+    消息拼接崩掉——而 ``safe_repr`` 的契约是「绝不抛」。
+    """
+    from src.utils.config import safe_repr
+
+    class _BadRepr:
+        def __repr__(self):
+            raise RuntimeError("repr 失败")
+
+    assert safe_repr(_BadRepr()) == "<_BadRepr>"
+
+
+def test_security_display_repr_reports_custom_repr_failure_as_magnitude():
+    """``_display_repr`` 对 ``repr`` 抛错的对象退回类型名而不是冒泡。"""
+    from src.utils.security import _display_repr
+
+    class _BadRepr:
+        def __repr__(self):
+            raise RuntimeError("repr 失败")
+
+    assert _display_repr(_BadRepr()) == "<_BadRepr>"
+
+
+def test_redact_sensitive_text_reports_custom_str_failure_as_magnitude():
+    """``redact_sensitive_text`` 对 ``str()`` 抛错的对象退回类型名而不是冒泡。
+
+    收窄成 ``except ValueError`` 后，日志脱敏在遇到自定义 ``__str__`` 失败时
+    抛出——脱敏本应是「绝不阻断日志」的边界。
+    """
+    from src.utils.security import redact_sensitive_text as redact
+
+    class _BadStr:
+        def __str__(self):
+            raise RuntimeError("str 失败")
+
+    assert redact(_BadStr()) == "<_BadStr>"
+
+
+def test_display_render_value_falls_back_on_custom_str_failure():
+    """``_render_value`` 对 ``str()`` 抛错的对象退回 ``safe_repr``。"""
+    from src.ui.display_utils import _render_value
+
+    class _BadStr:
+        def __str__(self):
+            raise RuntimeError("str 失败")
+
+        def __repr__(self):
+            # ``_render_value`` 降级走 ``safe_repr``，其内部再用 ``repr()``；
+            # 两者都要失败才会落到类型名兜底。
+            raise RuntimeError("repr 失败")
+
+    assert _render_value(_BadStr()) == "<_BadStr>"
+
+
+def test_display_path_text_falls_back_on_custom_str_failure():
+    """``_path_text`` 对 ``str()`` 抛错的对象退回 ``safe_repr``。"""
+    from src.ui.display_utils import _path_text
+
+    class _BadStr:
+        def __str__(self):
+            raise RuntimeError("str 失败")
+
+        def __repr__(self):
+            raise RuntimeError("repr 失败")
+
+    assert _path_text(_BadStr()) == "<_BadStr>"
+
+
+def test_fingerprint_falls_back_on_custom_repr_failure():
+    """``_fingerprint`` 对 ``repr`` 抛错的对象退回类型名而不是冒泡。
+
+    收窄成 ``except ValueError`` 后，``options`` 里一个自定义 ``__repr__``
+    失败的对象会让缓存键计算崩掉。
+    """
+    from src.services.retrieval_service import _fingerprint
+
+    class _BadRepr:
+        def __repr__(self):
+            raise RuntimeError("repr 失败")
+
+    assert _fingerprint(_BadRepr(), set()) == "<_BadRepr>"
+
+
+def test_resolve_within_converts_symlink_loop_to_valueerror(tmp_path):
+    """``Path.resolve()`` 对符号链接环抛 ``RuntimeError``，收敛成 ``ValueError``。
+
+    收窄成 ``except OSError`` 后，``RuntimeError: Symlink loop`` 穿透本函数的
+    ``ValueError`` 契约，调用方（``ensure_trusted_source`` 只接 ``ValueError``）
+    拿到的是 pathlib 内部错误。
+    """
+    from src.utils.security import resolve_within
+
+    (tmp_path / "a").symlink_to(tmp_path / "b")
+    (tmp_path / "b").symlink_to(tmp_path / "a")
+    with pytest.raises(ValueError, match="无法解析"):
+        resolve_within(tmp_path / "a" / "x", tmp_path, label="快照")
+
+
+def test_require_finite_number_rejects_numeric_string():
+    """数值字符串必须被拒，而不是经 ``to_finite_float`` 静默转成浮点。
+
+    删除类型守卫后，``"0.5"`` 会被 ``to_finite_float`` 接受并返回 ``0.5``——
+    ``SessionConfig`` 的兄弟字段本应只接受数值。
+    """
+    from src.runtime.contracts import SessionConfig
+
+    with pytest.raises(ValueError, match="必须是数值"):
+        SessionConfig._require_finite_number("0.5", "权重")
+
+
+def test_require_chat_temperature_rejects_numeric_string_with_numeric_message():
+    """``require_chat_temperature`` 对非数值给出「必须是数值」，而不是范围消息。
+
+    删除类型守卫后，``"0.5"`` 落到范围检查并报「必须在 0.0 到 1.0 之间」——
+    把「类型不对」说成了「范围不对」。
+    """
+    from src.utils.config import require_chat_temperature
+
+    with pytest.raises(ValueError, match="必须是数值"):
+        require_chat_temperature("0.5")
+
+
+def test_validate_rerank_output_reports_non_numeric_score_readably():
+    """非数值 score（如 ``"abc"``）收敛成本方法的 ``RuntimeError``。
+
+    收窄成 ``except TypeError`` 后，``float("abc")`` 的 ``ValueError`` 冒泡，
+    调用方拿到的是裸转换错误而不是「provider 返回的 score 无效」。
+    """
+    with pytest.raises(RuntimeError, match="score 无效"):
+        RetrievalService._validate_rerank_output([0], ["abc"], 5)
+
+
+def test_key_text_falls_back_to_digest_for_int_subclass_repr_failure():
+    """数值子类的 ``repr`` 抛错时退回摘要键，而不是冒泡。
+
+    ``_key_text`` 的 ``except (ValueError, RuntimeError, RecursionError)`` 收窄成
+    ``except ValueError`` 后，``int`` 派生类覆写 ``__repr__`` 抛 ``RuntimeError``
+    会让去重键计算崩掉——这正是「合并检索结果」的中途。
+    """
+
+    class _BadReprInt(int):
+        def __repr__(self):
+            raise RuntimeError("repr 失败")
+
+    from src.services.retrieval_service import _key_text
+
+    assert _key_text(_BadReprInt(7)).startswith("<整数，")

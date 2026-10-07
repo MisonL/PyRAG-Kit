@@ -1085,21 +1085,17 @@ class Settings(BaseSettings):
         # ``bool`` 是 ``int`` 的子类，``int(True) == 1`` 会被静默接受。
         if isinstance(v, bool):
             raise ValueError(f"检索候选倍率必须是整数，不能是布尔值 {safe_repr(v)}。")
-        # ``inf`` 有**两条**独立入口，缺任何一条都会让程序以裸 traceback 退出：
+        # ``config.toml`` 写 ``retrieval_candidate_multiplier = inf``（合法
+        # TOML，``tomllib`` 原样解析成 ``float('inf')``）必须给出「必须是整数，
+        # 但得到 inf」这种能直接定位到字段的消息。这条前置守卫先于下面的
+        # ``is_integer`` 收敛给出该消息；实测删掉它行为不变——``inf``／``nan``
+        # 的 ``is_integer()`` 同样返回 ``False``，会落到同一条消息——保留它是
+        # 因为同文件的 ``chat_top_k``／``log_retention_days``／``kb_chunk_size``
+        # 都有等价的前置守卫，判据要对齐。
         #
-        # 1. ``config.toml`` 写 ``retrieval_candidate_multiplier = inf``——合法
-        #    TOML，``tomllib`` 原样解析成 ``float('inf')``。下面这条 ``isfinite``
-        #    守卫在第一行就把它挡住，给出「必须是整数，但得到 inf」这种能直接定位
-        #    到字段的消息；同文件的 ``chat_top_k``／``log_retention_days``／
-        #    ``kb_chunk_size`` 都有等价的前置守卫。
-        # 2. 其它非有限数值类型（``Decimal('Infinity')`` 等，只能从 Python 调用方
-        #    传入）。它们不是 ``float``，走不进上面那条守卫，由 ``int()`` 抛
-        #    ``OverflowError``——它是 ``ArithmeticError`` 子类而**不是**
-        #    ``ValueError``，必须在下面显式列出，否则穿透 ``get_settings`` 的全部
-        #    三个 handler。
-        #
-        # 两条都必要：删掉守卫会让 ``inf`` 的报错变成泛化的转换失败；删掉
-        # ``OverflowError`` 会让第二条路径裸崩。两条路径各有回归测试。
+        # 其它非有限数值类型（``Decimal('Infinity')`` 等，只能从 Python 调用方
+        # 传入）不是 ``float``，走不进这条守卫；但它们也到不了下面的 ``int()``
+        # ——``_coerce_number`` 的类型兜底会先给出「必须是数值，但得到 Decimal」。
         if isinstance(v, float) and not math.isfinite(v):
             raise ValueError(f"检索候选倍率必须是整数，但得到 {safe_repr(v)}。")
         # 与同文件的 ``chat_top_k``／``log_retention_days``／``kb_chunk_size``
@@ -1114,6 +1110,10 @@ class Settings(BaseSettings):
         number = _coerce_number(v, "检索候选倍率")
         if isinstance(number, float) and not number.is_integer():
             raise ValueError(f"检索候选倍率必须是整数，但得到 {safe_repr(v)}。")
+        # ``number`` 已是 ``int`` 或整值 ``float``，``int()`` 对它们不会失败；
+        # 唯一能走到 ``except`` 的是覆写了 ``__int__`` 的数值子类（``int``／
+        # ``float`` 的派生类，只能从 Python 调用方传入），它可能抛
+        # ``OverflowError``／``ValueError``／``TypeError`` 中任意一种。
         try:
             value = int(number)
         except (ValueError, TypeError, OverflowError) as exc:

@@ -189,3 +189,50 @@ def test_cleanup_old_logs_actually_rotates_through_a_real_handler(tmp_path, monk
 
     remaining = sorted(p.name for p in tmp_path.iterdir())
     assert remaining == [], f"真实轮转产生的文件未被清理干净: {remaining}"
+
+
+# ── 回归：``os.makedirs`` 对含 NUL 字节路径抛 ``ValueError``（不是 OSError）──
+#
+# 两个建 handler 的入口（``get_chat_logger`` / ``get_module_logger``）的
+# ``except`` 都列了 ``ValueError``。``get_module_logger`` 在**模块导入期**被
+# ``cleanup.py`` 调用，漏接 ``ValueError`` 会让 ``import main`` 直接失败。
+
+
+class _NullByteSettings:
+    """日志目录含 NUL 字节：``os.makedirs`` 抛 ``ValueError: embedded null byte``。"""
+
+    log_level = "WARNING"
+    log_path = "/tmp/bad\x00dir"
+
+
+def test_module_logger_degrades_on_null_byte_log_path(monkeypatch):
+    """``log_path`` 含 NUL 字节时降级为仅控制台，而不是让 ``ValueError`` 冒泡。
+
+    收窄成 ``except OSError`` 后，``makedirs`` 的 ``ValueError`` 穿透本函数——
+    而它在导入期就被调用，异常会让整个程序无法启动。
+    """
+    monkeypatch.setattr(log_manager, "get_settings", lambda: _NullByteSettings())
+
+    logger = log_manager.get_module_logger("test.nullbyte.module")
+
+    assert any(isinstance(h, logging.StreamHandler) for h in logger.handlers)
+    assert not any(isinstance(h, logging.FileHandler) for h in logger.handlers)
+
+
+def test_chat_logger_degrades_on_null_byte_log_path(monkeypatch):
+    """聊天日志记录器对同一形态给同样的降级。"""
+    logger = logging.getLogger("chat_logger")
+    saved = list(logger.handlers)
+    for handler in saved:
+        logger.removeHandler(handler)
+
+    monkeypatch.setattr(log_manager, "get_settings", lambda: _NullByteSettings())
+    try:
+        result = log_manager.get_chat_logger()
+        assert result is logger
+        assert not any(isinstance(h, logging.FileHandler) for h in logger.handlers)
+    finally:
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+        for handler in saved:
+            logger.addHandler(handler)
