@@ -7,6 +7,7 @@
 
 import asyncio
 import pathlib
+import tempfile
 
 import numpy as np
 import pytest
@@ -1349,3 +1350,575 @@ def test_unit_weight_rejects_bool_with_numeric_message():
 
     with pytest.raises(ValueError, match="必须是数值"):
         SessionConfig._validate_unit_weight(True, "权重")
+
+
+# --- 调用名互换：any↔all、min↔max、bool↔int、str↔repr 的语义缺口 ----------
+#
+# 来源：把同名同形、语义相邻的内建调用互换后全量仍绿的存活点。存活即说明该
+# 调用的**特有语义**从未被测试覆盖。逐条用探针确认行为改变后按守卫存在时
+# 的行为写断言。
+
+
+def test_retryable_error_matches_any_single_token_in_class_name():
+    """类名含多个 token 时命中**其一**即可重试（``any`` 不是 ``all``）。
+
+    ``all`` 变异后要求全部 token 都命中，``TimeoutFooError`` 这类只含一个
+    目标 token 的类名会被误判为不可重试。
+    """
+    from src.providers.__base__.model_provider import is_retryable_error
+
+    class TimeoutFooError(Exception):
+        pass
+
+    assert is_retryable_error(TimeoutFooError("x")) is True
+    assert is_retryable_error(Exception("x")) is False
+
+
+def test_normalize_messages_does_not_duplicate_existing_system_prompt():
+    """已有 system 消息时不再插入（``not any`` 不是 ``not all``）。
+
+    ``all`` 变异后只要有一条不是 system 就插入，system 提示被重复。
+    """
+    from src.providers.__base__.model_provider import normalize_messages
+
+    messages = [
+        {"role": "system", "content": "已有"},
+        {"role": "user", "content": "hi"},
+    ]
+    normalized = normalize_messages(None, "新系统提示", messages)
+    assert len(normalized) == 2
+    assert normalized[0]["content"] == "已有"
+
+
+def test_google_as_bool_falls_back_to_truthiness():
+    """非 bool/int/float/str 的取值按真值兜底（``bool`` 不是 ``int``）。
+
+    ``int`` 变异后 ``int([1])`` 抛 ``TypeError``，配置里的真值形态直接崩。
+    """
+    from src.providers.google import GoogleProvider
+
+    class _Truthy:
+        def __bool__(self):
+            return True
+
+    assert GoogleProvider._as_bool(_Truthy()) is True
+    assert GoogleProvider._as_bool(()) is False
+
+
+def test_google_http_options_flags_key_with_single_sensitive_suffix():
+    """敏感键后缀匹配命中**其一**即拒绝（``any`` 不是 ``all``）。
+
+    ``all`` 变异后要求全部后缀都匹配，``myaccesskey`` 这类只含一个后缀的
+    键会被放行。
+    """
+    from src.providers.google import GoogleProvider
+
+    with pytest.raises(ValueError, match="不允许包含凭证"):
+        GoogleProvider._validate_http_options({"headers": {"myaccesskey": "v"}})
+    GoogleProvider._validate_http_options({"headers": {"normal": "v"}})
+
+
+def test_anthropic_tool_result_is_error_is_bool():
+    """``is_error`` 收敛成 ``bool``（``bool`` 不是 ``int``）。
+
+    ``int`` 变异后 ``int("yes")`` 抛 ``ValueError``，工具结果转换直接崩。
+    """
+    from src.providers.anthropic import AnthropicProvider
+
+    converted = AnthropicProvider._convert_messages(
+        [{"role": "tool", "tool_call_id": "t1", "content": "err", "is_error": "yes"}]
+    )
+    tool_result = converted[0]["content"][0]
+    assert tool_result["is_error"] is True
+
+
+def test_model_dump_include_secrets_is_bool():
+    """``include_secrets`` 按 ``bool`` 收敛（``bool`` 不是 ``int``）。
+
+    ``int`` 变异后 ``int("")`` 抛 ``ValueError``，``model_dump`` 直接崩。
+    """
+    settings = Settings(_env_file=None)
+    assert settings.model_dump(include_secrets="") == settings.model_dump(include_secrets=False)
+    assert settings.model_dump(include_secrets=True) != settings.model_dump(include_secrets=False)
+
+
+def test_model_dump_json_include_secrets_is_bool():
+    """``model_dump_json`` 与 ``model_dump`` 同判据（两份 ``bool()`` 都要判）。
+
+    两处源码逐字相同，但分属不同方法：只测 ``model_dump`` 时，
+    ``model_dump_json`` 的 ``bool`` 换成 ``int`` 后全量仍绿——而
+    ``int("")`` 抛 ``ValueError``，序列化直接崩。
+    """
+    import json
+
+    settings = Settings(_env_file=None)
+    assert json.loads(settings.model_dump_json(include_secrets="")) == json.loads(
+        settings.model_dump_json(include_secrets=False)
+    )
+    assert json.loads(settings.model_dump_json(include_secrets=True)) != json.loads(
+        settings.model_dump_json(include_secrets=False)
+    )
+
+
+def test_require_int_value_returns_int_not_bool():
+    """整数字段返回 ``int``（``int`` 不是 ``bool``）。
+
+    ``bool`` 变异后 ``_require_int_value(2.0)`` 返回 ``True``，下游按整数
+    使用的地方拿到布尔值。
+    """
+    from src.runtime.contracts import SessionConfig
+
+    result = SessionConfig._require_int_value(2.0, "字段")
+    assert result == 2
+    assert isinstance(result, int)
+    assert not isinstance(result, bool)
+
+
+def test_stable_fingerprint_uses_repr_for_distinction():
+    """``_stable_fingerprint`` 用 ``repr`` 区分取值（``repr`` 不是 ``str``）。
+
+    ``str`` 变异后 ``__repr__`` 与 ``__str__`` 不同的对象得到同一个指纹，
+    缓存键碰撞。
+    """
+
+    class _Dual:
+        def __repr__(self):
+            return "R"
+
+        def __str__(self):
+            return "S"
+
+    from src.services.retrieval_service import _stable_fingerprint
+
+    assert _stable_fingerprint(_Dual()) == "R"
+
+
+def test_resource_proxy_repr_uses_repr():
+    """``_NativeResourceProxy`` 的 ``repr`` 用 ``repr``（``repr`` 不是 ``str``）。
+
+    ``str`` 变异后 ``__repr__`` 与 ``__str__`` 不同的值在调试输出里形态改变。
+    """
+
+    class _Dual:
+        def __repr__(self):
+            return "R"
+
+        def __str__(self):
+            return "S"
+
+    from src.providers.resources import _NativeResourceProxy
+
+    proxy = _NativeResourceProxy(_Dual(), None, "x")
+    assert repr(proxy) == "R"
+
+
+def test_display_repr_uses_str():
+    """``_display_repr`` 用 ``str``（``str`` 不是 ``repr``）。
+
+    ``repr`` 变异后字符串取值被加上引号，显示形态改变。
+    """
+
+    class _Dual:
+        def __repr__(self):
+            return "R"
+
+        def __str__(self):
+            return "S"
+
+    from src.utils.security import _display_repr
+
+    assert _display_repr(_Dual()) == "S"
+    assert _display_repr("abc") == "abc"
+
+
+def test_background_poll_sleeps_min_of_interval_and_remaining():
+    """轮询睡眠取 ``min(interval, remaining)``（``min`` 不是 ``max``）。
+
+    剩余时间（10s）远大于轮询间隔（0.5s）时，必须只睡**间隔**那么久；``max``
+    变异会睡满 10s，等于把 deadline 一次性耗尽。
+    """
+    import time as _time
+    from types import SimpleNamespace
+
+    from src.providers import openai_compatible as oc
+    from src.providers.openai_compatible import OpenAICompatibleProvider
+
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._provider = None
+    provider._options = {"background_poll_interval": 0.5, "background_timeout": 10.0}
+    pending = {"status": "in_progress", "id": "resp-1"}
+    provider._get_client = lambda: SimpleNamespace(
+        responses=SimpleNamespace(retrieve=lambda *a, **k: pending)
+    )
+
+    sleeps: list[float] = []
+    clock = iter([100.0, 100.0, 111.0])
+    oc.time = SimpleNamespace(
+        monotonic=lambda: next(clock),
+        sleep=sleeps.append,
+    )
+    try:
+        with pytest.raises(TimeoutError):
+            provider._poll_background_response(pending, {})
+    finally:
+        oc.time = _time
+
+    assert sleeps == [0.5]
+
+
+def test_background_poll_async_sleeps_min_of_interval_and_remaining():
+    """异步轮询睡眠同样取 ``min(interval, remaining)``（与同步分支同判据）。"""
+    import time as _time
+    from types import SimpleNamespace
+
+    from src.providers import openai_compatible as oc
+    from src.providers.openai_compatible import OpenAICompatibleProvider
+
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._provider = None
+    provider._options = {"background_poll_interval": 0.5, "background_timeout": 10.0}
+    pending = {"status": "in_progress", "id": "resp-1"}
+
+    async def _retrieve(*args, **kwargs):
+        return pending
+
+    provider._get_aclient = lambda: SimpleNamespace(responses=SimpleNamespace(retrieve=_retrieve))
+
+    sleeps: list[float] = []
+
+    async def _sleep(seconds):
+        sleeps.append(seconds)
+
+    clock = iter([100.0, 100.0, 111.0])
+    real_time, real_asyncio = oc.time, oc.asyncio
+    oc.time = SimpleNamespace(monotonic=lambda: next(clock), sleep=_time.sleep)
+    oc.asyncio = SimpleNamespace(sleep=_sleep)
+    try:
+        with pytest.raises(TimeoutError):
+            asyncio.run(provider._poll_background_response_async(pending, {}))
+    finally:
+        oc.time, oc.asyncio = real_time, real_asyncio
+
+    assert sleeps == [0.5]
+
+
+# --- 调用名互换（修正变异器后重扫）的覆盖缺口 -------------------------------
+#
+# 上一轮 ``mut_name.py`` 用 ``src.index(line_text)`` 定位行首，而同一行文本
+# （如 ``    return any(\n``）在文件里出现多次时它返回**第一次**的位置——于是
+# 变异落到更早的那一行上，扫描结果变成「改的是 A 行、记的是 B 行」。修正成按
+# 行号累加偏移后重扫，下列缺口才暴露出来。
+
+
+def test_missing_argument_error_uses_str_not_repr():
+    """``_is_missing_required_argument_error`` 用 ``str`` 判消息（``str`` 不是 ``repr``）。
+
+    ``repr`` 变异后类名也被搜进关键词：``MissingRequiredArgumentError("无关")``
+    被误判成「缺少必需参数」，资源调用被拒。
+    """
+    from src.providers.__base__.model_provider import _is_missing_required_argument_error
+
+    class MissingRequiredArgumentError(TypeError):
+        pass
+
+    assert (
+        _is_missing_required_argument_error(MissingRequiredArgumentError("完全无关的消息")) is False
+    )
+    assert (
+        _is_missing_required_argument_error(
+            TypeError("__init__() missing 1 required positional argument: 'x'")
+        )
+        is True
+    )
+
+
+def test_resource_method_guard_accepts_each_extension_name():
+    """资源方法守卫对三个扩展名**各自**放行（``any`` 不是 ``all``）。
+
+    每个方法除扩展参数外都带一个普通参数：``all`` 变异后要求**每个**参数
+    都满足条件，普通参数让它为假，三个扩展名一个都过不了守卫，资源方法
+    不再被包装。
+    """
+    from src.providers.__base__.model_provider import _is_provider_resource_method
+
+    def _create_extra_body(self, extra_body=None, temperature=None):
+        return None
+
+    def _create_extra_headers(self, extra_headers=None, temperature=None):
+        return None
+
+    def _create_extra_query(self, extra_query=None, temperature=None):
+        return None
+
+    def _create_plain(self, temperature=None):
+        return None
+
+    assert _is_provider_resource_method("create", _create_extra_body) is True
+    assert _is_provider_resource_method("create", _create_extra_headers) is True
+    assert _is_provider_resource_method("create", _create_extra_query) is True
+    assert _is_provider_resource_method("create", _create_plain) is False
+
+
+def test_compat_complete_drops_kwargs_without_varkw():
+    """兼容层 ``complete`` 只在签名**没有** ``**kwargs`` 时裁剪参数（``any`` 不是 ``all``）。
+
+    ``all`` 变异后对带 ``**kwargs`` 的 Provider 也裁剪，``temperature`` 被丢掉，
+    ``invoke`` 收到 ``None``。
+    """
+    from src.providers.__base__.model_provider import LargeLanguageModel
+
+    class _NoVarKw(LargeLanguageModel):
+        def invoke(self, prompt, **kwargs):
+            return f"{prompt}|{kwargs.get('temperature')}"
+
+        async def ainvoke(self, prompt, **kwargs):
+            return "a"
+
+    assert _NoVarKw().complete(prompt="hi", temperature=0.25).text == "hi|0.25"
+
+
+def test_compat_stream_events_drops_kwargs_without_varkw():
+    """兼容层 ``stream_events`` 与 ``complete`` 同判据（``any`` 不是 ``all``）。
+
+    ``all`` 变异后 ``temperature`` 被裁剪，流事件文本变成 ``hi|None``。
+    """
+    from src.providers.__base__.model_provider import LargeLanguageModel
+
+    class _NoVarKw(LargeLanguageModel):
+        def invoke(self, prompt, **kwargs):
+            yield f"{prompt}|{kwargs.get('temperature')}"
+
+        async def ainvoke(self, prompt, **kwargs):
+            return "a"
+
+    events = list(_NoVarKw().stream_events(prompt="hi", temperature=0.25))
+    assert [event.text for event in events] == ["hi|0.25"]
+
+
+def test_compat_astream_events_drops_kwargs_without_varkw():
+    """兼容层 ``astream_events`` 与同步分支同判据（``any`` 不是 ``all``）。
+
+    ``all`` 变异后 ``temperature`` 被裁剪，异步流事件文本变成 ``hi|None``。
+    """
+    import asyncio
+
+    from src.providers.__base__.model_provider import LargeLanguageModel
+
+    class _NoVarKw(LargeLanguageModel):
+        def invoke(self, prompt, **kwargs):
+            yield "s"
+
+        async def ainvoke(self, prompt, **kwargs):
+            yield f"{prompt}|{kwargs.get('temperature')}"
+
+    async def _collect():
+        return [
+            event.text async for event in _NoVarKw().astream_events(prompt="hi", temperature=0.25)
+        ]
+
+    assert asyncio.run(_collect()) == ["hi|0.25"]
+
+
+def test_google_terminal_event_matches_any_candidate():
+    """流块终止判据对**任一** candidate 生效（``any`` 不是 ``all``）。
+
+    ``all`` 变异后要求每个 candidate 都有 ``finish_reason``，只有一个带终止
+    标记的流块被判成「未终止」，``terminal_seen`` 不置位。
+    """
+    from types import SimpleNamespace
+
+    from src.providers.google import GoogleProvider
+
+    _none = SimpleNamespace(finish_reason=None)
+    _stop = SimpleNamespace(finish_reason="STOP")
+    assert (
+        GoogleProvider._stream_chunk_has_terminal_event(SimpleNamespace(candidates=[_none, _stop]))
+        is True
+    )
+    assert (
+        GoogleProvider._stream_chunk_has_terminal_event(SimpleNamespace(candidates=[_stop, _stop]))
+        is True
+    )
+    assert (
+        GoogleProvider._stream_chunk_has_terminal_event(SimpleNamespace(candidates=[_none, _none]))
+        is False
+    )
+
+
+def test_volcengine_classify_rejects_single_bad_label():
+    """Ark Classification 的 labels 判据对**任一**非法项拒绝（``any`` 不是 ``all``）。
+
+    ``all`` 变异后要求每个标签都非法才拒绝，``["ok", 123]`` 被静默接受，
+    随后 ``123.strip()`` 抛裸 ``AttributeError``——不是本类承诺的 ``ValueError``。
+    """
+    from src.providers.volcengine import VolcengineProvider
+
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "m"
+    with pytest.raises(ValueError, match="labels 必须是非空字符串列表"):
+        provider.classify("q", ["ok", 123])
+    with pytest.raises(ValueError, match="labels 必须是非空字符串列表"):
+        provider.classify("q", ["ok", "fine", "  "])
+
+
+def test_volcengine_async_classify_rejects_single_bad_label():
+    """异步 ``async_classify`` 与同步 ``classify`` 同判据（``any`` 不是 ``all``）。
+
+    ``all`` 变异后 ``["ok", 123]`` 被接受，``123.strip()`` 抛裸 ``AttributeError``。
+    """
+    import asyncio
+
+    from src.providers.volcengine import VolcengineProvider
+
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "m"
+
+    async def _call():
+        await provider.async_classify("q", ["ok", 123])
+
+    with pytest.raises(ValueError, match="labels 必须是非空字符串列表"):
+        asyncio.run(_call())
+
+
+def test_google_http_options_message_lists_findings_sorted():
+    """``http_options`` 违规消息按字典序列出（``sorted`` 不是 ``reversed``）。
+
+    ``reversed`` 变异后顺序颠倒，消息与 ``sorted`` 的约定不一致。
+    """
+    from src.providers.google import GoogleProvider
+
+    with pytest.raises(ValueError) as excinfo:
+        GoogleProvider._validate_http_options({"headers": {"aaccesskey": "1", "zaccesskey": "2"}})
+    message = str(excinfo.value)
+    assert "headers.aaccesskey, headers.zaccesskey" in message
+
+
+def test_knowledge_build_document_source_uses_str_not_repr():
+    """知识库文档的 ``source`` 元数据用 ``str``（``str`` 不是 ``repr``）。
+
+    ``repr`` 变异后 ``source`` 变成 ``PosixPath('/x/a.md')``，检索结果与
+    快照里的来源都带上 ``PosixPath(...)`` 包装。
+    """
+    from pathlib import Path
+
+    from src.etl.pipeline import Pipeline
+    from src.services.knowledge_build_service import KnowledgeBuildService
+
+    with tempfile.TemporaryDirectory() as tmp:
+        file_path = Path(tmp) / "a.md"
+        file_path.write_text("# 标题\n\n正文", encoding="utf-8")
+        pipeline = Pipeline.from_file_path(file_path, splitter_structure_mode="standard")
+        chunks = KnowledgeBuildService._process_file(None, pipeline, file_path)
+    assert chunks[0].metadata["source"] == str(file_path)
+    assert "PosixPath(" not in chunks[0].metadata["source"]
+
+
+def test_resource_provider_label_uses_str_not_repr():
+    """``_resource_provider_label`` 用 ``str`` 取标签（``str`` 不是 ``repr``）。
+
+    ``repr`` 变异后标签变成 ``R`` 而不是 ``S``，错误消息里的 Provider 标识
+    与实际对象脱节。
+    """
+    from src.providers.resources import _resource_provider_label
+
+    class _Dual:
+        def __str__(self):
+            return "S"
+
+        def __repr__(self):
+            return "R"
+
+    class _Provider:
+        _provider = _Dual()
+
+    assert _resource_provider_label(_Provider()) == "S"
+
+
+def test_duplicate_extension_key_message_uses_str_not_repr():
+    """重复扩展字段消息用 ``str`` 列键名（``str`` 不是 ``repr``）。
+
+    ``repr`` 变异后消息里出现 ``'extra-body'``（带引号），与 ``str`` 形态不一致。
+    """
+    from src.utils.security import validate_secret_free_resource_kwargs
+
+    with pytest.raises(ValueError) as excinfo:
+        validate_secret_free_resource_kwargs({"extra_body": {}, "extra-body": {}}, "Provider")
+    assert "extra-body" in str(excinfo.value)
+    assert "'extra-body'" not in str(excinfo.value)
+
+
+def test_trusted_source_message_lists_roots_with_str():
+    """受信来源消息用 ``str`` 列根路径（``str`` 不是 ``repr``）。
+
+    ``repr`` 变异后消息里出现 ``PosixPath('/tmp/trusted')``，路径被包上类名。
+    """
+    from src.utils.security import ensure_trusted_source
+
+    with pytest.raises(ValueError) as excinfo:
+        ensure_trusted_source("/etc/evil.pkl", ["/tmp/trusted"], label="测试")
+    message = str(excinfo.value)
+    assert "受信路径=['/tmp/trusted']" in message
+    assert "PosixPath(" not in message
+
+
+def test_settings_error_message_uses_str_not_repr():
+    """``_redacted_settings_error`` 用 ``str`` 取 ``msg``（``str`` 不是 ``repr``）。
+
+    ``repr`` 变异后消息里出现 ``'Value error, ...'``（带引号），与 ``str`` 形态
+    不一致。
+    """
+    from pydantic import ValidationError
+
+    from src.utils.config import Settings, _redacted_settings_error
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, chat_top_k=-1)
+    try:
+        Settings(_env_file=None, chat_top_k=-1)
+    except ValidationError as exc:
+        message = _redacted_settings_error(exc)
+    assert "chat_top_k 必须是 1 到 2000 之间的整数" in message
+    assert "'Value error" not in message
+
+
+def test_toml_decode_error_message_uses_str_not_repr():
+    """``TOMLDecodeError`` 消息用 ``str``（``str`` 不是 ``repr``）。
+
+    ``repr`` 变异后消息里出现 ``TOMLDecodeError('Invalid value ...')``，
+    带类名与引号。
+    """
+    import pathlib
+    import tempfile
+
+    from src.utils import config
+
+    with tempfile.TemporaryDirectory() as tmp:
+        config.CONFIG_TOML_PATH = pathlib.Path(tmp) / "config.toml"
+        config.CONFIG_TOML_PATH.write_text("a = ", encoding="utf-8")
+        config.get_settings.cache_clear()
+        with pytest.raises(ValueError) as excinfo:
+            config.get_settings()
+    message = str(excinfo.value)
+    assert "配置解析失败 - Invalid value" in message
+    assert "TOMLDecodeError(" not in message
+
+
+def test_recursion_error_message_uses_str_not_repr():
+    """``RecursionError`` 消息用 ``str``（``str`` 不是 ``repr``）。
+
+    ``repr`` 变异后消息里出现 ``RecursionError('maximum recursion depth exceeded')``。
+    """
+    import pathlib
+    import tempfile
+
+    from src.utils import config
+
+    with tempfile.TemporaryDirectory() as tmp:
+        config.CONFIG_TOML_PATH = pathlib.Path(tmp) / "config.toml"
+        config.CONFIG_TOML_PATH.write_text("a = " + "[" * 600, encoding="utf-8")
+        config.get_settings.cache_clear()
+        with pytest.raises(ValueError) as excinfo:
+            config.get_settings()
+    message = str(excinfo.value)
+    assert "嵌套层级过深（maximum recursion depth exceeded）" in message
+    assert "RecursionError(" not in message
