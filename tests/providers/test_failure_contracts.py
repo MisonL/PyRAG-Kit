@@ -1104,3 +1104,10 @@ def test_aembed_query_reports_empty_provider_result_readably():
     """异步入口同判据。"""
     with pytest.raises(ValueError, match="返回空结果"):
         asyncio.run(_EmptyEmbedding().aembed_query("q"))
+
+
+@pytest.mark.parametrize("status", [400, "400"])
+def test_chat_status_is_error_includes_status_400_itself(status):
+    """400 本身算错误状态（``>= 400`` 不是 ``> 400``）。"""
+    assert OpenAICompatibleProvider._chat_status_is_error(status) is True
+    assert OpenAICompatibleProvider._chat_status_is_error(399) is False

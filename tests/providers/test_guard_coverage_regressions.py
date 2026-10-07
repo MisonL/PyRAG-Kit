@@ -1037,3 +1037,58 @@ def test_google_connect_live_converts_async_notimplementederror():
     provider._client = _Client()
     with pytest.raises(NotImplementedError, match="当前 google-genai SDK 未提供异步 Live"):
         provider.connect_live(model="m")
+
+
+def test_background_poll_times_out_when_remaining_is_exactly_zero(monkeypatch):
+    """剩余时间恰好为 0 即超时（``<= 0`` 不是 ``< 0``），不得再发起 retrieve。
+
+    时钟注入只替换**本模块**引用的 ``time``：``asyncio.run`` 自身也要读真实
+    时钟，直接打补丁到全局 ``time.monotonic`` 会让它的调度序列错位。
+    变异成 ``< 0`` 后 ``remaining == 0`` 这一轮不超时，会多调用一次
+    ``retrieve``（断言 ``calls == []`` 即红）。
+    """
+    import time as _time
+    from types import SimpleNamespace
+
+    import src.providers.openai_compatible as oc
+
+    sync_calls: list[str] = []
+    async_calls: list[str] = []
+
+    class _SyncResponses:
+        def retrieve(self, response_id, **kwargs):
+            sync_calls.append(response_id)
+            return SimpleNamespace(status="queued", id=response_id)
+
+    class _AsyncResponses:
+        async def retrieve(self, response_id, **kwargs):
+            async_calls.append(response_id)
+            return SimpleNamespace(status="queued", id=response_id)
+
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._provider = None
+    provider._options = {"background_poll_interval": 0.5, "background_timeout": 10.0}
+    provider._get_client = lambda: SimpleNamespace(responses=_SyncResponses())
+    provider._get_aclient = lambda: SimpleNamespace(responses=_AsyncResponses())
+    pending = {"status": "in_progress", "id": "resp-1"}
+
+    # deadline 读表 100.0（deadline=110）；remaining 读表恰好 110.0 → == 0。
+    clock = iter([100.0, 110.0, 121.0, 121.0])
+    monkeypatch.setattr(
+        oc, "time", SimpleNamespace(monotonic=lambda: next(clock), sleep=_time.sleep)
+    )
+    with pytest.raises(TimeoutError):
+        provider._poll_background_response(pending, {})
+    assert sync_calls == [], "remaining == 0 即超时，不得再发起 retrieve"
+
+    clock = iter([100.0, 110.0, 121.0, 121.0])
+    monkeypatch.setattr(
+        oc, "time", SimpleNamespace(monotonic=lambda: next(clock), sleep=_time.sleep)
+    )
+
+    async def consume():
+        await provider._poll_background_response_async(pending, {})
+
+    with pytest.raises(TimeoutError):
+        asyncio.run(consume())
+    assert async_calls == [], "remaining == 0 即超时，不得再发起 retrieve"

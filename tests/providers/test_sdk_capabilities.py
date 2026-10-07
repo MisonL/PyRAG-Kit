@@ -10906,3 +10906,13 @@ def test_ark_async_classification_attribute_error_reports_readably():
 
     with pytest.raises(NotImplementedError, match="Ark Async Classification 资源"):
         _with_classification_attribute_error(lambda: asyncio.run(run()))
+
+
+def test_google_http_options_timeout_rejects_zero_and_accepts_positive():
+    """``timeout <= 0`` 拒绝：0 与负数都必须拦下（``<`` 不是 ``<=``）。"""
+    from src.providers.google import GoogleProvider
+
+    for bad in (0, -1, 0.0):
+        with pytest.raises(ValueError, match="正整数毫秒"):
+            GoogleProvider._validate_http_options({"timeout": bad})
+    GoogleProvider._validate_http_options({"timeout": 1})

@@ -6,19 +6,21 @@
 """
 
 import asyncio
+import pathlib
 
 import numpy as np
 import pytest
 
 from src.providers.local_hash import _normalize as normalize_vector
 from src.retrieval.vdb.faiss_store import FaissStore
+from src.runtime.contracts import RetrievalMethod, build_session_config
 from src.services.retrieval_service import (
     HybridReranker,
     RetrievalService,
     _document_key,
     _document_metadata,
 )
-from src.utils.config import Settings, _coerce_number
+from src.utils.config import Settings, _coerce_number, get_settings
 from src.utils.security import (
     _model_dump_mapping,
     redact_sensitive_text,
@@ -1074,3 +1076,236 @@ def test_key_text_falls_back_to_digest_for_int_subclass_repr_failure():
     from src.services.retrieval_service import _key_text
 
     assert _key_text(_BadReprInt(7)).startswith("<整数，")
+
+
+# --- 边界比较符互换：恰好等于阈值的情形必须有测试 --------------------------
+#
+# 来源：把 ``<``↔``<=``、``>``↔``>=`` 互换后全量仍绿的存活点。存活即说明
+# 「取值恰好等于阈值」从未被测试覆盖（off-by-one 盲区）。逐条用探针确认
+# 边界值处的行为改变后，按守卫存在时的行为写断言。
+
+
+def test_separator_table_accepts_exactly_the_maximum():
+    """分隔符表恰好等于上界（64）时接受，65 项才拒绝。
+
+    ``>`` 改 ``>=`` 后 64 项被误拒——真实配置可能正好用满上界。
+    """
+    from src.etl.splitters.recursive_text_splitter import RecursiveTextSplitter
+
+    limit = RecursiveTextSplitter._MAX_SEPARATORS
+    assert RecursiveTextSplitter._require_separators([f"s{i}" for i in range(limit)])
+    with pytest.raises(ValueError, match="分隔符表最多"):
+        RecursiveTextSplitter._require_separators([f"s{i}" for i in range(limit + 1)])
+
+
+def test_client_timeout_accepts_exactly_the_maximum():
+    """客户端超时恰好等于上界时接受，超过才拒绝。"""
+    from src.providers.__base__.model_provider import (
+        _MAX_CLIENT_TIMEOUT_SECONDS,
+        normalize_client_timeout,
+    )
+
+    assert normalize_client_timeout(_MAX_CLIENT_TIMEOUT_SECONDS, "X", "timeout") == (
+        _MAX_CLIENT_TIMEOUT_SECONDS
+    )
+    with pytest.raises(ValueError, match="不能超过"):
+        normalize_client_timeout(_MAX_CLIENT_TIMEOUT_SECONDS + 1, "X", "timeout")
+
+
+@pytest.mark.parametrize("status", [500, "500"])
+def test_retryable_error_includes_status_500_itself(status):
+    """500 本身可重试（``>= 500`` 不是 ``> 500``）。"""
+    from types import SimpleNamespace
+
+    from src.providers.__base__.model_provider import is_retryable_error
+
+    assert is_retryable_error(SimpleNamespace(status_code=status)) is True
+    assert is_retryable_error(SimpleNamespace(status_code=499)) is False
+
+
+def test_google_http_options_timeout_accepts_exactly_the_millisecond_maximum():
+    """``http_options.timeout`` 恰好等于毫秒上界时接受，多 1 毫秒才拒绝。"""
+    from src.providers.__base__.model_provider import _MAX_CLIENT_TIMEOUT_SECONDS
+    from src.providers.google import GoogleProvider
+
+    boundary_ms = int(_MAX_CLIENT_TIMEOUT_SECONDS * 1000)
+    GoogleProvider._validate_http_options({"timeout": boundary_ms})
+    with pytest.raises(ValueError, match="正整数毫秒"):
+        GoogleProvider._validate_http_options({"timeout": boundary_ms + 1})
+
+
+def test_google_partial_args_accepts_list_index_zero():
+    """``json_path`` 的列表索引 0 是合法写入位置（``< 0`` 不是 ``<= 0``）。"""
+    from src.providers.google import GoogleProvider
+
+    result = GoogleProvider._partial_args_to_mapping(
+        [{"json_path": "$.a[0]", "string_value": "hello"}]
+    )
+    assert result == {"a": ["hello"]}
+
+
+def test_google_merge_tool_arguments_extends_list_at_boundary():
+    """列表恰好需要扩容一个位置（``index == len``）时必须扩容，否则 IndexError。"""
+    from src.providers.google import GoogleProvider
+
+    assert GoogleProvider._merge_tool_arguments([1], [1, 2]) == [1, 2]
+
+
+def test_local_hash_dimension_zero_falls_back_to_default():
+    """``model_name`` 解析出维度 0 时退回默认，而不是产生 0 维向量。"""
+    from src.providers.local_hash import DEFAULT_DIMENSION, _parse_dimension
+
+    assert _parse_dimension("local-hash-0") == DEFAULT_DIMENSION
+    assert _parse_dimension("local-hash-1") == 1
+
+
+@pytest.mark.parametrize("count", [2**63, 2**64 - 1])
+def test_manifest_count_accepts_up_to_64_bits(count):
+    """位数恰好到 64 位（``2**64 - 1``）时接受，第 65 位才拒绝。"""
+    from src.runtime.contracts import _manifest_count
+
+    assert _manifest_count(count, "document_count") == count
+    with pytest.raises(ValueError, match="超出合理范围"):
+        _manifest_count(2**64, "document_count")
+
+
+def test_toml_string_does_not_escape_plain_space():
+    """普通空格不需要转义（``< ' '`` 不是 ``<= ' '``），控制字符才转义。"""
+    from src.runtime.contracts import KnowledgeSnapshotManifest
+
+    assert KnowledgeSnapshotManifest._toml_string("a b") == '"a b"'
+    assert KnowledgeSnapshotManifest._toml_string("a\x01b") == '"a\\u0001b"'
+    assert KnowledgeSnapshotManifest._toml_string("a\x7fb") == '"a\\u007Fb"'
+
+
+def test_safe_repr_truncates_only_beyond_limit():
+    """``repr`` 长度恰好等于 ``limit`` 时不截断，超过才截断。"""
+    from src.utils.config import safe_repr
+
+    exact = "x" * 78  # repr 后恰好 80 字符
+    assert len(repr(exact)) == 80
+    assert safe_repr(exact) == repr(exact)
+    over = "x" * 79
+    assert safe_repr(over).endswith("...")
+
+
+def test_snapshot_id_accepts_exactly_the_maximum_length():
+    """快照 id 恰好等于长度上界（64）时接受，65 才拒绝。"""
+    import tempfile
+
+    from src.retrieval.snapshot_repository import (
+        _MAX_SNAPSHOT_ID_LENGTH,
+        SnapshotRepository,
+    )
+
+    repo = SnapshotRepository.__new__(SnapshotRepository)
+    repo.root = pathlib.Path(tempfile.mkdtemp())
+    repo._require_snapshot_id_within_root("a" * _MAX_SNAPSHOT_ID_LENGTH, source="test")
+    with pytest.raises(ValueError, match="快照 id 过长"):
+        repo._require_snapshot_id_within_root("a" * (_MAX_SNAPSHOT_ID_LENGTH + 1), source="test")
+
+
+def test_rebuild_indices_skips_faiss_for_empty_embeddings():
+    """空嵌入矩阵不建 FAISS 索引（``len > 0`` 不是 ``len >= 0``）。"""
+    import numpy as np
+
+    store = object.__new__(FaissStore)
+    store.documents = []
+    store.embeddings = np.zeros((0, 4), dtype=np.float32)
+    store._tokenized_docs_cache = None
+    store.bm25_index = None
+    store.faiss_index = None
+    store._rebuild_indices()
+    assert store.faiss_index is None
+
+
+def test_deduplicate_parent_documents_keeps_first_on_equal_scores():
+    """分数相同时保留先出现的文档（``>`` 不是 ``>=``）。"""
+    from src.services.retrieval_service import _deduplicate_parent_documents
+
+    documents = [
+        {"page_content": "first", "metadata": {"parent_id": "p1"}, "score": 0.5},
+        {"page_content": "second", "metadata": {"parent_id": "p1"}, "score": 0.5},
+    ]
+    assert [d["page_content"] for d in _deduplicate_parent_documents(documents)] == ["first"]
+
+
+def test_keyword_search_stops_exactly_at_top_k():
+    """结果数恰好达到 ``top_k`` 时停止（``>=`` 不是 ``>``），不多取一条。"""
+    import jieba
+    import numpy as np
+    import rank_bm25
+
+    store = FaissStore(file_path=None)
+    # 每篇各含一个只出现一次的独有词 -> 四篇都是正分；查询四词时四条都合格。
+    texts = ["独一 甲", "独二 乙", "独三 丙", "独四 丁"]
+    store.documents = [
+        {"page_content": text, "metadata": {"source": f"s{index}.md"}}
+        for index, text in enumerate(texts)
+    ]
+    store.embeddings = np.zeros((len(texts), 4), dtype=np.float32)
+    store._tokenized_docs_cache = [list(jieba.cut(text)) for text in texts]
+    store.bm25_index = rank_bm25.BM25Okapi(store._tokenized_docs_cache)
+
+    query = "独一 独二 独三 独四"
+    scores = store.bm25_index.get_scores(list(jieba.cut(query)))
+    assert (scores > 0).sum() == 4, "前提：四篇都必须正分"
+    assert len(store.keyword_search(query, top_k=2)) == 2
+    assert len(store.keyword_search(query, top_k=1)) == 1
+
+
+def test_retrieve_accepts_candidate_product_exactly_at_the_maximum():
+    """``top_k × multiplier`` 恰好等于上界时接受，越界才拒绝。"""
+    from src.services.retrieval_service import _MAX_RETRIEVAL_CANDIDATES, RetrievalService
+
+    class _Store:
+        def semantic_search(self, embedding, top_k):
+            return []
+
+        def resolve_parent_content(self, parent_id):
+            return None
+
+    class _Embedding:
+        async def embed_query(self, query):
+            return [0.0] * 4
+
+    config = build_session_config(get_settings())
+    config.retrieval_method = RetrievalMethod.SEMANTIC_SEARCH
+    config.rerank_enabled = False
+    config.top_k = _MAX_RETRIEVAL_CANDIDATES
+    config.retrieval_candidate_multiplier = 1
+    # 恰好等于上界：接受（不抛）。
+    asyncio.run(RetrievalService(_Store(), _Embedding()).retrieve("q", config))
+
+
+def test_retrieve_keeps_document_scoring_exactly_at_the_threshold():
+    """分数恰好等于阈值时保留（``>=`` 不是 ``>``）。"""
+    from src.services.retrieval_service import RetrievalService
+
+    class _Store:
+        def semantic_search(self, embedding, top_k):
+            return [
+                {"page_content": "exact", "metadata": {"source": "a.md"}, "score": 0.5},
+                {"page_content": "below", "metadata": {"source": "b.md"}, "score": 0.4},
+            ]
+
+        def resolve_parent_content(self, parent_id):
+            return None
+
+    class _Embedding:
+        async def embed_query(self, query):
+            return [0.0] * 4
+
+    config = build_session_config(get_settings())
+    config.retrieval_method = RetrievalMethod.SEMANTIC_SEARCH
+    config.rerank_enabled = False
+    config.score_threshold = 0.5
+    results = asyncio.run(RetrievalService(_Store(), _Embedding()).retrieve("q", config))
+    assert [d["page_content"] for d in results] == ["exact"]
+
+
+def test_overlap_accepts_one_below_the_maximum():
+    """overlap 恰好等于上界减一（999999）时接受，等于上界（1000000）才拒绝。"""
+    assert Settings.validate_non_negative_overlap(999999) == 999999
+    with pytest.raises(ValueError, match="必须小于"):
+        Settings.validate_non_negative_overlap(1000000)

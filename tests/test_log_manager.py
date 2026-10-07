@@ -236,3 +236,19 @@ def test_chat_logger_degrades_on_null_byte_log_path(monkeypatch):
             logger.removeHandler(handler)
         for handler in saved:
             logger.addHandler(handler)
+
+
+def test_cleanup_keeps_logs_exactly_at_the_retention_boundary(tmp_path, monkeypatch):
+    """恰好达到保留天数的日志保留（``>`` 不是 ``>=``），多一天才删。"""
+    from datetime import datetime, timedelta
+
+    now = datetime.now().astimezone()
+    exact = tmp_path / f"app_log_{(now - timedelta(days=15)).strftime('%Y-%m-%d')}.log"
+    beyond = tmp_path / f"app_log_{(now - timedelta(days=16)).strftime('%Y-%m-%d')}.log"
+    exact.write_text("x", encoding="utf-8")
+    beyond.write_text("x", encoding="utf-8")
+
+    _cleanup_with(monkeypatch, tmp_path, retention_days=15)
+
+    assert exact.exists(), "恰好 15 天不应被删"
+    assert not beyond.exists(), "16 天应被删"
