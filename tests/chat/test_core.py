@@ -286,6 +286,10 @@ def test_chat_async_retrieves_with_intent():
 
     assert retrieval_queries == ["清除浏览器缓存的操作步骤"]
     assert chunks == ["回答"]
+    # 走 LLM 异步生成分支时必须**流式**请求：stream 标志是这一分支的契约
+    # （与 ChatService.generate_reply 同判据），反向成 False 后整段回复在
+    # provider 内部一次性缓冲再返回，逐块 yield 名存实亡。
+    assert model_calls[0]["stream"] is True
     assert "temperature" not in model_calls[0]
 
 
@@ -1166,3 +1170,24 @@ def test_importing_chat_core_does_not_start_interactive_session():
     assert result.returncode == 0, output
     assert "客服已就绪" not in output
     assert "感谢使用，再见！" not in output
+
+
+def test_display_retrieved_docs_renders_the_column_header_row():
+    """检索详情表必须渲染**列头**（``show_header=True``）。
+
+    ``show_header`` 反向成 ``False`` 后 rich 不再输出列头行，表格只剩数据行：
+    第一列的数字与第三列的小数失去列名（``来源``／``预览``／``得分``），
+    用户看到三列中间夹着省略号却无从判断哪列是分数。
+    """
+    from io import StringIO
+
+    buffer = StringIO()
+    bot = _silent_bot(buffer)
+
+    bot._display_retrieved_docs(
+        [{"page_content": "正文", "metadata": {"source": "a.md"}, "score": 0.5}]
+    )
+
+    output = buffer.getvalue()
+    for column in ("来源", "预览", "得分"):
+        assert column in output, f"列头 {column!r} 未渲染：{output!r}"

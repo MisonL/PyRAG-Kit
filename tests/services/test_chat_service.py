@@ -94,6 +94,32 @@ def test_generate_reply_omits_sampling_without_capability_declaration():
     assert "temperature" not in model.calls[0]
 
 
+def test_generate_reply_requests_a_streaming_completion():
+    """``generate_reply`` 必须**流式**请求：整段回复要逐块 yield 给调用方。
+
+    ``stream`` 反向成 ``False`` 后 provider 在内部把整段回复缓冲完再返回，
+    ``chat_async`` 的逐块 yield 名存实亡——用户看到的是「先卡住、再一次性
+    刷出全文」，而终端流式输出正是这个接口存在的理由。既有的三条
+    ``generate_reply`` 用例只断言了采样字段，没有一条断言过 ``stream``。
+    """
+    model = _ResponsesReasoningModel()
+    service = ChatService(model, retrieval_service=object())
+
+    async def consume():
+        return [
+            chunk
+            async for chunk in service.generate_reply(
+                "问题",
+                "意图",
+                [],
+                type("SessionConfig", (), {"chat_temperature": 0.7})(),
+            )
+        ]
+
+    assert asyncio.run(consume()) == ["检索"]
+    assert model.calls[0]["stream"] is True
+
+
 def test_chat_service_passes_sampling_when_capability_is_declared():
     model = _SamplingModel()
     service = ChatService(model, retrieval_service=object())

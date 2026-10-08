@@ -1568,3 +1568,96 @@ def test_non_llm_protocol_error_names_the_matching_role():
                 }
             )
         assert f"{role} 配置不支持 protocol" in str(excinfo.value)
+
+
+# ── 回归：Settings 的每一个凭证字段都必须同时隐藏于 repr 与 dump ──
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    sorted(
+        {
+            "anthropic_api_key",
+            "google_api_key",
+            "siliconflow_api_key",
+            "gemini_api_key",
+            "google_application_credentials",
+            "openai_api_key",
+            "qwen_api_key",
+            "ark_api_key",
+            "volc_access_key",
+            "volc_secret_key",
+            "jina_api_key",
+            "deepseek_api_key",
+            "grok_api_key",
+            "lm_studio_api_key",
+        }
+    ),
+)
+def test_settings_hides_each_credential_in_repr_and_dump(field_name):
+    """``repr=False`` 与 ``_secret_fields`` 必须对**每个**凭证字段同时生效。"""
+    secret = f"sk-test-{field_name}"
+    settings = Settings(**{field_name: secret})
+
+    assert secret not in repr(settings), f"repr 回显了 {field_name}"
+    assert secret not in str(settings), f"str 回显了 {field_name}"
+    assert field_name not in settings.model_dump(), f"model_dump 泄漏 {field_name}"
+    assert field_name not in settings.model_dump_json(), f"model_dump_json 泄漏 {field_name}"
+    assert settings.model_dump(include_secrets=True)[field_name] == secret
+
+
+#
+# 14 个 ``*_api_key`` 字段声明时带 ``repr=False``（被 ``_secret_fields`` 纳入
+# dump 排除），但此前只有 openai/lm_studio/gemini 三个被断言过 ``model_dump``，
+# 没有一条断言过 ``repr``——boolc 变异扫描实测：任意单个字段的 ``repr=False``
+# 反向成 ``True`` 后全量 4269 条仍全绿，``repr(settings)``／``str(settings)``
+# 会回显该字段的明文（日志与 traceback 里最常见的一手凭证出口）。这里把 14 个
+# 字段逐一对过三条判据：repr 不出现、model_dump 不含键、include_secrets=True
+# 时才拿得到明文。
+
+
+# ── 回归：kb 清洗开关的**默认值**必须是关闭（config.toml.example 同款取值）──
+#
+# 四个 bool 字面量互换后全量 4269 条仍全绿（boolc 扫描）。不带显式配置的调用方
+# （未初始化 config.toml 的全新部署）拿到的是字段默认值：反向后清洗默认改写
+# 空白/空格/URL、启用 QA 分段——行为变化没有任何一处测试或文档提示，而
+# ``config.toml.example`` 里四个键全写的是 ``false``。
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "kb_replace_whitespace",
+        "kb_remove_spaces",
+        "kb_remove_urls",
+        "kb_use_qa_segmentation",
+    ],
+)
+def test_kb_cleaning_switch_defaults_are_off(field_name):
+    """四个清洗开关的 schema 默认值必须是 ``False``。"""
+    assert Settings.model_fields[field_name].default is False
+
+
+# ── 回归：resolve_app_root 的两条分支 ──
+
+
+def test_resolve_app_root_returns_repo_root_when_not_frozen():
+    """非冻结（源码运行）时根目录是仓库根，不受 ``sys.frozen`` 缺失影响。"""
+    from src.utils import config as config_module
+
+    assert (
+        config_module.resolve_app_root()
+        == Path(config_module.__file__).resolve().parent.parent.parent
+    )
+
+
+def test_resolve_app_root_uses_executable_dir_when_frozen(monkeypatch, tmp_path):
+    """冻结（PyInstaller）运行时根目录是可执行文件所在目录。"""
+    import sys as sys_module
+
+    from src.utils import config as config_module
+
+    monkeypatch.setattr(sys_module, "frozen", True, raising=False)
+    monkeypatch.setattr(sys_module, "executable", str(tmp_path / "app.bin"))
+
+    assert config_module.resolve_app_root() == tmp_path

@@ -335,3 +335,111 @@ def test_splitter_logs_effective_parent_chunk_size(splitter_log_records):
     assert ready, "初始化后必须留下就绪日志"
     assert "chunk_size=333" in ready[-1]
     assert splitter.text_splitter._chunk_size == 333
+
+
+# ── 回归：分隔符被当成正则 / 日志阶段词与结构模式不一致（boolc 扫描存活点）──
+#
+# 四个布尔字面量互换后全量 4269 条仍全绿（boolc 变异扫描实测）：
+# * 189／334 ``is_separator_regex=False`` → ``True``：``kb_splitter_separators``
+#   是**字面量**分隔符（默认 ``["###"]``），正则模式下 ``***`` 被 ``re`` 当成
+#   「重复前一项」而抛裸 ``re.error: nothing to repeat``，用户看到的是正则语法
+#   错误而不是「分隔符配置」；``|`` 则从字面竖线变成「空串或空串」的交替，切点
+#   完全错位。
+# * 452／458 ``hierarchical`` 标志：它唯一的作用是选择日志里的阶段词
+#   （``层级分割``／``分割``）。反向之后标准分支的日志写成「层级分割完成」，
+#   层级分支的日志把「层级分割」写成「分割」——按日志定位「哪条分支产出的块」
+#   正是排查分块问题时唯一的线索。
+
+
+def test_splitter_treats_separators_as_literals_not_regex():
+    """分隔符表按**字面量**切分：``***`` 不得被当成正则而抛 ``re.error``。
+
+    正则模式下 ``***`` 的 ``*`` 是量词、前面没有可重复项，LangChain 的
+    ``re.search(separator_, text)`` 直接抛 ``re.error: nothing to repeat at
+    position 0``——异常类型与「分隔符配置」毫无关联。
+    """
+    splitter, settings, original = _splitter_with(
+        mode="char",
+        kb_chunk_size=60,
+        kb_chunk_overlap=0,
+        kb_splitter_separators=["***"],
+    )
+    try:
+        chunks = splitter.split(
+            [
+                Document(
+                    content="***" + "内容" * 20 + "***" + "内容" * 20, metadata={"source": "s.md"}
+                )
+            ]
+        )
+    finally:
+        _restore(settings, original)
+
+    assert splitter.text_splitter._is_separator_regex is False
+    assert len(chunks) >= 2, "字面量分隔符必须真的切出多块"
+
+
+def test_child_splitter_treats_separators_as_literals_not_regex():
+    """层级模式的**子**分片器同样按字面量切分。
+
+    ``_build_child_splitter`` 是另一处构造点，只改父分片器会留下同族缺口：
+    正则模式下子分片阶段抛同一个 ``re.error``，父分片成功而子分片失败。
+    """
+    splitter, settings, original = _splitter_with(
+        mode="char",
+        structure_mode="hierarchical",
+        kb_chunk_size=60,
+        kb_chunk_overlap=0,
+        kb_child_chunk_size=30,
+        kb_child_chunk_overlap=0,
+        kb_splitter_separators=["***"],
+    )
+    try:
+        chunks = splitter.split(
+            [
+                Document(
+                    content="***" + "内容" * 20 + "***" + "内容" * 20, metadata={"source": "c.md"}
+                )
+            ]
+        )
+    finally:
+        _restore(settings, original)
+
+    assert splitter._build_child_splitter()._is_separator_regex is False
+    assert chunks, "子分片必须产出块"
+
+
+def test_splitter_log_stage_word_matches_structure_mode(splitter_log_records):
+    """单篇文档的完成日志必须报**该分支**的阶段词。
+
+    标准分支写「分割完成」，层级分支写「层级分割完成」。两处的 ``hierarchical``
+    标志是这句日志唯一的来源：反向之后标准分支报「层级分割完成」、层级分支报
+    「分割完成」，而「这批块是哪条分支产出的」正是排查分块问题的唯一线索。
+    """
+    for structure_mode, expected, unexpected in (
+        ("standard", "分割完成", "层级分割完成"),
+        ("hierarchical", "层级分割完成", "分割"),
+    ):
+        splitter, settings, original = _splitter_with(
+            mode="char",
+            structure_mode=structure_mode,
+            kb_chunk_size=60,
+            kb_chunk_overlap=0,
+            kb_child_chunk_size=30,
+            kb_child_chunk_overlap=0,
+            kb_splitter_separators=["###"],
+        )
+        try:
+            splitter.split([Document(content="###" + "内容" * 30, metadata={"source": "stage.md"})])
+        finally:
+            _restore(settings, original)
+
+        messages = [m for m in splitter_log_records.messages("DEBUG") if "stage.md" in m]
+        assert messages, f"{structure_mode} 分支必须留下单篇文档日志"
+        # 断言**整句**（来源 + 阶段词 + 逗号）：「层级分割完成」包含「分割完成」
+        # 这个子串，只看子串无法区分两条分支。
+        if expected == "层级分割完成":
+            assert f"'stage.md' {expected}，" in messages[-1], f"阶段词错误：{messages[-1]!r}"
+        else:
+            assert f"'stage.md' {expected}，" in messages[-1], f"阶段词错误：{messages[-1]!r}"
+            assert "层级分割" not in messages[-1], f"标准分支报了对侧阶段词：{messages[-1]!r}"

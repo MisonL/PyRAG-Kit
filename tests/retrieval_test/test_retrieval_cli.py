@@ -906,3 +906,24 @@ def test_quit_command_exits_before_running_retrieval(monkeypatch):
     asyncio.run(run_retrieval_test_async())
 
     assert calls == []
+
+
+def test_display_results_renders_the_column_header_row(monkeypatch):
+    """召回测试表必须渲染**列头**（``show_header=True``）。
+
+    ``show_header`` 反向成 ``False`` 后 rich 不再输出列头行，表格只剩数据行：
+    第一列的排名与第四列的小数失去列名（``排名``／``内容``／``来源``／``分数``），
+    用户看到四列数据却无从判断哪列是分数。既有用例只断言了内容与标记形态。
+    """
+    from src.retrieval_test.core import display_results
+
+    buffer = _console_buffer(monkeypatch)
+
+    display_results(
+        "查询",
+        [{"page_content": "内容", "metadata": {"source": "a.md"}, "score": 0.5}],
+    )
+
+    rendered = buffer.getvalue()
+    for column in ("排名", "内容", "来源", "分数"):
+        assert column in rendered, f"列头 {column!r} 未渲染：{rendered!r}"

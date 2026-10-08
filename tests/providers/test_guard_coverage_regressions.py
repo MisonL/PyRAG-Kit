@@ -4173,3 +4173,45 @@ def test_anthropic_stream_event_keeps_non_ascii_tool_arguments_verbatim():
 
     assert converted is not None
     assert converted.tool_call["arguments"] == '{"a":"中文"}'
+
+
+# ── face 13（True ↔ False 互换）扫描在 Google 入口的存活位点 ──
+# 实测：574／1483／1900 反向后全量 4269 条仍全绿，用能触达守卫的判别输入
+# 确认行为确实改变（EQUIV 桶逐条反证，见 1922/1287 等处的甄别记录）。
+
+
+def test_google_validate_http_options_keeps_blank_query_values():
+    """``keep_blank_values=True``：query 里值为空的敏感参数同样要被报出来。
+
+    反向成 ``False`` 后 ``parse_qsl`` 丢弃 ``token=``（值为空）这一项，整个 query
+    归一成空对——「配置里放了一个空 token」被静默接受，与 ``redact_sensitive_text``
+    对非空值的拦截（同一行的前半判据）只判了一半。实测 base 报
+    ``headers.X?token``，变异体接受。
+    """
+    with pytest.raises(ValueError, match=r"headers\.X\?token\b"):
+        GoogleProvider._validate_http_options({"headers": {"X": "http://h/p?token="}})
+
+
+def test_google_decode_data_uri_rejects_illegal_base64_characters():
+    """Google data URI 的 base64 必须 ``validate=True``，与 Anthropic 侧同判据。
+
+    反向成 ``False`` 后 ``base64.b64decode`` 丢弃非法字符，``"YWJj!!!"`` 被解成
+    ``b"abc"`` 照常返回——损坏的图片被当成合法数据继续走。既有用例断言的是
+    非 ASCII 输入（走 ``ValueError``），ASCII 非法字符这一半此前无人看守。
+    """
+    with pytest.raises(ValueError, match="data URI 不是有效 Base64"):
+        GoogleProvider._decode_data_uri("data:image/png;base64,YWJj!!!", "图片")
+
+
+def test_google_response_text_reaches_the_accessor_fallback_when_parts_are_empty():
+    """``saw_parts`` 初值必须是 ``False``：parts 为空时才够得着 ``response.text`` 兜底。
+
+    反向成 ``True`` 后空 parts 也被当成「看过部件」，直接返回空串，随后
+    ``response.text`` 里的正文被跳过——SDK 构造的**无 parts** 响应
+    （只有 ``text`` 属性）此前拿得到正文，变异后拿到空字符串。
+    """
+    from types import SimpleNamespace as NS
+
+    response = NS(candidates=[NS(content=NS(parts=[]))], text="兜底正文")
+
+    assert GoogleProvider._response_text(response) == "兜底正文"

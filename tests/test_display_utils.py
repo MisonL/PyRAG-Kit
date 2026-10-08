@@ -1009,3 +1009,30 @@ def test_require_model_detail_rejects_non_mapping_configurations_with_list():
 
     with pytest.raises(ValueError, match="未找到key"):
         _require_model_detail(["not", "a", "mapping"], "demo", "LLM")
+
+
+# ── 回归：配置面板的两张表都必须关掉列头（boolc 扫描存活点）──
+#
+# ``Table(..., show_header=False)`` 反向成 ``True`` 后 rich 会插入一行**空白
+# 列头**——两张表的列都没有名字（只有样式），于是那一行只剩两边框之间的空白。
+# 用户看到的是「聊天机器人配置」与第一条数据之间、以及「API密钥与URL配置」
+# 与 ``QWEN_API_KEY`` 之间各多出一个空行。既有的用例只断言了脱敏与数值渲染，
+# 从不检查表格结构，两处守卫因此同时无人看守。
+
+
+def test_display_chat_config_tables_render_without_a_header_row(rendered):
+    """两张配置表都不得渲染列头行（列没有名字，只会多出一行空白）。
+
+    ``show_header`` 反向成 ``True`` 后 rich 在标题与第一条数据之间插入一行只有
+    边框的空白行。断言「标题行的下一行就是第一条数据」，两张表各判一次。
+    """
+    lines = [line for line in rendered.splitlines() if line.strip()]
+    chat_index = next(i for i, line in enumerate(lines) if "聊天机器人配置" in line)
+    assert "检索策略:" in lines[chat_index + 1], (
+        f"聊天配置表在标题后多出非数据行：{lines[chat_index + 1]!r}"
+    )
+
+    api_index = next(i for i, line in enumerate(lines) if "API密钥与URL配置" in line)
+    assert "QWEN_API_KEY" in lines[api_index + 1], (
+        f"API 配置表在标题后多出非数据行：{lines[api_index + 1]!r}"
+    )

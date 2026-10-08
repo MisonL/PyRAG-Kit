@@ -9460,6 +9460,36 @@ def test_responses_input_rejects_non_sequence_content(bad_content):
         normalize_responses_input(None, None, [{"role": "user", "content": bad_content}])
 
 
+@pytest.mark.parametrize("bad_content", [5, {"a": 1}], ids=["int", "dict"])
+def test_responses_input_rejects_invalid_assistant_content_alongside_tool_calls(bad_content):
+    """带 ``tool_calls`` 的 assistant 消息，其「有值但非法」的 ``content`` 必须显式报错。
+
+    ``_responses_has_content`` 末行 ``return True`` 反向成 ``False`` 后实测：
+    int/dict 这类非 ``None``、非字符串、非序列的 content 被判为「无内容」而整段
+    丢弃，只剩 ``function_call`` 发给服务端——助手文本无声消失。既有
+    ``test_responses_input_rejects_non_sequence_content`` 只走 ``role="user"``
+    路径（另一处守卫），从未触发这里。
+    """
+    with pytest.raises(ValueError, match="content 必须是字符串或内容块序列"):
+        normalize_responses_input(
+            None,
+            None,
+            [
+                {
+                    "role": "assistant",
+                    "content": bad_content,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "f", "arguments": "{}"},
+                        }
+                    ],
+                }
+            ],
+        )
+
+
 def test_responses_input_rejects_function_role_without_tool_call_id():
     """``role="function"`` 的消息必须带 ``tool_call_id``。
 
@@ -10916,3 +10946,80 @@ def test_google_http_options_timeout_rejects_zero_and_accepts_positive():
         with pytest.raises(ValueError, match="正整数毫秒"):
             GoogleProvider._validate_http_options({"timeout": bad})
     GoogleProvider._validate_http_options({"timeout": 1})
+
+
+# ── 回归：chat 请求构造必须把 ``require_tool_call_ids=True`` 传给规范化层 ──
+#
+# openai 1048 与 volcengine 1020 的布尔字面量互换后全量测试仍全绿：两者调用
+# ``normalize_messages(..., require_tool_call_ids=True)`` 的**调用点标志**无人
+# 看守——既有的 ``test_chat_completions_still_requires_tool_call_id`` 直接调
+# ``normalize_messages`` 本身，不经过构造器。反向成 ``False`` 后缺 id 的
+# assistant 历史被静默放进请求，网关按自己那一套处理（或直接 400），而 Chat
+# Completions 协议要求 assistant 历史的每个 ``tool_call`` 都带 id（构造器上方
+# 的注释写明了这一点）。
+
+
+@pytest.mark.parametrize(
+    "provider_cls,protocol",
+    [
+        pytest.param(OpenAICompatibleProvider, "chat_completions", id="openai"),
+        pytest.param(VolcengineProvider, "chat_completions", id="volcengine"),
+    ],
+)
+def test_build_chat_request_rejects_tool_calls_without_id(provider_cls, protocol):
+    provider = object.__new__(provider_cls)
+    provider._model_name = "m"
+    provider._provider = "openai"
+    provider._protocol = protocol
+    provider._options = {}
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"type": "function", "function": {"name": "f", "arguments": "{}"}}],
+        }
+    ]
+
+    with pytest.raises(ValueError, match="缺少 id/call_id"):
+        provider._build_chat_request(prompt="hi", messages=messages)
+
+
+# ── 回归：动态资源 Facade 的 ``_delegate_native`` 必须逐类声明 ──
+#
+# 四个类的 ``_delegate_native = True`` 互换后全量测试仍全绿（boolc 扫描）：
+# 既有用例只通过 ``dir(resources_module)`` 取**第一个** OpenAI 命名的 Facade
+# 来验证动态资源代理，其余类从不实例化。反向成 ``False`` 后 ``__getattr__``
+# 与 ``beta``／``async_beta`` 直接抛 ``AttributeError``——官方 SDK 在模块发布
+# 之后新增的资源（Realtime／Webhooks／Interactions 等）对这几个渠道整棵树消失，
+# 而这是 Facade 存在的唯一理由。
+
+
+@pytest.mark.parametrize(
+    "facade_name,client_attr",
+    [
+        pytest.param("_AsyncOnlyResourceFacade", "async_sdk_client", id="async-only"),
+        pytest.param("GoogleResources", "sdk_client", id="google"),
+        pytest.param("AsyncGoogleResources", "async_sdk_client", id="async-google"),
+        pytest.param("AsyncArkResources", "async_sdk_client", id="async-ark"),
+    ],
+)
+def test_facade_delegates_native_resources_for_every_declaring_class(facade_name, client_attr):
+    """每个声明 ``_delegate_native = True`` 的 Facade 都要能转发动态资源。"""
+    import src.providers.resources as resources_module
+
+    facade_cls = getattr(resources_module, facade_name)
+    assert facade_cls._delegate_native is True
+
+    provider = SimpleNamespace(
+        _provider="demo",
+        sdk_client=SimpleNamespace(brand_new="SYNC", beta="SYNC-BETA"),
+        async_sdk_client=SimpleNamespace(brand_new="ASYNC", beta="ASYNC-BETA"),
+    )
+    facade = facade_cls(provider)
+
+    # ``__getattr__`` 走 ``_delegate_client_name``，而 ``beta``／``async_beta``
+    # 两个属性方法固定读同步／异步客户端——三者的客户端来源不同，分开断言。
+    expected = "ASYNC" if client_attr == "async_sdk_client" else "SYNC"
+    assert facade.brand_new == expected
+    assert facade.beta == "SYNC-BETA"
+    assert facade.async_beta == "ASYNC-BETA"

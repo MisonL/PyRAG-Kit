@@ -217,6 +217,22 @@ def test_jina_rerank_requests_documents_by_default():
     assert payload["return_documents"] is True
 
 
+def test_siliconflow_rerank_requests_documents_by_default():
+    """SiliconFlow 侧的 sibling：默认请求也必须带 ``return_documents=True``。
+
+    反向成 ``False`` 后响应里没有文档文本，调用方按「返回文档」写的
+    ``_parse_response`` 拿到空内容——而 Jina 侧早有这条默认值断言，
+    SiliconFlow 侧只断言了「不允许覆盖」，默认值本身无人看守。
+    """
+    provider = object.__new__(SiliconflowRerankProvider)
+    provider._model_name = "rerank-model"
+    provider._options = {}
+
+    payload = provider._prepare_payload("query", ["document"], 1)
+
+    assert payload["return_documents"] is True
+
+
 # ---------------------------------------------------------------------------
 # 超出双精度范围的整数
 # ---------------------------------------------------------------------------
@@ -563,3 +579,94 @@ def test_rerank_rejects_extra_body_override_of_request_field(provider_type):
 
     with pytest.raises(ValueError, match="extra_body 不允许覆盖请求字段: model"):
         provider._prepare_payload("q", ["d"], 1)
+
+
+# ── 回归：Rerank 的重试耗尽必须抛**原始异常**（boolc 扫描存活点）──
+#
+# ``@retry(..., reraise=True)`` 是 jina／siliconflow 两条 rerank 路径共用的
+# 守卫（``True`` ↔ ``False`` 互换后全量测试仍全绿）。反向成 ``False`` 后
+# tenacity 把最后一次异常包成 ``RetryError`` 抛出——它既不是 ``ValueError``
+# 也不是 ``RuntimeError``／``ConnectionError``，调用方按后三者写的错误分类
+# 全部接不住：一次「上游不可达」被显示成与错误内容无关的 tenacity 内部类型。
+#
+# 同文件 ``test_rerank_*`` 都靠 monkeypatch 掉 httpx，重试守卫本身从未执行。
+
+
+@pytest.mark.parametrize(
+    "provider_cls",
+    [JinaProvider, SiliconflowRerankProvider],
+    ids=["jina", "siliconflow"],
+)
+def test_rerank_reraise_original_error_after_retries_exhausted(monkeypatch, provider_cls):
+    """重试耗尽后必须抛出**原始** ``ConnectionError``，不是 ``RetryError``。"""
+    provider = object.__new__(provider_cls)
+    provider._model_name = "m"
+    provider._options = {}
+    provider._base_url = "http://example.invalid"
+    provider._api_key = "k"
+    provider._get_headers = dict
+    provider._request_timeout = lambda: 1.0
+
+    class _BoomClient:
+        def __init__(self, *_args, **_kwargs):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def post(self, *_args, **_kwargs):
+            raise ConnectionError("上游不可达")
+
+    monkeypatch.setattr("httpx.Client", _BoomClient)
+    # 不真的等 2s + 4s 退避：直接掏掉 wait 调用（tenacity 的 sleep 是实例属性）。
+    monkeypatch.setattr(provider_cls.rerank.retry, "sleep", lambda _seconds: None)
+
+    with pytest.raises(ConnectionError):
+        provider.rerank("q", ["d1"], 1)
+
+
+@pytest.mark.parametrize(
+    "provider_cls",
+    [JinaProvider, SiliconflowRerankProvider],
+    ids=["jina", "siliconflow"],
+)
+def test_arerank_reraise_original_error_after_retries_exhausted(monkeypatch, provider_cls):
+    """异步入口是**另一处装饰器**（同文件 256／248），守卫必须逐个看守。"""
+    import asyncio
+
+    provider = object.__new__(provider_cls)
+    provider._model_name = "m"
+    provider._options = {}
+    provider._base_url = "http://example.invalid"
+    provider._api_key = "k"
+    provider._get_headers = dict
+    provider._request_timeout = lambda: 1.0
+
+    class _BoomAsyncClient:
+        def __init__(self, *_args, **_kwargs):
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, *_args, **_kwargs):
+            raise ConnectionError("上游不可达")
+
+    monkeypatch.setattr("httpx.AsyncClient", _BoomAsyncClient)
+
+    # 异步重试的 ``sleep`` 是被 ``await`` 的，必须给协程函数——给同步 lambda
+    # 会抛 ``TypeError: object NoneType can't be used in 'await' expression``，
+    # 那样测试在**未变异**的代码上也会失败，红验证就成了假绿。
+    async def _no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(provider_cls.arerank.retry, "sleep", _no_sleep)
+
+    with pytest.raises(ConnectionError):
+        asyncio.run(provider.arerank("q", ["d1"], 1))

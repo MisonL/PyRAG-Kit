@@ -752,3 +752,61 @@ def test_exit_choice_returns_from_editor_only_on_exit(monkeypatch):
 
     assert len(calls) == 1
     assert result == (False, {})
+
+
+def test_model_switch_marks_llm_for_reload(monkeypatch):
+    """主菜单里选「切换模型」且模型确实改变时，必须返回 ``llm_needs_reload=True``。
+
+    ``llm_needs_reload = True`` 反向成 ``False`` 后，编辑器把「LLM 已更换」这件事
+    吞掉：``launch_config_editor`` 的返回值是调用方（``chat.core``）决定是否
+    ``reload_llm()`` 的唯一依据，返回 False 时旧模型继续服务——用户在菜单里换了
+    模型，聊天却仍在用上一个。既有的主菜单用例只覆盖「调整检索参数」这条不触发
+    重载的分支。
+    """
+    from src.ui import config_menu
+
+    answers = iter(["2. 切换模型", "exit"])
+
+    def _select(*_args, **_kwargs):
+        return _Choice(next(answers))
+
+    monkeypatch.setattr(config_menu.questionary, "select", _select)
+    monkeypatch.setattr(config_menu.console, "print", lambda *a, **k: None)
+    # ``edit_model_params`` 返回「模型是否改变」——这里让它报告已改变。
+    monkeypatch.setattr(config_menu, "edit_model_params", lambda _cfg: True)
+
+    result = config_menu.launch_config_editor({})
+
+    assert result[0] is True, "切换模型后必须标记需要重载 LLM"
+
+
+def test_retrieval_menu_loops_until_back_is_chosen(monkeypatch):
+    """``edit_retrieval_params`` 的循环必须真的循环（``while True``）。
+
+    反向成 ``while False`` 后循环体一次都不执行：菜单直接返回，任何编辑都无效
+    ——用户改完 Top K 再返回主菜单，配置一个字没变，而界面上没有任何提示。
+    既有的检索菜单用例只走「进入一次即 back」的路径，从不需要第二次迭代。
+    """
+    from src.ui import config_menu
+
+    answers = iter(["top_k", "back", "back"])
+
+    def _select(*_args, **_kwargs):
+        return _Choice(next(answers))
+
+    monkeypatch.setattr(config_menu.questionary, "select", _select)
+    monkeypatch.setattr(config_menu.questionary, "text", lambda *_a, **_k: _Choice("7"))
+    monkeypatch.setattr(config_menu.console, "print", lambda *a, **k: None)
+    chat_config = {
+        "retrieval_method": RetrievalMethod.HYBRID_SEARCH,
+        "hybrid_fusion_strategy": "rrf",
+        "retrieval_candidate_multiplier": 3,
+        "top_k": 5,
+        "vector_weight": 0.5,
+        "keyword_weight": 0.5,
+        "rerank_enabled": False,
+    }
+
+    config_menu.edit_retrieval_params(chat_config)
+
+    assert chat_config["top_k"] == 7, "循环未执行，编辑没有落盘"
