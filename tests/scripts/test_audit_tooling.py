@@ -104,6 +104,29 @@ def test_mutate_cmpdir_flips_only_first_operator_of_chain(tmp_path):
     assert "0 >= x < 10" in target.read_text(encoding="utf-8")
 
 
+def test_mutate_boolc_flips_literal_both_directions(tmp_path):
+    """``True``↔``False`` 两条方向都要翻转。"""
+    target = tmp_path / "mod.py"
+    target.write_text("def f(flag=True):\n    return flag\n")
+    apply_mutation(target, 1, 11, "boolc")
+    assert "flag=False" in target.read_text(encoding="utf-8")
+
+    target.write_text("def f(flag=False):\n    return flag\n")
+    apply_mutation(target, 1, 11, "boolc")
+    assert "flag=True" in target.read_text(encoding="utf-8")
+
+
+def test_mutate_boolc_ignores_non_boolean_constants():
+    """``1``／``0``／``"True"``／``None`` 取值不同型，不是 boolc 的位点。
+
+    ``bool`` 是 ``int`` 的子类，判据必须先按取值类型筛（``isinstance(value,
+    bool)``）再收位点；只按 ``Constant`` 收会把 ``1``／``0`` 也当成布尔字面量，
+    变异落到数字上、``boolc`` 的结论随之失真。
+    """
+    tree = ast.parse('x = 1\ny = "True"\nz = None\nw = True\nv = False\n')
+    assert [(ln, col) for ln, col, _ in mutate.iter_sites(tree, "boolc")] == [(4, 4), (5, 4)]
+
+
 def test_mutate_column_is_utf8_byte_offset(tmp_path):
     """含中文的行：col_offset 是 UTF-8 字节偏移，不是字符偏移。"""
     target = tmp_path / "mod.py"

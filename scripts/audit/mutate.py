@@ -11,6 +11,8 @@
   多操作数比较只翻转第一个 ``Eq``/``NotEq``。
 * ``cmpdir``：``x < y`` → ``x > y``、``x <= y`` → ``x >= y``（反之亦然），
   方向反转；多操作数比较只翻转第一个 ``Lt``/``LtE``/``Gt``/``GtE``。
+* ``boolc``：``True`` → ``False``（反之亦然），只替换布尔字面量本身；``1``／
+  ``0``／``"True"`` 等取值不同型，不是本 kind 的位点。
 
 坐标约定：``line`` 为 1 起始行号，``col`` 为 CPython AST 的 ``col_offset``
 （**UTF-8 字节**偏移）。旧版 ``mut_cmp.py`` 把 ``col_offset`` 当字符偏移
@@ -28,7 +30,7 @@ import pathlib
 import re
 import sys
 
-KINDS = ("drop", "notin", "isnot", "eqneq", "cmpdir")
+KINDS = ("drop", "notin", "isnot", "eqneq", "cmpdir", "boolc")
 
 _OP_KINDS = {
     "notin": (ast.NotIn,),
@@ -59,6 +61,11 @@ def iter_sites(tree: ast.AST, kind: str):
     if kind == "drop":
         for node in ast.walk(tree):
             if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+                yield node.lineno, node.col_offset, node
+        return
+    if kind == "boolc":
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, bool):
                 yield node.lineno, node.col_offset, node
         return
     wanted = _OP_KINDS[kind]
@@ -108,6 +115,18 @@ def find_nearest_site(
 def mutate_source(src: str, node: ast.AST, kind: str) -> str:
     """返回对 ``node`` 施加 ``kind`` 变异后的全文（不写盘、不校验）。"""
     lines = src.splitlines(keepends=True)
+    if kind == "boolc":
+        # ``Constant`` 带完整位置信息，直接按字面量跨度替换（这不是运算符
+        # 节点，不需要区段正则）。字面量本身必须真的是 ``True``／``False``——
+        # 否则是 ``1``／``0``／``"True"`` 之类取了别名的取值，不是本 kind 的位点。
+        start = _char_offset(lines, node.lineno, node.col_offset)
+        end = _char_offset(lines, node.end_lineno, node.end_col_offset)
+        literal = src[start:end]
+        if literal not in ("True", "False"):
+            raise SiteNotFound(f"boolc 定位不符: {literal!r}")
+        replacement = "False" if literal == "True" else "True"
+        return src[:start] + replacement + src[end:]
+
     if kind == "drop":
         start = _char_offset(lines, node.lineno, node.col_offset)
         if src[start : start + 3] != "not":
