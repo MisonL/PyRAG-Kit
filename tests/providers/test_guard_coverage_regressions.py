@@ -11,14 +11,23 @@ from types import SimpleNamespace
 
 import pytest
 
+from src.providers.__base__ import model_provider as model_provider_module
 from src.providers.__base__.model_provider import (
     CompletionRequest,
+    LargeLanguageModel,
     StreamEvent,
     _guard_provider_resource_method,
     _responses_content_part,
     _responses_has_content,
     _responses_json_text,
     content_to_text,
+    normalize_chat_messages,
+    normalize_embedding_vector,
+    normalize_messages,
+    normalize_responses_input,
+    normalize_tool_arguments,
+    retry_async_call,
+    retry_sync_call,
 )
 from src.providers.anthropic import AnthropicProvider
 from src.providers.google import GoogleProvider
@@ -464,6 +473,9 @@ def test_guard_provider_resource_method_is_idempotent():
 
     guarded = _guard_provider_resource_method(plain)
     assert _guard_provider_resource_method(guarded) is guarded
+    # ``getattr(method, "_resource_guarded", False)`` 的默认值若反向成 ``True``，
+    # 未包装的方法也会被判为「已安装」——守卫被静默跳过，凭证与能力校验全部失效。
+    assert getattr(guarded, "_resource_guarded", None) is True
 
 
 # --- 收口批：轮询、文件内容、消息转换、异步流与流终止去重 -------------------
@@ -3728,3 +3740,209 @@ def test_ark_ainvoke_stream_yields_text_delta():
         return [chunk async for chunk in provider.ainvoke("hi", stream=True, temperature=0.5)]
 
     assert asyncio.run(consume()) == ["答"]
+
+
+# --- face 13（True ↔ False 互换扫描）存活位点 ---------------------------------
+
+
+class _RecordingLLM(LargeLanguageModel):
+    """记录 ``invoke``／``ainvoke`` 收到的 ``stream`` 实参。"""
+
+    def __init__(self):
+        self.seen: list[tuple[str, bool]] = []
+
+    def invoke(self, prompt=None, system_prompt=None, tools=None, stream=True, temperature=0.7):
+        self.seen.append(("invoke", stream))
+        yield "x"
+
+    async def ainvoke(
+        self, prompt=None, system_prompt=None, tools=None, stream=True, temperature=0.7
+    ):
+        self.seen.append(("ainvoke", stream))
+        yield "x"
+
+
+@pytest.mark.parametrize("method", ["complete", "acomplete", "stream_events", "astream_events"])
+def test_compat_layer_forces_stream_flag_for_its_call_shape(method):
+    """兼容层必须按自己的调用形态固定 ``stream``，不能沿用请求里的取值。
+
+    ``complete``／``acomplete`` 要**非流式**（一次性聚合），``stream_events``／
+    ``astream_events`` 要**流式**（逐块产出）。``CompletionRequest.stream`` 的
+    默认值 ``True`` 被反向成 ``False`` 后，``complete``／``acomplete`` 的
+    ``copy_with(stream=False)`` 仍显式固定，但 ``stream_events``／
+    ``astream_events`` 的 ``copy_with(stream=True)`` 变成 ``False``——两条事件
+    流路径静默退化成非流式，逐块产出变成一次性返回。既有用例只断言了
+    ``complete`` 的文本结果，事件流两条路径的 ``stream`` 实参从未被观察。
+    """
+    provider = _RecordingLLM()
+
+    if method == "complete":
+        provider.complete(prompt="hi")
+    elif method == "acomplete":
+        asyncio.run(provider.acomplete(prompt="hi"))
+    elif method == "stream_events":
+        list(provider.stream_events(prompt="hi"))
+    else:
+
+        async def _drain():
+            return [event async for event in provider.astream_events(prompt="hi")]
+
+        asyncio.run(_drain())
+
+    expected_method = "ainvoke" if method in ("acomplete", "astream_events") else "invoke"
+    expected_stream = method in ("stream_events", "astream_events")
+    assert provider.seen == [(expected_method, expected_stream)]
+
+
+def test_completion_request_stream_defaults_to_true():
+    """``CompletionRequest.stream`` 的默认值是 ``True``（``bool`` 不是 ``int``）。
+
+    默认值反向成 ``False`` 后，未显式指定 ``stream`` 的请求会静默走非流式；
+    ``to_invoke_kwargs`` 原样转发该字段，调用方拿到的 ``stream`` 与契约相反。
+    """
+    assert CompletionRequest(prompt="hi").stream is True
+    assert CompletionRequest(prompt="hi").to_invoke_kwargs()["stream"] is True
+
+
+def test_completion_request_temperature_flag_defaults_off_and_stays_private():
+    """``_temperature_explicit`` 的 dataclass 默认值是 ``False``，且字段保持私有。
+
+    默认值反向成 ``True`` 后：``repr`` 里出现该字段（``repr=False`` 失效）、
+    两个 ``CompletionRequest`` 不再相等（``compare=False`` 失效）、而
+    ``__post_init__`` 仍按真实显式性赋值——``temperature_is_explicit`` 与
+    ``repr``／``==`` 的语义互相矛盾。``init=False`` 使该字段不能从构造器传入，
+    因此 ``repr``／``==`` 是观察默认值的唯一入口。
+    """
+    request = CompletionRequest(prompt="hi")
+    assert "_temperature_explicit" not in repr(request)
+    assert request == CompletionRequest(prompt="hi", temperature=0.7)
+
+
+def test_normalize_chat_messages_requires_tool_call_ids_only_when_asked():
+    """缺 ``id`` 的历史工具调用：默认放行，``require_tool_call_ids=True`` 才拒绝。
+
+    ``require_tool_call_ids`` 默认 ``False`` 被反向成 ``True`` 后，**默认路径**
+    开始拒绝无 id 的 assistant 历史——Gemini 这类不带 id 的历史在 Chat 路径上
+    被静默挡下；而显式要求 id 的路径（Responses）行为不变。既有用例只覆盖了
+    ``require_tool_call_ids=True`` 与带 id 的输入，默认路径这一半从未被触达。
+    """
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"type": "function", "function": {"name": "f", "arguments": "{}"}}],
+        }
+    ]
+
+    normalized = normalize_chat_messages(messages)
+    assert normalized[0]["tool_calls"][0]["type"] == "function"
+
+    with pytest.raises(ValueError, match="缺少 id/call_id"):
+        normalize_chat_messages(messages, require_tool_call_ids=True)
+
+
+def test_normalize_messages_keeps_custom_tool_call_type_only_when_asked():
+    """``custom_tool_call`` 的原始类型只在 ``keep_responses_type=True`` 时保留。
+
+    默认 ``False`` 被反向成 ``True`` 后，Chat 路径会把 Responses 专属的
+    ``custom_tool_call`` 原样带进请求体——Chat Completions 的
+    ``tool_calls[].type`` 只接受 ``function``。既有用例只覆盖了
+    ``keep_responses_type=True`` 与 ``function`` 类型，默认路径这一半从未被触达。
+    """
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "c1", "type": "custom_tool_call", "name": "f", "input": "raw text"}
+            ],
+        }
+    ]
+
+    normalized = normalize_messages(None, None, messages)
+    assert normalized[0]["tool_calls"][0]["type"] == "function"
+
+    kept = normalize_messages(None, None, messages, keep_responses_type=True)
+    assert kept[0]["tool_calls"][0]["type"] == "function"
+    assert kept[0]["tool_calls"][0]["_responses_tool_call_type"] == "custom_tool_call"
+
+
+def test_responses_input_requires_call_id_for_function_call_output():
+    """Responses 的 ``function_call_output`` 必须带 ``call_id``（``require_call_id=True``）。
+
+    该默认值反向成 ``False`` 后，缺 ``call_id`` 的 ``function_call_output`` 不再
+    被拒——下游按 ``call_id`` 关联工具调用时拿到 ``None``，关联静默失效。
+    """
+    messages = [{"type": "function_call_output", "output": "{}"}]
+
+    with pytest.raises(ValueError, match="call_id"):
+        normalize_responses_input(None, None, messages)
+
+
+def test_responses_json_text_keeps_non_ascii_verbatim():
+    """``json.dumps`` 的 ``ensure_ascii=False`` 必须保留非 ASCII 字符。
+
+    反向成 ``True`` 后中文被转义成 ``\\uXXXX`` 形态——字节数翻倍、下游按原文匹配
+    的调用方拿不到原值。既有用例只断言了「是 JSON 字符串」，没有断言转义形态。
+    """
+    assert model_provider_module._responses_json_text({"a": "中文"}, "loc") == '{"a":"中文"}'
+
+
+def test_normalize_tool_arguments_keeps_non_ascii_verbatim():
+    """工具参数序列化同样必须 ``ensure_ascii=False``。"""
+    assert normalize_tool_arguments({"a": "中文"}) == '{"a":"中文"}'
+
+
+def test_normalize_embedding_vector_rejects_invalid_base64_with_value_error():
+    """非法 base64 必须报 ``ValueError``，不能漏出 ``binascii.Error``。
+
+    ``validate=True`` 反向成 ``False`` 后，``base64.b64decode`` 忽略非法字符，
+    ``"YWJj!!!"`` 被解成 ``b"abc"`` 并继续走 float32 解析——错误从「内容无效」
+    变成「不是有效的 float32 字节序列」，调用方按前者写的错误分类接不住。
+    """
+    with pytest.raises(ValueError, match="base64 内容无效"):
+        normalize_embedding_vector("YWJj!!!")
+
+
+@pytest.mark.parametrize("retry", [retry_sync_call, retry_async_call])
+def test_retry_helpers_reraise_original_error(retry):
+    """重试耗尽后必须抛出**原始异常**，不是 ``RetryError``。
+
+    ``reraise=True`` 反向成 ``False`` 后，tenacity 把最后一次异常包成
+    ``RetryError`` 抛出——它既不是 ``ValueError`` 也不是 ``RuntimeError``，
+    调用方按后者写的错误分类全部接不住。既有用例把 ``retry_*`` 整体 monkeypatch
+    掉了，真实重试路径的收场从未被观察。
+    """
+
+    class _TimeoutLike(Exception):
+        pass
+
+    def _boom():
+        raise _TimeoutLike("boom")
+
+    async def _aboom():
+        raise _TimeoutLike("aboom")
+
+    target = _boom if retry is retry_sync_call else _aboom
+    with pytest.raises(_TimeoutLike):
+        if retry is retry_sync_call:
+            retry(target)
+        else:
+            asyncio.run(retry(target))
+
+
+def test_responses_has_content_treats_empty_containers_as_absent():
+    """空串／空列表／``0`` 都算「没有内容」（``return True`` 兜底）。
+
+    兜底反向成 ``False`` 后，``0`` 与空容器被判为无内容——``_responses_content_part``
+    随后走空内容分支，``0`` 这样的合法取值被静默丢弃。既有用例只覆盖了
+    ``None` 与空串，``0` 与空容器这一半从未被触达。
+    """
+    assert _responses_has_content(None) is False
+    assert _responses_has_content("") is False
+    assert _responses_has_content("x") is True
+    assert _responses_has_content([]) is False
+    assert _responses_has_content([1]) is True
+    assert _responses_has_content(0) is True
+    assert _responses_has_content(1) is True
+    assert _responses_has_content({"a": 1}) is True
