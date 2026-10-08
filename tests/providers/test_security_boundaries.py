@@ -876,3 +876,30 @@ def test_options_must_be_a_mapping():
     """``options`` 非对象必须给带 provider 名的 ``ValueError``，不是裸 ``TypeError``。"""
     with pytest.raises(ValueError, match="options 必须是对象"):
         validate_secret_free_options(5, "Anthropic")
+
+
+def test_secret_free_options_keeps_self_copied_sdk_model():
+    """``model_copy`` 返回自身时必须退回 ``deepcopy``（``copied is not value`` 不是 ``is value``）。
+
+    ``is value`` 变异后判据反转：返回自身的模型被当成「已复制」直接返回，
+    调用方拿到的是同一个可变对象——后续对返回值的修改会污染调用方的原对象。
+    """
+    from src.utils.security import validate_secret_free_options
+
+    class SelfCopy:
+        def __init__(self):
+            self.value = 1
+
+        def model_copy(self, deep=False):
+            return self
+
+        def __deepcopy__(self, memo):
+            clone = SelfCopy()
+            clone.value = 2
+            return clone
+
+    original = SelfCopy()
+    validated = validate_secret_free_options({"k": original}, "T")
+
+    assert validated["k"] is not original
+    assert validated["k"].value == 2

@@ -320,3 +320,18 @@ def test_splitter_accepts_the_largest_legal_size():
     """反向守卫：合法的大取值（位数远在上限内）照常接受。"""
     splitter = RecursiveTextSplitter(parent_chunk_size=10**6, parent_chunk_overlap=0)
     assert splitter.parent_chunk_size == 10**6
+
+
+def test_splitter_logs_effective_parent_chunk_size(splitter_log_records):
+    """日志报**生效**的 ``chunk_size``（``is not None`` 不是 ``is None``）。
+
+    显式给出 ``parent_chunk_size`` 时不得回落到 settings 的默认值：``is None``
+    变异后日志报 ``chunk_size=1500``（settings 默认），而实际用的是 333——
+    排查分块效果时日志给出的数字与真实行为相反。
+    """
+    splitter = RecursiveTextSplitter(parent_chunk_size=333)
+
+    ready = [m for m in splitter_log_records.messages("INFO") if "文本分割器已就绪" in m]
+    assert ready, "初始化后必须留下就绪日志"
+    assert "chunk_size=333" in ready[-1]
+    assert splitter.text_splitter._chunk_size == 333

@@ -959,3 +959,183 @@ def test_apply_config_update_async_reports_missing_retrieval_service(monkeypatch
     asyncio.run(bot.apply_config_update_async({"active_llm_configuration": "new-model"}, True))
 
     assert any("LLM 切换失败" in message for message in messages)
+
+
+# --- 否定变异（not / not in / is not）扫描的覆盖缺口 -------------------------
+#
+# 把守卫里的 ``is not`` 换成 ``is``、``not`` 去掉后全量仍绿的存活点。判据是
+# 「只换掉其中一个 ``is not``」——同步分支大多有测试，异步兄弟方法没有。
+
+
+class _ClosableModel:
+    def __init__(self, name="m"):
+        self.name = name
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def _disposal_bot(model):
+    """构造一个只够跑 ``reload_llm``/``apply_config_update_async`` 的 Chatbot。"""
+    from src.runtime.contracts import build_session_config
+    from src.utils.config import Settings
+
+    bot = object.__new__(Chatbot)
+    bot.console = SimpleNamespace(print=lambda *_args, **_kwargs: None)
+    bot.logger = SimpleNamespace(warning=lambda *_args, **_kwargs: None)
+    bot.session_config = build_session_config(Settings(_env_file=None))
+    bot.session_config.active_llm_configuration = "new-model"
+    bot.retrieval_service = object()
+    bot.llm_model = model
+    bot.chat_service = object()
+    return bot
+
+
+def test_chatbot_aclose_disposes_llm_model():
+    """``aclose()`` 释放 LLM 模型（``is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后 ``_adispose_model`` 永不执行，异步会话退出时模型
+    不被关闭——连接池泄漏。同步 ``close()`` 有测试，异步兄弟方法此前没有。
+    """
+    llm = _ClosableModel()
+    retrieval = SimpleNamespace(aclose=lambda: None)
+    bot = object.__new__(Chatbot)
+    bot.llm_model = llm
+    bot.chat_service = object()
+    bot.retrieval_service = retrieval
+    bot.logger = SimpleNamespace(warning=lambda *_args, **_kwargs: None)
+
+    asyncio.run(bot.aclose())
+
+    assert llm.closed is True
+    assert bot.llm_model is None
+
+
+def test_reload_llm_disposes_previous_model_only_when_replaced(monkeypatch):
+    """``reload_llm`` 只在**换成了不同对象**时释放旧模型。
+
+    137 行有两个 ``is not``：换第一个（``is None``）后不同对象的旧模型不再
+    被释放；换第二个（``is``）后工厂返回同一对象时会把刚装上的模型关掉。
+    """
+    # (a) 工厂返回**同一对象**：不得释放
+    same = _ClosableModel()
+    bot = _disposal_bot(same)
+    monkeypatch.setattr(
+        "src.chat.core.ModelProviderFactory.get_llm_provider", lambda *_a, **_k: same
+    )
+    assert bot.reload_llm() is True
+    assert same.closed is False
+
+    # (b) 换成**不同对象**：必须释放旧模型
+    old, new = _ClosableModel("old"), _ClosableModel("new")
+    bot = _disposal_bot(old)
+    monkeypatch.setattr(
+        "src.chat.core.ModelProviderFactory.get_llm_provider", lambda *_a, **_k: new
+    )
+    assert bot.reload_llm() is True
+    assert old.closed is True
+    assert new.closed is False
+    assert bot.llm_model is new
+
+
+def test_reload_llm_failure_disposes_only_uninstalled_model(monkeypatch):
+    """``reload_llm`` 失败时释放**未装上**的新模型，保留在用的旧模型。
+
+    ``new_model is not self.llm_model`` 换成 ``is`` 后新模型不再被释放——
+    初始化失败留下的 Provider 泄漏连接池。
+    """
+    old, new = _ClosableModel("old"), _ClosableModel("new")
+    bot = _disposal_bot(old)
+    monkeypatch.setattr(
+        "src.chat.core.ModelProviderFactory.get_llm_provider", lambda *_a, **_k: new
+    )
+    monkeypatch.setattr(
+        "src.chat.core.ChatService",
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("service init failed")),
+    )
+
+    assert bot.reload_llm() is False
+    assert new.closed is True
+    assert old.closed is False
+    assert bot.llm_model is old
+
+
+def test_apply_config_update_async_disposes_previous_model_only_when_replaced(monkeypatch):
+    """异步配置更新与同步 ``reload_llm`` 同判据（两个 ``is not`` 都要判）。
+
+    264 行的两个 ``is not`` 此前都无测试：换成 ``is None`` 后旧模型不释放；
+    换成 ``is`` 后工厂返回同一对象时把在用的模型关掉。
+    """
+    # (a) 工厂返回**同一对象**：不得释放
+    same = _ClosableModel()
+    bot = _disposal_bot(same)
+    monkeypatch.setattr(
+        "src.chat.core.ModelProviderFactory.get_llm_provider", lambda *_a, **_k: same
+    )
+    asyncio.run(bot.apply_config_update_async({"active_llm_configuration": "new-model"}, True))
+    assert same.closed is False
+
+    # (b) 换成**不同对象**：必须释放旧模型
+    old, new = _ClosableModel("old"), _ClosableModel("new")
+    bot = _disposal_bot(old)
+    monkeypatch.setattr(
+        "src.chat.core.ModelProviderFactory.get_llm_provider", lambda *_a, **_k: new
+    )
+    asyncio.run(bot.apply_config_update_async({"active_llm_configuration": "new-model"}, True))
+    assert old.closed is True
+    assert new.closed is False
+    assert bot.llm_model is new
+
+
+def test_apply_config_update_async_rolls_back_session_config_on_failure(monkeypatch):
+    """异步重载失败时回滚 ``session_config``（``is not None`` 不是 ``is None``）。
+
+    ``llm_needs_reload`` 为真时 ``previous_config`` 必非 ``None``（假值已在
+    前面提前返回），因此 ``is None`` 变异后回滚永不执行——用户看到「已保留
+    当前模型配置」，实际留下的是失败的那份配置。
+    """
+    from src.runtime.contracts import build_session_config
+    from src.utils.config import Settings
+
+    bot = _disposal_bot(_ClosableModel("old"))
+    bot.session_config = build_session_config(Settings(_env_file=None))
+    bot.session_config.active_llm_configuration = "old-model"
+    monkeypatch.setattr(
+        "src.chat.core.ModelProviderFactory.get_llm_provider",
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("reload failed")),
+    )
+
+    asyncio.run(bot.apply_config_update_async({"active_llm_configuration": "new-model"}, True))
+
+    assert bot.session_config.active_llm_configuration == "old-model"
+
+
+def test_apply_config_update_async_passes_llm_configurations_when_present(monkeypatch):
+    """``llm_configurations`` 存在时传给工厂（``is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后走单参分支，用户的模型定义（provider/model_name）被
+    整个丢掉。
+    """
+    from src.runtime.contracts import build_session_config
+    from src.utils.config import Settings
+
+    bot = _disposal_bot(_ClosableModel("old"))
+    bot.session_config = build_session_config(Settings(_env_file=None))
+    bot.session_config.active_llm_configuration = "old-model"
+    bot.session_config.llm_configurations = {
+        "new-model": ModelDetail(provider="openai", model_name="gpt-4o")
+    }
+    received = []
+
+    def _factory(*args, **_kwargs):
+        received.append(args)
+        return _ClosableModel("new")
+
+    monkeypatch.setattr("src.chat.core.ModelProviderFactory.get_llm_provider", _factory)
+
+    asyncio.run(bot.apply_config_update_async({"active_llm_configuration": "new-model"}, True))
+
+    assert received == [
+        ("new-model", {"new-model": ModelDetail(provider="openai", model_name="gpt-4o")})
+    ]

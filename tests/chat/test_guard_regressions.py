@@ -86,3 +86,39 @@ def test_start_chat_session_exits_cleanly_on_eof(monkeypatch):
     monkeypatch.setattr("src.chat.core.PromptSession", lambda: EofSession([]))
     monkeypatch.setattr("src.chat.core.display_chat_config", lambda *_a, **_k: None)
     asyncio.run(__import__("src.chat.core", fromlist=["x"]).start_chat_session_async())
+
+
+# --- 否定变异：``if not callable(apply_sync)`` 去掉 not ----------------------
+
+
+def test_start_chat_session_survives_bot_without_config_update_methods(monkeypatch):
+    """bot 两个配置更新方法都没有时报错并留在会话里，而不是终止。
+
+    ``if not callable(apply_sync)`` 去掉 ``not`` 后，缺方法的替身走
+    ``apply_sync(...)`` → 裸 ``TypeError``；它不落在 ``except (ValueError,
+    KeyError)`` 里，会一路穿透到 ``finally``，用户被丢出会话。
+    """
+    from tests.chat.test_core import FakeChatbot, FakePromptSession
+
+    class NoUpdateChatbot(FakeChatbot):
+        apply_config_update = None
+        apply_config_update_async = None
+
+        def __getattribute__(self, name):
+            # 两个方法都不存在：走 ``getattr(bot, ..., None)`` 的 None 分支。
+            if name in {"apply_config_update", "apply_config_update_async"}:
+                return None
+            return super().__getattribute__(name)
+
+    monkeypatch.setattr("src.chat.core.Chatbot", NoUpdateChatbot)
+    monkeypatch.setattr(
+        "src.chat.core.PromptSession",
+        lambda: FakePromptSession(["/config", "/quit"]),
+    )
+    monkeypatch.setattr("src.chat.core.display_chat_config", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "src.chat.core.launch_config_editor",
+        lambda chat_config: (False, dict(chat_config)),
+    )
+    # 不抛异常即表示会话存活到 /quit。
+    asyncio.run(__import__("src.chat.core", fromlist=["x"]).start_chat_session_async())

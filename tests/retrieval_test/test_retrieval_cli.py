@@ -846,3 +846,22 @@ def test_run_retrieval_test_async_exits_cleanly_on_eof(monkeypatch):
     monkeypatch.setattr("src.retrieval_test.core.ExcelLogger", lambda: None)
 
     asyncio.run(run_retrieval_test_async())
+
+
+def test_excel_log_drops_none_scores_from_all_scores_column(tmp_path):
+    """``all_scores`` 列必须过滤掉 ``None`` 分数（``v is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后字典推导只保留**值为 None** 的分数，真实的 ``score``
+    被丢掉、``semantic_score``／``keyword_score`` 反而以 ``null`` 落盘——
+    日志里再也看不到本次检索的实际得分。
+    """
+    from openpyxl import load_workbook
+
+    from src.retrieval_test.excel_logger import ExcelLogger
+
+    logger = ExcelLogger(log_dir=str(tmp_path))
+    logger.log_results("q", [{"content": "c", "source": "s", "score": 0.5}])
+
+    worksheet = load_workbook(logger.filepath).active
+    row = next(worksheet.iter_rows(min_row=2, max_col=8, values_only=True))
+    assert row[7] == '{"score": 0.5}'

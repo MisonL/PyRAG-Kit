@@ -576,3 +576,59 @@ def test_weight_validator_rejects_non_numeric_and_out_of_range(monkeypatch):
     assert validate("-0.1") is False
     assert validate("abc") is False
     assert validate("") is False
+
+
+def test_edit_retrieval_params_writes_rerank_toggle(monkeypatch):
+    """确认框返回布尔时写回 ``rerank_enabled``（``is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后判据反转：用户确认「启用」时不再写回配置，只有
+    「未作答」（``None``）才写入——开关永远不生效。
+    """
+    from src.ui import config_menu
+
+    answers = iter(["rerank", "back"])
+
+    def _select(*_args, **_kwargs):
+        return _Choice(next(answers))
+
+    monkeypatch.setattr(config_menu.questionary, "select", _select)
+    monkeypatch.setattr(config_menu.questionary, "confirm", lambda *_a, **_k: _Choice(True))
+    chat_config = {
+        "retrieval_method": RetrievalMethod.HYBRID_SEARCH,
+        "hybrid_fusion_strategy": "rrf",
+        "retrieval_candidate_multiplier": 3,
+        "top_k": 5,
+        "vector_weight": 0.5,
+        "keyword_weight": 0.5,
+        "rerank_enabled": False,
+    }
+
+    config_menu.edit_retrieval_params(chat_config)
+
+    assert chat_config["rerank_enabled"] is True
+
+
+def test_edit_model_params_writes_selected_rerank_configuration(monkeypatch):
+    """选中新的 Rerank 配置时写回激活项（``is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后判据反转：用户选中的配置不再写回，激活项保持原值——
+    菜单显示切换成功而配置没变。
+    """
+    from src.ui import config_menu
+
+    answers = iter(["rerank", "b", "back"])
+
+    def _select(*_args, **_kwargs):
+        return _Choice(next(answers))
+
+    monkeypatch.setattr(config_menu.questionary, "select", _select)
+    chat_config = {
+        "llm_configurations": {"a": object()},
+        "rerank_configurations": {"a": object(), "b": object()},
+        "active_llm_configuration": "a",
+        "active_rerank_configuration": "a",
+    }
+
+    config_menu.edit_model_params(chat_config)
+
+    assert chat_config["active_rerank_configuration"] == "b"

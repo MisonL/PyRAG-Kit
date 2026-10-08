@@ -1677,6 +1677,29 @@ def test_compat_complete_drops_kwargs_without_varkw():
     assert _NoVarKw().complete(prompt="hi", temperature=0.25).text == "hi|0.25"
 
 
+def test_compat_acomplete_drops_kwargs_without_varkw():
+    """兼容层 ``acomplete`` 与 ``complete`` 同判据（``not any`` 不是 ``any``）。
+
+    去掉 ``not`` 后对带 ``**kwargs`` 的 Provider 也裁剪参数，``temperature``
+    被丢掉，``ainvoke`` 收到 ``None``。
+    """
+    import asyncio
+
+    from src.providers.__base__.model_provider import LargeLanguageModel
+
+    class _NoVarKw(LargeLanguageModel):
+        def invoke(self, prompt, **kwargs):
+            yield "s"
+
+        async def ainvoke(self, prompt, **kwargs):
+            yield f"{prompt}|{kwargs.get('temperature')}"
+
+    async def _collect():
+        return (await _NoVarKw().acomplete(prompt="hi", temperature=0.25)).text
+
+    assert asyncio.run(_collect()) == "hi|0.25"
+
+
 def test_compat_stream_events_drops_kwargs_without_varkw():
     """兼容层 ``stream_events`` 与 ``complete`` 同判据（``any`` 不是 ``all``）。
 
@@ -1922,3 +1945,90 @@ def test_recursion_error_message_uses_str_not_repr():
     message = str(excinfo.value)
     assert "嵌套层级过深（maximum recursion depth exceeded）" in message
     assert "RecursionError(" not in message
+
+
+def test_faiss_normalize_documents_strips_internal_metadata_keys():
+    """``_normalize_documents`` 从元数据里剔除内部键（``key not in {...}`` 不是 ``key in {...}``）。
+
+    ``not in`` 换成 ``in`` 后判据反转：内部键被**保留**、用户元数据被**剔除**。
+    """
+    _documents, parents = FaissStore._normalize_documents(
+        [
+            {
+                "page_content": "x",
+                "metadata": {
+                    "chunk_id": "c1",
+                    "doc_id": "d1",
+                    "parent_id": "p1",
+                    "parent_chunk_index": 0,
+                    "parent_content": "父块正文",
+                    "user_key": "v",
+                },
+            }
+        ],
+        {},
+    )
+
+    parent_metadata = next(iter(parents.values()))["metadata"]
+    for internal in ("chunk_id", "doc_id", "parent_id", "parent_chunk_index"):
+        assert internal not in parent_metadata
+    assert parent_metadata["user_key"] == "v"
+
+
+def test_faiss_save_snapshot_reports_embedding_dimension_from_array():
+    """``save_snapshot`` 的 ``embedding_dimension`` 取自嵌入数组（``is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后维度恒为 0，快照统计与实际不符。
+    """
+    import json
+
+    import faiss
+    import numpy as np
+
+    store = object.__new__(FaissStore)
+    store.documents = []
+    store.parent_documents = {}
+    store.embeddings = np.zeros((2, 4), dtype=np.float32)
+    store.faiss_index = faiss.IndexFlatL2(4)
+    store.bm25_index = None
+    store._tokenized_docs_cache = None
+
+    with tempfile.TemporaryDirectory() as tmp:
+        store.save_snapshot(tmp)
+        stats = json.loads((pathlib.Path(tmp) / "stats.json").read_text(encoding="utf-8"))
+
+    assert stats["embedding_dimension"] == 4
+
+
+def test_faiss_load_snapshot_rebuilds_when_lexical_index_missing():
+    """``lexical.index`` 缺失时重建索引（去掉 ``not`` 后反转成「存在才重建」）。
+
+    反转后缺索引的快照**不**重建 BM25，关键词检索静默失效。
+    """
+    import numpy as np
+
+    store = object.__new__(FaissStore)
+    store.documents = []
+    store.parent_documents = {}
+    store.embeddings = np.zeros((1, 4), dtype=np.float32)
+    store.faiss_index = None
+    store.bm25_index = None
+    store._tokenized_docs_cache = None
+    rebuilt: list[bool] = []
+    store._rebuild_indices = lambda: rebuilt.append(True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        snapshot = root / "snap-x"
+        snapshot.mkdir()
+        for name in ("chunks.pkl", "parents.pkl", "embeddings.npy", "semantic.index"):
+            pass
+        import pickle
+
+        (snapshot / "chunks.pkl").write_bytes(pickle.dumps([]))
+        (snapshot / "parents.pkl").write_bytes(pickle.dumps({}))
+        np.save(snapshot / "embeddings.npy", store.embeddings)
+        (root / "ACTIVE_SNAPSHOT").write_text("snap-x", encoding="utf-8")
+        store.load_snapshot(str(snapshot), snapshot_root=root)
+
+    assert rebuilt == [True]

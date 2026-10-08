@@ -1110,7 +1110,7 @@ def test_anthropic_output_format_requires_beta_for_tool_runner_only():
     provider = object.__new__(AnthropicProvider)
     provider._options = {}
     provider._model_name = "claude-sonnet-4-5"
-    with pytest.raises(ValueError, match="不支持 output_format"):
+    with pytest.raises(ValueError, match="请使用 parse 或 stream"):
         provider._build_message_params(
             prompt="hi", output_format=str, stream=False, beta=False, for_tool_runner=True
         )
@@ -1408,3 +1408,1850 @@ def test_volcengine_responses_request_seed_param_without_extra_body():
 
     request = provider._build_responses_request(CompletionRequest(prompt="hi", seed=7))
     assert request["extra_body"]["seed"] == 7
+
+
+def test_native_item_keeps_id_and_status_metadata():
+    """原生内容块 item 的 ``id``/``status`` 元数据必须保留（``not in`` 不是 ``in``）。
+
+    内容块转换只产出 SDK 输入联合里的字段，item 级元数据不在其中；
+    ``key not in converted`` 换成 ``key in converted`` 后两个字段都被丢掉。
+    """
+    from src.providers.__base__.model_provider import _normalize_responses_native_item
+
+    result = _normalize_responses_native_item(
+        {"type": "input_text", "text": "hi", "id": "i1", "status": "s1"}, "loc", "openai"
+    )
+
+    assert result["id"] == "i1"
+    assert result["status"] == "s1"
+    assert result["text"] == "hi"
+
+
+def test_responses_content_part_extracts_nested_image_file_id():
+    """嵌套 ``image_url`` 对象里的 ``file_id`` 要提取出来（``is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后 file_id 被丢掉：同时带 url 时静默少发一个字段，
+    只带 file_id 时报「缺少 image_url 或 file_id」——用户按文档写嵌套形态
+    却被拒。
+    """
+    from src.providers.__base__.model_provider import _responses_content_part
+
+    both = _responses_content_part(
+        {"type": "input_image", "image_url": {"url": "https://x/y.png", "file_id": "f1"}}, "loc"
+    )
+    assert both["image_url"] == "https://x/y.png"
+    assert both["file_id"] == "f1"
+
+    only_id = _responses_content_part(
+        {"type": "input_image", "image_url": {"file_id": "f2"}}, "loc"
+    )
+    assert only_id["file_id"] == "f2"
+
+
+# --- 否定变异（not / not in / is not）扫描的覆盖缺口 -------------------------
+#
+# 把 ``is not`` 换成 ``is``、``not in`` 换成 ``in``、去掉 ``not`` 后全量仍绿的
+# 存活点。这批集中在 Responses 输入转换与 Anthropic 参数装配——两处都是
+# 「可选字段有就给、没有就不给」的形态，判据反向时字段被静默丢掉。
+
+
+def test_function_call_output_keeps_status_for_list_output():
+    """列表 ``output`` 的 ``function_call_output`` 保留 ``status``（``is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后 ``status`` 被丢掉——工具结果的状态元数据静默消失。
+    """
+    from src.providers.__base__.model_provider import _responses_function_output_item
+
+    item = _responses_function_output_item(
+        {
+            "type": "function_call_output",
+            "call_id": "c1",
+            "output": [{"type": "input_text", "text": "hi"}],
+            "status": "completed",
+        },
+        "loc",
+    )
+
+    assert item["status"] == "completed"
+
+
+def test_function_call_output_keeps_status_for_text_output():
+    """纯文本 ``output`` 的分支同样保留 ``status``（两处判据逐字相同）。
+
+    1062 行与 1051 行是两份独立拷贝，只测其中一份时另一份反向仍绿。
+    """
+    from src.providers.__base__.model_provider import _responses_function_output_item
+
+    item = _responses_function_output_item(
+        {
+            "type": "function_call_output",
+            "call_id": "c1",
+            "output": "hi",
+            "status": "completed",
+        },
+        "loc",
+    )
+
+    assert item["status"] == "completed"
+
+
+def test_responses_content_part_extracts_nested_image_url():
+    """嵌套 ``image_url`` 对象里的 ``url`` 要提取出来（``is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后走 ``source.pop("image_url")`` 分支，url 被丢掉。
+    """
+    from src.providers.__base__.model_provider import _responses_content_part
+
+    converted = _responses_content_part(
+        {"type": "input_image", "image_url": {"url": "https://x/y.png"}}, "loc"
+    )
+
+    assert converted["image_url"] == "https://x/y.png"
+
+
+def test_responses_content_part_extracts_nested_file_url():
+    """``{"type": "file", "file": {"url": ...}}`` 的 ``url`` 映射成 ``file_url``（``not in`` 不是 ``in``）。
+
+    ``not in`` 换成 ``in`` 后嵌套 url 不再提升到顶层，整条输入被
+    「缺少 file_id、file_data 或 file_url」拒绝——用户按文档写嵌套形态却被拒。
+    """
+    from src.providers.__base__.model_provider import _responses_content_part
+
+    converted = _responses_content_part({"type": "file", "file": {"url": "https://x/y.pdf"}}, "loc")
+
+    assert converted == {"type": "input_file", "file_url": "https://x/y.pdf"}
+
+
+def test_input_file_detail_allowlist_accepts_only_known_values():
+    """``input_file`` 的 ``detail`` 白名单只放行 auto/low/high（``not in`` 不是 ``in``）。
+
+    ``not in`` 换成 ``in`` 后判据反转：合法的 ``high`` 被拒、任意的 ``weird``
+    被放行发给 SDK。
+    """
+    from src.providers.__base__.model_provider import _responses_content_part
+
+    accepted = _responses_content_part(
+        {"type": "input_file", "file_id": "f1", "detail": "high"}, "loc", provider="openai"
+    )
+    assert accepted["detail"] == "high"
+
+    with pytest.raises(ValueError, match="detail 不受 Openai Responses SDK 支持"):
+        _responses_content_part(
+            {"type": "input_file", "file_id": "f1", "detail": "weird"}, "loc", provider="openai"
+        )
+
+
+def test_retry_async_stream_closes_iterator_on_early_exit():
+    """提前退出时关闭被包装的异步迭代器（``is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后 ``aclose()`` 永不调用——消费方 ``break`` 之后底层
+    连接不会被释放。
+    """
+    from src.providers.__base__.model_provider import retry_async_stream
+
+    closed: list[bool] = []
+
+    def _make():
+        async def _gen():
+            try:
+                yield 1
+                yield 2
+                yield 3
+            finally:
+                closed.append(True)
+
+        return _gen()
+
+    async def _consume_one():
+        stream = retry_async_stream(_make)
+        first = await stream.__anext__()
+        await stream.aclose()
+        # 快照必须在协程**内**取：``asyncio.run`` 的收尾会关闭仍在引用的
+        # 异步生成器，把「未显式关闭」的差异掩盖成相同结果。
+        return first, list(closed)
+
+    first, closed_after_close = asyncio.run(_consume_one())
+    assert first == 1
+    assert closed_after_close == [True]
+
+
+def test_merge_tool_call_fragment_keeps_existing_text_arguments():
+    """已有文本 ``arguments`` 时不被子片段的非字符串取值覆盖（去掉 ``not`` 后反转）。
+
+    ``not merged.get("arguments")`` 的 ``not`` 去掉后，非字符串分片会覆盖
+    已累积的文本参数——流式拼接出的参数从中间被替换成对象。
+    """
+    from src.providers.__base__.model_provider import merge_tool_call_fragment
+
+    accumulator: dict = {}
+    merge_tool_call_fragment(accumulator, {"index": 0, "arguments": "abc"})
+    _, merged = merge_tool_call_fragment(accumulator, {"index": 0, "arguments": {"obj": 1}})
+
+    assert merged["arguments"] == "abc"
+
+
+# --- Anthropic 可选参数：``is not None`` 判据 ---------------------------------
+
+
+def _anthropic_provider():
+    provider = object.__new__(AnthropicProvider)
+    provider._model_name = "m"
+    provider._options = {}
+    provider._default_max_tokens = lambda: 1024
+    return provider
+
+
+def test_anthropic_message_params_keep_stop_sequences():
+    """``stop`` 给出时装配 ``stop_sequences``（``is not None`` 不是 ``is None``）。"""
+    params = _anthropic_provider()._build_message_params(prompt="hi", stop="END")
+
+    assert params["stop_sequences"] == ["END"]
+
+
+def test_anthropic_message_params_keep_tool_choice():
+    """``tool_choice`` 给出时装配（``is not None`` 不是 ``is None``）。"""
+    params = _anthropic_provider()._build_message_params(prompt="hi", tool_choice={"type": "auto"})
+
+    assert params["tool_choice"] == {"type": "auto"}
+
+
+def test_anthropic_message_params_keep_container_and_inference_geo():
+    """``container``／``inference_geo`` 给出时装配（两个 ``is not None`` 各自要判）。"""
+    params = _anthropic_provider()._build_message_params(
+        prompt="hi", container="c1", inference_geo="us"
+    )
+
+    assert params["container"] == "c1"
+    assert params["inference_geo"] == "us"
+
+
+def test_anthropic_count_tokens_forwards_extra_query():
+    """``count_tokens`` 转发 ``extra_query``（``is not None`` 不是 ``is None``）。"""
+    captured: dict = {}
+
+    def _client():
+        def count_tokens(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(input_tokens=3)
+
+        return SimpleNamespace(messages=SimpleNamespace(count_tokens=count_tokens))
+
+    provider = _anthropic_provider()
+    provider._get_client = _client
+
+    provider.count_tokens(CompletionRequest(prompt="hi", extra_query={"k": "v"}))
+
+    assert captured["extra_query"] == {"k": "v"}
+
+
+# --- Anthropic 四个 count_tokens 兄弟方法的可选字段透传 -----------------------
+#
+# 四个方法（``count_tokens``／``beta_count_tokens``／``async_count_tokens``／
+# ``async_beta_count_tokens``）逐字重复同一组 ``if request.X is not None:
+# params[...] = X``。否定变异扫描里这 40 余处**全部**存活：没有任何测试断言
+# 这些可选字段被转发到 SDK 调用。表驱动覆盖，避免逐条重复。
+
+_ANTHROPIC_TOKEN_COUNT_COMMON_CASES = [
+    ({"tool_choice": {"type": "auto"}}, "tool_choice", {"type": "auto"}),
+    ({"cache_control": {"type": "ephemeral"}}, "cache_control", {"type": "ephemeral"}),
+    ({"user": "u1"}, "user_profile_id", "u1"),
+    (
+        {"output_config": {"format": {"type": "json_schema", "name": "x", "schema": {}}}},
+        "output_config",
+        {"format": {"type": "json_schema", "name": "x", "schema": {}}},
+    ),
+    (
+        {"thinking": {"type": "enabled", "budget_tokens": 1024}},
+        "thinking",
+        {"type": "enabled", "budget_tokens": 1024},
+    ),
+    ({"extra_body": {"custom": "v"}}, "extra_body", {"custom": "v"}),
+    ({"extra_query": {"k": "v"}}, "extra_query", {"k": "v"}),
+    ({"timeout": 5.0}, "timeout", 5.0),
+    ({"extra_headers": {"X-Trace": "1"}}, "extra_headers", {"X-Trace": "1"}),
+]
+
+_ANTHROPIC_TOKEN_COUNT_BETA_CASES = [
+    ({"context_management": {"edits": []}}, "context_management", {"edits": []}),
+    ({"mcp_servers": [{"url": "https://x"}]}, "mcp_servers", [{"url": "https://x"}]),
+    ({"speed": "fast"}, "speed", "fast"),
+]
+
+
+def _capturing_anthropic_provider(captured: dict, *, beta: bool):
+    """构造一个把 ``count_tokens`` 参数记进 ``captured`` 的 Anthropic Provider。"""
+    provider = _anthropic_provider()
+
+    def _count_tokens(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(input_tokens=3)
+
+    messages = SimpleNamespace(count_tokens=_count_tokens)
+    client = (
+        SimpleNamespace(beta=SimpleNamespace(messages=messages))
+        if beta
+        else SimpleNamespace(messages=messages)
+    )
+    provider._get_client = lambda: client
+    provider._get_aclient = lambda: client
+    return provider
+
+
+@pytest.mark.parametrize(
+    "method_name,beta",
+    [
+        ("count_tokens", False),
+        ("beta_count_tokens", True),
+        ("async_count_tokens", False),
+        ("async_beta_count_tokens", True),
+    ],
+)
+@pytest.mark.parametrize("request_kwargs,param_key,expected", _ANTHROPIC_TOKEN_COUNT_COMMON_CASES)
+def test_anthropic_token_count_forwards_common_optional_field(
+    method_name, beta, request_kwargs, param_key, expected
+):
+    """四个 count_tokens 方法都转发通用可选字段（``is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后字段被静默丢掉——调用方设置了 ``timeout``／``user``
+    却不会生效。
+    """
+    captured: dict = {}
+    provider = _capturing_anthropic_provider(captured, beta=beta)
+
+    result = getattr(provider, method_name)(CompletionRequest(prompt="hi", **request_kwargs))
+    if method_name.startswith("async_"):
+        asyncio.run(result)
+
+    assert captured[param_key] == expected
+
+
+@pytest.mark.parametrize("method_name", ["beta_count_tokens", "async_beta_count_tokens"])
+@pytest.mark.parametrize("request_kwargs,param_key,expected", _ANTHROPIC_TOKEN_COUNT_BETA_CASES)
+def test_anthropic_beta_token_count_forwards_beta_only_field(
+    method_name, request_kwargs, param_key, expected
+):
+    """Beta 专属字段只在 beta 方法上转发（``is not None`` 不是 ``is None``）。"""
+    captured: dict = {}
+    provider = _capturing_anthropic_provider(captured, beta=True)
+
+    result = getattr(provider, method_name)(CompletionRequest(prompt="hi", **request_kwargs))
+    if method_name.startswith("async_"):
+        asyncio.run(result)
+
+    assert captured[param_key] == expected
+
+
+@pytest.mark.parametrize("method_name", ["beta_count_tokens", "async_beta_count_tokens"])
+def test_anthropic_beta_token_count_merges_profile_beta(method_name):
+    """``betas`` 与 user profile 头合并后转发（``is not None`` 不是 ``is None``）。"""
+    captured: dict = {}
+    provider = _capturing_anthropic_provider(captured, beta=True)
+
+    result = getattr(provider, method_name)(
+        CompletionRequest(prompt="hi", user="u1", betas=["custom-beta"])
+    )
+    if method_name.startswith("async_"):
+        asyncio.run(result)
+
+    assert captured["betas"] == ["custom-beta", "user-profiles-2026-08-18"]
+
+
+# --- Google ``_build_generation_config`` 的可选字段透传 ----------------------
+#
+# 与 Anthropic 的 count_tokens 同一形态：一串 ``if X is not None: values[...] = X``
+# 在否定变异扫描里全部存活——没有任何测试断言这些生成参数真的进了
+# ``GenerateContentConfig``。
+
+_GOOGLE_GENERATION_CONFIG_CASES = [
+    ({"top_p": 0.9}, "top_p", 0.9),
+    ({"top_k": 7}, "top_k", 7),
+    ({"frequency_penalty": 0.5}, "frequency_penalty", 0.5),
+    ({"presence_penalty": 0.4}, "presence_penalty", 0.4),
+    ({"seed": 11}, "seed", 11),
+    ({"modalities": ["TEXT"]}, "response_modalities", ["TEXT"]),
+    ({"stop": "END"}, "stop_sequences", ["END"]),
+]
+
+
+def _google_provider(options=None):
+    provider = object.__new__(GoogleProvider)
+    provider._model_name = "gemini-2.0-flash"
+    provider._options = options or {}
+    return provider
+
+
+@pytest.mark.parametrize("kwargs,attribute,expected", _GOOGLE_GENERATION_CONFIG_CASES)
+def test_google_generation_config_forwards_optional_field(kwargs, attribute, expected):
+    """生成参数逐个进 ``GenerateContentConfig``（``is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后参数被静默丢掉——调用方设置的 ``seed``／``stop``
+    不会到达服务端。
+    """
+    config = _google_provider()._build_generation_config(None, None, None, **kwargs)
+
+    assert getattr(config, attribute) == expected
+
+
+def test_google_generation_config_forwards_tool_choice():
+    """``tool_choice`` 转成 ``tool_config``（``is not None`` 不是 ``is None``）。"""
+    config = _google_provider()._build_generation_config(
+        None, None, None, tool_choice={"type": "auto"}
+    )
+
+    assert config.tool_config is not None
+    assert config.tool_config.function_calling_config.mode.name == "AUTO"
+
+
+def test_google_generation_config_forwards_options_thinking():
+    """模型 options 里的 ``thinking`` 转成 ``thinking_config``（``is not None`` 不是 ``is None``）。"""
+    provider = _google_provider({"thinking": {"thinking_budget": 1024}})
+
+    config = provider._build_generation_config(None, None, None)
+
+    assert config.thinking_config is not None
+
+
+# --- Google / OpenAI 兼容：去掉 ``not`` 或反转 ``is not`` 的存活点 ------------
+
+
+def test_google_tool_choice_accepts_non_empty_function_name():
+    """``function.name`` 合法时照常转换（第二个 ``not`` 去掉后判据反转）。
+
+    ``not name.strip()`` 的 ``not`` 去掉后，非空名字反而被拒——合法的
+    function tool_choice 一律抛「缺少 function.name」。
+    """
+    from src.providers.google import GoogleProvider
+
+    config = GoogleProvider._convert_tool_choice(
+        {"type": "function", "function": {"name": "get_weather"}}
+    )
+
+    assert config.function_calling_config.mode.name == "ANY"
+    assert config.function_calling_config.allowed_function_names == ["get_weather"]
+
+
+def test_google_tool_result_resolves_name_from_call_id():
+    """工具结果缺 ``name`` 时按 ``tool_call_id`` 反查（``not part_name`` 的 ``not`` 去掉后不再反查）。
+
+    反查被跳过时报「缺少可关联的 tool_call_id/name」——而 id 恰好是调用方
+    唯一给出的关联信息。
+    """
+    from src.providers.google import GoogleProvider
+
+    contents = GoogleProvider._contents(
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+        ],
+        None,
+        None,
+    )
+
+    assert "lookup" in str(contents)
+
+
+def test_google_candidate_refusal_falls_back_to_part_text():
+    """``type=refusal`` 且 ``refusal`` 为空时退回 ``text``（``not value`` 的 ``not`` 去掉后不再退回）。
+
+    退回被跳过时拒答被读成 ``None``，安全拦截表现为一次正常回复。
+    """
+    from src.providers.google import GoogleProvider
+
+    candidate = {
+        "content": {"parts": [{"type": "refusal", "text": "无法回答该问题"}]},
+    }
+
+    assert GoogleProvider._candidate_refusal(candidate) == "无法回答该问题"
+
+
+def test_google_merge_tool_arguments_merges_into_existing_element():
+    """列表参数在**已有**元素上继续递归合并（``is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后已有元素被新值整体替换——分片追加变成覆盖，前一
+    分片里的字段丢失。
+    """
+    from src.providers.google import GoogleProvider
+
+    merged = GoogleProvider._merge_tool_arguments([{"a": 1}], [{"b": 2}])
+
+    assert merged == [{"a": 1, "b": 2}]
+
+
+def test_chat_request_forwards_stop_parameter():
+    """Chat Completions 转发 ``stop``（``is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后停止序列被静默丢掉——调用方设置的停止词不生效。
+    """
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "gpt-4o"
+    provider._provider = "openai"
+    provider._options = {}
+
+    request = provider._build_chat_request(prompt="hi", stop=["END"])
+
+    assert request["stop"] == ["END"]
+
+
+def test_anthropic_beta_create_rejects_output_format():
+    """``beta_create`` 拒绝 ``output_format``（``is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后守卫不触发，落到 ``_build_message_params`` 的同名拒绝——
+    两者消息前缀相同、**指引不同**（这里指向 ``beta_parse``，那里指向 ``parse``），
+    断言必须带上指引部分。
+    """
+    provider = _anthropic_provider()
+
+    with pytest.raises(ValueError, match="请使用 beta_parse 或 beta_stream"):
+        provider.beta_create(CompletionRequest(prompt="hi", output_format={"type": "json_schema"}))
+
+
+def test_anthropic_async_beta_create_rejects_output_format():
+    """异步 ``async_beta_create`` 与同步版同判据（``is not None`` 不是 ``is None``）。"""
+    provider = _anthropic_provider()
+
+    async def _call():
+        await provider.async_beta_create(
+            CompletionRequest(prompt="hi", output_format={"type": "json_schema"})
+        )
+
+    with pytest.raises(ValueError, match="请使用 beta_parse 或 beta_stream"):
+        asyncio.run(_call())
+
+
+def test_anthropic_async_count_tokens_prefers_explicit_output_config():
+    """显式 ``output_config`` 不被 ``response_format`` 覆盖（``not in`` 不是 ``in``）。
+
+    ``not in`` 换成 ``in`` 后 fallback 无条件覆盖，用户显式给的 output_config
+    被 ``response_format`` 派生的值替换。
+    """
+    captured: dict = {}
+    provider = _capturing_anthropic_provider(captured, beta=False)
+
+    asyncio.run(
+        provider.async_count_tokens(
+            CompletionRequest(
+                prompt="hi",
+                output_config={"explicit": True},
+                response_format={"type": "json_object"},
+            )
+        )
+    )
+
+    assert captured["output_config"] == {"explicit": True}
+
+
+def test_chat_request_forwards_remaining_optional_fields():
+    """Chat Completions 转发 ``top_p``／``user``／``extra_query``（三个 ``is not None`` 各自要判）。
+
+    与 ``stop`` 同形态：``is None`` 变异后字段被静默丢掉。
+    """
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "gpt-4o"
+    provider._provider = "openai"
+    provider._options = {}
+
+    request = provider._build_chat_request(
+        prompt="hi", top_p=0.9, user="u1", extra_query={"k": "v"}
+    )
+
+    assert request["top_p"] == 0.9
+    assert request["user"] == "u1"
+    assert request["extra_query"] == {"k": "v"}
+
+
+def test_jina_rerank_accepts_valid_results_list(monkeypatch):
+    """合法响应（``results`` 是列表）照常解析（去掉 ``not`` 后反转成「是列表就报错」）。
+
+    判据反转后每一次**成功**的 rerank 都被当成响应非法，检索直接失败。
+    """
+    import httpx
+
+    from src.providers.jina import JinaProvider
+
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"results": [{"index": 0, "relevance_score": 0.9}]}
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def post(self, *_args, **_kwargs):
+            return _Response()
+
+    monkeypatch.setattr(httpx, "Client", _Client)
+    provider = object.__new__(JinaProvider)
+    provider._model_name = "m"
+    provider._options = {}
+    provider._base_url = "https://api.jina.ai/v1/rerank"
+    provider._get_headers = dict
+
+    indices, scores = provider.rerank("q", ["a"], 1)
+
+    assert indices == [0]
+    assert scores == [0.9]
+
+
+def test_jina_arerank_accepts_valid_results_list(monkeypatch):
+    """异步 ``arerank`` 与同步版同判据（去掉 ``not`` 后同样反转）。"""
+    import httpx
+
+    from src.providers.jina import JinaProvider
+
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"results": [{"index": 0, "relevance_score": 0.9}]}
+
+    class _AsyncClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, *_args, **_kwargs):
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _AsyncClient)
+    provider = object.__new__(JinaProvider)
+    provider._model_name = "m"
+    provider._options = {}
+    provider._base_url = "https://api.jina.ai/v1/rerank"
+    provider._get_headers = dict
+
+    indices, scores = asyncio.run(provider.arerank("q", ["a"], 1))
+
+    assert indices == [0]
+    assert scores == [0.9]
+
+
+def test_google_safety_block_chunk_emits_finish_event():
+    """安全拦截块要产出 ``finish`` 事件（``not any`` 的 ``not`` 去掉后不再产出）。
+
+    去掉 ``not`` 后判据反转成「已有 finish 才追加」，而此处恰恰是**没有**
+    finish 的路径——被拦截的流丢失终止事件，消费方看不到结束标记。
+    """
+    from src.providers.google import GoogleProvider
+
+    chunk = SimpleNamespace(
+        candidates=[],
+        prompt_feedback=SimpleNamespace(block_reason="SAFETY", block_reason_message="m"),
+    )
+
+    events = GoogleProvider._stream_events_from_chunk(chunk)
+
+    assert [event.type for event in events] == ["refusal_delta", "finish"]
+    assert events[-1].finish_reason == "SAFETY"
+
+
+def test_google_vertex_count_tokens_keeps_system_instruction():
+    """Vertex 模式下 ``count_tokens`` 带上 ``system_instruction``（``is not False`` 不是 ``is False``）。
+
+    ``is False`` 变异后该分支只在 Developer API 下成立——而那条路径已在上面
+    被拒，于是 system_instruction 永远进不了 config。
+    """
+    captured: dict = {}
+
+    def _client():
+        def count_tokens(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(total_tokens=3)
+
+        return SimpleNamespace(models=SimpleNamespace(count_tokens=count_tokens))
+
+    provider = _google_provider()
+    provider._get_client = _client
+    provider._effective_vertex_mode = lambda _client: True
+    provider._token_count_system_prompt = lambda _request: "sys"
+
+    provider.count_tokens(CompletionRequest(prompt="hi"))
+
+    assert captured["config"].system_instruction == "sys"
+
+
+def test_google_async_vertex_count_tokens_keeps_system_instruction():
+    """异步 ``async_count_tokens`` 与同步版同判据（``is not False`` 不是 ``is False``）。"""
+    captured: dict = {}
+
+    def _client():
+        def count_tokens(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(total_tokens=3)
+
+        aio = SimpleNamespace(models=SimpleNamespace(count_tokens=count_tokens))
+        return SimpleNamespace(models=SimpleNamespace(count_tokens=count_tokens), aio=aio)
+
+    provider = _google_provider()
+    provider._get_client = _client
+    provider._effective_vertex_mode = lambda _client: True
+    provider._token_count_system_prompt = lambda _request: "sys"
+
+    asyncio.run(provider.async_count_tokens(CompletionRequest(prompt="hi")))
+
+    assert captured["config"].system_instruction == "sys"
+
+
+def test_chat_request_forwards_response_format_tool_choice_and_stream_options():
+    """Chat Completions 转发 ``response_format``／``tool_choice``／``stream_options``。
+
+    三者与 ``stop`` 同形态，``is None`` 变异后字段被静默丢掉。
+    """
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "gpt-4o"
+    provider._provider = "openai"
+    provider._options = {}
+
+    request = provider._build_chat_request(
+        prompt="hi",
+        response_format={"type": "json_object"},
+        tool_choice="auto",
+        stream_options={"include_usage": True},
+    )
+
+    assert request["response_format"] == {"type": "json_object"}
+    assert request["tool_choice"] == "auto"
+    assert request["stream_options"] == {"include_usage": True}
+
+
+def test_chat_request_forwards_extra_headers():
+    """Chat Completions 转发 ``extra_headers``（``is not None`` 不是 ``is None``）。"""
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "gpt-4o"
+    provider._provider = "openai"
+    provider._options = {}
+
+    request = provider._build_chat_request(prompt="hi", extra_headers={"X-Trace": "1"})
+
+    assert request["extra_headers"] == {"X-Trace": "1"}
+
+
+def test_chat_request_uses_configured_max_completion_tokens_when_request_omits_it():
+    """请求未给长度时回落到配置的 ``max_completion_tokens``。
+
+    ``is not None`` 变异后回落不生效，配置的输出长度被忽略。
+    """
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "gpt-4o"
+    provider._provider = "openai"
+    provider._options = {"max_completion_tokens": 256}
+
+    request = provider._build_chat_request(prompt="hi")
+
+    assert request.get("max_completion_tokens") == 256
+
+
+def test_verified_protocols_reject_blank_string_entry():
+    """``server_verified_protocols`` 拒绝空白字符串条目（``not value.strip()`` 的 ``not`` 去掉后反转）。
+
+    反转后合法协议反而被拒，而空白串被放行并归一化成无效协议。
+    """
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._provider = "openai"
+
+    with pytest.raises(ValueError, match="必须是非空字符串"):
+        provider._normalize_verified_protocols(["chat_completions", "  "])
+
+    assert provider._normalize_verified_protocols(["chat_completions"]) == {"chat_completions"}
+
+
+def test_response_tool_keys_defaults_to_event_when_item_missing():
+    """``_response_tool_keys`` 未给 ``item`` 时退回 ``event``（``is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后一律用 ``event``，显式传入的 ``item`` 被忽略——关联键
+    取自错误的对象。
+    """
+    event = {"output_index": None}
+    item = {"id": "item-1"}
+
+    keys = OpenAICompatibleProvider._response_tool_keys(event, item)
+
+    assert ("item_id", "item-1") in keys
+
+
+def test_remember_response_tool_metadata_prefers_arguments_field():
+    """``_remember_response_tool_metadata`` 从 ``arguments`` 取参数（``is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后 ``arguments`` 与 ``input`` 都不再看，工具调用元数据
+    丢失参数。
+    """
+    metadata: dict = {}
+    event = {
+        "item_id": "k1",
+        "item": {"id": "k1", "type": "function_call", "name": "lookup", "arguments": '{"a": 1}'},
+    }
+
+    OpenAICompatibleProvider._remember_response_tool_metadata(event, metadata)
+
+    assert metadata[("item_id", "k1")]["arguments"] == '{"a": 1}'
+
+
+def test_vector_store_file_update_keeps_none_attributes():
+    """``attributes=None`` 按 SDK 契约原样传 ``None``（``is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后 ``attributes`` 变成 ``None`` 而不是传入的对象，
+    SDK 侧「清空属性」与「不传」的语义被混淆。
+    """
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._aclient = SimpleNamespace(
+        vector_stores=SimpleNamespace(files=SimpleNamespace(update=object()))
+    )
+    captured: dict = {}
+
+    async def _call(_method, *, kwargs=None, **_rest):
+        captured.update(kwargs or {})
+        return "ok"
+
+    provider._call_async_sdk_resource = _call
+
+    asyncio.run(provider.async_update_vector_store_file("vs1", "f1", attributes={"k": "v"}))
+
+    assert captured["attributes"] == {"k": "v"}
+
+
+def test_google_generation_config_forwards_thinking_and_service_tier():
+    """``thinking``／``service_tier`` 参数进 ``GenerateContentConfig``。
+
+    与其它生成参数同形态，``is None`` 变异后字段被静默丢掉。
+    """
+    config = _google_provider()._build_generation_config(
+        None, None, None, thinking={"thinking_budget": 512}, service_tier="flex"
+    )
+
+    assert config.thinking_config is not None
+    assert config.service_tier == "flex"
+
+
+def test_google_vertex_count_tokens_keeps_tools():
+    """Vertex 模式下 ``count_tokens`` 带上 ``tools``（``is not False`` 不是 ``is False``）。"""
+    captured: dict = {}
+
+    def _client():
+        def count_tokens(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(total_tokens=3)
+
+        return SimpleNamespace(models=SimpleNamespace(count_tokens=count_tokens))
+
+    provider = _google_provider()
+    provider._get_client = _client
+    provider._effective_vertex_mode = lambda _client: True
+    provider._token_count_system_prompt = lambda _request: None
+
+    provider.count_tokens(
+        CompletionRequest(prompt="hi", tools=[{"type": "function", "function": {"name": "f"}}])
+    )
+
+    assert captured["config"].tools
+
+
+def test_google_async_vertex_count_tokens_keeps_tools():
+    """异步 ``async_count_tokens`` 与同步版同判据（``is not False`` 不是 ``is False``）。"""
+    captured: dict = {}
+
+    def _client():
+        def count_tokens(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(total_tokens=3)
+
+        aio = SimpleNamespace(models=SimpleNamespace(count_tokens=count_tokens))
+        return SimpleNamespace(models=SimpleNamespace(count_tokens=count_tokens), aio=aio)
+
+    provider = _google_provider()
+    provider._get_client = _client
+    provider._effective_vertex_mode = lambda _client: True
+    provider._token_count_system_prompt = lambda _request: None
+
+    asyncio.run(
+        provider.async_count_tokens(
+            CompletionRequest(prompt="hi", tools=[{"type": "function", "function": {"name": "f"}}])
+        )
+    )
+
+    assert captured["config"].tools
+
+
+def test_google_options_generation_count_rejects_negative_at_construction():
+    """构造期校验 ``options`` 里的 ``max_output_tokens``／``candidate_count``。
+
+    ``options[key] is not None`` 换成 ``is None`` 后构造期校验被跳过，
+    非法取值要等首次提问才暴露。
+    """
+    from src.providers.google import GoogleProvider
+
+    with pytest.raises(ValueError, match="max_output_tokens"):
+        GoogleProvider("gemini-2.0-flash", {"max_output_tokens": -1})
+
+    with pytest.raises(ValueError, match="candidate_count"):
+        GoogleProvider("gemini-2.0-flash", {"candidate_count": 0})
+
+
+def test_google_extract_refusal_prefers_block_reason_message():
+    """``_extract_refusal`` 优先用 ``block_reason_message``（``not message.strip()`` 的 ``not`` 去掉后反转）。
+
+    反转后合法消息被跳过，退回 ``message`` 字段——取到的是另一条文案。
+    """
+    from src.providers.google import GoogleProvider
+
+    feedback = SimpleNamespace(
+        block_reason="SAFETY", block_reason_message="被安全策略拦截", message="其它消息"
+    )
+
+    assert (
+        GoogleProvider._extract_refusal(SimpleNamespace(candidates=[], prompt_feedback=feedback))
+        == "被安全策略拦截"
+    )
+
+
+def test_google_merge_tool_call_fragment_keeps_non_string_arguments():
+    """非字符串参数直接写入（``arguments is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后非字符串参数（对象形态的 JSON 参数）被丢弃。
+    """
+    from src.providers.google import GoogleProvider
+
+    accumulator: dict = {}
+    _, merged = GoogleProvider._merge_tool_call(accumulator, {"index": 0, "arguments": {"a": 1}})
+
+    assert merged["arguments"] == {"a": 1}
+
+
+def test_google_stream_chunk_keeps_refusal_from_part_text():
+    """流块里 ``type=refusal`` 且无 ``refusal`` 字段时退回 ``text``（去掉 ``not`` 后不再退回）。"""
+    from src.providers.google import GoogleProvider
+
+    chunk = SimpleNamespace(
+        candidates=[
+            SimpleNamespace(
+                content=SimpleNamespace(parts=[SimpleNamespace(type="refusal", text="拒答内容")])
+            )
+        ]
+    )
+
+    events = GoogleProvider._stream_events_from_chunk(chunk)
+
+    assert any(event.type == "refusal_delta" for event in events)
+
+
+def test_google_stream_chunk_emits_candidate_refusal_once():
+    """candidate 拒答只发一次（``not refusal_emitted`` 的 ``not`` 去掉后判据反转）。
+
+    去掉 ``not`` 后 ``refusal_emitted`` 为假时才发——首个候选之后不再发出，
+    多候选响应丢掉后续拒答。
+    """
+    from src.providers.google import GoogleProvider
+
+    chunk = SimpleNamespace(
+        candidates=[
+            SimpleNamespace(content=SimpleNamespace(parts=[SimpleNamespace(refusal="第一条")])),
+            SimpleNamespace(content=SimpleNamespace(parts=[SimpleNamespace(refusal="第二条")])),
+        ]
+    )
+
+    events = GoogleProvider._stream_events_from_chunk(chunk)
+    refusals = [event.refusal for event in events if event.type == "refusal_delta"]
+
+    assert refusals[0] == "第一条"
+
+
+def test_siliconflow_rerank_accepts_valid_results_list(monkeypatch):
+    """SiliconFlow 合法响应照常解析（去掉 ``not`` 后反转成「是列表就报错」）。
+
+    与 Jina 同一份近似副本、同一处判据，两处都要各自覆盖。
+    """
+    import httpx
+
+    from src.providers.siliconflow_rerank import SiliconflowRerankProvider
+
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"results": [{"index": 0, "relevance_score": 0.9}]}
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def post(self, *_args, **_kwargs):
+            return _Response()
+
+    monkeypatch.setattr(httpx, "Client", _Client)
+    provider = object.__new__(SiliconflowRerankProvider)
+    provider._model_name = "m"
+    provider._options = {}
+    provider._base_url = "https://api.siliconflow.cn/v1/rerank"
+    provider._get_headers = dict
+
+    indices, scores = provider.rerank("q", ["a"], 1)
+
+    assert indices == [0]
+    assert scores == [0.9]
+
+
+def test_siliconflow_arerank_accepts_valid_results_list(monkeypatch):
+    """异步 ``arerank`` 与同步版同判据。"""
+    import httpx
+
+    from src.providers.siliconflow_rerank import SiliconflowRerankProvider
+
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"results": [{"index": 0, "relevance_score": 0.9}]}
+
+    class _AsyncClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, *_args, **_kwargs):
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _AsyncClient)
+    provider = object.__new__(SiliconflowRerankProvider)
+    provider._model_name = "m"
+    provider._options = {}
+    provider._base_url = "https://api.siliconflow.cn/v1/rerank"
+    provider._get_headers = dict
+
+    indices, scores = asyncio.run(provider.arerank("q", ["a"], 1))
+
+    assert indices == [0]
+    assert scores == [0.9]
+
+
+def test_retry_async_stream_invokes_first_event_validator():
+    """首个事件交给 ``first_event_validator``（``is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后校验器永不调用——流建立阶段的错误事件不再被拦。
+    """
+    from src.providers.__base__.model_provider import retry_async_stream
+
+    seen: list = []
+
+    def _make():
+        async def _gen():
+            yield {"type": "error", "message": "boom"}
+
+        return _gen()
+
+    async def _consume():
+        stream = retry_async_stream(_make, first_event_validator=seen.append)
+        return await stream.__anext__()
+
+    asyncio.run(_consume())
+
+    assert seen == [{"type": "error", "message": "boom"}]
+
+
+def test_retry_async_stream_closes_iterator_when_first_event_raises():
+    """首事件校验抛错时关闭迭代器（``is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后建立阶段的失败不释放底层流。
+    """
+    from src.providers.__base__.model_provider import retry_async_stream
+
+    closed: list[bool] = []
+
+    def _make():
+        async def _gen():
+            try:
+                yield {"type": "error"}
+            finally:
+                closed.append(True)
+
+        return _gen()
+
+    def _boom(_event):
+        raise ValueError("bad first event")
+
+    async def _consume():
+        stream = retry_async_stream(_make, first_event_validator=_boom)
+        try:
+            await stream.__anext__()
+        except ValueError:
+            pass
+        return list(closed)
+
+    assert asyncio.run(_consume()) == [True]
+
+
+def test_merge_tool_call_fragment_keeps_non_string_arguments_without_existing():
+    """已有参数为空时非字符串分片直接写入（``not merged.get("arguments")`` 的 ``not`` 去掉后反转）。"""
+    from src.providers.__base__.model_provider import merge_tool_call_fragment
+
+    accumulator: dict = {}
+    _, merged = merge_tool_call_fragment(accumulator, {"index": 0, "arguments": {"a": 1}})
+
+    assert merged["arguments"] == {"a": 1}
+
+
+# --- 其余否定变异存活点 -------------------------------------------------------
+
+
+def test_resource_proxy_dir_lists_cached_children():
+    """``_NativeResourceProxy.__dir__`` 列出已缓存的子节点（``not name.startswith("_")`` 的 ``not`` 去掉后反转）。
+
+    反转后只列出下划线开头的名字——资源名一个都不出现，``dir(proxy)``
+    与 ``__getattr__`` 的可达名字不一致。
+    """
+    from src.providers.resources import _NativeResourceProxy
+
+    proxy = _NativeResourceProxy(SimpleNamespace(), None, "root")
+    proxy._children["messages"] = object()
+
+    names = dir(proxy)
+
+    assert "messages" in names
+
+
+def test_anthropic_message_params_keep_cache_control_thinking_and_service_tier():
+    """``cache_control``／``thinking``／``service_tier`` 给出时装配（三个 ``is not None`` 各自要判）。
+
+    与 ``stop``／``tool_choice`` 同形态：``is None`` 变异后字段被静默丢掉。
+    """
+    params = _anthropic_provider()._build_message_params(
+        prompt="hi",
+        cache_control={"type": "ephemeral"},
+        thinking={"type": "enabled", "budget_tokens": 1024},
+        service_tier="standard_only",
+    )
+
+    assert params["cache_control"] == {"type": "ephemeral"}
+    assert params["thinking"] == {"type": "enabled", "budget_tokens": 1024}
+    assert params["service_tier"] == "standard_only"
+
+
+def _ark_responses_provider():
+    provider = object.__new__(VolcengineProvider)
+    provider._options = {}
+    provider._model_name = "doubao"
+    provider._protocol = "responses"
+    provider._request_options = dict
+    return provider
+
+
+def test_ark_responses_rejects_unsupported_field():
+    """Ark Responses 拒绝不支持的请求字段（``is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后字典推导只收集**值为 None** 的字段，非空的不支持字段
+    不再进入拒绝列表——用户设置了 ``container`` 却被静默忽略。
+    """
+    provider = _ark_responses_provider()
+
+    with pytest.raises(ValueError, match="container"):
+        provider._build_responses_request(CompletionRequest(prompt="hi", container="c1"))
+
+
+def test_ark_responses_forwards_explicit_temperature():
+    """显式 ``temperature`` 进请求（``is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后显式温度被丢掉，模型回落到服务端默认值。
+    """
+    provider = _ark_responses_provider()
+
+    request = provider._build_responses_request(CompletionRequest(prompt="hi", temperature=0.25))
+
+    assert request["temperature"] == 0.25
+
+
+def test_ark_responses_rejects_credentials_in_extra_body():
+    """Ark Responses 校验 ``extra_body`` 不含凭证（``is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后校验被跳过，凭证原样进请求体。
+    """
+    provider = _ark_responses_provider()
+
+    with pytest.raises(ValueError, match="extra_body"):
+        provider._build_responses_request(
+            CompletionRequest(prompt="hi", extra_body={"api_key": "sk-live-SECRET"})
+        )
+
+
+def test_anthropic_options_reject_unknown_key():
+    """模型 ``options`` 里的未知键被拒（``key not in allowed_options`` 不是 ``key in``）。
+
+    ``not in`` 换成 ``in`` 后判据反转：**未知键被放行**、已知键反被拒——
+    用户写错一个字段名会被静默忽略。
+    """
+    provider = _anthropic_provider()
+    provider._options = {"unknown_option": 1}
+
+    with pytest.raises(ValueError, match="unknown_option"):
+        provider._build_message_params(prompt="hi")
+
+
+def test_google_async_validate_tuning_reward_forwards_single_config():
+    """只传 ``single_reward_config`` 时转发它（``is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后 kwargs 里什么都不放，SDK 收到空配置。
+    """
+    from types import SimpleNamespace
+
+    provider = object.__new__(GoogleProvider)
+    provider._options = {}
+    provider._get_client = lambda: SimpleNamespace(aio=object())
+    captured: dict = {}
+
+    async def validate_reward(**kwargs):
+        captured.update(kwargs)
+        return "ok"
+
+    provider._require_resource = lambda *_a, **_kw: SimpleNamespace(validate_reward=validate_reward)
+    provider._resource_config_kwargs = lambda _cls, _config, _kwargs: {}
+
+    asyncio.run(
+        provider.async_validate_tuning_reward(
+            "t1", sample_response={}, example={}, single_reward_config={"a": 1}
+        )
+    )
+
+    assert captured["single_reward_config"] == {"a": 1}
+
+
+def test_anthropic_stream_error_message_reads_nested_non_string_values():
+    """嵌套错误对象里**非字符串**取值也要继续下钻（``value is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后非字符串取值被丢弃、不再入队，嵌套消息读不出来，
+    用户只看到兜底文案「Anthropic Messages 流返回错误」。
+    """
+    provider = AnthropicProvider
+
+    nested = SimpleNamespace(message=SimpleNamespace(message="深层消息"))
+
+    assert provider._stream_error_message(nested) == "深层消息"
+
+
+def test_google_merge_tool_call_keeps_non_string_arguments():
+    """``_merge_tool_call`` 保留非字符串参数（``arguments is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后对象／列表形态的参数被丢弃，``arguments`` 变成空字典。
+    """
+    from src.providers.google import GoogleProvider
+
+    _, merged = GoogleProvider._merge_tool_call({}, {"index": 0, "arguments": [1, 2]})
+    assert merged["arguments"] == [1, 2]
+
+    _, merged_int = GoogleProvider._merge_tool_call({}, {"index": 0, "arguments": 42})
+    assert merged_int["arguments"] == 42
+
+
+# ── 否定变异扫描（face 11）补的覆盖缺口 ──
+#
+# 把守卫里的 ``not``／``not in``／``is not`` 变异后全量仍绿的 39 个存活点，
+# 逐条用真实入口探针确认行为改变后补测试；27 处确认为真缺口，其余 12 处为
+# 等价变异（如 ``reject_unsupported_kwargs`` 自身已按 ``is not None`` 过滤，
+# 上游再过滤一层不改变收场）。
+
+
+def test_anthropic_duplicate_sampling_field_with_extra_body():
+    """``top_p`` 同时在 options 与 extra_body 时必须报错（两个 ``is not None`` 都要判）。
+
+    ``sampling_options[key] is not None`` 变异成 ``is None`` 后，只有 options
+    一侧非空时不再报重复，请求字段被 ``extra_body`` 静默顶掉。
+    """
+    provider = object.__new__(AnthropicProvider)
+    provider._model_name = "claude-3-5-sonnet"
+    provider._options = {"top_p": 0.9}
+    provider._default_max_tokens = lambda: 1024
+
+    with pytest.raises(ValueError, match="top_p 与 extra_body 重复"):
+        provider._build_message_params(prompt="hi", extra_body={"top_p": 0.5})
+
+
+def test_anthropic_beta_only_fields_rejected_without_beta():
+    """非 beta 调用传 beta 专属字段必须拒绝（``value is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后字典推导只收集**值为 None** 的 beta 字段，``mcp_servers``
+    这类非空字段不再进入 ``ignored``——参数被静默丢弃。
+    """
+    provider = object.__new__(AnthropicProvider)
+    provider._model_name = "claude-3-5-sonnet"
+    provider._options = {}
+    provider._default_max_tokens = lambda: 1024
+
+    with pytest.raises(ValueError, match="mcp_servers"):
+        provider._build_message_params(prompt="hi", mcp_servers=[{"url": "https://x"}])
+
+
+def test_anthropic_tool_content_list_is_preserved():
+    """``role=tool`` 的列表内容原样透传（``not isinstance`` 不是 ``isinstance``）。
+
+    ``not`` 删除后列表被 ``content_to_text`` 压平成字符串，多块内容（文本＋
+    图片）退化成一段拼接文本，结构化信息丢失。
+    """
+    converted = AnthropicProvider._convert_messages(
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "call-1", "function": {"name": "lookup", "arguments": "{}"}}],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": [
+                    {"type": "text", "text": "part-a"},
+                    {"type": "text", "text": "part-b"},
+                ],
+            },
+        ]
+    )
+
+    assert converted[1]["content"][0]["content"] == [
+        {"type": "text", "text": "part-a"},
+        {"type": "text", "text": "part-b"},
+    ]
+
+
+def test_anthropic_supports_sampling_option_tracks_model_generation():
+    """旧模型支持采样、新模型不支持（``not deprecated or allow`` 的 ``not`` 不可删）。
+
+    ``not`` 删除后判据反转：旧模型被判成不支持采样（调用方丢掉 temperature），
+    新模型被判成支持（把已弃用字段发给服务端换回 400）。
+    """
+    legacy = object.__new__(AnthropicProvider)
+    legacy._model_name = "claude-3-5-sonnet"
+    legacy._options = {}
+    modern = object.__new__(AnthropicProvider)
+    modern._model_name = "claude-sonnet-4-6"
+    modern._options = {}
+
+    assert legacy.supports_sampling_option("temperature") is True
+    assert modern.supports_sampling_option("temperature") is False
+
+
+def test_anthropic_async_stream_emits_completed_tool_call():
+    """``astream_events`` 在 finish 前交付 ``tool_call_completed``。
+
+    ``key not in completed_tool_calls`` 变异成 ``in`` 后判据反转，工具调用
+    永远不满足条件——调用方只看到 delta，拿不到完整调用。
+    """
+    provider = object.__new__(AnthropicProvider)
+    provider._model_name = "claude-3-5-sonnet"
+    provider._options = {}
+    provider._api_key = "k"
+    provider._normalized_client_options = {}
+    provider._default_max_tokens = lambda: 1024
+
+    class _Stream:
+        def __init__(self, agen):
+            self._agen = agen.__aiter__()
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            return await self._agen.__anext__()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Messages:
+        def stream(self, **_kwargs):
+            async def gen():
+                yield {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "tool_use", "id": "toolu_1", "name": "lookup"},
+                }
+                yield {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "input_json_delta", "partial_json": "{}"},
+                }
+                yield {"type": "message_delta", "delta": {"stop_reason": "tool_use"}}
+                yield {"type": "message_stop"}
+
+            return _Stream(gen())
+
+    provider._aclient = type("A", (), {"messages": _Messages()})()
+
+    async def run():
+        return [
+            event.type
+            async for event in provider.astream_events(CompletionRequest(prompt="hi", stream=True))
+        ]
+
+    assert asyncio.run(run()) == [
+        "tool_call_delta",
+        "tool_call_delta",
+        "tool_call_completed",
+        "finish",
+    ]
+
+
+def test_google_tool_result_part_resolves_name_from_call_id():
+    """``tool_result`` 只有 ``tool_call_id`` 时从已登记的调用名解析（``not part_name`` 不可删）。
+
+    ``not`` 删除后回退分支不再执行，``part_name`` 保持 ``None``，随后被判成
+    「缺少可关联的 tool_call_id/name」——标准形态的并行工具结果全部报错。
+    """
+    contents = GoogleProvider._contents(
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call-1", "function": {"name": "lookup_order", "arguments": "{}"}}
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_call_id": "call-1", "response": {"ok": True}}
+                ],
+            },
+        ],
+        None,
+        None,
+    )
+
+    response = contents[1].parts[0].function_response
+    assert response.name == "lookup_order"
+    assert response.id == "call-1"
+
+
+def test_google_tool_result_accepts_valid_name():
+    """显式给出合法 ``name`` 的 ``tool_result`` 必须通过（``not part_name.strip()`` 的 ``not`` 不可删）。
+
+    ``not`` 删除后判据反转：非空名字反而触发「缺少可关联的 tool_call_id/name」，
+    只有空名字才被接受——恰好与契约相反。
+    """
+    contents = GoogleProvider._contents(
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "call-1", "function": {"name": "lookup", "arguments": "{}"}}],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_call_id": "call-1",
+                        "name": "lookup",
+                        "response": {"ok": True},
+                    }
+                ],
+            },
+        ],
+        None,
+        None,
+    )
+
+    assert contents[1].parts[0].function_response.name == "lookup"
+
+
+def test_google_stream_refusal_part_uses_text_fallback():
+    """``type=refusal`` 的块缺 ``refusal`` 字段时回退到 ``text``（``not part_refusal`` 不可删）。
+
+    ``not`` 删除后回退分支不再执行，``part_refusal`` 保持 ``None``；同一块的
+    ``text`` 又被当成普通文本交付——调用方同时收到 ``text_delta`` 与
+    ``refusal_delta``，把拒答内容当正文显示。
+    """
+    part = SimpleNamespace(type="refusal", text="I cannot help with that.", refusal=None)
+    chunk = SimpleNamespace(candidates=[SimpleNamespace(content=SimpleNamespace(parts=[part]))])
+
+    events = GoogleProvider._stream_events_from_chunk(chunk)
+
+    assert [(event.type, event.refusal) for event in events] == [
+        ("refusal_delta", "I cannot help with that.")
+    ]
+
+
+def test_google_stream_candidate_refusal_emitted_once():
+    """candidate 级拒答原因在未发过 ``refusal_delta`` 时交付（``not refusal_emitted`` 不可删）。
+
+    ``not`` 删除后判据反转：只有**已经发过**拒答才补发，candidate 级的
+    ``finish_message`` 永远不会被交付——拒答原因静默丢失。
+    """
+    candidate = SimpleNamespace(
+        content=SimpleNamespace(parts=[SimpleNamespace(type="text", text="hi", refusal=None)]),
+        finish_message="blocked by safety",
+    )
+    chunk = SimpleNamespace(candidates=[candidate])
+
+    events = GoogleProvider._stream_events_from_chunk(chunk)
+
+    assert [event.type for event in events] == ["text_delta", "refusal_delta"]
+    assert events[1].refusal == "blocked by safety"
+
+
+def test_google_async_validate_tuning_reward_forwards_composite_config():
+    """只传 ``composite_reward_config`` 时转发它（``is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后 kwargs 里什么都不放，SDK 收到空配置。
+    """
+    provider = object.__new__(GoogleProvider)
+    provider._options = {}
+    provider._get_client = lambda: SimpleNamespace(aio=object())
+    captured: dict = {}
+
+    async def validate_reward(**kwargs):
+        captured.update(kwargs)
+        return "ok"
+
+    provider._require_resource = lambda *_a, **_kw: SimpleNamespace(validate_reward=validate_reward)
+    provider._resource_config_kwargs = lambda _cls, _config, _kwargs: {}
+
+    asyncio.run(
+        provider.async_validate_tuning_reward(
+            "t1", sample_response={}, example={}, composite_reward_config={"b": 2}
+        )
+    )
+
+    assert captured["composite_reward_config"] == {"b": 2}
+
+
+def test_openai_chat_request_forwards_metadata():
+    """``metadata`` 给出时进请求（``is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后 metadata 被静默丢弃。
+    """
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "m"
+    provider._provider = "openai"
+    provider._protocol = "chat_completions"
+    provider._options = {}
+
+    request = provider._build_chat_request(prompt="hi", metadata={"trace": "t1"})
+
+    assert request["metadata"] == {"trace": "t1"}
+
+
+def test_openai_responses_configured_top_logprobs_used_as_fallback():
+    """请求未给 ``top_logprobs`` 时回退到 options（``is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后回退取值恒为 ``None``，配置里的 top_logprobs 永远不生效。
+    """
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "m"
+    provider._provider = "openai"
+    provider._protocol = "responses"
+    provider._options = {"top_logprobs": 3}
+
+    request = provider._build_responses_request(prompt="hi")
+
+    assert request["top_logprobs"] == 3
+
+
+def test_openai_responses_official_endpoint_rejects_configured_extra_body_stop():
+    """官方端点下 options.extra_body 的 ``stop`` 必须拒绝（``value is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后字典推导只收集**值为 None** 的项，非空的 ``stop``
+    不再进入拒绝列表——官方端点会把它当未知字段或静默忽略。
+    """
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "m"
+    provider._provider = "openai"
+    provider._protocol = "responses"
+    provider._options = {"extra_body": {"stop": "END"}}
+
+    with pytest.raises(ValueError, match="stop"):
+        provider._build_responses_request(prompt="hi")
+
+
+def test_openai_response_retrieve_kwargs_drops_none_values():
+    """``_response_retrieve_kwargs`` 过滤 ``None`` 值（``params[key] is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后只保留**值为 None** 的项，真正的取值被丢掉。
+    """
+    out = OpenAICompatibleProvider._response_retrieve_kwargs({"timeout": None, "include": ["a"]})
+
+    assert out == {"include": ["a"]}
+
+
+def test_openai_responses_sync_emits_completed_before_later_events():
+    """``output_item.done`` 的完整调用**立即**交付，不推迟到 finish。
+
+    ``key not in completed_tool_calls`` 变异成 ``in`` 后判据反转，完成事件被
+    推迟到 ``finish`` 才补发——调用方在中间收到文本增量，顺序错乱。
+    """
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "m"
+    provider._provider = "openai"
+    provider._protocol = "responses"
+    provider._options = {}
+
+    class Responses:
+        def create(self, **_request):
+            item = SimpleNamespace(
+                type="function_call", call_id="call-1", name="lookup", arguments='{"id":1}'
+            )
+            return iter(
+                [
+                    SimpleNamespace(type="response.output_item.done", item=item, output_index=0),
+                    SimpleNamespace(type="response.output_text.delta", delta="后续文本"),
+                    SimpleNamespace(
+                        type="response.completed",
+                        response=SimpleNamespace(status="completed"),
+                    ),
+                ]
+            )
+
+    provider._get_client = lambda: SimpleNamespace(responses=Responses())
+
+    events = list(provider.stream_events(CompletionRequest(prompt="hi")))
+
+    assert [event.type for event in events] == ["tool_call_completed", "text_delta", "finish"]
+
+
+def test_openai_responses_async_emits_completed_before_later_events():
+    """异步分支同判据。"""
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "m"
+    provider._provider = "openai"
+    provider._protocol = "responses"
+    provider._options = {}
+
+    class Responses:
+        def create(self, **_request):
+            item = SimpleNamespace(
+                type="function_call", call_id="call-1", name="lookup", arguments='{"id":1}'
+            )
+
+            async def gen():
+                yield SimpleNamespace(type="response.output_item.done", item=item, output_index=0)
+                yield SimpleNamespace(type="response.output_text.delta", delta="后续文本")
+                yield SimpleNamespace(
+                    type="response.completed", response=SimpleNamespace(status="completed")
+                )
+
+            return gen()
+
+    provider._get_aclient = lambda: SimpleNamespace(responses=Responses())
+
+    async def run():
+        return [
+            event.type async for event in provider.astream_events(CompletionRequest(prompt="hi"))
+        ]
+
+    assert asyncio.run(run()) == ["tool_call_completed", "text_delta", "finish"]
+
+
+def test_openai_async_compact_responses_forwards_only_given_fields():
+    """``async_compact_responses`` 只转发显式给出的字段（``value is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后判据反转，只转发**值为 None** 的字段——SDK 收到一堆
+    空参数，真正的 ``input`` 与 ``timeout`` 全被丢掉。
+    """
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "m"
+    provider._provider = "openai"
+    provider._protocol = "responses"
+    provider._options = {}
+    captured: dict = {}
+
+    class Responses:
+        async def compact(self, **kwargs):
+            captured.update(kwargs)
+            return "ok"
+
+    provider._get_aclient = lambda: SimpleNamespace(responses=Responses())
+    provider._call_async_sdk_resource = lambda fn, kwargs=None, operation="": fn(**(kwargs or {}))
+
+    asyncio.run(provider.async_compact_responses(input="hi", timeout=9))
+
+    assert set(captured) == {"model", "input", "timeout"}
+
+
+def test_openai_async_update_vector_store_file_drops_none_extras():
+    """``async_update_vector_store_file`` 过滤未给出的扩展参数（``value is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后只转发**值为 None** 的扩展，SDK 收到一堆 ``extra_*``
+    空参数，而显式给出的 ``timeout`` 被丢掉。
+    """
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "m"
+    provider._provider = "openai"
+    provider._protocol = "responses"
+    provider._options = {}
+    captured: dict = {}
+
+    class _Files:
+        async def update(self, *args, **kwargs):
+            captured.update(kwargs)
+            return "ok"
+
+    provider._get_aclient = lambda: SimpleNamespace(vector_stores=SimpleNamespace(files=_Files()))
+    provider._call_async_sdk_resource = lambda fn, args=(), kwargs=None, operation="": fn(
+        *args, **(kwargs or {})
+    )
+
+    asyncio.run(
+        provider.async_update_vector_store_file(
+            "vs1", "f1", attributes={"a": 1}, extra_headers=None, timeout=9
+        )
+    )
+
+    assert set(captured) == {"vector_store_id", "attributes", "timeout"}
+
+
+def test_ark_responses_rejects_unsupported_request_field():
+    """拒绝不支持的 Ark Responses 请求字段（``getattr(...) is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后字典推导只收集**取值恰为 None** 的字段（即未设置的），
+    非空的 ``fallbacks`` 不再进入拒绝列表——用户设置了却被静默忽略。
+    """
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "m"
+    provider._options = {}
+
+    with pytest.raises(ValueError, match="fallbacks"):
+        provider._build_responses_request(CompletionRequest(prompt="hi", fallbacks=[{"a": 1}]))
+
+
+def test_ark_responses_native_kwargs_validate_extra_body_secrets():
+    """原生入口的 ``extra_body`` 必须过凭证校验（``params["extra_body"] is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后校验分支不再执行，携带 ``api_key`` 的 extra_body
+    被原样放行——凭证会随请求发往远端。
+    """
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "m"
+    provider._options = {}
+
+    with pytest.raises(ValueError, match="api_key"):
+        provider._validate_native_response_kwargs(
+            {"model": "m", "input": "hi", "extra_body": {"api_key": "sk-abcdef1234567890"}}
+        )
+
+
+def test_ark_responses_sync_emits_completed_before_later_events():
+    """Ark 同步流同判据：``output_item.done`` 立即交付。"""
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "ark-model"
+    provider._protocol = "responses"
+    provider._options = {"server_verified_protocols": ["responses"]}
+
+    class Responses:
+        def create(self, **_request):
+            item = SimpleNamespace(
+                type="function_call", call_id="call-1", name="lookup", arguments='{"id":1}'
+            )
+            return iter(
+                [
+                    SimpleNamespace(type="response.output_item.done", item=item, output_index=0),
+                    SimpleNamespace(type="response.output_text.delta", delta="后续文本"),
+                    SimpleNamespace(
+                        type="response.completed",
+                        response=SimpleNamespace(status="completed"),
+                    ),
+                ]
+            )
+
+    provider._get_client = lambda: SimpleNamespace(responses=Responses())
+
+    events = list(provider.stream_events(CompletionRequest(prompt="hi")))
+
+    assert [event.type for event in events] == ["tool_call_completed", "text_delta", "finish"]
+
+
+def test_ark_responses_async_emits_completed_before_later_events():
+    """Ark 异步流同判据。"""
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "ark-model"
+    provider._protocol = "responses"
+    provider._options = {"server_verified_protocols": ["responses"]}
+
+    class Responses:
+        def create(self, **_request):
+            item = SimpleNamespace(
+                type="function_call", call_id="call-1", name="lookup", arguments='{"id":1}'
+            )
+
+            async def gen():
+                yield SimpleNamespace(type="response.output_item.done", item=item, output_index=0)
+                yield SimpleNamespace(type="response.output_text.delta", delta="后续文本")
+                yield SimpleNamespace(
+                    type="response.completed", response=SimpleNamespace(status="completed")
+                )
+
+            return gen()
+
+    provider._get_aclient = lambda: SimpleNamespace(responses=Responses())
+
+    async def run():
+        return [
+            event.type async for event in provider.astream_events(CompletionRequest(prompt="hi"))
+        ]
+
+    assert asyncio.run(run()) == ["tool_call_completed", "text_delta", "finish"]
+
+
+def test_ark_responses_async_deduplicates_tool_call_delivered_by_finish():
+    """finish 分支补发 pending 时不得重复已交付的调用（``key not in completed`` 不是 ``in``）。
+
+    ``in`` 变异后 finish 分支对**已交付**的调用再发一次，调用方收到两个
+    相同 id 的 ``tool_call_completed``。
+    """
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "ark-model"
+    provider._protocol = "responses"
+    provider._options = {"server_verified_protocols": ["responses"]}
+
+    class Responses:
+        def create(self, **_request):
+            item = SimpleNamespace(
+                type="function_call", call_id="call-1", name="lookup", arguments='{"id":1}'
+            )
+
+            async def gen():
+                yield SimpleNamespace(type="response.output_item.done", item=item, output_index=0)
+                yield SimpleNamespace(
+                    type="response.function_call_arguments.done", item=item, output_index=0
+                )
+                yield SimpleNamespace(
+                    type="response.completed", response=SimpleNamespace(status="completed")
+                )
+
+            return gen()
+
+    provider._get_aclient = lambda: SimpleNamespace(responses=Responses())
+
+    async def run():
+        return [
+            event.type async for event in provider.astream_events(CompletionRequest(prompt="hi"))
+        ]
+
+    assert asyncio.run(run()).count("tool_call_completed") == 1
