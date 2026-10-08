@@ -38,8 +38,10 @@
 
 import argparse
 import ast
+import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -164,21 +166,34 @@ def prepare_worktree(repo: pathlib.Path, name: str, head: str) -> pathlib.Path:
 def run_pytest(
     worktree: pathlib.Path, selector: str, python: str, first_failure: bool
 ) -> tuple[int, str]:
-    """跑 pytest；返回 ``(退出码, 输出末行)``。超时抛 ``subprocess.TimeoutExpired``。"""
+    """跑 pytest；返回 ``(退出码, 输出末行)``。超时抛 ``subprocess.TimeoutExpired``。
+
+    字节码缓存隔离：``==``↔``!=`` 这类变异不改变文件长度，若还原与再变异发生在
+    与上一次编译**同一秒**内，CPython 的 (mtime, size) 校验会把上一轮的
+    ``__pycache__`` 当成有效缓存——pytest 实际执行的是上一轮的字节码，判定与
+    当前位点无关。每次运行把 pyc 写到独立前缀目录并清除，强制按源码重新编译。
+    """
     args = [python, "-m", "pytest", "-q", "-p", "no:cacheprovider"]
     if first_failure:
         args.append("-x")
     if selector:
         args.append(selector)
-    proc = subprocess.run(
-        args,
-        cwd=worktree,
-        capture_output=True,
-        text=True,
-        errors="replace",
-        timeout=PYTEST_TIMEOUT,
-        check=False,
-    )
+    pycache_prefix = worktree / ".pycache-audit"
+    shutil.rmtree(pycache_prefix, ignore_errors=True)
+    env = {**os.environ, "PYTHONPYCACHEPREFIX": str(pycache_prefix)}
+    try:
+        proc = subprocess.run(
+            args,
+            cwd=worktree,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=PYTEST_TIMEOUT,
+            check=False,
+            env=env,
+        )
+    finally:
+        shutil.rmtree(pycache_prefix, ignore_errors=True)
     lines = (proc.stdout + proc.stderr).strip().splitlines()
     return proc.returncode, lines[-1] if lines else ""
 
