@@ -3255,3 +3255,77 @@ def test_ark_responses_async_deduplicates_tool_call_delivered_by_finish():
         ]
 
     assert asyncio.run(run()).count("tool_call_completed") == 1
+
+
+def test_ark_responses_sync_deduplicates_tool_call_delivered_by_finish():
+    """Ark 同步流同判据：finish 分支不得重复交付已发过的调用。"""
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "ark-model"
+    provider._protocol = "responses"
+    provider._options = {"server_verified_protocols": ["responses"]}
+
+    class Responses:
+        def create(self, **_request):
+            item = SimpleNamespace(
+                type="function_call", call_id="call-1", name="lookup", arguments='{"id":1}'
+            )
+            return iter(
+                [
+                    SimpleNamespace(type="response.output_item.done", item=item, output_index=0),
+                    SimpleNamespace(
+                        type="response.function_call_arguments.done", item=item, output_index=0
+                    ),
+                    SimpleNamespace(
+                        type="response.completed", response=SimpleNamespace(status="completed")
+                    ),
+                ]
+            )
+
+    provider._get_client = lambda: SimpleNamespace(responses=Responses())
+
+    events = list(provider.stream_events(CompletionRequest(prompt="hi")))
+
+    assert [event.type for event in events].count("tool_call_completed") == 1
+
+
+def test_openai_compatible_merge_resource_kwargs_keeps_none_by_default():
+    """默认（``omit_none=False``）必须原样保留 ``None`` 取值。
+
+    ``not omit_none`` 的 ``not`` 被删后默认路径也进入过滤：调用方显式给出的
+    ``None`` 字段被静默丢弃，SDK 收到的是「未提供」而不是「显式置空」。
+    """
+    out = OpenAICompatibleProvider._merge_resource_kwargs({"a": 1, "b": None}, None, "T")
+
+    assert out == {"a": 1, "b": None}
+
+
+def test_openai_compatible_merge_resource_kwargs_omits_none_when_requested():
+    """``omit_none=True`` 时过滤 ``None``（``value is not None`` 不是 ``is None``）。
+
+    ``is None`` 变异后判据反转：只保留值为 ``None`` 的字段，真正的取值全部
+    被丢掉。
+    """
+    out = OpenAICompatibleProvider._merge_resource_kwargs(
+        {"a": 1, "b": None}, None, "T", omit_none=True
+    )
+
+    assert out == {"a": 1}
+
+
+def test_openai_responses_none_max_output_tokens_not_forwarded():
+    """值为 ``None`` 的 ``max_output_tokens`` 不得进入请求体。
+
+    原先只在取值非 ``None`` 时才把它移出 ``configured_options``；显式配置成
+    ``None`` 时键留在 options 里、经 ``_merge_options`` 原样并入请求，SDK 收到
+    ``max_output_tokens: null``。改为无条件移出：真实取值经 ``configured_limits``
+    重新写回，``None`` 不落进请求。
+    """
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "m"
+    provider._provider = "openai"
+    provider._protocol = "responses"
+    provider._options = {"max_output_tokens": None}
+
+    request = provider._build_responses_request(prompt="hi")
+
+    assert "max_output_tokens" not in request

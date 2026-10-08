@@ -2472,6 +2472,48 @@ def test_openai_responses_stream_deduplicates_tool_completion_events():
     assert [event.type for event in events] == ["tool_call_completed", "finish"]
 
 
+def test_openai_responses_async_stream_deduplicates_tool_completion_events():
+    """异步流的 finish 分支同判据：``key not in completed_tool_calls`` 不是 ``in``。
+
+    ``in`` 变异后，同一次调用既经 ``output_item.done`` 立即交付、又留在
+    ``function_call_arguments.done`` 的 pending 里，``finish`` 时再补发一遍，
+    调用方收到两个相同 id 的 ``tool_call_completed``。
+    """
+    provider = _responses_provider()
+
+    class Responses:
+        def create(self, **_request):
+            item = SimpleNamespace(
+                type="function_call",
+                call_id="call-1",
+                name="lookup",
+                arguments='{"id":1}',
+            )
+
+            async def gen():
+                yield SimpleNamespace(type="response.output_item.done", item=item, output_index=0)
+                yield SimpleNamespace(
+                    type="response.function_call_arguments.done",
+                    item=item,
+                    output_index=0,
+                )
+                yield SimpleNamespace(
+                    type="response.completed",
+                    response=SimpleNamespace(status="completed"),
+                )
+
+            return gen()
+
+    provider._get_aclient = lambda: SimpleNamespace(responses=Responses())
+
+    async def collect():
+        return [
+            event.type async for event in provider.astream_events(CompletionRequest(prompt="hello"))
+        ]
+
+    assert asyncio.run(collect()) == ["tool_call_completed", "finish"]
+
+
 def test_openai_responses_stream_flushes_tool_delta_before_finish():
     provider = _responses_provider()
 

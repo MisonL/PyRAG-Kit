@@ -903,3 +903,13 @@ def test_secret_free_options_keeps_self_copied_sdk_model():
 
     assert validated["k"] is not original
     assert validated["k"].value == 2
+
+
+def test_secret_free_options_nested_non_string_key_reports_path():
+    """嵌套层级的非字符串键消息必须带出路径（``label if not path else ...``）。
+
+    删掉 ``not`` 后判据反转：嵌套层级丢掉 ``outer.inner``，用户拿到
+    「Jina Rerank options 的键必须是字符串」却不知道是哪一层子表写错了键。
+    """
+    with pytest.raises(ValueError, match=r"Jina Rerank options 的 outer\.inner 的键必须是字符串"):
+        validate_secret_free_options({"outer": {"inner": {1: "x"}}}, "Jina Rerank")

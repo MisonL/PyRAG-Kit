@@ -59,6 +59,33 @@ def test_google_provider_uses_credentials_without_api_key(monkeypatch):
     client_class.assert_called_once_with(credentials=credentials, vertexai=True)
 
 
+def test_google_provider_loads_credentials_file_and_forwards_it(monkeypatch):
+    """设置里的凭证文件路径加载出的凭证必须传给 SDK（``"credentials" not in client_options``）。
+
+    ``in`` 变异后仅在 ``client_options`` 已有 credentials 时才赋值——文件加载
+    出的凭证被静默丢弃，SDK 落回 ADC/API key 路径，而配置看起来完全正常。
+    """
+    credentials = object()
+    settings = MagicMock()
+    settings.google_api_key = None
+    settings.google_application_credentials = "/tmp/credentials.json"
+    monkeypatch.setattr(google_module, "get_settings", lambda: settings)
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    monkeypatch.setattr(
+        GoogleProvider, "_load_credentials_file", staticmethod(lambda path: credentials)
+    )
+    with patch.object(google_module.genai, "Client") as client_class:
+        client_class.return_value = MagicMock()
+        provider = GoogleProvider(
+            model_name="gemini-1.5-flash",
+            options={"vertexai": True},
+        )
+
+        provider._get_client()
+
+    client_class.assert_called_once_with(credentials=credentials, vertexai=True)
+
+
 def test_google_provider_accepts_gemini_api_key_alias(monkeypatch):
     settings = SimpleNamespace(google_api_key=None, gemini_api_key="gemini-key")
     monkeypatch.setattr(google_module, "get_settings", lambda: settings)

@@ -1380,8 +1380,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             raise ValueError(
                 "Responses options 不能同时设置多个输出长度字段: " + ", ".join(configured_limits)
             )
-        if configured_max_output_tokens is not None:
-            configured_options.pop("max_output_tokens", None)
+        configured_options.pop("max_output_tokens", None)
         configured_frequency_penalty = configured_options.pop("frequency_penalty", None)
         configured_presence_penalty = configured_options.pop("presence_penalty", None)
         configured_top_logprobs = configured_options.pop("top_logprobs", None)
