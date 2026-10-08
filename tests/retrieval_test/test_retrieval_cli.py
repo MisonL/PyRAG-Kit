@@ -865,3 +865,44 @@ def test_excel_log_drops_none_scores_from_all_scores_column(tmp_path):
     worksheet = load_workbook(logger.filepath).active
     row = next(worksheet.iter_rows(min_row=2, max_col=8, values_only=True))
     assert row[7] == '{"score": 0.5}'
+
+
+def test_quit_command_exits_before_running_retrieval(monkeypatch):
+    """``/quit`` 必须直接退出循环，不能当作查询送进检索（``==`` 不是 ``!=``）。
+
+    ``==``→``!=`` 变异后判据反转：``/quit`` 不退出并被送去检索（实测
+    ``retrieve`` 收到 ``"/quit"``），而其它任何输入都立即退出。
+    """
+    calls = []
+
+    class RecordingService:
+        def __init__(self, *_args, **_kwargs):
+            return None
+
+        async def retrieve(self, query, *_args, **_kwargs):
+            calls.append(query)
+            return []
+
+    class QuitOnceSession:
+        def __init__(self):
+            self._first = True
+
+        async def prompt_async(self, *_args, **_kwargs):
+            if self._first:
+                self._first = False
+                return "/quit"
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr("src.retrieval_test.core.PromptSession", QuitOnceSession)
+    monkeypatch.setattr("src.retrieval_test.core.ExcelLogger", lambda: None)
+    monkeypatch.setattr("src.retrieval_test.core.RetrievalService", RecordingService)
+    monkeypatch.setattr("src.retrieval_test.core.EmbeddingService", lambda *_a, **_k: object())
+    monkeypatch.setattr(
+        "src.retrieval_test.core.VectorStoreFactory.get_default_vector_store",
+        lambda: object(),
+    )
+    monkeypatch.setattr("src.retrieval_test.core.console.print", lambda *a, **k: None)
+
+    asyncio.run(run_retrieval_test_async())
+
+    assert calls == []

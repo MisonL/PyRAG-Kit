@@ -2032,3 +2032,44 @@ def test_faiss_load_snapshot_rebuilds_when_lexical_index_missing():
         store.load_snapshot(str(snapshot), snapshot_root=root)
 
     assert rebuilt == [True]
+
+
+# --- face 12（== ↔ != 互换扫描）存活位点 -------------------------------------
+
+
+def test_rerank_provider_cache_evicts_only_stale_same_provider_entries(monkeypatch):
+    """配置重载只清理**同一 provider 键**的陈旧实例（两个判据各占一半）。
+
+    ``key[0] == provider_key`` 变异成 ``!=`` 后会关闭无关 provider 的实例、
+    留下真正陈旧的实例；``key != cache_key`` 变异成 ``==`` 后陈旧实例永不
+    关闭——实测变异体 ``closed`` 分别变成 ``['other']`` 与 ``[]``，旧传输与
+    凭证一直挂着。
+    """
+    from types import SimpleNamespace
+
+    from src.services.retrieval_service import RetrievalService
+
+    closed = []
+
+    class Provider:
+        def __init__(self, name):
+            self.name = name
+
+        def close(self):
+            closed.append(self.name)
+
+    service = object.__new__(RetrievalService)
+    service._rerank_providers = {
+        ("jina", "jina", "m-old", "fp1"): Provider("stale-jina"),
+        ("other", "other", "m", "fp"): Provider("other"),
+    }
+    monkeypatch.setattr(
+        "src.services.retrieval_service.ModelProviderFactory.get_rerank_provider",
+        lambda *_args, **_kwargs: Provider("new"),
+    )
+    detail = SimpleNamespace(provider="jina", model_name="m-new", options={})
+
+    service._get_rerank_provider("jina", {"jina": detail})
+
+    assert closed == ["stale-jina"]
+    assert sorted(key[0] for key in service._rerank_providers) == ["jina", "other"]

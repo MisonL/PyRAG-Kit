@@ -1,4 +1,7 @@
 import asyncio
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -10,6 +13,8 @@ from src.runtime.contracts import SessionConfig
 from src.utils.config import ModelDetail, RetrievalMethod
 from src.utils.log_manager import RedactingFormatter
 from src.utils.security import safe_exception_text
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_safe_exception_text_redacts_credentials():
@@ -1139,3 +1144,25 @@ def test_apply_config_update_async_passes_llm_configurations_when_present(monkey
     assert received == [
         ("new-model", {"new-model": ModelDetail(provider="openai", model_name="gpt-4o")})
     ]
+
+
+def test_importing_chat_core_does_not_start_interactive_session():
+    """import ``src.chat.core`` 不得触发 ``__main__`` 分支（``==`` 不是 ``!=``）。
+
+    ``if __name__ == "__main__"`` 的 ``==``→``!=`` 变异后守卫常真：任何 import
+    都会把模块当作主脚本执行（实测子进程直接进入会话，打出「客服已就绪」与
+    「感谢使用，再见！」）——所有 import 该模块的调用方（含本仓库其它测试）
+    都会被拖进交互式会话。
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", "import src.chat.core"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "客服已就绪" not in output
+    assert "感谢使用，再见！" not in output

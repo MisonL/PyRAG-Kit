@@ -252,3 +252,34 @@ def test_cleanup_keeps_logs_exactly_at_the_retention_boundary(tmp_path, monkeypa
 
     assert exact.exists(), "恰好 15 天不应被删"
     assert not beyond.exists(), "16 天应被删"
+
+
+def test_importing_log_manager_does_not_run_demo_block():
+    """import ``src.utils.log_manager`` 不得执行模块底部的演示日志（``==`` 不是 ``!=``）。
+
+    ``if __name__ == "__main__"`` 的 ``==``→``!=`` 变异后守卫常真：任何 import
+    都会跑演示块——实测子进程 stderr 出现「这是一条聊天警告。」「这是一条模块
+    错误！」等占位日志，被 import 该模块的 20 多个调用方在 import 期污染日志。
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [sys.executable, "-c", "import src.utils.log_manager"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    for marker in (
+        "这是一条聊天信息。",
+        "这是一条聊天警告。",
+        "这是一条模块信息。",
+        "这是一条模块错误！",
+    ):
+        assert marker not in output, marker

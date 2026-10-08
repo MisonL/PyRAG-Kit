@@ -632,3 +632,123 @@ def test_edit_model_params_writes_selected_rerank_configuration(monkeypatch):
     config_menu.edit_model_params(chat_config)
 
     assert chat_config["active_rerank_configuration"] == "b"
+
+
+# --- face 12（== ↔ != 互换扫描）存活位点 -------------------------------------
+
+
+def test_weights_warning_shown_only_outside_hybrid_mode(monkeypatch):
+    """权重提示只在非混合检索模式出现（``!= HYBRID_SEARCH`` 不是 ``==``）。
+
+    ``!=``→``==`` 变异后判据反转：混合模式下反而警告「权重仅在混合检索生效」，
+    非混合模式静默——提示与事实相反。
+    """
+    from src.ui import config_menu
+
+    def _run(method):
+        printed = []
+        answers = iter(["weights", "back"])
+
+        def _select(*_args, **_kwargs):
+            return _Choice(next(answers))
+
+        monkeypatch.setattr(config_menu.questionary, "select", _select)
+        monkeypatch.setattr(config_menu.questionary, "text", lambda *_a, **_k: _Choice(None))
+        monkeypatch.setattr(config_menu.console, "print", lambda *a, **k: printed.append(str(a)))
+        chat_config = {
+            "retrieval_method": method,
+            "hybrid_fusion_strategy": "rrf",
+            "retrieval_candidate_multiplier": 3,
+            "top_k": 5,
+            "vector_weight": 0.5,
+            "keyword_weight": 0.5,
+            "rerank_enabled": False,
+        }
+        config_menu.edit_retrieval_params(chat_config)
+        return any("权重调整仅在" in message for message in printed)
+
+    assert _run(RetrievalMethod.SEMANTIC_SEARCH) is True
+    assert _run(RetrievalMethod.HYBRID_SEARCH) is False
+
+
+def test_fusion_warning_shown_only_outside_hybrid_mode(monkeypatch):
+    """融合策略提示同判据（``!=``→``==`` 变异后提示与事实相反）。"""
+    from src.ui import config_menu
+
+    def _run(method):
+        printed = []
+        answers = iter(["fusion", "rrf", "back"])
+
+        def _select(*_args, **_kwargs):
+            return _Choice(next(answers))
+
+        monkeypatch.setattr(config_menu.questionary, "select", _select)
+        monkeypatch.setattr(config_menu.console, "print", lambda *a, **k: printed.append(str(a)))
+        chat_config = {
+            "retrieval_method": method,
+            "hybrid_fusion_strategy": "rrf",
+            "retrieval_candidate_multiplier": 3,
+            "top_k": 5,
+            "vector_weight": 0.5,
+            "keyword_weight": 0.5,
+            "rerank_enabled": False,
+        }
+        config_menu.edit_retrieval_params(chat_config)
+        return any("融合策略仅在" in message for message in printed)
+
+    assert _run(RetrievalMethod.SEMANTIC_SEARCH) is True
+    assert _run(RetrievalMethod.HYBRID_SEARCH) is False
+
+
+def test_candidate_multiplier_selection_writes_value(monkeypatch):
+    """选中「候选过量招募倍率」时写回配置（``elif choice == ...`` 不是 ``!=``）。
+
+    ``==``→``!=`` 变异后分支判据反转：该选项被静默跳过（倍率保持原值），
+    其余任何取值反而落入倍率编辑分支——实测变异体倍率停留在 3。
+    """
+    from src.ui import config_menu
+
+    answers = iter(["candidate_multiplier", "back"])
+
+    def _select(*_args, **_kwargs):
+        return _Choice(next(answers))
+
+    monkeypatch.setattr(config_menu.questionary, "select", _select)
+    monkeypatch.setattr(config_menu.questionary, "text", lambda *_a, **_k: _Choice("5"))
+    chat_config = {
+        "retrieval_method": RetrievalMethod.HYBRID_SEARCH,
+        "hybrid_fusion_strategy": "rrf",
+        "retrieval_candidate_multiplier": 3,
+        "top_k": 5,
+        "vector_weight": 0.5,
+        "keyword_weight": 0.5,
+        "rerank_enabled": False,
+    }
+
+    config_menu.edit_retrieval_params(chat_config)
+
+    assert chat_config["retrieval_candidate_multiplier"] == 5
+
+
+def test_exit_choice_returns_from_editor_only_on_exit(monkeypatch):
+    """主菜单仅在选「保存并返回聊天」（或未作答）时退出（``== "exit"``）。
+
+    ``==``→``!=`` 变异后判据反转：任何非 exit 选项立即结束编辑器——实测
+    选择「1. 调整检索参数」时编辑函数从未被调用。
+    """
+    from src.ui import config_menu
+
+    calls = []
+    answers = iter(["1. 调整检索参数", "exit"])
+
+    def _select(*_args, **_kwargs):
+        return _Choice(next(answers))
+
+    monkeypatch.setattr(config_menu.questionary, "select", _select)
+    monkeypatch.setattr(config_menu.console, "print", lambda *a, **k: None)
+    monkeypatch.setattr(config_menu, "edit_retrieval_params", lambda cfg: calls.append(cfg))
+
+    result = config_menu.launch_config_editor({})
+
+    assert len(calls) == 1
+    assert result == (False, {})

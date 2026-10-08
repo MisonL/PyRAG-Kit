@@ -1540,3 +1540,31 @@ def test_retrieval_candidate_multiplier_rejects_numeric_subclass_with_failing_in
 
     with pytest.raises((ValueError, ValidationError)):
         Settings(retrieval_candidate_multiplier=_EvilFloat(2.0))
+
+
+# --- face 12（== ↔ != 互换扫描）存活位点 -------------------------------------
+
+
+def test_non_llm_protocol_error_names_the_matching_role():
+    """错误消息的角色名必须与字段一致（``info.field_name == "embedding_..."``）。
+
+    ``==``→``!=`` 变异后两个角色的标签互换：embedding 配置报「Rerank 配置
+    不支持 protocol」，反之亦然——用户按消息去改错误的字段。
+    """
+    for field_name, role in (
+        ("embedding_configurations", "Embedding"),
+        ("rerank_configurations", "Rerank"),
+    ):
+        with pytest.raises(ValidationError) as excinfo:
+            Settings(
+                **{
+                    field_name: {
+                        "demo": {
+                            "provider": "openai",
+                            "model_name": "demo-model",
+                            "protocol": "responses",
+                        }
+                    }
+                }
+            )
+        assert f"{role} 配置不支持 protocol" in str(excinfo.value)

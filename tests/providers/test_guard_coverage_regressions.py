@@ -22,6 +22,7 @@ from src.providers.__base__.model_provider import (
 )
 from src.providers.anthropic import AnthropicProvider
 from src.providers.google import GoogleProvider
+from src.providers.local_hash import LocalHashEmbeddingProvider
 from src.providers.openai_compatible import OpenAICompatibleProvider
 from src.providers.volcengine import VolcengineProvider
 
@@ -3329,3 +3330,401 @@ def test_openai_responses_none_max_output_tokens_not_forwarded():
     request = provider._build_responses_request(prompt="hi")
 
     assert "max_output_tokens" not in request
+
+
+# --- face 12（== ↔ != 互换扫描）存活位点 -------------------------------------
+#
+# 358 个 eqneq 候选全量扫描后 27 个存活；下列每条经真实入口探针确认 base 与
+# 变异体收场逐字不同，按守卫存在时的行为写断言。
+
+
+def test_normalize_messages_inserts_system_only_when_history_lacks_it():
+    """消息没有 system 角色时补插 system_prompt（``not any(...)`` 不是 ``any(...)``）。
+
+    ``==``→``!=`` 变异后判据反转：有 system 时重复插入、没有时反而丢弃
+    system_prompt——实测变异体输出只剩 ``[{'role': 'user', ...}]``。
+    """
+    from src.providers.__base__.model_provider import normalize_messages
+
+    out = normalize_messages(None, "你在做客服。", [{"role": "user", "content": "hi"}])
+
+    assert [m["role"] for m in out] == ["system", "user"]
+    assert out[0]["content"] == "你在做客服。"
+
+
+def test_responses_content_part_original_detail_only_for_openai_variant():
+    """``detail="original`` 只对 openai 变体合法（``variant == "openai"``）。
+
+    ``==``→``!=`` 变异后判据反转：openai 被拒、ark 反而接受 ``original``——
+    两侧的可选值集合互换，与 Responses 契约（原图只在官方端点存在）相反。
+    """
+    from src.providers.__base__.model_provider import _responses_content_part
+
+    part = {"type": "input_image", "image_url": "https://x/y.png", "detail": "original"}
+
+    openai_out = _responses_content_part(dict(part), "L", provider="openai")
+    assert openai_out.get("detail") == "original"
+    with pytest.raises(ValueError, match="L.detail 必须"):
+        _responses_content_part(dict(part), "L", provider="ark")
+
+
+def test_capability_report_verified_protocols_cleared_for_non_llm_role():
+    """非 llm 角色不得继承注册表里的 ``server_verified_protocols``（``== "llm"``）。
+
+    ``==``→``!=`` 变异后判据反转：注册的验收证据从 llm 报告里消失、却出现在
+    embedding 报告里——与 `protocol_status` 对齐的注释约定（协议只对 llm 适用）
+    相反。注册表项默认是空集，测试里临时写入非空值再还原。
+    """
+    from src.providers.factory import ModelProviderFactory
+
+    info = ModelProviderFactory._provider_map["openai"]
+    original = info.get("server_verified_protocols")
+    info["server_verified_protocols"] = {"responses"}
+    try:
+        llm = ModelProviderFactory.capability_report("openai", role="llm")
+        embedding = ModelProviderFactory.capability_report("openai", role="embedding")
+    finally:
+        info["server_verified_protocols"] = original
+
+    assert llm["server_verified_protocols"] == ["responses"]
+    assert llm["protocol_status"]["responses"]["server_verified"] is True
+    assert embedding["server_verified_protocols"] == []
+    assert embedding["protocol_status"] == {}
+
+
+def test_google_as_bool_coerces_numeric_zero_and_nonzero():
+    """数值强制转换 ``value != 0``：0→False，非 0→True。
+
+    ``!=``→``==`` 变异后判据反转：``_as_bool(0)`` 为 True、``_as_bool(1)`` 为
+    False——配置里的数值布尔被静默取反。
+    """
+    from src.providers.google import GoogleProvider
+
+    assert GoogleProvider._as_bool(0) is False
+    assert GoogleProvider._as_bool(1) is True
+    assert GoogleProvider._as_bool(1.5) is True
+    assert GoogleProvider._as_bool(-2.0) is True
+    assert GoogleProvider._as_bool(True) is True
+    assert GoogleProvider._as_bool(False) is False
+
+
+def test_google_stream_prompt_feedback_emits_refusal_alongside_content():
+    """同一 chunk 既有内容又带安全拦截时，refusal_delta 仍要发出一次。
+
+    ``==``→``!=`` 变异后去重判据反转：已有 refusal 才追加——常见形态（内容与
+    prompt_feedback 同 chunk）下安全拦截被静默丢弃，上层看不到拒答原因。
+    """
+    part = SimpleNamespace(type="text", text="部分内容", refusal=None)
+    cand = SimpleNamespace(content=SimpleNamespace(parts=[part]), finish_reason=None)
+    feedback = SimpleNamespace(block_reason="SAFETY", block_reason_message=None, message=None)
+    chunk = SimpleNamespace(candidates=[cand], prompt_feedback=feedback, usage_metadata=None)
+
+    events = GoogleProvider._stream_events_from_chunk(chunk)
+
+    assert [(e.type, e.refusal) for e in events] == [
+        ("text_delta", None),
+        ("refusal_delta", "Google 提示被安全策略拦截: SAFETY"),
+        ("finish", None),
+    ]
+
+
+def test_google_stream_top_level_finish_kept_when_chunk_has_content():
+    """内容与顶层 finish_reason 同 chunk 时 finish 仍要发出（``==`` 去重判据）。
+
+    ``==``→``!=`` 变异后反转：已有 finish 才追加——实测变异体只剩
+    ``[('text_delta', None)]``，finish_reason 丢失，上层永远等不到终止事件。
+    """
+    part = SimpleNamespace(type="text", text="回答", refusal=None)
+    cand = SimpleNamespace(content=SimpleNamespace(parts=[part]), finish_reason=None)
+    chunk = SimpleNamespace(
+        candidates=[cand], prompt_feedback=None, usage_metadata=None, finish_reason="STOP"
+    )
+
+    events = GoogleProvider._stream_events_from_chunk(chunk)
+
+    assert [(e.type, e.finish_reason) for e in events] == [("text_delta", None), ("finish", "STOP")]
+
+
+def test_local_hash_embedding_matches_reference_sign_pattern():
+    """哈希符号位 ``digest[0] % 2 == 0`` / ``digest[15] % 2 == 0`` 决定落点符号。
+
+    任一 ``==``→``!=`` 变异都会改变既有文本的嵌入值——快照指纹随之漂移，
+    与「离线可复现」的契约矛盾。期望值由 base 源码实算得出。
+    """
+    provider = LocalHashEmbeddingProvider("local-hash-8")
+
+    vec = provider._embed_text("hello world")
+
+    assert [round(v, 4) for v in vec] == [0.0, 0.0, 0.7071, -0.7071, 0.0, 0.0, 0.0, 0.0]
+
+
+def test_openai_chat_invoke_stream_yields_text_delta():
+    """同步 invoke 流式路径按 ``event.type == "text_delta"`` 交付文本。
+
+    ``==``→``!=`` 变异后文本全部被丢弃——实测变异体 ``list(...)`` 为 ``[]``，
+    聊天界面收到空回复；finish 守卫（独立判据）仍绿，所以只有显式断言文本
+    才能抓住它。
+    """
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "demo"
+    provider._provider = "openai"
+    provider._protocol = "chat_completions"
+    provider._options = {}
+
+    class Completions:
+        def create(self, **_request):
+            return iter(
+                [
+                    SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                delta=SimpleNamespace(content="答", tool_calls=None),
+                                finish_reason=None,
+                            )
+                        ]
+                    ),
+                    SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                delta=SimpleNamespace(content=None, tool_calls=None),
+                                finish_reason="stop",
+                            )
+                        ]
+                    ),
+                ]
+            )
+
+    provider._get_client = lambda: SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+
+    assert list(provider.invoke("hi", stream=True)) == ["答"]
+
+
+def test_openai_chat_ainvoke_stream_yields_text_delta():
+    """异步 invoke 流式路径同判据（``==``→``!=`` 变异后返回空列表）。"""
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "demo"
+    provider._provider = "openai"
+    provider._protocol = "chat_completions"
+    provider._options = {}
+
+    class Completions:
+        async def create(self, **_request):
+            return [
+                SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            delta=SimpleNamespace(content="答", tool_calls=None),
+                            finish_reason=None,
+                        )
+                    ]
+                ),
+                SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            delta=SimpleNamespace(content=None, tool_calls=None),
+                            finish_reason="stop",
+                        )
+                    ]
+                ),
+            ]
+
+    provider._get_aclient = lambda: SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+
+    async def consume():
+        return [chunk async for chunk in provider.ainvoke("hi", stream=True)]
+
+    assert asyncio.run(consume()) == ["答"]
+
+
+def test_openai_responses_batch_guard_covers_explicit_endpoint():
+    """显式 ``endpoint="/v1/responses"`` 同样要过未验证服务端的门禁。
+
+    判据是 ``endpoint.rstrip("/") == "/v1/responses"``；``==``→``!=`` 变异后
+    网关（未验证 Responses）带着显式端点直接调到 SDK ``batches.create``——
+    实测变异体返回 ``batch``，远端 404/405 的保护被绕开。
+    """
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "demo"
+    provider._provider = "openai"
+    provider._protocol = "responses"
+    provider._options = {}
+    provider._base_url = "https://gateway.example/v1"
+    provider._server_verified_protocols = frozenset()
+
+    with pytest.raises(ValueError, match="未验证 Responses"):
+        provider.create_batch("file-1", endpoint="/v1/responses")
+
+
+def test_openai_responses_batch_default_endpoint_is_responses():
+    """responses 协议下缺省 endpoint 是 ``/v1/responses``，不是 chat 端点。
+
+    ``==``→``!=`` 变异后判据反转：默认请求打到 ``/v1/chat/completions``——
+    batch 与聊天端点混用，服务端按错误路由处理。
+    """
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "demo"
+    provider._provider = "openai"
+    provider._protocol = "responses"
+    provider._options = {}
+    provider._base_url = "https://api.openai.com/v1/"
+    provider._server_verified_protocols = frozenset()
+    captured = {}
+
+    class Batches:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return "batch"
+
+    provider._get_client = lambda: SimpleNamespace(batches=Batches())
+
+    assert provider.create_batch("file-1") == "batch"
+    assert captured["endpoint"] == "/v1/responses"
+
+
+def test_openai_async_responses_batch_guard_covers_explicit_endpoint():
+    """异步 create_batch 同判据（``==``→``!=`` 变异后门禁被绕开）。"""
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "demo"
+    provider._provider = "openai"
+    provider._protocol = "responses"
+    provider._options = {}
+    provider._base_url = "https://gateway.example/v1"
+    provider._server_verified_protocols = frozenset()
+
+    class Batches:
+        async def create(self, **_kwargs):
+            return "batch"
+
+    provider._get_aclient = lambda: SimpleNamespace(batches=Batches())
+
+    with pytest.raises(ValueError, match="未验证 Responses"):
+        asyncio.run(provider.async_create_batch("file-1", endpoint="/v1/responses"))
+
+
+def test_openai_async_responses_batch_default_endpoint_is_responses():
+    """异步缺省 endpoint 同判据（``==``→``!=`` 变异后打到 chat 端点）。"""
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "demo"
+    provider._provider = "openai"
+    provider._protocol = "responses"
+    provider._options = {}
+    provider._base_url = "https://api.openai.com/v1/"
+    provider._server_verified_protocols = frozenset()
+    captured = {}
+
+    class Batches:
+        async def create(self, **kwargs):
+            captured.update(kwargs)
+            return "batch"
+
+    provider._get_aclient = lambda: SimpleNamespace(batches=Batches())
+
+    assert asyncio.run(provider.async_create_batch("file-1")) == "batch"
+    assert captured["endpoint"] == "/v1/responses"
+
+
+def _ark_chat_chunks():
+    return [
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "t1",
+                                "function": {"name": "f", "arguments": '{"a":1}'},
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ]
+        },
+        {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+    ]
+
+
+def _ark_chat_provider():
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "ark-model"
+    provider._provider = "volcengine"
+    provider._protocol = "chat_completions"
+    provider._options = {}
+    return provider
+
+
+def test_ark_chat_stream_events_flush_completed_after_delta():
+    """finish 前先冲刷：``tool_call_delta`` 先于 ``tool_call_completed`` 发出。
+
+    冲刷判据 ``converted.type == "finish"`` 若变异成 ``!=``，冲刷提前到首个
+    delta 上——实测事件序列变成 ``[tool_call_completed, tool_call_delta,
+    finish]``，消费方在看到片段之前先收到完成事件。
+    """
+    provider = _ark_chat_provider()
+
+    class Completions:
+        def create(self, **_request):
+            return iter(_ark_chat_chunks())
+
+    provider._get_client = lambda: SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+
+    events = list(provider.stream_events(CompletionRequest(prompt="hi")))
+
+    assert [e.type for e in events] == ["tool_call_delta", "tool_call_completed", "finish"]
+
+
+def test_ark_async_chat_stream_events_flush_completed_after_delta():
+    """异步 stream_events 同判据（``==``→``!=`` 变异后完成事件抢在片段前）。"""
+    provider = _ark_chat_provider()
+
+    class Completions:
+        async def create(self, **_request):
+            return _ark_chat_chunks()
+
+    provider._get_aclient = lambda: SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+
+    async def collect():
+        return [e.type async for e in provider.astream_events(CompletionRequest(prompt="hi"))]
+
+    assert asyncio.run(collect()) == ["tool_call_delta", "tool_call_completed", "finish"]
+
+
+def test_ark_invoke_stream_yields_text_delta():
+    """Ark 同步 invoke 按 ``event.type == "text_delta"`` 交付文本。
+
+    ``==``→``!=`` 变异后文本全部丢弃（实测 ``[]``），聊天界面收到空回复。
+    """
+    provider = _ark_chat_provider()
+
+    class Completions:
+        def create(self, **_request):
+            return iter(
+                [
+                    {"choices": [{"delta": {"content": "答"}, "finish_reason": None}]},
+                    {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+                ]
+            )
+
+    provider._get_client = lambda: SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+
+    assert list(provider.invoke("hi", stream=True, temperature=0.5)) == ["答"]
+
+
+def test_ark_ainvoke_stream_yields_text_delta():
+    """Ark 异步 invoke 同判据（``==``→``!=`` 变异后返回空列表）。"""
+    provider = _ark_chat_provider()
+
+    class Completions:
+        async def create(self, **_request):
+            return [
+                {"choices": [{"delta": {"content": "答"}, "finish_reason": None}]},
+                {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+            ]
+
+    provider._get_aclient = lambda: SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+
+    async def consume():
+        return [chunk async for chunk in provider.ainvoke("hi", stream=True, temperature=0.5)]
+
+    assert asyncio.run(consume()) == ["答"]
