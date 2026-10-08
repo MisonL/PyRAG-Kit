@@ -1,0 +1,51 @@
+# 否定变异扫描的 39 个存活位点（坐标为本轮扫描时的源码位置）。
+#
+# 期望判定来自逐点人工复核：34 处 KILLED（红验证过的测试）、5 处 SURVIVED
+# （确证的等价变异）、1 处 MUTFAIL（openai_compatible.py:1383 的守卫已被
+# 「max_output_tokens=None 不进入请求体」修复移除，位点不再存在）。
+#
+# 用法（需要 1 个以上已注册且干净的 git worktree）：
+#   uv run python scripts/audit/verify_sites.py --worktrees /path/wt scripts/audit/regressions/green39.txt
+#
+# 夹具同时覆盖三种防呆路径：openai_compatible.py 的 7 个位点在修复后行号
+# 整体上移 1（漂移定位）；1383 验证 MUTFAIL 上报；SURVIVED 行验证无
+# selector 时的全量套件判定。
+src/providers/anthropic.py|1613|31|notin|tests/providers/test_guard_coverage_regressions.py::test_anthropic_async_stream_emits_completed_tool_call|KILLED
+src/providers/anthropic.py|281|12|drop|tests/providers/test_guard_coverage_regressions.py::test_anthropic_supports_sampling_option_tracks_model_generation|KILLED
+src/providers/anthropic.py|684|19|drop|tests/providers/test_guard_coverage_regressions.py::test_anthropic_tool_content_list_is_preserved|KILLED
+src/providers/anthropic.py|841|71|isnot|tests/providers/test_guard_coverage_regressions.py::test_anthropic_beta_only_fields_rejected_without_beta|KILLED
+src/providers/anthropic.py|972|19|isnot||SURVIVED
+src/providers/anthropic.py|981|19|isnot|tests/providers/test_guard_coverage_regressions.py::test_anthropic_duplicate_sampling_field_with_extra_body|KILLED
+src/ui/config_menu.py|209|15|isnot|tests/ui/test_config_menu.py::test_edit_retrieval_params_writes_rerank_toggle|KILLED
+src/ui/config_menu.py|436|15|isnot|tests/ui/test_config_menu.py::test_edit_model_params_writes_selected_rerank_configuration|KILLED
+src/retrieval_test/excel_logger.py|346|84|isnot|tests/retrieval_test/test_retrieval_cli.py::test_excel_log_drops_none_scores_from_all_scores_column|KILLED
+src/providers/factory.py|356|16|isnot||SURVIVED
+src/providers/google.py|1792|27|drop|tests/providers/test_guard_coverage_regressions.py::test_google_tool_result_part_resolves_name_from_call_id|KILLED
+src/providers/google.py|1794|61|drop|tests/providers/test_guard_coverage_regressions.py::test_google_tool_result_accepts_valid_name|KILLED
+src/providers/google.py|2547|19|drop|tests/providers/test_guard_coverage_regressions.py::test_google_stream_refusal_part_uses_text_fallback|KILLED
+src/providers/google.py|2583|37|drop|tests/providers/test_guard_coverage_regressions.py::test_google_stream_candidate_refusal_emitted_once|KILLED
+src/providers/google.py|306|19|notin|tests/providers/test_google_genai.py::test_google_provider_loads_credentials_file_and_forwards_it|KILLED
+src/providers/google.py|3666|11|isnot|tests/providers/test_guard_coverage_regressions.py::test_google_async_validate_tuning_reward_forwards_composite_config|KILLED
+src/providers/google.py|571|15|drop||SURVIVED
+src/providers/__base__/model_provider.py|1201|11|notin||SURVIVED
+src/providers/__base__/model_provider.py|335|7|isnot||SURVIVED
+src/providers/openai_compatible.py|1153|11|isnot|tests/providers/test_guard_coverage_regressions.py::test_openai_chat_request_forwards_metadata|KILLED
+src/providers/openai_compatible.py|1383|11|isnot|tests/providers/test_guard_coverage_regressions.py::test_openai_responses_none_max_output_tokens_not_forwarded|MUTFAIL
+src/providers/openai_compatible.py|1492|15|isnot|tests/providers/test_guard_coverage_regressions.py::test_openai_responses_official_endpoint_rejects_configured_extra_body_stop|KILLED
+src/providers/openai_compatible.py|1574|28|isnot|tests/providers/test_guard_coverage_regressions.py::test_openai_responses_configured_top_logprobs_used_as_fallback|KILLED
+src/providers/openai_compatible.py|2453|27|notin|tests/providers/test_guard_coverage_regressions.py::test_openai_responses_sync_emits_completed_before_later_events|KILLED
+src/providers/openai_compatible.py|2509|31|notin|tests/providers/test_protocol_adapters.py::test_openai_responses_async_stream_deduplicates_tool_completion_events|KILLED
+src/providers/openai_compatible.py|2543|27|notin|tests/providers/test_guard_coverage_regressions.py::test_openai_responses_async_emits_completed_before_later_events|KILLED
+src/providers/openai_compatible.py|4821|19|isnot|tests/providers/test_guard_coverage_regressions.py::test_openai_async_update_vector_store_file_drops_none_extras|KILLED
+src/providers/openai_compatible.py|5285|15|isnot|tests/providers/test_guard_coverage_regressions.py::test_openai_async_compact_responses_forwards_only_given_fields|KILLED
+src/providers/openai_compatible.py|576|33|isnot|tests/providers/test_guard_coverage_regressions.py::test_openai_response_retrieve_kwargs_drops_none_values|KILLED
+src/providers/openai_compatible.py|982|58|drop|tests/providers/test_guard_coverage_regressions.py::test_openai_compatible_merge_resource_kwargs_keeps_none_by_default|KILLED
+src/providers/openai_compatible.py|982|75|isnot|tests/providers/test_guard_coverage_regressions.py::test_openai_compatible_merge_resource_kwargs_omits_none_when_requested|KILLED
+src/utils/security.py|499|11|isnot|tests/providers/test_security_boundaries.py::test_secret_free_options_keeps_self_copied_sdk_model|KILLED
+src/utils/security.py|680|49|drop|tests/providers/test_security_boundaries.py::test_secret_free_options_nested_non_string_key_reports_path|KILLED
+src/providers/volcengine.py|1425|38|isnot|tests/providers/test_guard_coverage_regressions.py::test_ark_responses_native_kwargs_validate_extra_body_secrets|KILLED
+src/providers/volcengine.py|1838|31|notin|tests/providers/test_guard_coverage_regressions.py::test_ark_responses_sync_deduplicates_tool_call_delivered_by_finish|KILLED
+src/providers/volcengine.py|1873|27|notin|tests/providers/test_guard_coverage_regressions.py::test_ark_responses_sync_emits_completed_before_later_events|KILLED
+src/providers/volcengine.py|1938|31|notin|tests/providers/test_guard_coverage_regressions.py::test_ark_responses_async_deduplicates_tool_call_delivered_by_finish|KILLED
+src/providers/volcengine.py|1942|31|notin|tests/providers/test_guard_coverage_regressions.py::test_ark_responses_async_deduplicates_tool_call_delivered_by_finish|KILLED
+src/providers/volcengine.py|1972|27|notin|tests/providers/test_guard_coverage_regressions.py::test_ark_responses_async_emits_completed_before_later_events|KILLED
