@@ -76,6 +76,34 @@ def test_mutate_eqneq_both_directions(tmp_path):
     assert "a == b" in target.read_text(encoding="utf-8")
 
 
+def test_mutate_cmpdir_reverses_direction_in_both_shapes(tmp_path):
+    """``<``↔``>`` 与 ``<=``↔``>=`` 各自反向；``<=`` 不能被切出 ``> =``。"""
+    target = tmp_path / "mod.py"
+    target.write_text("def f(a, b):\n    return a <= b\n")
+    apply_mutation(target, 2, 11, "cmpdir")
+    assert "a >= b" in target.read_text(encoding="utf-8")
+
+    target.write_text("def f(a, b):\n    return a >= b\n")
+    apply_mutation(target, 2, 11, "cmpdir")
+    assert "a <= b" in target.read_text(encoding="utf-8")
+
+    target.write_text("def f(a, b):\n    return a < b\n")
+    apply_mutation(target, 2, 11, "cmpdir")
+    assert "a > b" in target.read_text(encoding="utf-8")
+
+    target.write_text("def f(a, b):\n    return a > b\n")
+    apply_mutation(target, 2, 11, "cmpdir")
+    assert "a < b" in target.read_text(encoding="utf-8")
+
+
+def test_mutate_cmpdir_flips_only_first_operator_of_chain(tmp_path):
+    """链式比较 ``0 <= x < 10`` 只翻转第一个运算符（与 eqneq 同约定）。"""
+    target = tmp_path / "mod.py"
+    target.write_text("def f(x):\n    return 0 <= x < 10\n")
+    apply_mutation(target, 2, 11, "cmpdir")
+    assert "0 >= x < 10" in target.read_text(encoding="utf-8")
+
+
 def test_mutate_column_is_utf8_byte_offset(tmp_path):
     """含中文的行：col_offset 是 UTF-8 字节偏移，不是字符偏移。"""
     target = tmp_path / "mod.py"

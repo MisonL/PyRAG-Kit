@@ -9,6 +9,8 @@
 * ``isnot``：``x is not y`` → ``x is y``，只替换运算符区段。
 * ``eqneq``：``x == y`` → ``x != y``（反之亦然），只替换运算符区段；
   多操作数比较只翻转第一个 ``Eq``/``NotEq``。
+* ``cmpdir``：``x < y`` → ``x > y``、``x <= y`` → ``x >= y``（反之亦然），
+  方向反转；多操作数比较只翻转第一个 ``Lt``/``LtE``/``Gt``/``GtE``。
 
 坐标约定：``line`` 为 1 起始行号，``col`` 为 CPython AST 的 ``col_offset``
 （**UTF-8 字节**偏移）。旧版 ``mut_cmp.py`` 把 ``col_offset`` 当字符偏移
@@ -26,12 +28,13 @@ import pathlib
 import re
 import sys
 
-KINDS = ("drop", "notin", "isnot", "eqneq")
+KINDS = ("drop", "notin", "isnot", "eqneq", "cmpdir")
 
 _OP_KINDS = {
     "notin": (ast.NotIn,),
     "isnot": (ast.IsNot,),
     "eqneq": (ast.Eq, ast.NotEq),
+    "cmpdir": (ast.Lt, ast.LtE, ast.Gt, ast.GtE),
 }
 
 
@@ -128,8 +131,16 @@ def mutate_source(src: str, node: ast.AST, kind: str) -> str:
         pattern, replacement = r"\bnot\s+in\b", "in"
     elif kind == "isnot":
         pattern, replacement = r"\bis\s+not\b", "is"
-    else:
+    elif kind == "eqneq":
         pattern, replacement = r"==|!=", "!=" if isinstance(node.ops[index], ast.Eq) else "=="
+    else:
+        # 运算符节点（ast.Lt 等）不带位置信息，只能靠区段正则；按最长优先
+        # 排列，避免 ``<`` 先于 ``<=`` 命中而在 ``<=`` 里切出 ``> =``。
+        pattern = r"<=|>=|<|>"
+
+        def replacement(match: re.Match[str]) -> str:
+            return {"<": ">", "<=": ">=", ">": "<", ">=": "<="}[match.group(0)]
+
     new_segment, count = re.subn(pattern, replacement, segment, count=1)
     if count != 1:
         raise SiteNotFound(f"运算符区段内未找到 {pattern!r}: {segment!r}")

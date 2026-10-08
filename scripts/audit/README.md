@@ -25,7 +25,8 @@ uv run python scripts/audit/verify_sites.py \
 - `drop`：删除 `not`；
 - `notin`：`not in` ↔ `in`；
 - `isnot`：`is not` ↔ `is`；
-- `eqneq`：`==` ↔ `!=`。
+- `eqneq`：`==` ↔ `!=`；
+- `cmpdir`：`<` ↔ `>`、`<=` ↔ `>=`（方向反转）。
 
 `expected` 可为 `KILLED`、`SURVIVED`、`MUTFAIL` 或 `COLLECT_ERROR`。验证器会在启动时同步每个已注册且干净的 worktree 到主仓 HEAD；选择器先检查文件与测试名；pytest 退出码 4/5 不会被当成红测；源码行号漂移只在窗口内找到唯一最近节点时自动修正，否则明确报 `MUTFAIL`。每条变异都在 `finally` 中还原，结束时再次检查 worktree 清洁。
 
