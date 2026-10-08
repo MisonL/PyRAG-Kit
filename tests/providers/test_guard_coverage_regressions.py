@@ -7,6 +7,7 @@
 """
 
 import asyncio
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -3946,3 +3947,229 @@ def test_responses_has_content_treats_empty_containers_as_absent():
     assert _responses_has_content(0) is True
     assert _responses_has_content(1) is True
     assert _responses_has_content({"a": 1}) is True
+
+
+# --- face 13（True ↔ False 互换扫描）：Anthropic 入口与数据形态 ---------------
+
+
+class _AnyAttr:
+    """任意属性访问都返回可调用对象，调用结果仍是 ``_AnyAttr``。"""
+
+    def __getattr__(self, _name):
+        return lambda *args, **kwargs: _AnyAttr()
+
+    def __iter__(self):
+        return iter(())
+
+    def __aiter__(self):
+        async def _gen():
+            for _item in ():
+                yield _item
+
+        return _gen()
+
+
+def _anthropic_flag_provider(recorder: dict):
+    """记录各入口传给 ``_build_message_params``／``_parse_params`` 的开关。"""
+    provider = _anthropic_provider()
+
+    def _build(**kwargs):
+        recorder.setdefault("build", []).append(
+            {key: kwargs.get(key) for key in ("stream", "beta", "for_parse", "for_tool_runner")}
+        )
+        return {}
+
+    def _parse(params, *, beta):
+        recorder.setdefault("parse", []).append(beta)
+        return {}
+
+    provider._build_message_params = _build
+    provider._parse_params = _parse
+    provider._validate_token_count_request = lambda request, *, beta: recorder.setdefault(
+        "token_count", []
+    ).append(beta)
+    provider._get_client = lambda: _AnyAttr()
+    provider._get_aclient = lambda: _AnyAttr()
+    return provider
+
+
+def _consume(call):
+    """调用入口并消费可能的生成器；返回是否抛异常。"""
+    try:
+        result = call()
+        if inspect.isawaitable(result):
+            asyncio.run(result)
+        elif inspect.isgenerator(result):
+            list(result)
+        elif inspect.isasyncgen(result):
+
+            async def _drain():
+                return [item async for item in result]
+
+            asyncio.run(_drain())
+    except Exception:  # noqa: BLE001 - 入口内部实现与本用例无关
+        return True
+    return False
+
+
+@pytest.mark.parametrize(
+    "method_name,expected",
+    [
+        ("complete", {"stream": False, "beta": None, "for_parse": None, "for_tool_runner": None}),
+        ("acomplete", {"stream": False, "beta": None, "for_parse": None, "for_tool_runner": None}),
+        ("parse", {"stream": False, "beta": None, "for_parse": True, "for_tool_runner": None}),
+        (
+            "async_parse",
+            {"stream": False, "beta": None, "for_parse": True, "for_tool_runner": None},
+        ),
+        (
+            "beta_create",
+            {"stream": False, "beta": True, "for_parse": None, "for_tool_runner": None},
+        ),
+        (
+            "async_beta_create",
+            {"stream": False, "beta": True, "for_parse": None, "for_tool_runner": None},
+        ),
+        ("beta_parse", {"stream": False, "beta": True, "for_parse": True, "for_tool_runner": None}),
+        (
+            "async_beta_parse",
+            {"stream": False, "beta": True, "for_parse": True, "for_tool_runner": None},
+        ),
+        ("beta_stream", {"stream": True, "beta": True, "for_parse": None, "for_tool_runner": None}),
+        (
+            "async_beta_stream",
+            {"stream": True, "beta": True, "for_parse": None, "for_tool_runner": None},
+        ),
+        (
+            "beta_tool_runner",
+            {"stream": True, "beta": True, "for_parse": None, "for_tool_runner": True},
+        ),
+        (
+            "async_beta_tool_runner",
+            {"stream": True, "beta": True, "for_parse": None, "for_tool_runner": True},
+        ),
+    ],
+)
+def test_anthropic_entries_pass_expected_stream_and_beta_flags(method_name, expected):
+    """每个公共入口传给 ``_build_message_params`` 的开关必须与它的形态一致。
+
+    这些开关都是布尔字面量，反向成另一个取值后：``complete``／``acomplete``／
+    ``parse`` 三条**非流式**入口变成流式装配、``beta_*`` 不再启用 Beta 资源、
+    ``parse`` 不再走 ``for_parse`` 分支（``output_format`` 校验与配置覆盖的
+    行为随之改变）。既有用例只断言了各入口的最终结果或错误消息，装配开关
+    本身从未被观察。
+    """
+    recorder: dict = {}
+    provider = _anthropic_flag_provider(recorder)
+    request = CompletionRequest(prompt="hi")
+    calls = {
+        "complete": lambda: provider.complete(request),
+        "acomplete": lambda: provider.acomplete(request),
+        "parse": lambda: provider.parse({}, request),
+        "async_parse": lambda: provider.async_parse({}, request),
+        "beta_create": lambda: provider.beta_create(request),
+        "async_beta_create": lambda: provider.async_beta_create(request),
+        "beta_parse": lambda: provider.beta_parse({}, request),
+        "async_beta_parse": lambda: provider.async_beta_parse({}, request),
+        "beta_stream": lambda: provider.beta_stream(request),
+        "async_beta_stream": lambda: provider.async_beta_stream(request),
+        "beta_tool_runner": lambda: provider.beta_tool_runner([], request),
+        "async_beta_tool_runner": lambda: provider.async_beta_tool_runner([], request),
+    }
+
+    _consume(calls[method_name])
+
+    assert recorder["build"] == [expected]
+
+
+@pytest.mark.parametrize(
+    "method_name,expected_beta",
+    [
+        ("count_tokens", False),
+        ("beta_count_tokens", True),
+        ("async_count_tokens", False),
+        ("async_beta_count_tokens", True),
+    ],
+)
+def test_anthropic_token_count_entries_declare_beta_consistently(method_name, expected_beta):
+    """``count_tokens`` 家族必须按入口声明是否走 Beta 资源（``beta=False`` 不是 ``True``）。
+
+    反向成另一个取值后，普通入口被当成 Beta 调用（``beta=False`` 的 token
+    计数会去申请 Beta 专属资源），或反过来让 Beta 入口走非 Beta 校验——
+    两边的参数约束与资源挂载不一致。既有用例只断言了返回的 token 数。
+    """
+    recorder: dict = {}
+    provider = _anthropic_flag_provider(recorder)
+    request = CompletionRequest(prompt="hi")
+
+    _consume(lambda: getattr(provider, method_name)(request))
+
+    assert recorder["token_count"] == [expected_beta]
+
+
+def test_anthropic_convert_content_rejects_illegal_base64_characters():
+    """data URI 的 base64 必须 ``validate=True``，非法字符不能被静默忽略。
+
+    ``validate=False`` 时 ``base64.b64decode`` 丢弃非法字符，``"YWJj!!!"`` 被解成
+    ``b"abc"`` 并作为图片内容发给上游——损坏的图片被当成合法数据发送，而
+    ``"中文"`` 这类非 ASCII 输入则抛裸 ``ValueError: string argument should
+    contain only ASCII characters``（不是本模块的指引消息）。
+    """
+    with pytest.raises(ValueError, match="不是有效 Base64"):
+        AnthropicProvider._convert_content(
+            [{"type": "image_url", "image_url": {"url": "data:image/png;base64,YWJj!!!"}}]
+        )
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_anthropic_invoke_stream_returns_quietly_for_empty_stream(is_async):
+    """空事件流必须静默返回，不能报「message_stop 之前结束」。
+
+    ``saw_event`` 初值反向成 ``True`` 后，空响应被当成「收到过事件」并要求
+    ``message_stop``——实测抛 RuntimeError，而「响应对象没有可迭代事件」是
+    被支持的既有形态（下面的 ``current_message_snapshot``／``text_stream``
+    两条兜底路径正是为它准备的）。
+    """
+
+    class _EmptyStream:
+        def __iter__(self):
+            return iter(())
+
+        def __aiter__(self):
+            async def _gen():
+                for _item in ():
+                    yield _item
+
+            return _gen()
+
+        @property
+        def text_stream(self):
+            return ()
+
+    response = _EmptyStream()
+    if is_async:
+
+        async def run():
+            return [item async for item in AnthropicProvider._aiter_invoke_stream_text(response)]
+
+        assert asyncio.run(run()) == []
+    else:
+        assert list(AnthropicProvider._iter_invoke_stream_text(response)) == []
+
+
+def test_anthropic_stream_event_keeps_non_ascii_tool_arguments_verbatim():
+    """``tool_use`` 的初始参数序列化必须 ``ensure_ascii=False``。
+
+    反向成 ``True`` 后中文参数被转义成 ``\\uXXXX`` 形态——回填给模型的参数
+    与调用方给出的原值不同，按原文匹配的下游拿不到原值。
+    """
+    event = {
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {"type": "tool_use", "id": "t1", "name": "f", "input": {"a": "中文"}},
+    }
+
+    converted = AnthropicProvider._stream_event(event)
+
+    assert converted is not None
+    assert converted.tool_call["arguments"] == '{"a":"中文"}'
