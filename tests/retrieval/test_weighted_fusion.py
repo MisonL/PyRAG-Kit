@@ -455,10 +455,18 @@ def test_rrf_rank_out_of_range_is_treated_as_absent(rank):
     assert result[0]["score"] == 0.0
 
 
-def test_rrf_rank_in_range_still_counts():
+@pytest.mark.parametrize("rank_field", ["semantic_rank", "keyword_rank"])
+def test_rrf_rank_in_range_still_counts(rank_field):
+    """两路 rank 都要计入 RRF——只验证 semantic 一侧会让 keyword 判据反向无人发现。
+
+    ``_rrf_rerank`` 里两行同构（``if semantic_rank > 0``／``if keyword_rank > 0``），
+    原用例只喂 ``semantic_rank``，于是把 keyword 那行的 ``>`` 反向成 ``<`` 后，
+    关键词一路的贡献被静默清零（实测双路 rank 都为正时总分恰好减半、只给
+    ``keyword_rank`` 时得 0.0），全量套件仍然全绿。
+    """
     reranker = HybridReranker(0.5, 0.5)
 
-    result = reranker.rerank([{"metadata": {}, "page_content": "x", "semantic_rank": 1}])
+    result = reranker.rerank([{"metadata": {}, "page_content": "x", rank_field: 1}])
 
     assert result[0]["score"] > 0.0
 

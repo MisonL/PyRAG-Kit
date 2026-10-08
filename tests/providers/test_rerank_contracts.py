@@ -107,6 +107,40 @@ def test_rerank_invalid_index_is_explicit(provider_type):
 
 
 @pytest.mark.parametrize("provider_type", [JinaProvider, SiliconflowRerankProvider])
+def test_rerank_accepts_positive_index_within_range(provider_type):
+    """区间内的**正**下标必须被接受并映射到对应文档。
+
+    范围判据 ``not 0 <= direct_index < len(documents)`` 是链式比较，``<=`` 反向
+    成 ``>=`` 后整条判据变成「index > 0 或 index >= len 即拒绝」——除 0 以外的
+    合法下标全被拒（实测 index=1 报「index 无效」），而**负**下标反而被放行，
+    落到 ``positions[...].remove(-1)`` 抛裸 ``ValueError``，穿透本方法承诺的
+    ``RuntimeError``。既有用例只喂过 index=0 与越界的 index=4，因此这一半从未
+    被触达。
+    """
+    provider = object.__new__(provider_type)
+
+    indices, scores = provider._parse_response(
+        [{"index": 1, "relevance_score": 0.9}],
+        ["one", "two"],
+    )
+
+    assert indices == [1]
+    assert scores == [0.9]
+
+
+@pytest.mark.parametrize("provider_type", [JinaProvider, SiliconflowRerankProvider])
+def test_rerank_rejects_negative_index_with_runtime_error(provider_type):
+    """负下标必须报 ``index 无效``，不得穿透成 ``list.remove`` 的裸 ``ValueError``。"""
+    provider = object.__new__(provider_type)
+
+    with pytest.raises(RuntimeError, match="index 无效"):
+        provider._parse_response(
+            [{"index": -1, "relevance_score": 0.9}],
+            ["one", "two"],
+        )
+
+
+@pytest.mark.parametrize("provider_type", [JinaProvider, SiliconflowRerankProvider])
 def test_rerank_unknown_document_is_explicit(provider_type):
     provider = object.__new__(provider_type)
 
