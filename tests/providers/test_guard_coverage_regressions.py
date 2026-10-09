@@ -7,6 +7,7 @@
 """
 
 import asyncio
+import dataclasses
 import inspect
 from types import SimpleNamespace
 
@@ -477,6 +478,25 @@ def test_guard_provider_resource_method_is_idempotent():
     # ``getattr(method, "_resource_guarded", False)`` 的默认值若反向成 ``True``，
     # 未包装的方法也会被判为「已安装」——守卫被静默跳过，凭证与能力校验全部失效。
     assert getattr(guarded, "_resource_guarded", None) is True
+
+
+def test_guard_provider_resource_method_is_idempotent_for_coroutines():
+    """**协程**方法同样必须打上 ``_resource_guarded`` 标记并保持幂等。
+
+    ``_guard_provider_resource_method`` 对 ``inspect.iscoroutinefunction`` 走
+    ``async_wrapper`` 分支，其 ``setattr(async_wrapper, "_resource_guarded",
+    True)`` 与同步分支的赋值是**两处独立**的字面量。上面那条用例用的是同步
+    函数，只覆盖同步分支；实测把异步分支的标记反向成 ``False`` 后全量套件仍
+    绿——异步资源入口每次被重复包装都会多套一层，``_resource_guarded`` 的
+    幂等判断对它们失效。
+    """
+
+    async def plain(a, b):
+        return (a, b)
+
+    guarded = _guard_provider_resource_method(plain)
+    assert getattr(guarded, "_resource_guarded", None) is True
+    assert _guard_provider_resource_method(guarded) is guarded
 
 
 # --- 收口批：轮询、文件内容、消息转换、异步流与流终止去重 -------------------
@@ -3763,6 +3783,48 @@ class _RecordingLLM(LargeLanguageModel):
         yield "x"
 
 
+def test_chat_tool_call_item_defaults_to_no_call_id_requirement():
+    """``require_call_id`` 默认 ``False``：无 id 的历史工具调用必须被原样接受。
+
+    缺 id 的 Gemini 历史经 ``_chat_tool_call_item`` 默认路径必须通过；
+    ``require_call_id=False`` 反向成 ``True`` 后该路径开始拒绝本可发送的请求。
+    """
+    item = model_provider_module._chat_tool_call_item(
+        {"type": "function", "function": {"name": "f", "arguments": "{}"}}, "loc"
+    )
+
+    assert item == {"type": "function", "function": {"name": "f", "arguments": "{}"}}
+
+
+def test_chat_tool_call_item_does_not_leak_responses_marker_by_default():
+    """``keep_responses_type`` 默认 ``False``：内部标记不得进入 Chat 请求体。
+
+    该默认值反向成 ``True`` 后，``_chat_tool_call_item`` 会给
+    ``type != function`` 的工具调用挂上 ``_responses_tool_call_type``——一个
+    只在 Responses 内部判定用的字段随之进入 Chat Completions 请求体。
+    """
+    item = model_provider_module._chat_tool_call_item(
+        {"type": "custom_tool_call", "name": "f", "input": "raw"}, "loc"
+    )
+
+    assert "_responses_tool_call_type" not in item
+    assert item == {"type": "function", "function": {"name": "f", "arguments": "raw"}}
+
+
+def test_responses_input_rejects_tool_call_id_without_call_id_for_output():
+    """只有 Chat 的 ``tool_call_id`` 不能满足 Responses 的 ``call_id`` 要求。
+
+    缺 ``call_id`` 的 ``function_call_output`` 必须被拒；
+    ``require_call_id=True`` 反向成 ``False`` 后，``tool_call_id`` 被当成
+    ``call_id`` 的别名回填，而 Responses 的关联键是 ``call_id``，回填值与
+    调用方的 ``function_call`` 对不上，工具输出静默失联。
+    """
+    messages = [{"type": "function_call_output", "tool_call_id": "tc1", "output": "{}"}]
+
+    with pytest.raises(ValueError, match="tool_call_id/call_id"):
+        normalize_responses_input(None, None, messages)
+
+
 @pytest.mark.parametrize("method", ["complete", "acomplete", "stream_events", "astream_events"])
 def test_compat_layer_forces_stream_flag_for_its_call_shape(method):
     """兼容层必须按自己的调用形态固定 ``stream``，不能沿用请求里的取值。
@@ -3819,6 +3881,33 @@ def test_completion_request_temperature_flag_defaults_off_and_stays_private():
     assert request == CompletionRequest(prompt="hi", temperature=0.7)
 
 
+def test_completion_request_temperature_field_default_is_false_in_the_dataclass():
+    """``_temperature_explicit`` 的**字段声明默认值**必须是 ``False``。
+
+    上面那条用例断言的是 ``repr``／``==`` 的行为，而这两个面由
+    ``repr=False``／``compare=False`` 决定——把 ``default=False`` 反向成
+    ``True`` 后它们逐字不变，实测全量套件仍绿。声明默认值本身是
+    ``dataclasses.fields()`` 可直接读到的契约，也是「字段默认关」这条
+    docstring 承诺的落点，必须单独钉住。
+    """
+    field_info = {item.name: item for item in dataclasses.fields(CompletionRequest)}[
+        "_temperature_explicit"
+    ]
+    assert field_info.default is False
+    assert field_info.init is False
+
+
+def test_completion_request_temperature_field_cannot_be_passed_to_the_constructor():
+    """``init=False`` 必须让私有字段无法从构造器注入。
+
+    ``init=False`` 反向成 ``True`` 后，``CompletionRequest(prompt="hi",
+    _temperature_explicit=True)`` 被接受——调用方可以伪造「温度是显式传入的」
+    这一标记，而 ``__post_init__`` 随后会按真实取值覆盖它，标记与温度自相矛盾。
+    """
+    with pytest.raises(TypeError):
+        CompletionRequest(prompt="hi", _temperature_explicit=True)
+
+
 def test_normalize_chat_messages_requires_tool_call_ids_only_when_asked():
     """缺 ``id`` 的历史工具调用：默认放行，``require_tool_call_ids=True`` 才拒绝。
 
@@ -3862,6 +3951,7 @@ def test_normalize_messages_keeps_custom_tool_call_type_only_when_asked():
 
     normalized = normalize_messages(None, None, messages)
     assert normalized[0]["tool_calls"][0]["type"] == "function"
+    assert "_responses_tool_call_type" not in normalized[0]["tool_calls"][0]
 
     kept = normalize_messages(None, None, messages, keep_responses_type=True)
     assert kept[0]["tool_calls"][0]["type"] == "function"
@@ -4215,3 +4305,551 @@ def test_google_response_text_reaches_the_accessor_fallback_when_parts_are_empty
     response = NS(candidates=[NS(content=NS(parts=[]))], text="兜底正文")
 
     assert GoogleProvider._response_text(response) == "兜底正文"
+
+
+class _AnthropicRecorder:
+    """路径感知的假 Anthropic SDK 客户端：属性链成路径，末端调用被记录。"""
+
+    def __init__(self):
+        self.calls: list[tuple[str, dict]] = []
+        self._path = ""
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        child = _AnthropicRecorder()
+        child.calls = self.calls
+        child._path = f"{self._path}.{name}"
+        return child
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append((self._path.lstrip("."), kwargs))
+        return SimpleNamespace(
+            input_tokens=3,
+            total_tokens=3,
+            content=[SimpleNamespace(type="text", text="ok")],
+            stop_reason="end_turn",
+            usage=SimpleNamespace(input_tokens=3, output_tokens=1),
+        )
+
+
+@pytest.mark.parametrize(
+    "method_name,is_async",
+    [("parse", False), ("async_parse", True)],
+)
+def test_anthropic_parse_rejects_beta_only_params(method_name, is_async):
+    """非 Beta 的 ``parse`` 入口必须拒绝 ``cache_control`` 这类 Beta 专属参数。
+
+    ``_parse_params(params, beta=False)`` 的 ``beta`` 反向成 ``True`` 后，允许
+    集合被扩成 Beta 全集，``cache_control``／``speed`` 等字段被原样交给
+    非 Beta 的 ``messages.parse``——SDK 侧要么报未知参数、要么把 Beta 专属语义
+    发给普通端点。实测 base 抛「不支持请求参数: cache_control」，变异体照常调用
+    ``messages.parse``。
+    """
+    recorder = _AnthropicRecorder()
+    provider = _anthropic_provider()
+    provider._get_client = lambda: recorder
+    provider._get_aclient = lambda: recorder
+    request = CompletionRequest(prompt="hi", cache_control={"type": "ephemeral"})
+
+    with pytest.raises(ValueError, match=r"Anthropic Messages parse 不支持请求参数: cache_control"):
+        result = getattr(provider, method_name)({}, request)
+        if is_async:
+            asyncio.run(result)
+
+
+@pytest.mark.parametrize(
+    "method_name,is_async",
+    [("beta_parse", False), ("async_beta_parse", True)],
+)
+def test_anthropic_beta_parse_forwards_beta_only_params(method_name, is_async):
+    """Beta 的 ``beta_parse`` 入口必须放行 ``speed`` 这类 Beta 专属参数。
+
+    ``_parse_params(params, beta=True)`` 的 ``beta`` 反向成 ``False`` 后，允许
+    集合退化成普通集合，``speed``（经 ``beta_values`` 进入 params）被判为
+    「不支持请求参数」——合法的 Beta 调用直接失败。实测 base 调用
+    ``beta.messages.parse``，变异体抛 ``ValueError``。
+    """
+    recorder = _AnthropicRecorder()
+    provider = _anthropic_provider()
+    provider._get_client = lambda: recorder
+    provider._get_aclient = lambda: recorder
+    request = CompletionRequest(prompt="hi", speed="fast")
+
+    result = getattr(provider, method_name)({}, request)
+    if is_async:
+        asyncio.run(result)
+
+    assert [name for name, _ in recorder.calls] == ["beta.messages.parse"]
+    assert recorder.calls[0][1]["speed"] == "fast"
+
+
+def test_anthropic_async_count_tokens_declares_user_profile_beta_header():
+    """``async_count_tokens`` 的 ``_user_profile_fields(beta=False)`` 必须走头合并分支。
+
+    该调用的 ``beta=False`` 反向成 ``True`` 后，``_user_profile_fields`` 改走
+    Beta 资源分支：``user-profiles-2026-08-18`` 被塞进**第二个**返回值
+    （``betas``），而本处只取第一个返回值（``profile_headers``）——Beta 声明被
+    丢弃，``extra_headers`` 里不再有 ``anthropic-beta``。实测 base 的
+    ``messages.count_tokens`` 收到该头，变异体收到 ``None``。同步入口
+    （``count_tokens``）已被既有用例覆盖，异步这一支此前无人看守。
+    """
+    recorder = _AnthropicRecorder()
+    provider = _anthropic_provider()
+    provider._get_aclient = lambda: recorder
+
+    asyncio.run(provider.async_count_tokens(CompletionRequest(prompt="hi", user="u1")))
+
+    assert recorder.calls == [
+        (
+            "messages.count_tokens",
+            {
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "system": "You are a helpful assistant.",
+                "user_profile_id": "u1",
+                "extra_headers": {"anthropic-beta": "user-profiles-2026-08-18"},
+            },
+        )
+    ]
+
+
+def test_anthropic_build_message_params_rejects_output_format_without_stream():
+    """非流式装配拒绝 ``output_format``，除非调用方显式声明是 tool runner。
+
+    ``for_tool_runner`` 的默认值 ``False`` 反向成 ``True`` 后，任何**没有**声明
+    tool runner 的调用都满足 ``not (beta and for_tool_runner)``，于是
+    ``beta=True`` + ``stream=False`` + ``output_format`` 的组合不再报
+    「Messages.create 不支持 output_format」，``output_format`` 被原样塞进
+    ``messages.create`` 的参数。实测 base 抛 ``ValueError``，变异体返回含
+    ``output_format`` 的 params。
+    """
+    provider = _anthropic_provider()
+
+    with pytest.raises(ValueError, match="不支持 output_format"):
+        provider._build_message_params(prompt="hi", beta=True, stream=False, output_format=int)
+
+
+@pytest.mark.parametrize(
+    "provider_cls",
+    [AnthropicProvider, GoogleProvider, OpenAICompatibleProvider, VolcengineProvider],
+)
+def test_provider_invoke_and_ainvoke_default_to_streaming(provider_cls):
+    """所有 Provider 的 ``invoke``／``ainvoke`` 都必须默认 ``stream=True``。
+
+    ``stream`` 的默认值反向成 ``False`` 后，不传该参数的调用静默退化成非流式
+    ——``chat/core.py`` 与 ``ChatService`` 都靠显式传参自保，但公共签名承诺的
+    默认形态被改变。抽象基类 ``LargeLanguageModel`` 上的两处默认值是各 Provider
+    共同契约的落点，同样必须钉住（实测全量套件对这两处无感）。
+    """
+    for method_name in ("invoke", "ainvoke"):
+        parameters = inspect.signature(getattr(provider_cls, method_name)).parameters
+        assert parameters["stream"].default is True, f"{provider_cls.__name__}.{method_name}"
+
+
+def test_abstract_base_invoke_signatures_default_to_streaming():
+    """抽象基类的 ``invoke``／``ainvoke`` 签名默认值同样是 ``True``。
+
+    这两处（``model_provider.py`` 2167／2178 行）是各 Provider 覆盖时的契约来源，
+    反向成 ``False`` 后仅靠 ``inspect.signature`` 可观察；没有这条断言时全量
+    套件对它无感。
+    """
+    for method_name in ("invoke", "ainvoke"):
+        parameters = inspect.signature(getattr(LargeLanguageModel, method_name)).parameters
+        assert parameters["stream"].default is True, f"LargeLanguageModel.{method_name}"
+
+
+# =========================================================================
+# face 13：boolc（True↔False 字面量互换）扫描确认的真缺口
+# -------------------------------------------------------------------------
+# 以下用例对应 ``face13_auth68.log`` 中 68 个存活位点里经真实入口探针
+# 判定为**真缺口**的部分（另 18 处等价变异见 CHANGELOG 条目）。
+# =========================================================================
+
+
+# --- Google：原生工具 ``is True`` 与分片 ``will_continue`` -----------------
+
+
+def test_google_native_tool_accepts_boolean_true_marker():
+    """``{"type": "google_search", "google_search": True}`` 必须转成合法 ``Tool``。
+
+    ``native_value is True or native_value is None`` 反向成 ``is False`` 后，
+    布尔 ``True`` 既不是 ``False`` 也不是 ``None``，被原样交给
+    ``types.Tool(google_search=True)``——pydantic 校验失败，一条合法的
+    「打开内置搜索」声明直接抛 ``ValidationError``。
+    """
+    from google.genai import types
+
+    tools = GoogleProvider._convert_tools([{"type": "google_search", "google_search": True}])
+
+    assert len(tools) == 1
+    assert isinstance(tools[0], types.Tool)
+    assert tools[0].google_search is not None
+
+
+def test_google_native_tool_rejects_boolean_false_marker():
+    """``google_search=False`` 必须被拒（``is True or is None`` 不是「任意布尔」）。
+
+    ``is True`` 反向成 ``is False`` 后，``False`` 落进「当作空配置」分支，
+    本应报错的显式关闭标记被静默接受成 ``Tool(google_search=GoogleSearch())``。
+    """
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        GoogleProvider._convert_tools([{"type": "google_search", "google_search": False}])
+
+
+def test_google_tool_call_fragment_uses_will_continue_as_identity():
+    """无 id/index 的分片靠 ``will_continue is True`` 关联到已有候选。
+
+    ``tool_call.get("will_continue") is True`` 反向成 ``is False`` 后，一个
+    显式声明 ``will_continue=True`` 的分片不再被认作可关联——本可合并的流式
+    分片抛 ``RuntimeError: ... 无法确认是否为同一调用``。
+    """
+    accumulator = {("position", 0): {"type": "function", "name": "f"}}
+
+    key, merged = GoogleProvider._merge_tool_call(
+        accumulator, {"name": "f", "will_continue": True, "arguments": "{}"}
+    )
+
+    assert key == ("position", 0)
+    assert merged["name"] == "f"
+
+
+def test_google_tool_call_fragment_rejects_explicit_false_continuation():
+    """显式 ``will_continue=False`` 的分片不得被当成可关联。
+
+    ``is True`` 反向成 ``is False`` 后，``False is False`` 成立——一个显式声明
+    「本次调用到此为止」的分片被误认作可关联，两个同名并行调用被静默合并。
+    """
+    accumulator = {("position", 0): {"type": "function", "name": "f"}}
+
+    with pytest.raises(RuntimeError, match="无法确认是否为同一调用"):
+        GoogleProvider._merge_tool_call(
+            accumulator, {"name": "f", "will_continue": False, "arguments": "{}"}
+        )
+
+
+# --- OpenAI 兼容：``strict`` 默认值、空状态判定、流终止、background --------
+
+
+def test_responses_tools_default_strict_to_false():
+    """原生 function 工具未写 ``strict`` 时补 ``False``（严格模式默认关）。
+
+    ``setdefault("strict", False)`` 反向成 ``True`` 后，未显式要求严格模式的
+    工具被强制开启 ``strict``——服务端按严格 schema 校验，宽松的工具定义
+    开始报错。
+    """
+    converted = OpenAICompatibleProvider._convert_responses_tools(
+        [{"type": "function", "name": "f", "parameters": {"type": "object"}}]
+    )
+
+    assert converted[0]["strict"] is False
+
+
+def test_responses_tools_preserve_explicit_strict_true():
+    """显式 ``strict=True`` 必须保留（默认只补缺省，不覆盖调用方）。"""
+    converted = OpenAICompatibleProvider._convert_responses_tools(
+        [{"type": "function", "name": "f", "parameters": {"type": "object"}, "strict": True}]
+    )
+
+    assert converted[0]["strict"] is True
+
+
+@pytest.mark.parametrize("status", ["", "   ", " \t\n"])
+def test_chat_status_is_error_treats_blank_status_as_not_error(status):
+    """空白字符串状态不算错误（``if not normalized: return False``）。
+
+    ``return False`` 反向成 ``return True`` 后，网关在 HTTP 200 里放一个
+    空白 ``status`` 就会被判成业务失败——一次正常响应被报成 ``RuntimeError``。
+    """
+    assert OpenAICompatibleProvider._chat_status_is_error(status) is False
+
+
+def test_openai_async_chat_stream_requires_terminal_finish():
+    """异步 Chat 流缺少 finish 块时必须报错（``terminal_seen = True`` 初值）。
+
+    初值反向成 ``True`` 后，被截断的流不再报「finish 之前结束」——调用方
+    拿到一段不完整文本却以为流正常收尾。
+    """
+
+    def _rows(with_finish):
+        out = [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content="hi", tool_calls=None), finish_reason=None
+                    )
+                ],
+                usage=None,
+                id="r",
+            )
+        ]
+        if with_finish:
+            out.append(
+                SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            delta=SimpleNamespace(content=None, tool_calls=None),
+                            finish_reason="stop",
+                        )
+                    ],
+                    usage=None,
+                    id="r",
+                )
+            )
+        return out
+
+    def _provider(with_finish):
+        provider = object.__new__(OpenAICompatibleProvider)
+        provider._model_name = "m"
+        provider._provider = "openai"
+        provider._protocol = "chat_completions"
+        provider._options = {}
+
+        class Completions:
+            async def create(self, **_kw):
+                return _rows(with_finish)
+
+        provider._get_aclient = lambda: SimpleNamespace(
+            chat=SimpleNamespace(completions=Completions())
+        )
+        return provider
+
+    async def _collect(provider):
+        return [event async for event in provider.astream_events(CompletionRequest(prompt="hi"))]
+
+    complete = asyncio.run(_collect(_provider(True)))
+    assert [event.type for event in complete] == ["text_delta", "finish"]
+
+    with pytest.raises(RuntimeError, match="finish 事件之前结束"):
+        asyncio.run(_collect(_provider(False)))
+
+
+def test_openai_responses_stream_records_terminal_completed():
+    """收到 ``response.completed`` 的完整流必须正常收尾（不误报截断）。
+
+    ``terminal_seen = True`` 反向成 ``False`` 后，**已经**收到终止事件的完整流
+    仍被判为「response.completed 之前结束」——一次正常响应被报成 ``RuntimeError``。
+    """
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "m"
+    provider._provider = "openai"
+    provider._protocol = "responses"
+    provider._options = {"server_verified_protocols": ["responses"]}
+
+    class Responses:
+        def create(self, **_request):
+            return iter(
+                [
+                    SimpleNamespace(type="response.output_text.delta", delta="hi"),
+                    SimpleNamespace(
+                        type="response.completed",
+                        response=SimpleNamespace(status="completed", error=None),
+                    ),
+                ]
+            )
+
+    provider._get_client = lambda: SimpleNamespace(responses=Responses())
+
+    assert list(provider._invoke_responses({"stream": True})) == ["hi"]
+
+
+@pytest.mark.parametrize(
+    "method_name,is_async",
+    [("parse", False), ("async_parse", True)],
+)
+def test_openai_parse_rejects_background_requests(method_name, is_async):
+    """``parse`` 必须显式拒绝 ``background=True``（先于流式开关判定）。
+
+    ``request.copy_with(stream=False)`` 反向成 ``stream=True`` 后，
+    ``_build_responses_request`` 因 ``background and stream`` 抛出**另一条**
+    「background 请求不支持流式模式」——指引与 ``parse`` 语义不符，调用方按
+    「parse 不支持 background」写的分类接不住。
+    """
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "m"
+    provider._provider = "openai"
+    provider._protocol = "responses"
+    provider._options = {"server_verified_protocols": ["responses"]}
+
+    class _Never:
+        @staticmethod
+        def parse(**_kw):
+            return "unused"
+
+    provider._get_client = lambda: SimpleNamespace(
+        responses=_Never(), chat=SimpleNamespace(completions=_Never())
+    )
+    provider._get_aclient = lambda: SimpleNamespace(
+        responses=_Never(), chat=SimpleNamespace(completions=_Never())
+    )
+    request = CompletionRequest(prompt="hi", background=True)
+
+    with pytest.raises(ValueError, match="不支持 background=true"):
+        result = getattr(provider, method_name)(text_format=int, request=request)
+        if is_async:
+            asyncio.run(result)
+
+
+@pytest.mark.parametrize(
+    "method_name,is_async",
+    [("stream_responses", False), ("async_stream_responses", True)],
+)
+def test_openai_stream_responses_rejects_background_requests(method_name, is_async):
+    """``stream_responses`` 必须拒绝 ``background=True``。
+
+    ``request.copy_with(stream=True)`` 反向成 ``stream=False`` 后，
+    ``background`` 与 ``stream`` 不再冲突，后台请求被放行交给
+    ``responses.stream``——一个本应「非流式轮询」的请求被当成流式发出。
+    """
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "m"
+    provider._provider = "openai"
+    provider._protocol = "responses"
+    provider._options = {"server_verified_protocols": ["responses"]}
+
+    class _Never:
+        @staticmethod
+        async def stream(**_kw):
+            return "unused"
+
+    provider._get_client = lambda: SimpleNamespace(responses=_Never())
+    provider._get_aclient = lambda: SimpleNamespace(responses=_Never())
+    request = CompletionRequest(prompt="hi", background=True)
+
+    with pytest.raises(ValueError, match="background 请求不支持流式模式"):
+        result = getattr(provider, method_name)(request=request)
+        if is_async:
+            asyncio.run(result)
+
+
+# --- Ark（Volcengine）：异步 Responses 流终止 -------------------------------
+
+
+def test_ark_async_responses_stream_records_terminal_completed():
+    """Ark 异步 Responses 收到 ``response.completed`` 的完整流必须正常收尾。
+
+    ``terminal_seen = True`` 反向成 ``False`` 后，**已经**收到终止事件的完整流
+    仍被判为「response.completed 之前结束」——一次正常响应被报成 ``RuntimeError``。
+    """
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "m"
+    provider._provider = "volcengine"
+    provider._protocol = "responses"
+    provider._options = {}
+    provider._server_verified_protocols = frozenset({"responses"})
+
+    class Responses:
+        @staticmethod
+        def create(**_kw):
+            return iter(
+                [
+                    SimpleNamespace(type="response.output_text.delta", delta="hi"),
+                    SimpleNamespace(
+                        type="response.completed",
+                        response=SimpleNamespace(status="completed", error=None),
+                    ),
+                ]
+            )
+
+    provider._aclient = SimpleNamespace(responses=Responses())
+
+    async def _collect():
+        return [chunk async for chunk in provider.ainvoke("hi")]
+
+    assert asyncio.run(_collect()) == ["hi"]
+
+
+# --- 私有请求装配器的 stream 默认值（与 ``_chat_tool_call_item`` 同类） ----
+
+
+def test_openai_chat_builder_defaults_to_streaming():
+    """``_build_chat_request`` 的 ``stream`` 默认值必须是 ``True``。"""
+    parameters = inspect.signature(OpenAICompatibleProvider._build_chat_request).parameters
+    assert parameters["stream"].default is True
+
+
+def test_openai_responses_builder_defaults_to_streaming():
+    """``_build_responses_request`` 的 ``stream`` 默认值必须是 ``True``。"""
+    parameters = inspect.signature(OpenAICompatibleProvider._build_responses_request).parameters
+    assert parameters["stream"].default is True
+
+
+def test_ark_chat_builder_defaults_to_streaming():
+    """Ark ``_build_chat_request`` 的 ``stream`` 默认值必须是 ``True``。"""
+    parameters = inspect.signature(VolcengineProvider._build_chat_request).parameters
+    assert parameters["stream"].default is True
+
+
+# --- reraise=True：重试耗尽后抛原始异常，不是 tenacity 的 RetryError --------
+#
+# 同 ``test_retry_helpers_reraise_original_error``：``reraise=True`` 反向成
+# ``False`` 后，最后一次异常被包成 ``RetryError``——调用方按
+# ``TimeoutError``／``ConnectionError`` 写的错误分类接不住。这里覆盖各
+# Provider 的 ``embed_documents``／``aembed_documents``／``complete`` 装饰器
+# （每一处都是**独立**的 ``@retry(...)``，必须逐个看守）。
+
+
+def _patch_retry_sleep(monkeypatch, decorated):
+    """掏掉退避等待（tenacity 的 ``sleep`` 是 retry 对象的实例属性）。"""
+    monkeypatch.setattr(decorated.retry, "sleep", lambda _seconds: None)
+
+
+@pytest.mark.parametrize(
+    "decorated",
+    [
+        OpenAICompatibleProvider.embed_documents,
+        OpenAICompatibleProvider.aembed_documents,
+        GoogleProvider.embed_documents,
+        GoogleProvider.aembed_documents,
+        VolcengineProvider.complete,
+        VolcengineProvider.embed_documents,
+        VolcengineProvider.aembed_documents,
+    ],
+    ids=["oc.embed", "oc.aembed", "g.embed", "g.aembed", "v.complete", "v.embed", "v.aembed"],
+)
+def test_provider_retry_decorators_reraise_original_error(decorated):
+    """每一处 ``@retry(reraise=True)`` 耗尽后都必须抛出原始异常。"""
+    assert decorated.retry.reraise is True
+
+
+def test_openai_embed_reraise_surfaces_timeout_error(monkeypatch):
+    """行为面确认：``embed_documents`` 耗尽后抛 ``TimeoutError`` 而非 ``RetryError``。"""
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "m"
+    provider._provider = "openai"
+    provider._options = {}
+    _patch_retry_sleep(monkeypatch, OpenAICompatibleProvider.embed_documents)
+
+    class Embeddings:
+        @staticmethod
+        def create(**_kw):
+            raise TimeoutError("boom")
+
+    provider._get_client = lambda: SimpleNamespace(embeddings=Embeddings())
+
+    with pytest.raises(TimeoutError):
+        provider.embed_documents(["a"])
+
+
+def test_google_embed_reraise_surfaces_timeout_error(monkeypatch):
+    """行为面确认：Google ``embed_documents`` 耗尽后抛 ``TimeoutError``。"""
+    provider = object.__new__(GoogleProvider)
+    provider._model_name = "gemini-2.0-flash"
+    provider._options = {}
+    _patch_retry_sleep(monkeypatch, GoogleProvider.embed_documents)
+
+    class Models:
+        @staticmethod
+        def embed_content(**_kw):
+            raise TimeoutError("boom")
+
+    class Client:
+        vertexai = False
+        models = Models()
+
+    provider._get_client = lambda: Client()
+
+    with pytest.raises(TimeoutError):
+        provider.embed_documents(["a"])

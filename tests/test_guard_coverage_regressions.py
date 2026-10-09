@@ -2073,3 +2073,201 @@ def test_rerank_provider_cache_evicts_only_stale_same_provider_entries(monkeypat
 
     assert closed == ["stale-jina"]
     assert sorted(key[0] for key in service._rerank_providers) == ["jina", "other"]
+
+
+# =========================================================================
+# face 13：boolc（True↔False 字面量互换）扫描确认的真缺口（工具/服务/检索批）
+# -------------------------------------------------------------------------
+# 对应 ``face13_auth68.log`` 中经真实入口探针判定为真缺口的位点；等价变异
+# 见 CHANGELOG 条目。
+# =========================================================================
+
+
+def test_run_config_is_frozen():
+    """``RunConfig`` 必须是 frozen dataclass。
+
+    ``@dataclass(frozen=True)`` 反向成 ``frozen=False`` 后，运行配置可被任意
+    改写——检索与 ETL 之间共享的同一份配置被中途篡改，且 ``__hash__`` 随之
+    消失（``frozen=True`` 才生成 ``__hash__``）。
+    """
+    import dataclasses
+
+    from src.runtime.contracts import build_run_config
+
+    config = build_run_config(get_settings())
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        config.log_path = pathlib.Path("/tmp/other")
+
+
+def test_knowledge_snapshot_manifest_is_frozen():
+    """``KnowledgeSnapshotManifest`` 必须是 frozen dataclass。
+
+    ``frozen=True`` 反向成 ``False`` 后，清单字段可被原地改写；且因
+    ``frozen=True`` 才生成 ``__hash__``，清单不再可哈希——依赖它做键的
+    调用方直接抛 ``TypeError: unhashable type``。
+    """
+    import dataclasses
+
+    from src.runtime.contracts import KnowledgeSnapshotManifest
+
+    manifest = KnowledgeSnapshotManifest.create(
+        snapshot_id="s1",
+        store_type="faiss",
+        embedding_provider="local-hash",
+        embedding_model="m",
+        chunk_mode="standard",
+        source_digest="d",
+        document_count=1,
+        chunk_count=1,
+    )
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        manifest.snapshot_id = "s2"
+    assert hash(manifest) is not None
+
+
+def test_settings_model_dump_exclude_merges_secret_fields():
+    """``model_dump(exclude=...)`` 必须把凭据字段并入排除集合。
+
+    ``{name: True for name in secret_exclude}`` 里的 ``True`` 反向成 ``False``
+    后，pydantic 把 ``exclude`` 中值为 ``False`` 的键理解为「不排除」——
+    14 个凭据字段全部出现在导出结果里。
+    """
+    dump = Settings().model_dump(exclude={"log_level": True})
+
+    leaked = set(Settings._secret_fields).intersection(dump)
+    assert leaked == set()
+
+
+def test_module_logger_file_handler_records_source_location():
+    """模块 logger 的文件处理器必须带 ``%(filename)s:%(lineno)d``。
+
+    ``_build_rotating_handler(..., with_location=True)`` 的 ``True`` 反向成
+    ``False`` 后，模块日志不再记录来源文件与行号——排障时无法定位调用点。
+    """
+    import logging
+
+    from src.utils import log_manager
+
+    log_dir = tmp_path_factory_dir()
+    original = log_manager.get_settings
+
+    class FakeSettings:
+        log_path = str(log_dir)
+        log_level = "INFO"
+
+    log_manager.get_settings = lambda: FakeSettings()
+    logger = logging.getLogger("test.face13.location.module")
+    saved_handlers = logger.handlers
+    logger.handlers = []
+    try:
+        configured = log_manager.get_module_logger("test.face13.location.module")
+        file_handler = next(
+            handler
+            for handler in configured.handlers
+            if isinstance(handler, logging.handlers.RotatingFileHandler)
+        )
+        assert "%(filename)s" in file_handler.formatter._fmt
+        assert "%(lineno)d" in file_handler.formatter._fmt
+    finally:
+        for handler in logger.handlers:
+            if handler not in saved_handlers:
+                handler.close()
+        logger.handlers = saved_handlers
+        log_manager.get_settings = original
+
+
+def test_chat_logger_file_handler_omits_source_location_by_default():
+    """聊天 logger 的文件处理器默认**不带**来源位置（``with_location`` 默认关）。
+
+    ``with_location: bool = False`` 反向成 ``True`` 后，聊天日志格式与模块日志
+    混同——调用方按聊天日志格式解析的字段位置全部错位。
+    """
+    import logging
+
+    from src.utils import log_manager
+
+    log_dir = tmp_path_factory_dir()
+    original = log_manager.get_settings
+
+    class FakeSettings:
+        log_path = str(log_dir)
+        log_level = "INFO"
+
+    log_manager.get_settings = lambda: FakeSettings()
+    chat_logger = logging.getLogger("chat_logger")
+    saved_handlers = chat_logger.handlers
+    chat_logger.handlers = []
+    try:
+        configured = log_manager.get_chat_logger()
+        file_handler = next(
+            handler
+            for handler in configured.handlers
+            if isinstance(handler, logging.handlers.RotatingFileHandler)
+        )
+        assert "%(filename)s" not in file_handler.formatter._fmt
+    finally:
+        for handler in configured.handlers:
+            if handler not in saved_handlers:
+                handler.close()
+        chat_logger.handlers = saved_handlers
+        log_manager.get_settings = original
+
+
+def test_faiss_save_snapshot_creates_nested_directory():
+    """``save_snapshot`` 必须能创建多级缺失目录（``mkdir(parents=True)``）。
+
+    ``parents=True`` 反向成 ``False`` 后，目标目录的父级不存在时 ``mkdir``
+    抛 ``FileNotFoundError``——首次把快照写到新路径（如带日期的子目录）直接失败。
+    """
+    import json
+
+    import faiss
+
+    store = object.__new__(FaissStore)
+    store.documents = []
+    store.parent_documents = {}
+    store.embeddings = np.zeros((2, 4), dtype=np.float32)
+    store.faiss_index = faiss.IndexFlatL2(4)
+    store.bm25_index = None
+    store._tokenized_docs_cache = None
+
+    with tempfile.TemporaryDirectory() as tmp:
+        nested = pathlib.Path(tmp) / "nested" / "deep"
+        store.save_snapshot(str(nested))
+        assert (nested / "stats.json").exists()
+        stats = json.loads((nested / "stats.json").read_text(encoding="utf-8"))
+
+    assert stats["embedding_dimension"] == 4
+
+
+def test_rerank_provider_cache_key_is_order_insensitive(monkeypatch):
+    """rerank 缓存键对 ``options`` 的键序不敏感（``sort_keys=True``）。
+
+    ``sort_keys=True`` 反向成 ``False`` 后，键序不同但内容相同的两份等价配置
+    生成不同的指纹——每次检索都重建一个 rerank provider，缓存失效且旧实例
+    不被复用。
+    """
+    from types import SimpleNamespace
+
+    from src.services.retrieval_service import RetrievalService
+
+    service = object.__new__(RetrievalService)
+    service._rerank_providers = {}
+    created = []
+
+    def _factory(*_args, **_kwargs):
+        instance = object()
+        created.append(instance)
+        return instance
+
+    monkeypatch.setattr(
+        "src.services.retrieval_service.ModelProviderFactory.get_rerank_provider", _factory
+    )
+    detail_a = SimpleNamespace(provider="jina", model_name="m", options={"z": 1, "a": 2})
+    detail_b = SimpleNamespace(provider="jina", model_name="m", options={"a": 2, "z": 1})
+
+    first = service._get_rerank_provider("jina", {"jina": detail_a})
+    second = service._get_rerank_provider("jina", {"jina": detail_b})
+
+    assert first is second
+    assert len(created) == 1
