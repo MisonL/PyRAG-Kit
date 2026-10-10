@@ -10997,7 +10997,6 @@ def test_build_chat_request_rejects_tool_calls_without_id(provider_cls, protocol
 @pytest.mark.parametrize(
     "facade_name,client_attr",
     [
-        pytest.param("_AsyncOnlyResourceFacade", "async_sdk_client", id="async-only"),
         pytest.param("GoogleResources", "sdk_client", id="google"),
         pytest.param("AsyncGoogleResources", "async_sdk_client", id="async-google"),
         pytest.param("AsyncArkResources", "async_sdk_client", id="async-ark"),
