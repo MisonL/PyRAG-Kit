@@ -2071,12 +2071,6 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         return events
 
     @classmethod
-    def _chat_stream_event(cls, chunk: Any) -> StreamEvent | None:
-        """兼容旧调用方，返回当前 chunk 的第一个统一事件。"""
-        events = cls._chat_stream_events(chunk)
-        return events[0] if events else None
-
-    @classmethod
     def _response_tool_keys(cls, event: Any, item: Any = None) -> list[Any]:
         """返回 Responses 工具事件可用的稳定关联键。"""
         item = item if item is not None else event
