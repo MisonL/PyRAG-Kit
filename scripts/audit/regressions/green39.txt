@@ -52,8 +52,8 @@ src/providers/openai_compatible.py|5278|15|isnot|tests/providers/test_guard_cove
 src/providers/openai_compatible.py|576|33|isnot|tests/providers/test_guard_coverage_regressions.py::test_openai_response_retrieve_kwargs_drops_none_values|KILLED
 src/providers/openai_compatible.py|982|58|drop|tests/providers/test_guard_coverage_regressions.py::test_openai_compatible_merge_resource_kwargs_keeps_none_by_default|KILLED
 src/providers/openai_compatible.py|982|75|isnot|tests/providers/test_guard_coverage_regressions.py::test_openai_compatible_merge_resource_kwargs_omits_none_when_requested|KILLED
-src/utils/security.py|507|11|isnot|tests/providers/test_security_boundaries.py::test_secret_free_options_keeps_self_copied_sdk_model|KILLED
-src/utils/security.py|688|49|drop|tests/providers/test_security_boundaries.py::test_secret_free_options_nested_non_string_key_reports_path|KILLED
+src/utils/security.py|512|11|isnot|tests/providers/test_security_boundaries.py::test_secret_free_options_keeps_self_copied_sdk_model|KILLED
+src/utils/security.py|693|49|drop|tests/providers/test_security_boundaries.py::test_secret_free_options_nested_non_string_key_reports_path|KILLED
 src/providers/volcengine.py|1428|38|isnot|tests/providers/test_guard_coverage_regressions.py::test_ark_responses_native_kwargs_validate_extra_body_secrets|KILLED
 src/providers/volcengine.py|1841|31|notin|tests/providers/test_guard_coverage_regressions.py::test_ark_responses_sync_deduplicates_tool_call_delivered_by_finish|KILLED
 src/providers/volcengine.py|1876|27|notin|tests/providers/test_guard_coverage_regressions.py::test_ark_responses_sync_emits_completed_before_later_events|KILLED

@@ -37,6 +37,13 @@
 
   新增/修改回归断言 6 处；全量 4380 passed；8 项质量门全绿。
 
+- **补漏：异常兜底分支脱敏、embeddings object dtype 收敛、夹具二次基线化**。存疑清单里逐条实测后确认 2 条真缺陷：
+  - **`safe_exception_text` 兜底分支跳过脱敏**（`src/utils/security.py`）。``str(exc)`` 抛异常（args 含超限整数）时，兜底分支逐元素 ``safe_repr`` 后**直接返回**，不经 ``redact_sensitive_text``——实测 `ValueError(10**4301, "Authorization: Basic [REDACTED-TEST-FIXTURE]")` 的输出里 base64 凭证明文。该函数 docstring 自称「最后一道展示边界」，22 处 ``except`` 依赖它，与主分支的收场不一致。兜底分支补上脱敏，实测 Basic/Bearer 凭证均被红acted。
+  - **`_validate_embeddings_shape` 对 ``dtype=object`` 抛裸 `OverflowError`**（`src/retrieval/vdb/faiss_store.py`）。``embeddings.astype(np.float32)`` 对含 ``10**400`` 的 object 数组抛 ``OverflowError: int too large to convert to float``（不是 ``ValueError``，穿透调用方的错误分类）；pickle 二进制格式让这种数组能正常往返。包成带指引的 ``ValueError``，与写入侧 ``_as_float32_matrix`` 一致。
+  - **`green39.txt` 夹具二次漂移**：本轮新增的 ``security.py`` 两处位点（507:11、688:49）因 ``safe_exception_text`` 修改而失效，夹具核对用例当场报出。按当前源码重新定位到 512:11、693:49（列不变，守卫语义一致），39/39 精确命中。
+
+  其余存疑条目查证后判为低危/未达：`Settings.model_dump` 对运行期注入的 ``options`` 不脱敏（无生产调用点，``security.py`` 的检查路径不受影响）；rerank 缓存键 ``default=str`` 塌陷（TOML 产不出 set，需 Python 直构 ``rerank_configurations``）；``FaissStore(file_path=不存在)`` 静默空 store（行为不一致但无真实调用方）；``background_poll`` 无 86400 上界（实测 1e19 会 ``OverflowError``，但只影响非交互的后台轮询路径，暂留观察）。全量 4382 passed；8 项质量门全绿。
+
 
 
 - **死代码消融：删除 `ChatService.retrieve`**（`src/services/chat_service.py`）。本轮换用**覆盖率**判据（与前两轮的静态引用计数互补）：全量套件在 `uv run --with coverage` 下 4365 passed、TOTAL 88%，导出 coverage JSON 后统计「整个函数体从未被执行」的定义。788 个零执行函数中，绝大多数是 `resources.py` 的 SDK 动态转发桩（408 个，`__getattr__` 派发）、CLI 入口（`main`/`parse_args`）与审计工具自身；逐条分诊后唯一的真死代码是 `ChatService.retrieve`。证据链：**生产零调用**——`chat/core.py` 的 `chat_async` 用 `_identify_intent_async`（L277）+ `_retrieve_knowledge_async`（L287，直连 `retrieval_service.retrieve`）+ `generate_reply`（L303）拼出等价流程，从未调用 `ChatService.retrieve`；**测试零调用**——coverage 证实该函数体（L53-55）从未执行，`test_chat_service.py` 里同名 `service.retrieve(...)` 的 `service` 全是 `RetrievalService`（由 `_retrieval_service_with_store` 构造）；**无动态派发**——全仓 `getattr(..., "retrieve")` 只落在 SDK 的 `content`/`files` 对象上，`ChatService` 实例的外部访问只有 `identify_intent`/`generate_reply`/`_build_prompt`；**无文档化**——HANDOFF.md 与开发文档只提 `RetrievalService.retrieve()`；自引入提交 `8b504d8` 起从未改动。删除后全量仍 4365 passed（与删前逐字一致，证明无引用），8 项质量门全绿。同批零执行候选经证伪后**保留**：`Chatbot.__init__`/`_initialize_vector_store` 是**测试盲区**（测试用 `Chatbot.__new__()` 绕过构造器，生产由 `chat/core.py:386` 的 `Chatbot(console)` 调用）；`google.acomplete`（`google.py:3309` 调用）、`anthropic._get_client`（20+ 生产调用点，测试 monkeypatch）是活的；`faiss_store.import_legacy_snapshot` 是文档化的旧快照迁移入口；openai_compatible/volcengine 的资源转发方法由 `resources.py` 的 facade 经 `self.provider.X(...)` 调用，属动态资源契约面。结论：**覆盖率判据同样只能筛出候选——测试盲区（`__new__` 绕过构造器）、动态派发与接口契约都会让承重代码显示为「从未执行」，必须逐项证伪**。

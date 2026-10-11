@@ -297,9 +297,20 @@ class FaissStore(VectorStoreBase):
         # 溢出警告在这里是预期行为（正是它说明 cast 确实产生了 inf），不能让它
         # 冒充成新的警告泄漏出去。
         if isinstance(embeddings, np.ndarray):
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)
-                cast = embeddings.astype(np.float32)
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    cast = embeddings.astype(np.float32)
+            except (TypeError, ValueError, OverflowError) as exc:
+                # ``dtype=object`` 的 ndarray 在 ``astype`` 时抛裸
+                # ``OverflowError: int too large to convert to float``——它不是
+                # ``ValueError``，而载入侧对「来源不自洽」的承诺是带指引的
+                # ``ValueError``（与写入侧 ``_as_float32_matrix`` 一致）。pickle 是
+                # 二进制格式、不受十进制位数限制，``10**400`` 这种元素能正常往返。
+                raise ValueError(
+                    f"{source}的 embeddings 无法转为 float32（{type(exc).__name__}: {exc}）。"
+                    " 请重建知识快照或修正数据来源。"
+                ) from exc
             if not np.isfinite(cast).all():
                 raise ValueError(
                     f"{source}的 embeddings 包含非有限值（NaN 或无穷大）。"

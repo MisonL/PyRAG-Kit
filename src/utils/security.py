@@ -480,7 +480,12 @@ def safe_exception_text(exc: BaseException) -> str:
         from src.utils.config import safe_repr
 
         rendered = ", ".join(safe_repr(item) for item in exc.args) if exc.args else ""
-        return f"{type(exc).__name__}: {rendered}" if rendered else type(exc).__name__
+        if not rendered:
+            return type(exc).__name__
+        # 兜底分支**同样**是展示边界，必须脱敏：异常 args 里的凭证（如
+        # ``Authorization: Basic <base64>``）若不过 ``redact_sensitive_text``
+        # 就会明文落进日志——与主分支的收场不一致。
+        return f"{type(exc).__name__}: {redact_sensitive_text(rendered)[:240]}"
     if not message:
         return type(exc).__name__
     return f"{type(exc).__name__}: {redact_sensitive_text(message)[:240]}"
