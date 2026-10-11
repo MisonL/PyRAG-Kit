@@ -197,6 +197,60 @@ def test_green39_fixture_parses_with_expected_verdicts():
     assert counts == {"KILLED": 33, "SURVIVED": 5, "MUTFAIL": 1}
 
 
+def test_green39_fixture_sites_resolve_at_head():
+    """夹具坐标必须在当前 HEAD 上精确命中，否则它在静默失效。
+
+    历史翻车：夹具记录在扫描当轮的坐标上，源码后续演化（行号漂移、守卫随修复
+    移动、死代码删除整段移位）后，39 个位点里 10 个已无法定位、10 个需漂移。
+    夹具却只按「字段可解析」放行，于是「已知答案」失去锚定意义。这条断言把
+    「坐标命中当前 HEAD」钉死：凡报 SiteNotFound 即夹具需重新基线化。
+    """
+    fixture = REPO_ROOT / "scripts" / "audit" / "regressions" / "green39.txt"
+    sites = parse_sites(fixture.read_text(encoding="utf-8"))
+    stale = []
+    for site in sites:
+        target = REPO_ROOT / site["target"]
+        tree = ast.parse(target.read_text(encoding="utf-8"))
+        try:
+            find_site(tree, site["line"], site["col"], site["kind"])
+        except SiteNotFound:
+            stale.append(f"{site['target']}:{site['line']}:{site['col']}:{site['kind']}")
+    assert not stale, "夹具坐标已在 HEAD 上失效，需重新基线化：\n" + "\n".join(stale)
+
+
+def test_pytest_infrastructure_failure_is_not_killed():
+    """解释器/依赖不可用（退出码也是 1）不得被当成 KILLED。
+
+    ``--python`` 指到没装 pytest 的解释器时，整轮位点会全部误报 KILLED；
+    这层嗅探把「基础设施不可用」与「测试失败」区分开。
+    """
+    from verify_sites import pytest_output_is_infrastructure_failure
+
+    assert pytest_output_is_infrastructure_failure("/usr/bin/python: No module named pytest")
+    assert pytest_output_is_infrastructure_failure("INTERNALERROR> ...")
+    assert not pytest_output_is_infrastructure_failure("1 failed, 10 passed in 2.0s")
+
+
+def test_selector_precheck_recognizes_class_methods_and_async(tmp_path):
+    """选择器预检必须用 AST 而非 ``^def`` 正则：类方法与 async def 也不能误判。"""
+    from verify_sites import check_selector
+
+    source = (
+        "def test_plain():\n"
+        "    pass\n"
+        "class TestX:\n"
+        "    def test_method_inside_class(self):\n"
+        "        pass\n"
+        "async def test_async_top_level():\n"
+        "    pass\n"
+    )
+    (tmp_path / "t.py").write_text(source, encoding="utf-8")
+    assert check_selector(tmp_path, "t.py::test_plain") is None
+    assert check_selector(tmp_path, "t.py::test_method_inside_class") is None
+    assert check_selector(tmp_path, "t.py::test_async_top_level") is None
+    assert check_selector(tmp_path, "t.py::test_missing") is not None
+
+
 def _git(repo: pathlib.Path, *args: str) -> str:
     return subprocess.run(
         ["git", *args], cwd=repo, check=True, capture_output=True, text=True
@@ -210,6 +264,15 @@ def audit_repo(tmp_path):
     (repo / "src").mkdir(parents=True)
     (repo / "tests").mkdir()
     (repo / ".gitignore").write_text("__pycache__/\n")
+    # 夹具仓库必须与 pytest 走同一套导入路径，否则 ``python -m pytest`` 在
+    # worktree 里收集不到 ``src``。
+    (repo / "conftest.py").write_text(
+        "import pathlib, sys\n"
+        "ROOT = pathlib.Path(__file__).resolve().parent\n"
+        "if str(ROOT) not in sys.path:\n"
+        "    sys.path.insert(0, str(ROOT))\n",
+        encoding="utf-8",
+    )
     (repo / "src" / "guard.py").write_text(
         "def check(value):\n"
         '    if value == "expected":\n'
@@ -280,3 +343,60 @@ def test_verify_sites_end_to_end(audit_repo, tmp_path):
         ["git", "status", "--short"], cwd=worktree, capture_output=True, text=True, check=False
     ).stdout
     assert status.strip() == ""
+
+
+def test_verify_sites_baseline_guard_rejects_red_suite(tmp_path):
+    """基线不绿时整轮必须中止，不得把存活点误判成 KILLED。
+
+    这是「无基线对照」那条历史翻车的回归：红套件会让真存活点报 KILLED，
+    把真缺口藏起来。夹具仓库里直接提交一个常红测试（不能是 worktree 未跟踪
+    文件——``prepare_worktree`` 会拒绝脏 worktree），verify_sites 必须以非零
+    退出并在输出里说明基线不绿，而不是照常输出 KILLED。
+    """
+    repo = tmp_path / "red-repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "tests").mkdir()
+    (repo / ".gitignore").write_text("__pycache__/\n", encoding="utf-8")
+    (repo / "conftest.py").write_text(
+        "import pathlib, sys\n"
+        "ROOT = pathlib.Path(__file__).resolve().parent\n"
+        "if str(ROOT) not in sys.path:\n"
+        "    sys.path.insert(0, str(ROOT))\n",
+        encoding="utf-8",
+    )
+    (repo / "src" / "guard.py").write_text(
+        'def check(value):\n    if value == "expected":\n        return "ok"\n    return "bad"\n',
+        encoding="utf-8",
+    )
+    (repo / "tests" / "test_always_red.py").write_text(
+        "def test_always_red():\n    assert False, 'baseline is red'\n",
+        encoding="utf-8",
+    )
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "audit@example.com")
+    _git(repo, "config", "user.name", "audit")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "init")
+    worktree = tmp_path / "red-wt"
+    _git(repo, "worktree", "add", "--detach", str(worktree))
+
+    sites_file = tmp_path / "sites.txt"
+    sites_file.write_text("src/guard.py|2|7|eqneq||SURVIVED\n")
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(VERIFY_SITES),
+            "--repo",
+            str(repo),
+            "--worktrees",
+            str(worktree),
+            str(sites_file),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert proc.returncode != 0, "基线不绿时 verify_sites 必须非零退出"
+    assert "基线" in proc.stdout + proc.stderr
+    assert "RESULT KILLED" not in proc.stdout

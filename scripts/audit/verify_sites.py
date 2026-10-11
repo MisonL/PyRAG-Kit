@@ -22,12 +22,15 @@
 
 1. 启动时校验每个 worktree 已注册且干净，并 ``checkout --detach`` 到主仓
    HEAD——陈旧提交/残留变异会让整轮判定失真。
-2. 位点未命中时在 ``--drift-window`` 行内做**唯一最近**漂移定位，命中则
+2. **基线对照**：先跑一次未变异的 pytest。基线不绿（有预先存在的失败）时，
+   任何位点都不得进 KILLED/SURVIVED 判定——否则红套件会把真存活点判成
+   KILLED（假绿），把真缺口藏起来。
+3. 位点未命中时在 ``--drift-window`` 行内做**唯一最近**漂移定位，命中则
    在备注里打印 ``DRIFTED``；平局或无匹配 → MUTFAIL，绝不施加到别的守卫。
-3. 选择器先在 worktree 内预检文件与测试名存在——pytest 对不存在的测试名
+4. 选择器先在 worktree 内预检文件与测试名存在——pytest 对不存在的测试名
    返回退出码 4，历史上被 ``returncode != 0`` 误判成「已杀死」。
-4. 每站点 try/finally 还原源码；结束复查全部 worktree 清洁。
-5. 无 selector 的扫描默认 ``pytest -q -x``（被杀变异秒退）；全量套件是
+5. 每站点 try/finally 还原源码；结束复查全部 worktree 清洁。
+6. 无 selector 的扫描默认 ``pytest -q -x``（被杀变异秒退）；全量套件是
    唯一判据，没有「子集先行」的两级语义。
 
 用法::
@@ -40,10 +43,10 @@ import argparse
 import ast
 import os
 import pathlib
-import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -83,6 +86,26 @@ def classify_pytest_exit(returncode: int) -> str:
     return VERDICT_ERROR
 
 
+# pytest 因「解释器/依赖不可用」而非「测试失败」退出时，返回码往往是 1（与
+# KILLED 同码），只有输出能区分。没有这层嗅探时，``--python`` 指到一个没装
+# pytest 的解释器会让**整轮**位点全部误报 KILLED。
+_PYTEST_UNAVAILABLE_MARKERS = (
+    "No module named pytest",
+    "No module named 'pytest'",
+    "ERROR: usage:",
+    "INTERNALERROR",
+    "attempted relative import",
+)
+
+
+def pytest_output_is_infrastructure_failure(output: str) -> bool:
+    """pytest 输出是否表明「基础设施不可用」而非「测试失败」。
+
+    这类收场与「变异被杀死」退出码相同（1），必须先排除，否则整轮判定失真。
+    """
+    return any(marker in output for marker in _PYTEST_UNAVAILABLE_MARKERS)
+
+
 def check_selector(worktree: pathlib.Path, selector: str) -> str | None:
     """在 worktree 内预检 ``文件::测试名``；返回错误原因或 ``None``。"""
     if "::" not in selector:
@@ -92,7 +115,20 @@ def check_selector(worktree: pathlib.Path, selector: str) -> str | None:
     if not path.is_file():
         return f"选择器文件不存在: {file_part}"
     source = path.read_text(encoding="utf-8")
-    if not re.search(rf"^def {re.escape(test_name)}\(", source, re.MULTILINE):
+    # 不能用 ``^def name(``：该正则只匹配**顶格**函数，类内方法、任何缩进 def、
+    # async def 全被误判「测试不存在」→ 假 COLLECT_ERROR，而 pytest 本可收集。
+    # 按 AST 遍历 ``FunctionDef``/``AsyncFunctionDef`` 取名字，与 pytest 的
+    # 实际收集方式一致。
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as exc:
+        return f"选择器文件语法错误: {file_part}: {exc}"
+    test_names = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    if test_name not in test_names:
         return f"选择器测试不存在: {file_part} 中未找到 def {test_name}("
     return None
 
@@ -195,6 +231,11 @@ def run_pytest(
     finally:
         shutil.rmtree(pycache_prefix, ignore_errors=True)
     lines = (proc.stdout + proc.stderr).strip().splitlines()
+    output = proc.stdout + proc.stderr
+    if pytest_output_is_infrastructure_failure(output):
+        # 退出码 1 在这里不代表「变异被杀死」——解释器/依赖不可用也是 1。
+        # 返回一个非判定码（2）让上层归 ENVIRONMENT 而非 KILLED。
+        return 2, (lines[-1] if lines else "pytest 基础设施不可用")
     return proc.returncode, lines[-1] if lines else ""
 
 
@@ -246,6 +287,29 @@ def _catch(fn):
     return None
 
 
+def _probe_selector_ast() -> str | None:
+    """把一段含类方法与 async def 的源码写进临时文件，验证 ``check_selector``
+    的 AST 版本能同时识别这三类声明（旧的正则只认顶格 def）。"""
+    source = (
+        "def test_plain():\n"
+        "    pass\n"
+        "class TestX:\n"
+        "    def test_method_inside_class(self):\n"
+        "        pass\n"
+        "async def test_async_top_level():\n"
+        "    pass\n"
+    )
+    worktree = pathlib.Path(tempfile.mkdtemp())
+    (worktree / "t.py").write_text(source, encoding="utf-8")
+    try:
+        return check_selector(worktree, "t.py::test_method_inside_class") or (
+            check_selector(worktree, "t.py::test_async_top_level")
+            or check_selector(worktree, "t.py::test_plain")
+        )
+    finally:
+        shutil.rmtree(worktree, ignore_errors=True)
+
+
 def selftest() -> int:
     """不触碰 worktree 的防呆自检。"""
     failures = []
@@ -276,6 +340,12 @@ def selftest() -> int:
     check(
         "缺测试名被拒",
         check_selector(DEFAULT_REPO, "tests/test_cleanup.py::test_no_such_test") is not None,
+    )
+    # 旧实现用 ``^def name(`` 正则，只认顶格函数——类方法与 async def 被误判
+    # 「测试不存在」。AST 遍历必须能识别这两类。
+    check(
+        "类方法/缩进声明被识别",
+        _probe_selector_ast() is None,
     )
 
     print("站点文件解析:")
@@ -322,6 +392,11 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--python", default=sys.executable, help="跑 pytest 的解释器")
     parser.add_argument("--drift-window", type=int, default=3, help="漂移定位的最大行距")
     parser.add_argument("--no-first-failure", action="store_true", help="扫描时不加 -x")
+    parser.add_argument(
+        "--no-baseline",
+        action="store_true",
+        help="跳过基线对照（自担风险：红套件会把存活点误判成 KILLED）",
+    )
     parser.add_argument("--selftest", action="store_true", help="运行防呆自检后退出")
     args = parser.parse_args(argv[1:])
 
@@ -342,6 +417,24 @@ def main(argv: list[str]) -> int:
     ]
     if not worktrees:
         raise RuntimeError("至少需要一个 --worktrees")
+
+    # 基线对照：先跑一次**未变异**的套件。基线不绿时任何位点都不能进
+    # KILLED/SURVIVED 判定——红套件会把真存活点判成 KILLED（假绿），
+    # 把真缺口藏起来。这是与「退出码分类」同等重要的前置门。
+    if not args.no_baseline:
+        print("基线对照中（未变异全量套件）...", flush=True)
+        for worktree in worktrees:
+            try:
+                rc, tail = run_pytest(worktree, "", args.python, first_failure=False)
+            except subprocess.TimeoutExpired:
+                raise RuntimeError(f"基线 pytest 超时 {PYTEST_TIMEOUT}s：{worktree}") from None
+            if rc != 0:
+                raise RuntimeError(
+                    f"基线套件不绿（退出码 {rc}）于 {worktree}：{tail}\n"
+                    " 预先存在的失败会让红套件把存活点误判成 KILLED。"
+                    " 请先在干净 HEAD 上跑全量套件并修复，或加 --no-baseline 跳过（自担风险）。"
+                )
+        print("基线绿。", flush=True)
 
     lock = threading.Lock()
     results: list[tuple[dict, str, str]] = []
