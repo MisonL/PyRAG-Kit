@@ -701,3 +701,35 @@ def test_splitter_keeps_string_source_verbatim_in_logs(caplog):
 
     assert "正在分割文档: a.md" in caplog.text
     assert "文档 'a.md' 分割完成" in caplog.text
+
+
+def test_document_repr_survives_oversized_integer_metadata():
+    """``Document`` 的 ``__str__``／``__repr__`` 必须对任何 metadata 都能渲染。
+
+    ``__repr__`` 是 pytest 失败报告、日志与调试器的**兜底渲染**；``metadata``
+    里一个位数超过 ``sys.get_int_max_str_digits()`` 的整数就让整条 f-string 抛
+    ``ValueError: Exceeds the limit``，报错现场反而什么都看不到（实测 pytest 把
+    失败对象显示成 ``<[ValueError(...) raised in repr()] Document object at ...>``）。
+    """
+    document = Document(content="正文", metadata={"source": 10**4301})
+
+    assert repr(document)
+    assert str(document)
+
+
+def test_document_repr_keeps_normal_metadata_verbatim():
+    """正常 metadata 的渲染逐字不变（降级只在渲染真的失败时发生）。"""
+    metadata = {"source": "knowledge_base/sample.md", "chunk_index": 0, "token_count": 320}
+    document = Document(content="正文", metadata=metadata)
+
+    assert str(document) == f"Document(content='正文...', metadata={metadata})"
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [{"source": 10**4301}, {"source": ["a.md"]}, {"source": 42}, {"source": {"p": 1}}],
+    ids=["huge-int", "list", "int", "dict"],
+)
+def test_document_repr_survives_malformed_metadata(metadata):
+    """非字符串 metadata 取值同样不得让 ``repr`` 抛。"""
+    assert repr(Document(content="正文", metadata=metadata))
