@@ -6,6 +6,13 @@
 
 ### 修复
 
+- **并发/时序维度审查：`RetrievalService` 退出路径的资源泄漏**（`src/services/retrieval_service.py`）。本轮的检查面与此前各轮正交（前几轮几乎全是单线程同步路径），聚焦 `asyncio.gather`／`asyncio.to_thread`／线程池与共享可变状态。先做原语盘点：`src/` 内 `asyncio.to_thread` 五处（`chat/core.py:173,413`、`local_hash.py:96`、`retrieval_service.py:759,770`）、`asyncio.gather` 一处（`retrieval_service.py:723`），无 `ThreadPoolExecutor`／`threading.Thread`／`asyncio.Lock`。逐项排查后的结论与修复：
+
+  - **真缺陷：`clear_rerank_cache`／`close`／`aclose` 在第一个关闭失败处中断，后续资源全部泄漏**。三处都是「先清空缓存字典、再逐个关闭」的形态，原实现直接调 `close_resource_sync(provider, ...)`／`close_embedding()`，第一个抛异常就让循环当场退出。实测（`RetrievalService.__new__` + 两个替身 Provider，一个 `close()` 抛 `RuntimeError`）：`clear_rerank_cache` 只关闭了 `['bad']`，第二个 Provider 从未被碰；`close` 在重排失败后连 Embedding Provider 都不关（`['bad']`，期望 `['bad','embedding']`）；`aclose` 同样只关 `['bad']`。危害是**双重**的：泄漏发生在退出路径上（用户不会再有机会重试），且 `src/retrieval/retriever.py:129` 在 `finally` 里裸 `await retrieval_service.aclose()`——异常顶替掉一次**成功**的检索返回值。契约修正为与四个 Provider 自己的 `close`／`aclose` 逐字对齐（`src/providers/*.py` 早已是 `first_error = first_error or exc` + `raise first_error` 的「关闭全部、报第一个错误」）：同一件「释放资源」的事，Provider 层已是该契约，服务层此前漏了。
+  - **已确认非缺陷（逐项证伪）**：`_gather_hybrid_results` 用 `asyncio.gather` 默认语义（一路失败丢弃另一路）——混合检索要求两路都成功才能融合，是有意设计；`EmbeddingService._get_model` 的无锁懒加载实测并发 300 次只构造 1 次（`local-hash` 无 I/O，`await` 前已完成赋值），不构成竞态；`FaissStore` 的 `semantic_search`／`keyword_search` 并发 300 次结果稳定（唯一结果组数 = 查询数，无串扰），且 `_rebuild_indices` 只在载入/写入期调用，不与检索并发；`is_retryable_error(asyncio.CancelledError())` 返回 `False`，取消不会被 tenacity 当可重试错误重放；`to_thread` 包装的 `embed_documents`／`vector_store` 方法均无共享可变状态。
+
+  新增 4 条回归断言（`tests/test_guard_coverage_regressions.py`：`clear_rerank_cache` 失败后继续关闭其余 Provider、`close` 失败后仍关闭 Embedding、`aclose` 同契约、全部成功时不误抛）。红验证：移除三处吞掉后，前 3 条各自变红（`KeyError`/计数为 0）；把条件 `raise` 改成无条件 `raise` 后，第 4 条变红。全量 4385 passed；8 项质量门全绿。
+
 - **全维度审查：6 处守卫不对称与安全/入口缺陷修复**。对分支的 162 提交、`src/` 8104 行改动做分维度对抗审查（7 个独立审查 + 逐条实测复现），修的是「成对路径只修了一侧」这一类系统性缺陷：
 
   - **`security.redact_sensitive_text` 漏 Basic 凭证**（`src/utils/security.py`）。`Authorization: Basic <base64>` 脱敏后逐字不变——`Basic` 是纯字母状态词，被键值正则按「裸关键词 + 状态字面量」（`_NON_CREDENTIAL_VALUE` 含 `basic`）放行，而 `_BEARER_TEXT_RE` 只认 `bearer`。新增 `_BASIC_AUTH_TEXT_RE`，要求前置 `(proxy-)?authorization` 键名以免误伤 `basic understanding` 这类普通文本。实测原 `Authorization: Basic [REDACTED-TEST-FIXTURE]` → `Authorization: Basic [REDACTED]`。

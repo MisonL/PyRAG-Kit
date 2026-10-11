@@ -158,6 +158,124 @@ def test_clear_rerank_cache_closes_duplicate_provider_once():
     assert provider.closed == 1
 
 
+def test_clear_rerank_cache_closes_remaining_providers_after_a_close_failure():
+    """单个 Provider 关闭失败时，其余 Provider 仍必须被释放。
+
+    删除 ``try``／``first_error`` 后循环在第一个失败处退出，后面所有
+    Provider 的传输层与凭证连接池全部泄漏——而本方法是 ``close``／``aclose``
+    的唯一重排资源出口，泄漏发生在退出路径上，用户不会再有机会重试。
+    契约与四个 Provider 自己的 ``close``／``aclose`` 对齐：关闭全部，再报
+    第一个错误。
+    """
+
+    class FailingProvider:
+        def __init__(self, label):
+            self.label = label
+
+        def close(self):
+            raise RuntimeError(f"{self.label} 关闭失败")
+
+    class CountingProvider:
+        def __init__(self):
+            self.closed = 0
+
+        def close(self):
+            self.closed += 1
+
+    service = object.__new__(RetrievalService)
+    good = CountingProvider()
+    service._rerank_providers = {"bad": FailingProvider("bad"), "good": good}
+    with pytest.raises(RuntimeError, match="bad 关闭失败"):
+        service.clear_rerank_cache()
+    assert good.closed == 1
+
+
+def test_close_closes_embedding_after_rerank_close_failure():
+    """重排 Provider 关闭失败后，Embedding Provider 仍必须被释放。
+
+    删除 ``try``／``first_error`` 后 ``clear_rerank_cache`` 的异常直接冒泡，
+    Embedding Provider 的连接池与 SDK 客户端一并泄漏；调用方
+    （``Chatbot.close``）虽然接住异常并记了日志，泄漏本身不会被回收。
+    """
+
+    class FailingRerank:
+        def close(self):
+            raise RuntimeError("重排关闭失败")
+
+    class CountingEmbedding:
+        def __init__(self):
+            self.closed = 0
+
+        def close(self):
+            self.closed += 1
+
+    service = object.__new__(RetrievalService)
+    service._rerank_providers = {"bad": FailingRerank()}
+    service.embedding_service = CountingEmbedding()
+    with pytest.raises(RuntimeError, match="重排关闭失败"):
+        service.close()
+    assert service.embedding_service.closed == 1
+
+
+def test_aclose_closes_remaining_providers_after_an_aclose_failure():
+    """异步关闭与同步关闭同一契约：失败后继续释放，最后报第一个错误。
+
+    ``retriever.py`` 在 ``finally`` 里裸 ``await`` 本方法，中断循环除了泄漏
+    还会让异常顶替掉一次**成功**的检索结果。
+    """
+
+    class FailingProvider:
+        async def aclose(self):
+            raise RuntimeError("异步关闭失败")
+
+    class CountingProvider:
+        def __init__(self):
+            self.closed = 0
+
+        async def aclose(self):
+            self.closed += 1
+
+    class CountingEmbedding:
+        def __init__(self):
+            self.closed = 0
+
+        async def aclose(self):
+            self.closed += 1
+
+    service = object.__new__(RetrievalService)
+    good = CountingProvider()
+    service._rerank_providers = {"bad": FailingProvider(), "good": good}
+    service.embedding_service = CountingEmbedding()
+    with pytest.raises(RuntimeError, match="异步关闭失败"):
+        asyncio.run(service.aclose())
+    assert good.closed == 1
+    assert service.embedding_service.closed == 1
+
+
+def test_close_and_aclose_do_not_raise_when_everything_closes_cleanly():
+    """全部资源关闭成功时不抛——``first_error`` 守卫不能误报。"""
+
+    class QuietProvider:
+        def close(self):
+            pass
+
+        async def aclose(self):
+            pass
+
+    class QuietEmbedding:
+        def close(self):
+            pass
+
+        async def aclose(self):
+            pass
+
+    service = object.__new__(RetrievalService)
+    service._rerank_providers = {"a": QuietProvider()}
+    service.embedding_service = QuietEmbedding()
+    service.close()
+    asyncio.run(service.aclose())
+
+
 # --- services --------------------------------------------------------------
 
 

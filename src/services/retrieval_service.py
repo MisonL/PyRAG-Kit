@@ -880,50 +880,100 @@ class RetrievalService:
         return provider
 
     def clear_rerank_cache(self) -> None:
-        """关闭并清空已缓存的 Rerank Provider。"""
+        """关闭并清空已缓存的 Rerank Provider。
+
+        单个 Provider 关闭失败**不能**中断其余 Provider 的释放：本方法是
+        ``close``／``aclose`` 的第一段，也是 ``RetrievalService`` 唯一的
+        重排资源出口。原实现直接调 ``close_resource_sync``，第一个抛异常的
+        Provider 会让循环当场退出——后面所有 Provider 的传输层与凭证连接池
+        全部泄漏，而泄漏发生在**退出路径**上，用户不会再有机会重试。
+
+        契约与四个 Provider 自己的 ``close``／``aclose`` 逐字对齐：先关闭全部
+        资源，再报出第一个错误（``src/providers/*.py`` 的同名实现里写作
+        ``first_error = first_error or exc`` + ``raise first_error``）。
+        同一件「释放资源」的事，Provider 层已经是这个契约，服务层此前漏了。
+        """
         providers = list(self._rerank_providers.values())
         self._rerank_providers.clear()
         closed: set[int] = set()
+        first_error: Exception | None = None
         for provider in providers:
             if id(provider) in closed:
                 continue
             closed.add(id(provider))
-            close_resource_sync(provider, "Rerank Provider")
+            try:
+                close_resource_sync(provider, "Rerank Provider")
+            except Exception as exc:  # noqa: BLE001 - close all resources before reporting
+                first_error = first_error or exc
+        if first_error is not None:
+            raise first_error
 
     def close(self) -> None:
-        """释放重排缓存及 EmbeddingService 持有的 Provider。"""
-        self.clear_rerank_cache()
+        """释放重排缓存及 EmbeddingService 持有的 Provider。
+
+        与 ``clear_rerank_cache`` 同一契约：重排 Provider 关闭失败时仍要继续
+        关闭 Embedding Provider，最后再报出第一个错误。原实现让
+        ``clear_rerank_cache`` 的异常直接冒泡，Embedding Provider 的连接池
+        连同它的 SDK 客户端一并泄漏——而调用方（``Chatbot.close``）虽然接了
+        这个异常并记了日志，泄漏本身并不会因此被回收。
+        """
+        first_error: Exception | None = None
+        try:
+            self.clear_rerank_cache()
+        except Exception as exc:  # noqa: BLE001 - close all resources before reporting
+            first_error = exc
         close_embedding = getattr(self.embedding_service, "close", None)
         if callable(close_embedding):
-            close_embedding()
+            try:
+                close_embedding()
+            except Exception as exc:  # noqa: BLE001 - close all resources before reporting
+                first_error = first_error or exc
+        if first_error is not None:
+            raise first_error
 
     async def aclose(self) -> None:
-        """异步释放重排缓存及 EmbeddingService 持有的 Provider。"""
+        """异步释放重排缓存及 EmbeddingService 持有的 Provider。
+
+        与 ``close`` 同一契约，且两处必须一致：``aclose`` 的循环此前同样在
+        第一个失败处中断，于是重排 Provider 的异步连接池与 Embedding Provider
+        一并泄漏。调用点 ``src/retrieval/retriever.py:129`` 在 ``finally`` 里
+        裸 ``await`` 本方法——关闭失败会顶替掉一次**成功**的检索返回值，因此
+        这里更要紧的是「先把所有资源释放干净」，而不是提前中断。
+        """
         providers = list(self._rerank_providers.values())
         self._rerank_providers.clear()
         closed: set[int] = set()
+        first_error: Exception | None = None
         for provider in providers:
             if id(provider) in closed:
                 continue
             closed.add(id(provider))
-            close = getattr(provider, "aclose", None)
-            if callable(close):
-                result = close()
-                if inspect.isawaitable(result):
-                    await result
-                continue
-            close = getattr(provider, "close", None)
-            if callable(close):
-                result = close()
-                if inspect.isawaitable(result):
-                    await result
+            try:
+                close = getattr(provider, "aclose", None)
+                if callable(close):
+                    result = close()
+                    if inspect.isawaitable(result):
+                        await result
+                    continue
+                close = getattr(provider, "close", None)
+                if callable(close):
+                    result = close()
+                    if inspect.isawaitable(result):
+                        await result
+            except Exception as exc:  # noqa: BLE001 - close all resources before reporting
+                first_error = first_error or exc
         close_embedding = getattr(self.embedding_service, "aclose", None)
         if not callable(close_embedding):
             close_embedding = getattr(self.embedding_service, "close", None)
         if callable(close_embedding):
-            result = close_embedding()
-            if inspect.isawaitable(result):
-                await result
+            try:
+                result = close_embedding()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as exc:  # noqa: BLE001 - close all resources before reporting
+                first_error = first_error or exc
+        if first_error is not None:
+            raise first_error
 
     async def _rerank_if_needed(
         self,
