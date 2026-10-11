@@ -1111,3 +1111,106 @@ def test_chat_status_is_error_includes_status_400_itself(status):
     """400 本身算错误状态（``>= 400`` 不是 ``> 400``）。"""
     assert OpenAICompatibleProvider._chat_status_is_error(status) is True
     assert OpenAICompatibleProvider._chat_status_is_error(399) is False
+
+
+# ── 回归：流关闭失败不得顶替流错误，也不得污染重试分类 ──
+#
+# ``iterate_async``／``retry_async_stream``／``retry_sync_stream`` 的 ``finally``
+# 都负责关闭迭代器。``finally`` 里抛出的异常会**替换**掉 ``try`` 中正在上抛的
+# 那个，于是「流中途断开」这类可重试错误被「关闭失败」这类不可重试错误顶替：
+# tenacity 的 ``is_retryable_error`` 按类名判据（含 "connection"）会把它当成
+# 可重试，实测一次 ``ConnectionError`` 只尝试了 1 次就放弃。
+
+
+class _StreamThatFailsOnClose:
+    """迭代中途抛可重试错误、关闭时抛不可重试错误的流。"""
+
+    def __init__(self, iteration_error, close_error):
+        self._iteration_error = iteration_error
+        self._close_error = close_error
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise self._iteration_error
+
+    async def aclose(self):
+        raise self._close_error
+
+
+def test_iterate_async_keeps_iteration_error_when_close_also_fails():
+    """关闭异常不能顶替流消费异常——原始错误必须上抛。
+
+    实测原实现抛出的是 ``关闭也失败``，``流中途断开`` 只留在 ``__context__``
+    里；调用方按异常类型分类（可重试／不可重试、是否报流错误）时拿到的是
+    关闭错误，真正的失败原因被掩盖。
+    """
+    stream = _StreamThatFailsOnClose(
+        iteration_error=ConnectionError("流中途断开"),
+        close_error=RuntimeError("关闭也失败"),
+    )
+
+    async def consume():
+        async for _ in iterate_async(stream):
+            pass
+
+    with pytest.raises(ConnectionError, match="流中途断开"):
+        asyncio.run(consume())
+
+
+def test_retry_async_stream_retries_retryable_error_when_close_fails():
+    """关闭失败不得把可重试错误变成不可重试——重试次数必须保持。
+
+    实测原实现只尝试 1 次：``finally`` 的 ``关闭失败（不可重试）`` 顶替了
+    ``连接中断（可重试）``，tenacity 的类名判据（含 "connection"）认不出它。
+    """
+    calls = []
+
+    async def factory():
+        calls.append(1)
+        return _StreamThatFailsOnClose(
+            iteration_error=ConnectionError("连接中断（可重试）"),
+            close_error=ValueError("关闭失败（不可重试）"),
+        )
+
+    async def consume():
+        async for _ in retry_async_stream(factory):
+            pass
+
+    with pytest.raises(ConnectionError, match="连接中断（可重试）"):
+        asyncio.run(consume())
+
+    assert len(calls) == 3
+
+
+def test_retry_sync_stream_keeps_iteration_error_when_close_also_fails():
+    """同步流同一契约：关闭异常不能顶替消费异常。
+
+    迭代器必须自带 ``close``：``retry_sync_stream`` 关闭的是 ``iter(factory())``
+    的返回值，若工厂返回生成器，拿到的是生成器自带的 ``close``，本用例要
+    覆盖的关闭路径就永远不会被走到。
+    """
+
+    class SyncStreamThatFailsOnClose:
+        def __init__(self):
+            self._emitted = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if not self._emitted:
+                self._emitted = True
+                return "first"
+            raise ConnectionError("同步流中途断开")
+
+        def close(self):
+            raise RuntimeError("同步关闭也失败")
+
+    def consume():
+        for _ in retry_sync_stream(lambda: SyncStreamThatFailsOnClose()):
+            pass
+
+    with pytest.raises(ConnectionError, match="同步流中途断开"):
+        consume()

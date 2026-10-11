@@ -5,6 +5,7 @@ import inspect
 import json
 import math
 import struct
+import sys
 from abc import ABC, abstractmethod
 from collections.abc import (
     AsyncGenerator,
@@ -1664,17 +1665,30 @@ async def iterate_async(value: Any) -> AsyncGenerator[Any, None]:
             return
         raise TypeError("SDK 流式响应既不是异步迭代器也不是同步迭代器。")
     finally:
-        close = getattr(value, "aclose", None)
-        if close is not None:
-            result = close()
-            if inspect.isawaitable(result):
-                await result
-        else:
-            close = getattr(value, "close", None)
+        # 关闭异常**不能**顶替 ``try`` 里正在上抛的那个：``finally`` 的异常
+        # 会替换掉它，而调用方按异常类型分类——``retry_async_stream`` 用
+        # ``is_retryable_error`` 的类名判据决定是否重试。实测「流中途断开」
+        # （``ConnectionError``，可重试）被「关闭也失败」（``RuntimeError``，
+        # 不可重试）顶替后，一次可重试的连接错误只尝试了 1 次就放弃。
+        #
+        # ``sys.exc_info()`` 必须在**进入 except 之前**取：一旦进到内层
+        # ``except``，它返回的就是关闭异常本身，判据失效。
+        in_flight = sys.exc_info()[0] is not None
+        try:
+            close = getattr(value, "aclose", None)
             if close is not None:
                 result = close()
                 if inspect.isawaitable(result):
                     await result
+            else:
+                close = getattr(value, "close", None)
+                if close is not None:
+                    result = close()
+                    if inspect.isawaitable(result):
+                        await result
+        except Exception:  # 清理失败不得顶替主流程异常
+            if not in_flight:
+                raise
 
 
 T = TypeVar("T")
@@ -1812,9 +1826,22 @@ def retry_sync_stream(
             yield first
         yield from iterator
     finally:
-        close = getattr(iterator, "close", None)
-        if close is not None:
-            close()
+        # 关闭异常**不能**顶替消费阶段正在上抛的那个：``finally`` 的异常会替换
+        # 掉它，而调用方按异常类型分类（``is_retryable_error`` 的类名判据决定
+        # 要不要重试）。实测同步流「中途断开」（``ConnectionError``，可重试）
+        # 被「关闭也失败」（``RuntimeError``，不可重试）顶替后只尝试 1 次。
+        #
+        # ``sys.exc_info()`` 必须在 ``finally`` 的**第一条语句**取、且早于
+        # 内层 ``except``：放到 ``try`` 之前取会恒为 ``None``（那时还没有异常），
+        # 进到内层 ``except`` 之后取则返回关闭异常本身。两种都会让判据失效。
+        in_flight = sys.exc_info()[0] is not None
+        try:
+            close = getattr(iterator, "close", None)
+            if close is not None:
+                close()
+        except Exception:  # 清理失败不得顶替主流程异常
+            if not in_flight:
+                raise
 
 
 async def retry_async_stream(
@@ -1843,17 +1870,25 @@ async def retry_async_stream(
             raise
 
     iterator, first = await retry_async_call(open_and_peek)
+    # 与 ``retry_sync_stream`` 同一契约：关闭异常不得顶替消费阶段的异常。
     try:
         if first is not _STREAM_END:
             yield first
         async for item in iterator:
             yield item
     finally:
-        close = getattr(iterator, "aclose", None)
-        if close is not None:
-            result = close()
-            if inspect.isawaitable(result):
-                await result
+        # ``sys.exc_info()`` 取在 ``finally`` 第一条语句，理由见
+        # ``retry_sync_stream`` 的同名位置。
+        in_flight = sys.exc_info()[0] is not None
+        try:
+            close = getattr(iterator, "aclose", None)
+            if close is not None:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+        except Exception:  # 清理失败不得顶替主流程异常
+            if not in_flight:
+                raise
 
 
 @contextmanager

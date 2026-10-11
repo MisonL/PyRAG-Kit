@@ -38,8 +38,8 @@ src/providers/google.py|2599|37|drop|tests/providers/test_guard_coverage_regress
 src/providers/google.py|306|19|notin|tests/providers/test_google_genai.py::test_google_provider_loads_credentials_file_and_forwards_it|KILLED
 src/providers/google.py|3674|11|isnot|tests/providers/test_guard_coverage_regressions.py::test_google_async_validate_tuning_reward_forwards_composite_config|KILLED
 src/providers/google.py|571|15|drop||SURVIVED
-src/providers/__base__/model_provider.py|1201|11|notin||SURVIVED
-src/providers/__base__/model_provider.py|335|7|isnot||SURVIVED
+src/providers/__base__/model_provider.py|1202|11|notin||SURVIVED
+src/providers/__base__/model_provider.py|336|7|isnot||SURVIVED
 src/providers/openai_compatible.py|1153|11|isnot|tests/providers/test_guard_coverage_regressions.py::test_openai_chat_request_forwards_metadata|KILLED
 src/providers/openai_compatible.py|1391|15|isnot|tests/providers/test_guard_coverage_regressions.py::test_openai_responses_none_max_output_tokens_not_forwarded|MUTFAIL
 src/providers/openai_compatible.py|1505|15|isnot|tests/providers/test_guard_coverage_regressions.py::test_openai_responses_official_endpoint_rejects_configured_extra_body_stop|KILLED
