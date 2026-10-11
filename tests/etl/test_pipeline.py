@@ -624,3 +624,80 @@ def test_recursive_text_splitter_rejects_non_string_separator_entry():
 
     with pytest.raises(ValueError, match="每一项都必须是字符串"):
         RecursiveTextSplitter._require_separators(["\n\n", 5])
+
+
+# ── 回归：ETL 日志插值不得因 metadata 取值形态而崩 ──
+#
+# ``Document.metadata`` 声明为 ``dict[str, Any]``，取值不受控。``str(10**4301)``
+# 撞 CPython 的整数位数上限（默认 4300 位）抛 ``ValueError: Exceeds the limit``，
+# 而 ETL 的日志行直接把它插进 f-string——一条日志／一次分片让建库主路径崩掉，
+# 报出的还是与「来源字段形态异常」无关的整数转换错误。
+
+
+class _PassthroughExtractor(MarkdownExtractor):
+    pass
+
+
+def _passthrough_pipeline() -> Pipeline:
+    """构造一个各阶段都不改数据的管线，单独暴露 ``process`` 的日志插值。"""
+    from src.etl.cleaners.base import BaseCleaner
+    from src.etl.splitters.base import BaseSplitter
+
+    class _Cleaner(BaseCleaner):
+        def clean(self, documents):
+            return documents
+
+    class _Splitter(BaseSplitter):
+        def split(self, documents):
+            return documents
+
+    return Pipeline(_PassthroughExtractor(), _Cleaner(), _Splitter())
+
+
+def test_pipeline_process_survives_oversized_integer_source():
+    """``metadata['source']`` 是位数超限整数时，日志插值不得让 ``process`` 崩。
+
+    删除守卫后 ``logger.info(f"开始处理文档: {source}")`` 抛
+    ``ValueError: Exceeds the limit (4300 digits)``——建库主路径失败，且错误
+    与「来源字段形态异常」毫无关系。
+    """
+    document = Document(content="正文", metadata={"source": 10**4301})
+
+    chunks = _passthrough_pipeline().process(document)
+
+    assert len(chunks) == 1
+
+
+def test_pipeline_process_survives_non_string_source():
+    """``source`` 是非字符串形态（列表）时同样不得崩。"""
+    document = Document(content="正文", metadata={"source": ["a.md"]})
+
+    chunks = _passthrough_pipeline().process(document)
+
+    assert len(chunks) == 1
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [10**4301, ["a.md"], {"path": "a.md"}, 42],
+    ids=["huge-int", "list", "dict", "int"],
+)
+def test_splitter_survives_malformed_source_in_logs(entry):
+    """分片器两条路径的 ``source`` 日志插值都不得因形态异常而崩。"""
+    document = Document(content="正文内容" * 50, metadata={"source": entry})
+
+    assert RecursiveTextSplitter().split([document])
+    assert RecursiveTextSplitter(structure_mode="hierarchical").split_hierarchical([document])
+
+
+def test_splitter_keeps_string_source_verbatim_in_logs(caplog):
+    """正常字符串来源的日志输出逐字不变（守卫只在非字符串时兜底）。"""
+    import logging
+
+    with caplog.at_level(logging.DEBUG, logger="src.etl.splitters.recursive_text_splitter"):
+        RecursiveTextSplitter().split(
+            [Document(content="正文内容" * 50, metadata={"source": "a.md"})]
+        )
+
+    assert "正在分割文档: a.md" in caplog.text
+    assert "文档 'a.md' 分割完成" in caplog.text

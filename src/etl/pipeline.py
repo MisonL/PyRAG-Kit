@@ -103,7 +103,15 @@ class Pipeline:
         # ``content``／``metadata``。
         if not isinstance(document, Document):
             raise ValueError(f"Pipeline 处理的文档必须是 Document，但得到 {safe_repr(document)}。")
-        source = document.metadata.get("source", "未知来源")
+        # ``metadata`` 声明为 ``dict[str, Any]``，取值不受控；而下面每一行日志都
+        # 把它插进 f-string。``str(10**4301)`` 撞 CPython 的整数位数上限，抛
+        # ``ValueError: Exceeds the limit (4300 digits)``——一条**日志**让建库
+        # 主路径崩掉，而 ``KnowledgeBuildService._process_file`` 的 ``except``
+        # 只按 ``ValueError`` 分类，收场是「建库失败：整数转换超限」，与真实
+        # 原因（来源字段形态异常）毫无关系。只在非字符串时兜底：正常路径的
+        # 输出逐字不变（``safe_repr`` 会给字符串加引号），异常形态退回量级描述。
+        source_value = document.metadata.get("source", "未知来源")
+        source = source_value if isinstance(source_value, str) else safe_repr(source_value)
         logger.info(f"开始处理文档: {source}")
 
         start_total = time.perf_counter()

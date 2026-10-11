@@ -19,6 +19,23 @@ from .base import BaseSplitter
 logger = get_module_logger(__name__)
 
 
+def _safe_source(document: Any) -> str:
+    """取出文档来源用于**日志插值**，形态异常时退回可安全渲染的文本。
+
+    ``Document.metadata`` 声明为 ``dict[str, Any]``，取值不受控；而本模块的日志
+    行把它插进 f-string／``%s``。``str(10**4301)`` 撞 CPython 的整数位数上限，
+    抛 ``ValueError: Exceeds the limit (4300 digits)``——一条 debug 日志让
+    ``split``／``split_hierarchical`` 崩掉，报出的是整数转换错误，与「来源字段
+    形态异常」毫无关系。
+
+    与 ``ui.display_utils.document_source`` 同一判据（那里供展示层用），本模块
+    不能反向依赖 ``ui``，故按同一规则在 ETL 侧取一个最小实现：字符串原样返回
+    （正常路径输出逐字不变），其余形态走 ``safe_repr``。
+    """
+    value = document.metadata.get("source", "未知来源")
+    return value if isinstance(value, str) else safe_repr(value)
+
+
 class RecursiveTextSplitter(BaseSplitter):
     """
     递归文本分割器。
@@ -368,7 +385,7 @@ class RecursiveTextSplitter(BaseSplitter):
         """标准单层分片。"""
         all_chunks: list[Document] = []
         for doc in documents:
-            logger.debug(f"正在分割文档: {doc.metadata.get('source', '未知来源')}")
+            logger.debug(f"正在分割文档: {_safe_source(doc)}")
 
             langchain_chunks = self.text_splitter.create_documents(
                 [doc.content], metadatas=[doc.metadata]
@@ -410,7 +427,7 @@ class RecursiveTextSplitter(BaseSplitter):
         self.parent_documents = {}
 
         for doc in documents:
-            logger.debug(f"正在层级分割文档: {doc.metadata.get('source', '未知来源')}")
+            logger.debug(f"正在层级分割文档: {_safe_source(doc)}")
             parent_documents = self.text_splitter.create_documents(
                 [doc.content], metadatas=[doc.metadata]
             )
@@ -469,7 +486,7 @@ class RecursiveTextSplitter(BaseSplitter):
         扫描，没有出现「原文有非空白内容却产出 0 块」的情形——因此这里不为它写
         警告分支（写不到的死代码只会让人误以为有防护）。
         """
-        source = doc.metadata.get("source", "未知来源")
+        source = _safe_source(doc)
         if produced:
             stage = "层级分割" if hierarchical else "分割"
             logger.debug("文档 '%s' %s完成，生成 %s 个块。", source, stage, produced)
