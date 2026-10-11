@@ -1810,6 +1810,16 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                         if not isinstance(function_name, str) or not function_name.strip():
                             raise ValueError("Google function_call 缺少 name。")
                         if call_id and function_name:
+                            # 同一 id 重复登记说明上游给了自相矛盾的调用序列
+                            # （两条 function_call 共用一个 id），静默覆盖会让
+                            # 后续 ``function_response`` 关联到后写的那条名字、
+                            # 与它实际回应的调用不符。宁可显式报错。
+                            existing = tool_call_names.get(call_id)
+                            if existing is not None and existing != function_name:
+                                raise ValueError(
+                                    f"Google 工具调用 id {call_id!r} 重复且名字冲突: "
+                                    f"{existing!r} vs {function_name!r}。"
+                                )
                             tool_call_names[call_id] = function_name
                         arguments = part.get("arguments", part.get("args", {}))
                         if isinstance(arguments, str):
@@ -1868,6 +1878,12 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                 if not isinstance(function_name, str) or not function_name.strip():
                     raise ValueError(f"Google assistant tool_calls[{index}] 缺少 function.name。")
                 if call_id and function_name:
+                    existing = tool_call_names.get(call_id)
+                    if existing is not None and existing != function_name:
+                        raise ValueError(
+                            f"Google 工具调用 id {call_id!r} 重复且名字冲突: "
+                            f"{existing!r} vs {function_name!r}。"
+                        )
                     tool_call_names[call_id] = function_name
                 arguments = function.get("arguments", function.get("args", {}))
                 if isinstance(arguments, str):

@@ -1096,7 +1096,9 @@ class AnthropicProvider(LargeLanguageModel):
         # ``RefusalBlock`` 的正式字段名（``text``／``reason`` 只是兼容形态）。
         refusal = next(
             (
-                field(block, "refusal") or field(block, "text") or field(block, "reason")
+                cls._refusal_text(
+                    field(block, "refusal") or field(block, "text") or field(block, "reason")
+                )
                 for block in blocks
                 if field(block, "type") == "refusal"
             ),

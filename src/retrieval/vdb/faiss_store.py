@@ -43,11 +43,24 @@ def _parent_key(parent_id: Any) -> str:
     （实测 ``pickle.loads(pickle.dumps(10**4301))`` 正常往返）。位数超限时
     ``str()`` 抛 ``ValueError: Exceeds the limit``：在 ``load_snapshot`` 里它让
     **加载宣布成功之后**的每一次检索都崩，在 ``resolve_parent_content`` 里它让
-    父块召回整体不可用。``safe_repr`` 对位数超限的值给出量级描述，同一取值
-    始终得到同一键，因此父块仍能被正确解析到。
+    父块召回整体不可用。
+
+    不能用 ``safe_repr``：它对位数超限的值只给量级描述（``<整数，约 4302 位
+    十进制>``），对 81~4300 位的整数给 ``text[:77] + "..."`` 截断——两者都让
+    **不同**取值塌成**同一**键（``10**4301`` 与 ``10**4301+1`` 得到同一键），
+    于是 ``_normalize_documents`` 的父块字典推导让后一条静默覆盖前一条，
+    ``resolve_parent_content`` 对两个不同 id 返回同一父块正文——父块内容张冠
+    李戴。按二进制补码取 sha256 摘要才能既稳定又唯一，判据与
+    ``retrieval_service._key_text`` 一致。
     """
     if isinstance(parent_id, str):
         return parent_id
+    import hashlib
+
+    if isinstance(parent_id, int):
+        raw = parent_id.to_bytes((parent_id.bit_length() + 8) // 8, "big", signed=True)
+        digest = hashlib.sha256(raw, usedforsecurity=False).hexdigest()
+        return f"<整数，{digest}>"
     return safe_repr(parent_id)
 
 

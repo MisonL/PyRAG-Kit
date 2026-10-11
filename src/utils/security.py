@@ -96,6 +96,13 @@ _SAFE_RESOURCE_PARAMETER_CONTAINERS = frozenset({"query", "params"})
 # ``密钥sk-...`` 两侧都不成立，而国产网关（SiliconFlow、Ark、DashScope）的
 # 错误消息正是中文，密钥会整串落进日志。
 _BEARER_TEXT_RE = re.compile(r"(?i)(?<![A-Za-z0-9])bearer\s+[A-Za-z0-9._~+/=-]+")
+# Basic 认证同理：``Authorization: Basic <base64>`` 是 SDK 异常回显的常见形态。
+# 要求前置 ``authorization`` 键名（大小写不敏感、可选 ``proxy-`` 前缀），
+# 否则 ``basic understanding`` 这类普通文本会被误伤。
+_BASIC_AUTH_TEXT_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(?:(?:proxy[_-]?)?authorization)\s*[:=]\s*"
+    r"basic\s+[A-Za-z0-9._~+/=:-]{8,}"
+)
 # A punctuation separator is unambiguous.  Whitespace-only forms are useful
 # for redacting messages such as ``token sk-...``, but treating every following
 # word as a credential causes ordinary text (``token usage``) to be rejected by
@@ -421,6 +428,7 @@ def redact_sensitive_text(value: Any) -> str:
     # 的可见前缀，使后续的 ``sk-`` 锚点失效，尾部掩码片段就会残留。
     redacted = _MASKED_CREDENTIAL_RE.sub(_redact_masked_credential, value)
     redacted = _BEARER_TEXT_RE.sub("Bearer [REDACTED]", redacted)
+    redacted = _BASIC_AUTH_TEXT_RE.sub("Basic [REDACTED]", redacted)
     redacted = _CREDENTIAL_KEY_VALUE_RE.sub(_redact_credential_pair, redacted)
     redacted = _SHORT_CREDENTIAL_KEY_RE.sub(r"\1=[REDACTED]", redacted)
     redacted = _URL_USERINFO_RE.sub(r"\1[REDACTED]:[REDACTED]@", redacted)

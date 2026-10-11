@@ -41,6 +41,11 @@ DEFAULT_RRF_K = 60.0
 # 只可能被畸形数据触及，不会限制任何真实场景。
 _MAX_RRF_RANK = 10**9
 
+# 与 ``safe_repr`` 的默认 ``limit`` 保持一致（见其定义）。``_key_text`` 用它判断
+# ``repr(int)`` 是否会被 ``safe_repr`` 截断——一旦截断就可能把不同整数塌成同一
+# 键，需改走摘要。
+_KEY_TEXT_TRUNCATE_LIMIT = 80
+
 
 class HybridReranker:
     def __init__(
@@ -490,13 +495,24 @@ def _key_text(value: Any) -> str:
         return value
     if isinstance(value, int):
         try:
-            repr(value)
+            rendered = repr(value)
         except (ValueError, RuntimeError, RecursionError):
             # 位数超过 ``sys.get_int_max_str_digits()``。按二进制补码取摘要，
             # 符号一并编进去，避免 ``n`` 与 ``-n`` 碰撞。
             raw = value.to_bytes((value.bit_length() + 8) // 8, "big", signed=True)
             digest = hashlib.sha256(raw, usedforsecurity=False).hexdigest()
             return f"<整数，{digest}>"
+        # 位数未超限、但 ``repr`` 已超过 ``safe_repr`` 的截断长度时不能再原样
+        # 返回：``safe_repr`` 会截成 ``text[:77] + "..."``，``10**100`` 与
+        # ``10**100+1`` 截断后得到**同一个键**，于是 ``_merge_hybrid_results``／
+        # ``_deduplicate_parent_documents`` 把两条不同文档并成一条，其中一条
+        # 静默消失。只有超过截断长度才走摘要——小整数（``chunk_index=3``）必须
+        # 原样保留，否则 ``source:3`` 这类普通键会被改写成摘要。
+        if len(rendered) > _KEY_TEXT_TRUNCATE_LIMIT:
+            raw = value.to_bytes((value.bit_length() + 8) // 8, "big", signed=True)
+            digest = hashlib.sha256(raw, usedforsecurity=False).hexdigest()
+            return f"<整数，{digest}>"
+        return rendered
     return safe_repr(value)
 
 

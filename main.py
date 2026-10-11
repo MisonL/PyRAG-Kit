@@ -394,17 +394,27 @@ def main():
                         width=CONSOLE_WIDTH,
                     )
                 )
-                # 延迟加载和执行
+                # 延迟加载和执行。
+                # ``SystemExit`` 不能终止整个程序：``embed_knowledge_base`` 在用户
+                # 取消确认时 ``sys.exit(0)``，而这里的 ``except Exception`` 接不住
+                # 它（``SystemExit`` 继承 ``BaseException``）。捕获后回到主菜单，
+                # 让用户能继续别的选项——「取消」不等于「退出程序」。
                 from scripts.embed_knowledge_base import main as run_embedding_process
 
-                run_embedding_process()
-                console.print(
-                    Panel(
-                        "[bold green]向量化处理完成。[/bold green]",
-                        border_style="green",
-                        width=CONSOLE_WIDTH,
+                try:
+                    run_embedding_process()
+                except SystemExit as exc:
+                    if exc.code not in (0, None):
+                        raise
+                    console.print("[bold yellow]操作已取消。[/bold yellow]")
+                else:
+                    console.print(
+                        Panel(
+                            "[bold green]向量化处理完成。[/bold green]",
+                            border_style="green",
+                            width=CONSOLE_WIDTH,
+                        )
                     )
-                )
             elif choice == "2":
                 console.print(
                     Panel(

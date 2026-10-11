@@ -508,11 +508,14 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         }
     )
 
-    # Classification 资源支持的请求参数。与 ``classify()`` 的内联白名单同源，
-    # 抽成常量是为了让动态路径（``resources.classification.create(...)``）能
-    # 复用同一判据——此前它完全绕过 Facade 的白名单与凭证扫描。
+    # Classification 资源支持的请求参数。业务参数（``query``/``model``/``labels``）
+    # 必须显式列进来：动态路径 ``resources.classification.create(...)`` 把它们放进
+    # ``kwargs``，若不在白名单里会被「不支持请求参数」拒掉——而静态 ``classify()``
+    # 是把这三个当**命名参数**传给 SDK、不经 kwargs 校验，于是两条路径对同一组
+    # 输入给出相反结论。此前白名单只含扩展字段，恒拒唯一的合法动态用法。
     _ARK_CLASSIFICATION_KEYS = frozenset(
         {"user", "extra_headers", "extra_query", "extra_body", "timeout"}
+        | {"query", "model", "labels"}
     )
 
     capabilities = frozenset(

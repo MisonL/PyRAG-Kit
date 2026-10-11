@@ -12,7 +12,6 @@ from rich.text import Text
 from ..utils.config import (  # 导入 get_settings 函数
     ROOT_DIR,
     get_settings,
-    is_double_convertible,
     require_detail_attributes,
     require_provider_name,
     require_rerank_enabled,
@@ -249,13 +248,16 @@ def coerce_score(value: Any, default: float = 0.0) -> float:
     """
     if isinstance(value, bool):
         return default
-    if isinstance(value, (int, float)):
-        # ``float(10**400)`` 抛 ``OverflowError``（**不是** ``ValueError``），
-        # 而这个函数承诺「绝不抛异常、退回默认值」。它是展示层与检索层共用的
-        # 唯一分数收敛规则，裸异常会让「形态异常就退回默认值」这条契约失效。
-        if not is_double_convertible(value):
+    # numpy 标量（``np.float32`` 等）不是 ``float`` 子类，但 ``float()`` 能无损
+    # 转换它们。第三方 store 的 score 常是 numpy 标量，只判 ``(int, float)`` 会把
+    # 真实分数静默归零——既影响排序又影响分数阈值。
+    # ``__float__``  duck-typing 之后必须实测 ``float()``，不能直接采信：
+    # ``is_double_convertible`` 对未知类型返回 ``False``，会漏掉 numpy 标量。
+    if isinstance(value, (int, float)) or hasattr(value, "__float__"):
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
             return default
-        number = float(value)
     elif isinstance(value, str):
         try:
             number = float(value)

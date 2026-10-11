@@ -26,7 +26,7 @@ from src.providers.openai_compatible import OpenAICompatibleProvider
 from src.retrieval.vdb.faiss_store import FaissStore
 from src.runtime.contracts import RetrievalMethod, SessionConfig
 from src.services.retrieval_service import _coerce_fusion_strategy, _key_text
-from src.utils.config import Settings, get_settings, safe_repr
+from src.utils.config import Settings, get_settings
 from src.utils.log_manager import cleanup_old_logs
 
 # pytest 自动生成 id 时会对参数调 ``str()``，位数超限的整数会让收集阶段自己崩掉。
@@ -707,10 +707,19 @@ def test_key_text_distinguishes_integers_beyond_conversion_limit():
 
 
 def test_key_text_keeps_normal_values_verbatim():
-    """收紧不能误伤：正常取值的键形态不变。"""
+    """收紧不能误伤：正常取值的键形态不变。
+
+    小整数（如 ``chunk_index``）必须原样保留，否则 ``source:3`` 这类普通键会被
+    改写成摘要。超长整数（``repr`` 超过 80 字符，会被 ``safe_repr`` 截断）走摘要，
+    见 ``test_key_text_distinguishes_integers_beyond_conversion_limit``——那里两个
+    仅差 1 的超限整数必须得到不同的键。
+    """
     assert _key_text("s") == "s"
     assert _key_text(5) == "5"
-    assert _key_text(10**400) == safe_repr(10**400)
+    assert _key_text(0) == "0"
+    assert _key_text(-17) == "-17"
+    # 恰好短于截断长度的整数仍原样返回。
+    assert _key_text(10**18) == str(10**18)
 
 
 @pytest.mark.parametrize("raw", ["RRF", " rrf ", "Rrf"])

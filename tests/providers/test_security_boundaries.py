@@ -144,6 +144,32 @@ def test_security_redacts_masked_credentials_after_bearer_prefix(value):
     assert "****" not in redacted
 
 
+# ── 回归：Basic 认证的 base64 必须脱敏 ──
+
+
+# ``Authorization: Basic <base64>`` 是 SDK 异常回显的常见形态。``Basic`` 是纯
+# 字母状态词，会被键值正则按「裸关键词 + 状态字面量」放行；而 ``_BEARER_TEXT_RE``
+# 只认 ``bearer``。此前 ``Authorization: Basic [REDACTED-TEST-FIXTURE]`` 脱敏后逐字
+# 不变，base64 凭证原样落进日志。
+@pytest.mark.parametrize(
+    "header",
+    [
+        "Authorization: Basic [REDACTED-TEST-FIXTURE]",
+        "Proxy-Authorization: Basic [REDACTED-TEST-FIXTURE]",
+        "authorization=basic [REDACTED-TEST-FIXTURE]",
+    ],
+)
+def test_security_redacts_basic_auth_credentials(header):
+    redacted = redact_sensitive_text(header)
+    assert "[REDACTED-TEST-FIXTURE]" not in redacted
+    assert "[REDACTED]" in redacted
+
+
+def test_security_does_not_redact_basic_as_ordinary_word():
+    """前置 ``authorization`` 键名是判据：普通文本里的 ``basic`` 不是凭证。"""
+    assert "basic understanding of tokens" == redact_sensitive_text("basic understanding of tokens")
+
+
 # ── 回归：urlsplit 无法解析的值不能让凭证整体绕过边界 ──
 
 
