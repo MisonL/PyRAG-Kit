@@ -2389,3 +2389,68 @@ def test_rerank_provider_cache_key_is_order_insensitive(monkeypatch):
 
     assert first is second
     assert len(created) == 1
+
+
+def test_stale_rerank_providers_are_all_closed_when_one_close_fails(monkeypatch):
+    """配置重载时逐个关闭旧 rerank 实例，单个失败不能中断其余关闭。
+
+    ``pop`` 已经把实例从缓存里摘掉，关闭失败的实例就此彻底失去引用——
+    循环若在这里中断，后面每个 stale 实例都是「已摘除但从未关闭」的泄漏。
+    这条路径发生在配置重载时（``config_menu`` 改完 rerank 配置后立刻检索），
+    用户不会再有机会重试。契约与 ``clear_rerank_cache``／``close``／``aclose``
+    一致：关闭全部，再报第一个错误。
+    """
+    from types import SimpleNamespace
+
+    from src.services.retrieval_service import RetrievalService
+
+    class FailingProvider:
+        def close(self):
+            raise RuntimeError("旧实例关闭失败")
+
+    class CountingProvider:
+        def __init__(self):
+            self.closed = 0
+
+        def close(self):
+            self.closed += 1
+
+    service = object.__new__(RetrievalService)
+    good = CountingProvider()
+    service._rerank_providers = {
+        ("jina", "jina", "m", "old-a"): FailingProvider(),
+        ("jina", "jina", "m", "old-b"): good,
+    }
+    monkeypatch.setattr(
+        "src.services.retrieval_service.ModelProviderFactory.get_rerank_provider",
+        lambda *_args, **_kwargs: object(),
+    )
+    detail = SimpleNamespace(provider="jina", model_name="m", options={"a": 1})
+
+    with pytest.raises(RuntimeError, match="旧实例关闭失败"):
+        service._get_rerank_provider("jina", {"jina": detail})
+
+    assert good.closed == 1
+    assert service._rerank_providers == {}
+
+
+def test_stale_rerank_replacement_does_not_raise_when_all_closes_succeed(monkeypatch):
+    """全部旧实例关闭成功时不抛——``first_error`` 守卫不能误报。"""
+    from types import SimpleNamespace
+
+    from src.services.retrieval_service import RetrievalService
+
+    class QuietProvider:
+        def close(self):
+            pass
+
+    service = object.__new__(RetrievalService)
+    service._rerank_providers = {("jina", "jina", "m", "old"): QuietProvider()}
+    monkeypatch.setattr(
+        "src.services.retrieval_service.ModelProviderFactory.get_rerank_provider",
+        lambda *_args, **_kwargs: object(),
+    )
+    detail = SimpleNamespace(provider="jina", model_name="m", options={"a": 1})
+
+    service._get_rerank_provider("jina", {"jina": detail})
+    assert len(service._rerank_providers) == 1

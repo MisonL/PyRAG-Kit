@@ -869,9 +869,21 @@ class RetrievalService:
             stale_keys = [
                 key for key in self._rerank_providers if key[0] == provider_key and key != cache_key
             ]
+            # 逐个关闭、失败不中断：``pop`` 已经把实例从缓存里摘掉，关闭失败
+            # 的实例就此彻底失去引用——循环若在这里中断，后面每个 stale 实例
+            # 都是「已摘除但从未关闭」的泄漏，而这条路径发生在**配置重载**
+            # 时（``config_menu`` 改完 rerank 配置后立刻检索），用户不会
+            # 再有机会重试。契约与 ``clear_rerank_cache``／``close``／``aclose``
+            # 一致：关闭全部，再报第一个错误。
+            first_error: Exception | None = None
             for stale_key in stale_keys:
                 stale_provider = self._rerank_providers.pop(stale_key)
-                close_resource_sync(stale_provider, "Rerank Provider")
+                try:
+                    close_resource_sync(stale_provider, "Rerank Provider")
+                except Exception as exc:  # noqa: BLE001 - close all resources before reporting
+                    first_error = first_error or exc
+            if first_error is not None:
+                raise first_error
             if configurations is None:
                 provider = ModelProviderFactory.get_rerank_provider(provider_key)
             else:
