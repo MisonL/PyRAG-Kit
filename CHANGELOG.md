@@ -41,6 +41,10 @@
   - **`safe_exception_text` 兜底分支跳过脱敏**（`src/utils/security.py`）。``str(exc)`` 抛异常（args 含超限整数）时，兜底分支逐元素 ``safe_repr`` 后**直接返回**，不经 ``redact_sensitive_text``——实测 `ValueError(10**4301, "Authorization: Basic [REDACTED-TEST-FIXTURE]")` 的输出里 base64 凭证明文。该函数 docstring 自称「最后一道展示边界」，22 处 ``except`` 依赖它，与主分支的收场不一致。兜底分支补上脱敏，实测 Basic/Bearer 凭证均被红acted。
   - **`_validate_embeddings_shape` 对 ``dtype=object`` 抛裸 `OverflowError`**（`src/retrieval/vdb/faiss_store.py`）。``embeddings.astype(np.float32)`` 对含 ``10**400`` 的 object 数组抛 ``OverflowError: int too large to convert to float``（不是 ``ValueError``，穿透调用方的错误分类）；pickle 二进制格式让这种数组能正常往返。包成带指引的 ``ValueError``，与写入侧 ``_as_float32_matrix`` 一致。
   - **`green39.txt` 夹具二次漂移**：本轮新增的 ``security.py`` 两处位点（507:11、688:49）因 ``safe_exception_text`` 修改而失效，夹具核对用例当场报出。按当前源码重新定位到 512:11、693:49（列不变，守卫语义一致），39/39 精确命中。
+  - **Responses 后台轮询无上界 → `time.sleep` 抛裸 `OverflowError`**（`src/providers/openai_compatible.py`）。``background_poll_interval``／``background_timeout`` 只判「是正数」，``1e19`` 通过校验后 ``time.sleep(1e19)`` 抛 ``OverflowError: timestamp out of range for platform time_t``（实测）——不是 ``TimeoutError``，也不在调用方按 ``ValueError`` 建立的分类里。两处补上界 ``_MAX_CLIENT_TIMEOUT_SECONDS``（与客户端 timeout 同一常量，该常量的存在理由正是「凡在其上做算术的下游都会炸」）。同步收紧既有测试的消息断言（``background_timeout 必须是正数`` → 含上界）并新增上界用例。
+  - **`green39.txt` 夹具三次漂移**：上界修复在 ``openai_compatible.py`` 新增 9 行，11 个位点坐标随之失效。逐条按上下文重新定位（含 ``_response_retrieve_kwargs`` 的 590:33、资源调用的 4828:19、字典推导的 996:58/75），39/39 恢复精确命中。
+
+  其余存疑条目查证后判为低危/未达：`Settings.model_dump` 对运行期注入的 ``options`` 不脱敏（无生产调用点）；rerank 缓存键 ``default=str`` 塌陷（TOML 产不出 set）；``FaissStore(file_path=不存在)`` 静默空 store（无真实调用方）。全量 4381 passed；8 项质量门全绿。
 
   其余存疑条目查证后判为低危/未达：`Settings.model_dump` 对运行期注入的 ``options`` 不脱敏（无生产调用点，``security.py`` 的检查路径不受影响）；rerank 缓存键 ``default=str`` 塌陷（TOML 产不出 set，需 Python 直构 ``rerank_configurations``）；``FaissStore(file_path=不存在)`` 静默空 store（行为不一致但无真实调用方）；``background_poll`` 无 86400 上界（实测 1e19 会 ``OverflowError``，但只影响非交互的后台轮询路径，暂留观察）。全量 4382 passed；8 项质量门全绿。
 

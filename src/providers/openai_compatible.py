@@ -9,6 +9,7 @@ import openai
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from src.providers.__base__.model_provider import (
+    _MAX_CLIENT_TIMEOUT_SECONDS,
     _UNSET_TEMPERATURE,
     CompletionRequest,
     CompletionResult,
@@ -547,7 +548,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
         )
         timeout = options.get(
             "background_timeout",
-            options.get("responses_poll_timeout", 300.0),
+            options.get("responses_timeout", options.get("responses_poll_timeout", 300.0)),
         )
         # ``math.isfinite(float(x))`` 对超出双精度范围的整数自己就抛
         # ``OverflowError``（**不是** ``ValueError``，会穿透调用方的
@@ -557,15 +558,28 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             or not isinstance(interval, (int, float))
             or not is_double_convertible(interval)
             or interval <= 0
+            or interval > _MAX_CLIENT_TIMEOUT_SECONDS
         ):
-            raise ValueError("Responses background_poll_interval 必须是正数。")
+            raise ValueError(
+                f"Responses background_poll_interval 必须是 1 到 {_MAX_CLIENT_TIMEOUT_SECONDS:.0f} 之间的正数。"
+            )
         if (
             isinstance(timeout, bool)
             or not isinstance(timeout, (int, float))
             or not is_double_convertible(timeout)
             or timeout <= 0
+            or timeout > _MAX_CLIENT_TIMEOUT_SECONDS
         ):
-            raise ValueError("Responses background_timeout 必须是正数。")
+            raise ValueError(
+                f"Responses background_timeout 必须是 1 到 {_MAX_CLIENT_TIMEOUT_SECONDS:.0f} 之间的正数。"
+            )
+        # 上界与客户端 timeout 同一个常量（``_MAX_CLIENT_TIMEOUT_SECONDS``）：
+        # 该常量存在的理由就是「凡在该值上再做算术的下游都会炸」——这里
+        # ``deadline = time.monotonic() + timeout`` 与 ``time.sleep(min(interval,
+        # remaining))`` 正是两处算术，``1e19`` 会让 ``time.sleep`` 抛
+        # ``OverflowError: timestamp out of range for platform time_t``（实测），
+        # 而它不是 ``TimeoutError``、也不在调用方的 ``except ValueError`` 分类里。
+        # 超大值从发请求开始就是不可达状态，根本没有「等得久」这个合法语义。
         return float(interval), float(timeout)
 
     @classmethod

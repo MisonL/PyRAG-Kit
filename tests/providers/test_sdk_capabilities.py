@@ -10024,11 +10024,29 @@ def test_openai_compatible_sdk_parameter_validation_failure_is_not_skipped():
     ],
 )
 def test_openai_compatible_background_timeout_must_be_positive_number(timeout):
-    """``background_timeout`` 非正／非数值必须报错，不是静默接受或裸异常。"""
+    """``background_timeout`` 非正／非数值必须报错，不是静默接受或裸异常。
+
+    消息含上界：``background_timeout`` 超过 ``_MAX_CLIENT_TIMEOUT_SECONDS`` 时
+    会在 ``time.sleep`` 上抛裸 ``OverflowError: timestamp out of range``（实测
+    ``1e19`` 即触发），而不是本方法承诺的 ``ValueError``。
+    """
     provider = object.__new__(OpenAICompatibleProvider)
     provider._options = {"background_timeout": timeout}
 
-    with pytest.raises(ValueError, match="background_timeout 必须是正数"):
+    with pytest.raises(ValueError, match="background_timeout 必须是 1 到 86400 之间的正数"):
+        provider._background_poll_config()
+
+
+def test_openai_compatible_background_timeout_upper_bound():
+    """``background_timeout`` 的上界与客户端 timeout 同一个常量。
+
+    ``1e19`` 会让 ``time.sleep`` 抛裸 ``OverflowError``——不是 ``TimeoutError``
+    也不是 ``ValueError``，调用方按 ``TimeoutError`` 建立的分类接不住。
+    """
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._options = {"background_timeout": 1e19}
+
+    with pytest.raises(ValueError, match="background_timeout 必须是 1 到 86400 之间的正数"):
         provider._background_poll_config()
 
 
