@@ -14,6 +14,12 @@
 # 期望判定来自逐点人工复核：33 处 KILLED（红验证过的测试）、5 处 SURVIVED
 # （确证的等价变异）、1 处 MUTFAIL（openai_compatible.py 的
 # max_output_tokens 守卫已被修复移除，位点不再存在——该行验证 MUTFAIL 上报）。
+# 注意：MUTFAIL 行本身仍指向一个**当前可施加**的 isnot（1377:15，即该守卫的
+# 邻位），但它在 HEAD 上会被 test_openai_responses_none_max_output_tokens_not_forwarded
+# 杀死——也就是 expected=MUTFAIL 与当前判定**不一致**。这条刻意保留为「夹具会
+# 随源码演化而漂移」的活样本：夹具核对（test_green39_fixture_sites_resolve_at_head）
+# 只校验坐标能否解析，不校验 expected 是否仍成立；跑 verify_sites 会报
+# expected MUTFAIL 实际 KILLED，提醒重新基线化。
 # SURVIVED 行验证无 selector 时的全量套件判定。
 src/providers/anthropic.py|1615|31|notin|tests/providers/test_guard_coverage_regressions.py::test_anthropic_async_stream_emits_completed_tool_call|KILLED
 src/providers/anthropic.py|281|12|drop|tests/providers/test_guard_coverage_regressions.py::test_anthropic_supports_sampling_option_tracks_model_generation|KILLED

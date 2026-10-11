@@ -3521,7 +3521,8 @@ def test_rerank_if_needed_rejects_non_document_list(ranked_results):
     service = RetrievalService(vector_store=object(), embedding_service=object())
     service._get_rerank_provider = lambda *args, **kwargs: _RerankStub()
 
-    with pytest.raises((TypeError, ValueError), match="文档列表"):
+    # 断言必须带阶段标签「重排」：只 match="文档列表" 时把标签换成别的词仍绿（假绿）。
+    with pytest.raises((TypeError, ValueError), match="重排返回的必须是文档列表"):
         asyncio.run(service._rerank_if_needed("q", ranked_results, config))
 
 
@@ -4492,20 +4493,29 @@ def test_hierarchical_child_overlap_ratio_does_not_over_tighten(child_size, chil
 # 两半都补：非列表（`None`／`5`／`"abc"`）与列表里的非 `Document` 项。
 
 
+_PASSTHROUGH = object()
+
+
 class _StageReturning:
-    """按阶段替换返回值的 Pipeline 协作者替身。"""
+    """按阶段替换返回值的 Pipeline 协作者替身。
+
+    传入 ``_PASSTHROUGH`` 时该阶段走正常行为（extract 返回 ``[document]``，
+    clean／split 原样返回入参列表）；否则返回给定值。这样可以让**任意一个**
+    阶段返回坏值而它前面的阶段正常——否则最先跑的 extractor 总是先失败，
+    cleaner／splitter 的守卫永远测不到。
+    """
 
     def __init__(self, value):
         self._value = value
 
     def extract(self, document, **kwargs):
-        return self._value
+        return [document] if self._value is _PASSTHROUGH else self._value
 
     def clean(self, documents, **kwargs):
-        return self._value
+        return documents if self._value is _PASSTHROUGH else self._value
 
     def split(self, documents, **kwargs):
-        return self._value
+        return documents if self._value is _PASSTHROUGH else self._value
 
 
 @pytest.mark.parametrize(
@@ -4516,28 +4526,52 @@ class _StageReturning:
         pytest.param("abc", "str", id="str"),
     ],
 )
-def test_pipeline_stage_return_must_be_a_list(value, label):
-    """三个阶段返回非列表必须收敛成带阶段名的 ``TypeError``，而不是裸 ``len()`` 错误。"""
+@pytest.mark.parametrize(
+    ("stage", "stage_label"),
+    [
+        pytest.param("extractor", "抽取阶段", id="extractor"),
+        pytest.param("cleaner", "清洗阶段", id="cleaner"),
+        pytest.param("splitter", "分割阶段", id="splitter"),
+    ],
+)
+def test_pipeline_stage_return_must_be_a_list(value, label, stage, stage_label):
+    """三个阶段返回非列表必须收敛成**带该阶段名**的 ``TypeError``。
+
+    断言必须逐个阶段指名道姓：只钉「抽取阶段」时，把 cleaner／splitter 的标签
+    改成别的词仍绿（假绿），因为最先失败的总是 extractor、另外两个阶段的守卫
+    从未执行。
+    """
     from src.etl.pipeline import Pipeline
     from src.models.document import Document
 
-    stub = _StageReturning(value)
-    pipeline = Pipeline(extractor=stub, cleaner=stub, splitter=stub)
+    parts = {
+        "extractor": _StageReturning(_PASSTHROUGH),
+        "cleaner": _StageReturning(_PASSTHROUGH),
+        "splitter": _StageReturning(_PASSTHROUGH),
+    }
+    parts[stage] = _StageReturning(value)
+    pipeline = Pipeline(
+        extractor=parts["extractor"], cleaner=parts["cleaner"], splitter=parts["splitter"]
+    )
 
-    with pytest.raises(TypeError, match=r"抽取阶段返回的必须是文档列表"):
+    with pytest.raises(TypeError, match=rf"{stage_label}返回的必须是文档列表"):
         pipeline.process(Document(content="正文" * 10, metadata={"source": "a.md"}))
 
 
 @pytest.mark.parametrize(
-    ("stage", "position"),
+    ("stage", "position", "stage_label"),
     [
-        pytest.param("extractor", 0, id="extractor"),
-        pytest.param("cleaner", 1, id="cleaner"),
-        pytest.param("splitter", 2, id="splitter"),
+        pytest.param("extractor", 0, "抽取阶段", id="extractor"),
+        pytest.param("cleaner", 1, "清洗阶段", id="cleaner"),
+        pytest.param("splitter", 2, "分割阶段", id="splitter"),
     ],
 )
-def test_pipeline_stage_return_items_must_be_documents(stage, position):
-    """列表里的非 ``Document`` 项必须带位置与阶段名报错。"""
+def test_pipeline_stage_return_items_must_be_documents(stage, position, stage_label):
+    """列表里的非 ``Document`` 项必须带**该阶段名**与位置报错。
+
+    断言必须指名阶段：``match=r"返回的第 0 项不是 Document"`` 不含阶段名时，任意
+    阶段的标签被替换都仍绿（假绿）。
+    """
     from src.etl.cleaners.basic_cleaner import BasicCleaner
     from src.etl.extractors.markdown_extractor import MarkdownExtractor
     from src.etl.pipeline import Pipeline
@@ -4549,7 +4583,7 @@ def test_pipeline_stage_return_items_must_be_documents(stage, position):
     parts[position] = _StageReturning([None])
     pipeline = Pipeline(extractor=parts[0], cleaner=parts[1], splitter=parts[2])
 
-    with pytest.raises(TypeError, match=r"返回的第 0 项不是 Document"):
+    with pytest.raises(TypeError, match=rf"{stage_label}返回的第 0 项不是 Document"):
         pipeline.process(Document(content="正文" * 10, metadata={"source": "a.md"}))
 
 

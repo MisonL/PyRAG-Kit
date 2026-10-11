@@ -144,6 +144,12 @@ def parse_sites(text: str) -> list[dict]:
         if len(fields) not in (4, 5, 6):
             raise ValueError(f"第 {number} 行字段数应为 4/5/6，实际 {len(fields)}: {raw!r}")
         target, lineno, col, kind = fields[0], int(fields[1]), int(fields[2]), fields[3]
+        if not target:
+            raise ValueError(f"第 {number} 行 target 为空: {raw!r}")
+        if lineno < 1:
+            raise ValueError(f"第 {number} 行行号必须 ≥1，实际 {lineno}: {raw!r}")
+        if col < 0:
+            raise ValueError(f"第 {number} 行列偏移必须 ≥0，实际 {col}: {raw!r}")
         if kind not in KINDS:
             raise ValueError(f"第 {number} 行未知 kind {kind!r}；可用: {', '.join(KINDS)}")
         selector = fields[4] if len(fields) >= 5 else ""

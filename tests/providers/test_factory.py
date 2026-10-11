@@ -298,6 +298,15 @@ def test_unsupported_provider_type():
         ModelProviderFactory._get_provider_class("unsupported_provider")
 
 
+def test_unsupported_provider_type_real_guard_not_mock():
+    """``test_unsupported_provider_type`` 断言的是 autouse 替身 ``mock_get_provider_class``，
+    真实守卫 ``factory.py:218`` 从未执行。这里直接调原始类的 ``__wrapped__`` 钉住真守卫，
+    避免替身掩盖 ``raise`` 被删/反转的回归。"""
+    real = _ORIGINAL_FACTORY._get_provider_class.__wrapped__
+    with pytest.raises(ValueError, match="不支持的模型提供商: unsupported_provider"):
+        real("unsupported_provider")
+
+
 # ── 回归：provider key 的形态校验 ──
 #
 # ``_get_model_detail`` 直接写 ``if provider_key not in configurations``，随后

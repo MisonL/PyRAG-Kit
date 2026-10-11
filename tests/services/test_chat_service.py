@@ -259,16 +259,20 @@ def _retrieval_service_with_store(store):
 
 
 @pytest.mark.parametrize(
-    "payload,label",
+    "payload,label,expected",
     [
-        (None, "返回 None"),
-        ({"a": 1}, "返回映射"),
-        (["x"], "返回字符串列表"),
-        ([None], "列表元素为 None"),
+        (None, "返回 None", "检索返回的必须是文档列表"),
+        ({"a": 1}, "返回映射", "检索返回的必须是文档列表"),
+        (["x"], "返回字符串列表", "检索返回的第 0 条不是文档映射"),
+        ([None], "列表元素为 None", "检索返回的第 0 条不是文档映射"),
     ],
 )
-def test_retrieve_rejects_malformed_store_results(payload, label):
-    """store 返回非文档列表时必须给出可读的错误，而不是 ``TypeError``。"""
+def test_retrieve_rejects_malformed_store_results(payload, label, expected):
+    """store 返回非文档列表时必须给出可读的错误，而不是 ``TypeError``。
+
+    断言必须带完整模板：只 match="文档" 时把任一标签换成别的词都仍绿（假绿）。
+    两种收场各钉各的模板——「不是 list」与「list 里第 0 条不是映射」。
+    """
     import asyncio
     import io
 
@@ -280,7 +284,7 @@ def test_retrieve_rejects_malformed_store_results(payload, label):
 
     service, config = _retrieval_service_with_store(_Store())
 
-    with pytest.raises(TypeError, match="文档"):
+    with pytest.raises(TypeError, match=expected):
         asyncio.run(service.retrieve("查询", config, console=Console(file=io.StringIO())))
 
 
@@ -393,16 +397,23 @@ def test_rerank_receives_only_strings(page_content, expected, label):
 
 
 @pytest.mark.parametrize(
-    ("label", "semantic", "keyword"),
+    ("label", "semantic", "keyword", "expected"),
     [
-        ("语义路返回 [None]", [None], []),
-        ("关键词路返回 [None]", [], [None]),
-        ("语义路返回 None", None, []),
-        ("关键词路返回字符串", [], "不是列表"),
+        ("语义路返回 [None]", [None], [], "语义检索返回的第 0 条不是文档映射"),
+        ("关键词路返回 [None]", [], [None], "关键词检索返回的第 0 条不是文档映射"),
+        ("语义路返回 None", None, [], "语义检索返回的必须是文档列表"),
+        ("关键词路返回字符串", [], "不是列表", "关键词检索返回的必须是文档列表"),
     ],
 )
-def test_hybrid_retrieval_reports_which_side_violated_the_contract(label, semantic, keyword):
-    """两路结果的形态问题必须报成可定位的 TypeError，且指明是哪一路。"""
+def test_hybrid_retrieval_reports_which_side_violated_the_contract(
+    label, semantic, keyword, expected
+):
+    """两路结果的形态问题必须报成可定位的 TypeError，且指明是哪一路。
+
+    ``pytest.raises`` 的 ``match`` 必须带**具体那一侧**的完整阶段标签（``语义检索``
+    ／``关键词检索``）：两路消息模板同构、仅标签不同，只 match="检索" 时任一标签被
+    替换都仍绿（假绿）。列表级与元素级是两条不同模板，各钉各的。
+    """
     import asyncio
 
     from src.runtime.contracts import build_session_config
@@ -427,7 +438,10 @@ def test_hybrid_retrieval_reports_which_side_violated_the_contract(label, semant
     config["retrieval_method"] = RetrievalMethod.HYBRID_SEARCH
     service = RetrievalService(vector_store=_Store(), embedding_service=_Embedding())
 
-    with pytest.raises(TypeError, match="检索"):
+    # 断言必须能区分「语义路」与「关键词路」——两路消息模板同构、仅 stage 标签不同。
+    # 只 match="检索" 时把任一标签换掉都仍绿（假绿）；改成精确前缀后，标签替换必然
+    # 红，用例才真正钉住「哪一路违反契约」这条信息。
+    with pytest.raises(TypeError, match=expected):
         asyncio.run(service.retrieve("查询", config))
 
 

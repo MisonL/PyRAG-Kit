@@ -25,6 +25,20 @@
   - **`green39.txt` 夹具已陈旧**：39 个位点在 HEAD 上 10 个无法定位、10 个需漂移（其中 4 个标 `KILLED` 的窗口内已无同 kind 节点），却只按「字段可解析」放行。坐标已重新基线化到当前 HEAD（39/39 exact），并新增 `test_green39_fixture_sites_resolve_at_head` 把「坐标命中当前 HEAD」钉死；源码再演化时按当轮重新定位或删除对应行。
   - 新增 `test_verify_sites_baseline_guard_rejects_red_suite`：基线不绿时必须非零退出且不输出 KILLED。README 同步基线对照与夹具失效说明。全量 4373 passed；8 项质量门全绿。
 
+- **测试假绿点修复：断言模板逐项化 + 替身掩盖补钉**（`tests/`）。上一轮审查的测试质量报告列出 7 条假绿风险点，逐条施加源码级变异（`raise`→`pass`、阶段标签替换、`>=`→`>`）实测复现后修复：
+  - **`test_unsupported_provider_type` 的替身掩盖**（`tests/providers/test_factory.py`）：autouse `patch_settings` 把 `_get_provider_class` 整体换成 mock，断言来自替身，真实守卫从未执行。新增 `test_unsupported_provider_type_real_guard_not_mock` 用 `_ORIGINAL_FACTORY` 的 `__wrapped__` 直钉源码；实测 `raise`→`pass` 时该用例红。
+  - **断言 `match=` 不含阶段标签**（`tests/services/test_chat_service.py`）：`match="检索"` 在「语义检索」与「关键词检索」之间不可区分，把任一标签换成别的词都仍绿。`test_hybrid_retrieval_reports_which_side_violated_the_contract` 改为逐参数化断言**那一侧**的完整模板（列表级「X 返回的必须是文档列表」与元素级「X 返回的第 0 条不是文档映射」各钉各的），实测把 `retrieval_service.py` 里 `关键词检索` 标签改成语义后红。
+  - **`test_retrieve_rejects_malformed_store_results` 断言过宽**（`match="文档"`）：改为逐参数化断言完整模板（列表级 vs 元素级）。
+  - **`test_rerank_if_needed_rejects_non_document_list` 断言过宽**（`match="文档列表"`）：补「重排」前缀。
+  - **`test_pipeline_stage_return_must_be_a_list` 只测了 extractor**（`tests/test_boundary_hardening_regressions.py`）：`_StageReturning` 三阶段同值时最先失败的总是 extractor，cleaner/splitter 的守卫从未执行。新增 stage 参数化 + `_PASSTHROUGH` 哨兵（前段正常、只让指定阶段返回坏值），三个阶段的返回值校验与逐项校验都各自带阶段名。
+  - **`test_pipeline_stage_return_items_must_be_documents` 断言不含阶段名**：同上，三个阶段的 `返回的第 0 项不是 Document` 各自指名。
+  - **边界等号侧未覆盖**（`child_size >= parent_size`）：现有用例只喂严格大于；源码变异 `>=`→`>` 后「子分片等于父分片」的用例红（`tests/etl/test_pipeline.py::test_hierarchical_mode_rejects_degenerate_child_sizes[...等于父分片]`），确认该边界确实被钉住——这一条是**已覆盖**而非缺口，未改动。
+  - **`parse_sites` 不校验数值**（`scripts/audit/verify_sites.py`）：实测空 target、负行号、负列全部静默通过。补三条校验，实测三类坏输入均被拒绝、合法输入不受影响。
+
+  新增/修改回归断言 6 处；全量 4380 passed；8 项质量门全绿。
+
+
+
 - **死代码消融：删除 `ChatService.retrieve`**（`src/services/chat_service.py`）。本轮换用**覆盖率**判据（与前两轮的静态引用计数互补）：全量套件在 `uv run --with coverage` 下 4365 passed、TOTAL 88%，导出 coverage JSON 后统计「整个函数体从未被执行」的定义。788 个零执行函数中，绝大多数是 `resources.py` 的 SDK 动态转发桩（408 个，`__getattr__` 派发）、CLI 入口（`main`/`parse_args`）与审计工具自身；逐条分诊后唯一的真死代码是 `ChatService.retrieve`。证据链：**生产零调用**——`chat/core.py` 的 `chat_async` 用 `_identify_intent_async`（L277）+ `_retrieve_knowledge_async`（L287，直连 `retrieval_service.retrieve`）+ `generate_reply`（L303）拼出等价流程，从未调用 `ChatService.retrieve`；**测试零调用**——coverage 证实该函数体（L53-55）从未执行，`test_chat_service.py` 里同名 `service.retrieve(...)` 的 `service` 全是 `RetrievalService`（由 `_retrieval_service_with_store` 构造）；**无动态派发**——全仓 `getattr(..., "retrieve")` 只落在 SDK 的 `content`/`files` 对象上，`ChatService` 实例的外部访问只有 `identify_intent`/`generate_reply`/`_build_prompt`；**无文档化**——HANDOFF.md 与开发文档只提 `RetrievalService.retrieve()`；自引入提交 `8b504d8` 起从未改动。删除后全量仍 4365 passed（与删前逐字一致，证明无引用），8 项质量门全绿。同批零执行候选经证伪后**保留**：`Chatbot.__init__`/`_initialize_vector_store` 是**测试盲区**（测试用 `Chatbot.__new__()` 绕过构造器，生产由 `chat/core.py:386` 的 `Chatbot(console)` 调用）；`google.acomplete`（`google.py:3309` 调用）、`anthropic._get_client`（20+ 生产调用点，测试 monkeypatch）是活的；`faiss_store.import_legacy_snapshot` 是文档化的旧快照迁移入口；openai_compatible/volcengine 的资源转发方法由 `resources.py` 的 facade 经 `self.provider.X(...)` 调用，属动态资源契约面。结论：**覆盖率判据同样只能筛出候选——测试盲区（`__new__` 绕过构造器）、动态派发与接口契约都会让承重代码显示为「从未执行」，必须逐项证伪**。
 
 - **死代码消融：删除 `_AsyncOnlyResourceFacade`**（`src/providers/resources.py`）。`_NativeFacade` 的 9 个直接子类里，只有它是**孤儿**——无子类、无实例化、无注册表登记、无文档记载，全仓唯一引用是 `tests/providers/test_sdk_capabilities.py` 里 `test_facade_delegates_native_resources_for_every_declaring_class` 的一条参数化（该用例引入于 `5cb8fe8`，为覆盖 boolc 扫描的 `_delegate_native` 判据而把「每个声明类」都列进来，包括这个未被接线的类）。其余三个 facade 基类（`OpenAICompatibleResources`/`AsyncOpenAICompatibleResources`/`GoogleResources` 等）都有子类或实例化。红绿验证：仅删类、保留测试行 → 该参数化实例 `AttributeError` 变红；类与测试行同删 → 定向 3 passed、全量 4365 passed（比删前少 1，正是移除的那条实例）。8 项质量门全绿。
