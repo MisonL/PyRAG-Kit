@@ -74,6 +74,28 @@ VERDICT_TIMEOUT = "TIMEOUT"
 #: 不允许作为期望值。
 EXPECTED_VERDICTS = (VERDICT_KILLED, VERDICT_SURVIVED, VERDICT_MUTFAIL, VERDICT_COLLECT_ERROR)
 
+#: 读**工作区源码文本**（而非导入后行为）的测试节点。变异扫描期间源码处于变异
+#: 态，这类测试会因为「源码长什么样变了」而红，与被测行为无关——把它们算进
+#: 「有没有测试失败」会让假 KILLED。实测：green39 夹具里 4 个 SURVIVED 位点
+#: （``anthropic.py:972``、``factory.py:356``、``model_provider.py:1202``／
+#: ``336``）落在 ``test_green39_fixture_sites_resolve_at_head`` 引用的节点上，
+#: 该元测试在变异下必红，于是 4 个存活点全部被误报 KILLED；去掉它后全量 4420
+#: passed（真·存活）。逐个剔除前要**实测**（同 deselect 跑一次，只剩该测试红才算
+#: 收进来）：盲目的 ``--deselect`` 对不存在的 node id 是静默通过的，不构成保护。
+_SOURCE_INSPECTING_TESTS = (
+    # 夹具坐标与源码 AST 的逐位点比对：变异点任一落进夹具引用的节点即必红。
+    "tests/scripts/test_audit_tooling.py::test_green39_fixture_sites_resolve_at_head",
+    # 读全仓源码做 AST 级断言（重复装饰符、markup 入口、raw %-logging、
+    # provider 的 importlib 隐藏导入、chat 的恢复分支形态）：断言的是源码文本
+    # 本身，任何变异都可能让它们变红，与变异点的实际被测行为无关。
+    "tests/test_boundary_hardening_regressions.py::test_no_duplicate_decorators_in_source_tree",
+    "tests/test_boundary_hardening_regressions.py::test_config_branch_missing_update_method_raises_a_caught_type",
+    "tests/test_display_utils.py::test_rich_markup_entry_points_never_receive_raw_variables",
+    "tests/test_display_utils.py::test_untrusted_free_argument_allowlist_has_no_stale_entries",
+    "tests/test_release_scripts.py::test_registered_provider_modules_have_no_static_import_path",
+    "tests/providers/test_security_boundaries.py::test_user_facing_error_paths_do_not_print_raw_exceptions",
+)
+
 
 def classify_pytest_exit(returncode: int) -> str:
     """把 pytest 退出码映射成判定；只有 0/1 是判定。"""
@@ -214,10 +236,20 @@ def run_pytest(
     与上一次编译**同一秒**内，CPython 的 (mtime, size) 校验会把上一轮的
     ``__pycache__`` 当成有效缓存——pytest 实际执行的是上一轮的字节码，判定与
     当前位点无关。每次运行把 pyc 写到独立前缀目录并清除，强制按源码重新编译。
+
+    **自指测试必须排除**：套件里有读**工作区源码文本**的元测试（校验夹具坐标
+    是否命中当前源码）。扫描时工作区正处于变异态，变异点一旦落在元测试引用的
+    节点上，元测试必红——它测的不是被测行为，而是「源码本身长什么样」。把它算进
+    「有没有测试失败」的判据，会让**任何**指向夹具所引用节点的存活变异被误报
+    KILLED（实测 green39 夹具里 4 个 SURVIVED 位点因此全部假报 KILLED）。
+    这些测试对工具自身仍有价值，但只在**未变异**的源码上跑，见
+    ``_SOURCE_INSPECTING_TESTS``。
     """
     args = [python, "-m", "pytest", "-q", "-p", "no:cacheprovider"]
     if first_failure:
         args.append("-x")
+    for node in _SOURCE_INSPECTING_TESTS:
+        args += ["--deselect", node]
     if selector:
         args.append(selector)
     pycache_prefix = worktree / ".pycache-audit"

@@ -11,16 +11,20 @@
 # 用法（需要 1 个以上已注册且干净的 git worktree）：
 #   uv run python scripts/audit/verify_sites.py --worktrees /path/wt scripts/audit/regressions/green39.txt
 #
-# 期望判定来自逐点人工复核：33 处 KILLED（红验证过的测试）、5 处 SURVIVED
-# （确证的等价变异）、1 处 MUTFAIL（openai_compatible.py 的
-# max_output_tokens 守卫已被修复移除，位点不再存在——该行验证 MUTFAIL 上报）。
-# 注意：MUTFAIL 行本身仍指向一个**当前可施加**的 isnot（1377:15，即该守卫的
-# 邻位），但它在 HEAD 上会被 test_openai_responses_none_max_output_tokens_not_forwarded
-# 杀死——也就是 expected=MUTFAIL 与当前判定**不一致**。这条刻意保留为「夹具会
-# 随源码演化而漂移」的活样本：夹具核对（test_green39_fixture_sites_resolve_at_head）
-# 只校验坐标能否解析，不校验 expected 是否仍成立；跑 verify_sites 会报
-# expected MUTFAIL 实际 KILLED，提醒重新基线化。
-# SURVIVED 行验证无 selector 时的全量套件判定。
+# 期望判定来自逐点人工复核（含本轮重新分诊，重跑时剔除自指元测试）：
+# 35 处 KILLED（红验证过的测试，含 google.py:571 与 openai_compatible.py:1391
+# 两处后补的 killer 选择器）、4 处 SURVIVED（确证的等价变异）。
+#
+# 本轮分诊的两个教训（假判定点都出在这里）：
+# 1. 元测试 test_green39_fixture_sites_resolve_at_head 读工作区源码 AST——变异
+#    点落在它引用的节点上时它必红，导致 4 个 SURVIVED 全部假报 KILLED。它已随
+#    其余读源码的测试一起被 run_pytest 从判定中 --deselect（只在未变异源码上
+#    跑）；因此 SURVIVED 现在是「剔除自指元测试后的全量套件存活」。
+# 2. 定点选择器与全量套件的结论可能相反（此前 openai_compatible.py:1153 记了
+#    一个能杀死它的全量 killer 却在定点下存活——实测换
+#    test_chat_request_forwards_extra_headers 即稳定杀死）。换 killer 必须在
+#    **定点模式**下重验，不能只看全量扫描的红。
+# SURVIVED 行验证无 selector 时的全量套件判定（同样剔除自指元测试）。
 src/providers/anthropic.py|1615|31|notin|tests/providers/test_guard_coverage_regressions.py::test_anthropic_async_stream_emits_completed_tool_call|KILLED
 src/providers/anthropic.py|281|12|drop|tests/providers/test_guard_coverage_regressions.py::test_anthropic_supports_sampling_option_tracks_model_generation|KILLED
 src/providers/anthropic.py|684|19|drop|tests/providers/test_guard_coverage_regressions.py::test_anthropic_tool_content_list_is_preserved|KILLED
@@ -37,11 +41,11 @@ src/providers/google.py|2563|19|drop|tests/providers/test_guard_coverage_regress
 src/providers/google.py|2599|37|drop|tests/providers/test_guard_coverage_regressions.py::test_google_stream_candidate_refusal_emitted_once|KILLED
 src/providers/google.py|306|19|notin|tests/providers/test_google_genai.py::test_google_provider_loads_credentials_file_and_forwards_it|KILLED
 src/providers/google.py|3674|11|isnot|tests/providers/test_guard_coverage_regressions.py::test_google_async_validate_tuning_reward_forwards_composite_config|KILLED
-src/providers/google.py|571|15|drop||SURVIVED
+src/providers/google.py|571|15|drop|tests/providers/test_guard_coverage_regressions.py::test_google_validate_http_options_keeps_blank_query_values|KILLED
 src/providers/__base__/model_provider.py|1202|11|notin||SURVIVED
 src/providers/__base__/model_provider.py|336|7|isnot||SURVIVED
-src/providers/openai_compatible.py|1153|11|isnot|tests/providers/test_guard_coverage_regressions.py::test_openai_chat_request_forwards_metadata|KILLED
-src/providers/openai_compatible.py|1391|15|isnot|tests/providers/test_guard_coverage_regressions.py::test_openai_responses_none_max_output_tokens_not_forwarded|MUTFAIL
+src/providers/openai_compatible.py|1153|11|isnot|tests/providers/test_guard_coverage_regressions.py::test_chat_request_forwards_extra_headers|KILLED
+src/providers/openai_compatible.py|1391|15|isnot|tests/providers/test_guard_coverage_regressions.py::test_openai_responses_none_max_output_tokens_not_forwarded|KILLED
 src/providers/openai_compatible.py|1505|15|isnot|tests/providers/test_guard_coverage_regressions.py::test_openai_responses_official_endpoint_rejects_configured_extra_body_stop|KILLED
 src/providers/openai_compatible.py|1587|28|isnot|tests/providers/test_guard_coverage_regressions.py::test_openai_responses_configured_top_logprobs_used_as_fallback|KILLED
 src/providers/openai_compatible.py|2460|27|notin|tests/providers/test_guard_coverage_regressions.py::test_openai_responses_sync_emits_completed_before_later_events|KILLED

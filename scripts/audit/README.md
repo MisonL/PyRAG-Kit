@@ -38,6 +38,8 @@ uv run python scripts/audit/verify_sites.py \
 
 `expected` 可为 `KILLED`、`SURVIVED`、`MUTFAIL` 或 `COLLECT_ERROR`。验证器会在启动时同步每个已注册且干净的 worktree 到主仓 HEAD；先跑未变异**基线套件**，不绿即中止（`--no-baseline` 可跳过，自担风险）；pytest 输出里出现 `No module named pytest`/`INTERNALERROR` 等基础设施故障标记时归为非判定（退出码 1 的「环境不可用」与「测试失败」同码）；选择器预检按 AST 收集函数名（顶格 def、类方法、async def 都识别，旧 `^def` 正则只认顶格）；pytest 退出码 4/5 不会被当成红测；源码行号漂移只在窗口内找到唯一最近节点时自动修正，否则明确报 `MUTFAIL`。每条变异都在 `finally` 中还原，结束时再次检查 worktree 清洁。
 
+**读源码文本的测试不参与判定**：套件里有一批测试断言的是「源码本身长什么样」（夹具坐标核对、重复装饰符扫描、`importlib.import_module` 存在性等，清单见 `verify_sites._SOURCE_INSPECTING_TESTS`）。变异期间源码处于变异态，这类测试只要被扫到就必红，测的却不是被测行为——把它们算进「有没有测试失败」会让假 KILLED。实测 green39 夹具里 4 个 SURVIVED 位点落在 `test_green39_fixture_sites_resolve_at_head` 引用的节点上，因此全部被误报 KILLED。这些测试只在**未变异**的基线上跑（普通 pytest 与 `--selftest` 均不受影响）；把它们放进排除列表前要逐个 `--deselect` 实测「只剩它红」，`--deselect` 对不存在的 node id 是静默通过的。
+
 位点不明确或基础设施出错时不会自动「猜成 KILLED」。先运行自检：
 
 ```bash

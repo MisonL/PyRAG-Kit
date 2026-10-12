@@ -226,6 +226,44 @@ def test_find_site_requires_exactly_one_match():
         find_site(tree, 99, 3, "eqneq")
 
 
+def test_source_inspecting_tests_are_excluded_from_verdicts():
+    """读工作区源码文本的测试必须被排除在判定之外。
+
+    实测：green39 夹具里 4 个 SURVIVED 位点恰好落进
+    ``test_green39_fixture_sites_resolve_at_head`` 引用的节点，元测试在变异下必红
+    ——扫描于是把 4 个存活点全部误报 KILLED。这些测试在**未变异**的源码上仍然
+    有价值，所以是排除而非删除；但排除列表必须是**存在**的，``--deselect`` 对
+    不存在的 node id 静默通过，写错名字不会报错。
+    """
+    from verify_sites import _SOURCE_INSPECTING_TESTS
+
+    assert _SOURCE_INSPECTING_TESTS, "排除列表不得为空——空列表意味着自指测试又被算进判定"
+    for node in _SOURCE_INSPECTING_TESTS:
+        file_part, _, test_name = node.partition("::")
+        assert file_part.endswith(".py") and test_name, node
+        path = REPO_ROOT / file_part
+        assert path.exists(), f"排除项指向不存在的文件: {file_part}"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        found = any(
+            isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn.name == test_name
+            for top in tree.body
+            for fn in _iter_functions(top)
+        )
+        assert found, f"排除项指向不存在的测试: {node}"
+
+
+def _iter_functions(top):
+    """遍历模块级 ClassDef 内的函数（含嵌套类里的方法）。"""
+    if isinstance(top, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        yield top
+    elif isinstance(top, ast.ClassDef):
+        for stmt in top.body:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                yield stmt
+            elif isinstance(stmt, ast.ClassDef):
+                yield from _iter_functions(stmt)
+
+
 def test_verify_sites_selftest_passes():
     proc = subprocess.run(
         [sys.executable, str(VERIFY_SITES), "--selftest"],
@@ -245,7 +283,7 @@ def test_green39_fixture_parses_with_expected_verdicts():
     counts: dict[str, int] = {}
     for site in sites:
         counts[site["expected"]] = counts.get(site["expected"], 0) + 1
-    assert counts == {"KILLED": 33, "SURVIVED": 5, "MUTFAIL": 1}
+    assert counts == {"KILLED": 35, "SURVIVED": 4}
 
 
 def test_green39_fixture_sites_resolve_at_head():
