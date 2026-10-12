@@ -164,6 +164,26 @@ def _store_with_documents(count: int = 5) -> FaissStore:
     return store
 
 
+def test_semantic_search_returns_empty_when_only_index_is_missing():
+    """``faiss_index`` 缺失但 ``embeddings`` 非空时也必须返回空列表。
+
+    守卫 ``if self.faiss_index is None or self.embeddings is None`` 的两个条件
+    **不互斥**：只要任一为 None 就该短路返回 []。把第一个 ``or`` 互换为 ``and``
+    后，只有两者同时为 None 才短路——半初始化状态（``index`` 为 None、
+    ``embeddings`` 非空，例如 ``_rebuild_indices`` 中途或外部注入的 store）会
+    越过守卫，落到 ``self.faiss_index.search(...)`` 抛
+    ``AttributeError: 'NoneType' object has no attribute 'search'``。
+    ``FaissStore`` 是 ``VectorStoreBase`` 的公开实现，第三方可直接构造。
+    """
+    import numpy as np
+
+    store = FaissStore(file_path=None)
+    store.faiss_index = None
+    store.embeddings = np.zeros((3, 4), dtype=np.float32)
+
+    assert store.semantic_search(np.ones(4, dtype=np.float32), 2) == []
+
+
 @pytest.mark.parametrize("bad_top_k", [0, -1, -100])
 def test_semantic_search_rejects_non_positive_top_k(bad_top_k):
     """非正 ``top_k`` 必须报项目自己的 ``ValueError``，而不是 FAISS 的空断言。"""

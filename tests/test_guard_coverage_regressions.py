@@ -422,6 +422,22 @@ def test_faiss_resolve_parent_content_tolerates_none_valued_entries():
     assert store.resolve_parent_content("") is None
 
 
+def test_faiss_resolve_parent_content_empty_string_returns_none():
+    """空串 ``content`` 必须返回 ``None``，不得返回 ``""``。
+
+    ``return content if isinstance(content, str) and content else None`` 的后半个
+    ``and content`` 是**有意**把空串归一成 ``None`` 的（契约是「无内容→None」，
+    调用方按 ``is None`` 判断）。把 ``and`` 互换为 ``or`` 后，``content=""`` 会
+    命中 ``isinstance("", str) or ""`` = True → 返回 ``""``。既有
+    ``test_faiss_resolve_parent_content_tolerates_none_valued_entries`` 只喂
+    ``"父块正文"`` 与 None 条目，空串分支从未被覆盖。
+    """
+    store = object.__new__(FaissStore)
+    store.parent_documents = {"empty": {"content": ""}}
+
+    assert store.resolve_parent_content("empty") is None
+
+
 def test_resource_proxy_children_cache_short_circuits_getattr():
     """``_children`` 中已缓存的子资源直接返回，不落到被包装对象上。
 
