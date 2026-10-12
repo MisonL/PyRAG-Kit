@@ -425,6 +425,20 @@ def test_security_parseable_and_unparseable_urls_check_query_keys_equally():
         validate_secret_free_options({"endpoint": "https://host/v1?myApiKey="}, "Provider")
 
 
+def test_security_unparseable_url_accepts_benign_query_keys():
+    """畸形 URL 回退分支只对**敏感** query 键拒绝，普通键照常放行。
+
+    回退分支逐个 query 键判断 ``if key and is_sensitive_option_key(key)``：
+    ``key`` 非空**且**是敏感键才登记。把 ``and`` 互换为 ``or`` 后，任何非空键
+    （哪怕普通键如 ``a``）都被当成凭证——无害的畸形 URL 被误拒。既有
+    ``test_security_unparseable_url_still_checks_query_key_names`` 只喂敏感键
+    ``?myApiKey=``（两种变异都 raise），非敏感键这条从未被覆盖。
+    """
+    assert validate_secret_free_options({"endpoint": "https://[::1/v1?a=1"}, "Provider") == {
+        "endpoint": "https://[::1/v1?a=1"
+    }
+
+
 def test_security_accepts_benign_unparseable_url():
     """严格度提升不能把无害的畸形 URL 也一并拒掉。"""
     assert validate_secret_free_options({"endpoint": "https://[::1/v1/models"}, "Provider") == {

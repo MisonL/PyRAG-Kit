@@ -217,6 +217,33 @@ def test_close_closes_embedding_after_rerank_close_failure():
     assert service.embedding_service.closed == 1
 
 
+def test_close_reports_the_first_error_when_both_closes_fail():
+    """重排与 Embedding 都关闭失败时，报的是**先发生**的那个错误。
+
+    ``first_error = first_error or exc`` 的 ``or`` 是「保留第一个错误」的守卫。
+    把它互换为 ``and`` 后：``first_error`` 已非 None（重排失败）时会被后发生的
+    Embedding 错误**覆盖**——用户看到「嵌入失败」，而真正的首个失败原因从栈上
+    消失。既有 ``test_close_closes_embedding_after_rerank_close_failure`` 只让
+    重排失败（Embedding 成功，走不到 942 行的 ``or``），
+    ``test_close_...`` 单障碍场景也盖不住这条双失败分支。
+    """
+
+    class FailingRerank:
+        def close(self):
+            raise RuntimeError("重排关闭失败")
+
+    class FailingEmbedding:
+        def close(self):
+            raise RuntimeError("嵌入关闭失败")
+
+    service = object.__new__(RetrievalService)
+    service._rerank_providers = {"bad": FailingRerank()}
+    service.embedding_service = FailingEmbedding()
+
+    with pytest.raises(RuntimeError, match="重排关闭失败"):
+        service.close()
+
+
 def test_aclose_closes_remaining_providers_after_an_aclose_failure():
     """异步关闭与同步关闭同一契约：失败后继续释放，最后报第一个错误。
 
@@ -250,6 +277,25 @@ def test_aclose_closes_remaining_providers_after_an_aclose_failure():
         asyncio.run(service.aclose())
     assert good.closed == 1
     assert service.embedding_service.closed == 1
+
+
+def test_aclose_reports_the_first_error_when_both_closes_fail():
+    """异步双失败同样报**先发生**的错误——与同步 ``close`` 同一契约。"""
+
+    class FailingProvider:
+        async def aclose(self):
+            raise RuntimeError("异步重排关闭失败")
+
+    class FailingEmbedding:
+        async def aclose(self):
+            raise RuntimeError("异步嵌入关闭失败")
+
+    service = object.__new__(RetrievalService)
+    service._rerank_providers = {"bad": FailingProvider()}
+    service.embedding_service = FailingEmbedding()
+
+    with pytest.raises(RuntimeError, match="异步重排关闭失败"):
+        asyncio.run(service.aclose())
 
 
 def test_close_and_aclose_do_not_raise_when_everything_closes_cleanly():
