@@ -159,8 +159,32 @@ class KnowledgeBuildService:
 
     @staticmethod
     def _compute_source_digest(markdown_files: Iterable[Path]) -> str:
+        """对知识库文件做内容摘要，读取失败给出与 ``_process_file`` 同一契约的指引。
+
+        这是同一个 `*.md` 清单的**第二处**读取点，也是 ``06f6a67`` 漏掉的那半：
+        ``_process_file`` 逐个 ``read_text`` 已把 ``UnicodeDecodeError``／``OSError``
+        收敛成带文件名的 ``ValueError``；而本方法在**全部 embedding 完成之后**
+        （`build` 的 `source_digest=...` 那一步）再读一遍同一批文件，失败时抛的是
+        裸 ``PermissionError``／``FileNotFoundError``。
+
+        两处差异在实测下都真实：`glob` 之后文件被删（TOCTOU）抛
+        ``FileNotFoundError: No such file or directory: ...``；`chmod 000` 后抛
+        ``PermissionError: [Errno 13] Permission denied``。此时 embedding 已经
+        全部跑完（最贵的一步），失败收场却是一条没有定位、没有「重试什么」指引的
+        裸 ``OSError``——不是 `build` 其余拒绝路径承诺的带指引 ``ValueError``。
+
+        按文件收敛而不是整体 ``try``：一条坏文件要报出**是哪个文件**，与
+        ``_process_file`` 的两条 `except` 逐字对齐。
+        """
         digest = hashlib.sha256()
         for file_path in markdown_files:
+            try:
+                content = file_path.read_bytes()
+            except OSError as exc:
+                raise ValueError(
+                    f"知识库文件无法读取: {file_path}。"
+                    f" 请检查该文件的权限与类型（{type(exc).__name__}: {exc}）。"
+                ) from exc
             digest.update(str(file_path).encode("utf-8"))
-            digest.update(file_path.read_bytes())
+            digest.update(content)
         return digest.hexdigest()

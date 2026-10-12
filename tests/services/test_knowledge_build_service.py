@@ -471,3 +471,122 @@ def test_build_reports_original_error_when_temp_cleanup_fails(tmp_path, monkeypa
     ):
         asyncio.run(service.build("standard"))
     assert "清理临时知识快照失败" in caplog.text
+
+
+# ── 源码摘要的第二次读取同样要带文件名的指引 ──
+#
+# ``_compute_source_digest`` 是 ``*.md`` 清单的**第二处**读取点（``06f6a67``
+# 只修了 ``_process_file`` 那半边），且它跑在全部 embedding 完成**之后**：
+# 此时最贵的一步已经做完，失败收场却是一条没有定位、没有「重试什么」指引的
+# 裸 ``OSError``。
+
+
+def test_compute_source_digest_reports_filename_on_permission_error(tmp_path):
+    """读取失败必须给出与 ``_process_file`` 同一契约的带文件名 ``ValueError``。"""
+    import os
+
+    if os.geteuid() == 0:
+        pytest.skip("以 root 运行时权限位不生效")
+
+    document = tmp_path / "文档.md"
+    document.write_text("# 正常", encoding="utf-8")
+    files = sorted(tmp_path.glob("*.md"))
+    document.chmod(0o000)
+    try:
+        with pytest.raises(ValueError) as excinfo:
+            KnowledgeBuildService._compute_source_digest(files)
+        message = str(excinfo.value)
+        assert "知识库文件无法读取" in message, message
+        assert "文档.md" in message, f"消息里没有出问题的文件名: {message}"
+    finally:
+        document.chmod(0o644)
+
+
+def test_compute_source_digest_reports_filename_when_file_disappears(tmp_path):
+    """``glob`` 之后文件被删（TOCTOU）同样要给带文件名的 ``ValueError``。"""
+    document = tmp_path / "文档.md"
+    document.write_text("# 正常", encoding="utf-8")
+    files = sorted(tmp_path.glob("*.md"))
+    document.unlink()
+
+    with pytest.raises(ValueError) as excinfo:
+        KnowledgeBuildService._compute_source_digest(files)
+
+    message = str(excinfo.value)
+    assert "知识库文件无法读取" in message, message
+    assert "文档.md" in message, f"消息里没有出问题的文件名: {message}"
+
+
+def test_compute_source_digest_normal_path_is_hex_digest(tmp_path):
+    """正常路径不受影响：仍是同一份内容的十六进制 SHA-256。"""
+    (tmp_path / "a.md").write_text("内容A", encoding="utf-8")
+    (tmp_path / "b.md").write_text("内容B", encoding="utf-8")
+
+    digest = KnowledgeBuildService._compute_source_digest(sorted(tmp_path.glob("*.md")))
+
+    assert len(digest) == 64
+    assert set(digest) <= set("0123456789abcdef")
+
+
+def test_build_digest_failure_after_embedding_still_names_the_file(tmp_path, monkeypatch):
+    """embedding 之后才变成不可读时，失败消息仍要带文件名。
+
+    这是该缺陷的真实时序：``_process_file`` 读成功 → embedding 跑完 →
+    文件被删/失去权限 → ``_compute_source_digest`` 读第二次。原实现抛裸
+    ``PermissionError``（``build`` 的其余拒绝路径不承诺这种收场），而此时
+    embedding 已经全部完成。
+    """
+    import os
+
+    if os.geteuid() == 0:
+        pytest.skip("以 root 运行时权限位不生效")
+
+    knowledge_base = tmp_path / "knowledge_base"
+    knowledge_base.mkdir()
+    victim = knowledge_base / "文档.md"
+    victim.write_text("# 正常\n\n正文", encoding="utf-8")
+
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_root.mkdir()
+    run_config = _RunConfig(knowledge_base, snapshot_root)
+
+    monkeypatch.setattr(
+        "src.services.knowledge_build_service.Pipeline.from_file_path",
+        lambda *args, **kwargs: _CountingPipeline(),
+    )
+
+    class _RevokingEmbedding:
+        """模拟「embedding 期间文件被删」的时序。"""
+
+        embedding_provider_key = "local-hash"
+        embedding_model_detail = SimpleNamespace(model_name="local-hash-32")
+
+        async def embed_in_batches(self, texts):
+            victim.unlink()
+            import numpy as np
+
+            return np.zeros((len(texts), 4), dtype=np.float32)
+
+    class _TolerantStore:
+        """upsert 容忍写入；digest 失败必须发生在 save_snapshot 之前。"""
+
+        def upsert_embeddings(self, documents, embeddings) -> None:
+            pass
+
+        def save_snapshot(self, snapshot_dir: str) -> None:
+            raise AssertionError("digest 失败时不应走到 save_snapshot")
+
+    service = KnowledgeBuildService(
+        run_config,
+        _TolerantStore(),
+        _RevokingEmbedding(),
+        SnapshotRepository(run_config),
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        asyncio.run(service.build("standard"))
+
+    message = str(excinfo.value)
+    assert "知识库文件无法读取" in message, message
+    assert "文档.md" in message, f"消息里没有出问题的文件名: {message}"
+    assert not list(snapshot_root.glob(".tmp-*")), "失败后临时快照目录必须被清理"
