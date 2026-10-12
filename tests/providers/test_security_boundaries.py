@@ -181,6 +181,26 @@ def test_security_rejects_credential_hidden_behind_unparseable_url():
         validate_secret_free_options({"note": unparseable}, "Provider")
 
 
+def test_security_unparseable_url_reports_the_real_field_path():
+    """回退分支的凭证消息必须带**真实字段路径**，不能退化成占位串 ``value``。
+
+    ``fallback = [path or "value"] if ... else []`` 里的 ``path or "value"`` 是
+    「路径为空时用占位串」的兜底；正常调用路径下 ``path`` 恒非空（``visit`` 从
+    字段名拼出）。把 ``or`` 互换为 ``and`` 后，非空 ``path`` 反而被换成
+    ``"value"``——凭证仍被拒（消息里仍有「凭证」二字），但用户看到的是
+    「凭证出现在 value」，无法定位是哪个配置字段写坏了。既有用例只
+    ``match="凭证"``，不校验路径，因此这条从未被覆盖。
+    """
+    unparseable = "https://[::1 token sk-FAKE0000FAKE0000FAKE0000FAKE0000"
+
+    with pytest.raises(ValueError) as excinfo:
+        validate_secret_free_options({"endpoint": unparseable}, "Provider")
+
+    message = str(excinfo.value)
+    assert "endpoint" in message
+    assert "value" not in message
+
+
 def test_security_parseable_and_unparseable_urls_are_equally_strict():
     """同样藏凭证的两个值，只因 URL 可解析与否而一个被拒一个放行，即为漏洞。"""
     secret = "token sk-FAKE0000FAKE0000FAKE0000FAKE0000"
@@ -410,6 +430,28 @@ def test_security_accepts_benign_unparseable_url():
     assert validate_secret_free_options({"endpoint": "https://[::1/v1/models"}, "Provider") == {
         "endpoint": "https://[::1/v1/models"
     }
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://user@host/v1",
+        "https://:pw@host/v1",
+        "https://user:pw@host/v1",
+    ],
+    ids=["only-user", "only-password", "user-and-password"],
+)
+def test_security_rejects_url_userinfo_whichever_half_is_present(url):
+    """URL 里**任一**半 userinfo（用户名或密码）都必须判为凭证。
+
+    判据是 ``parsed.username is not None or parsed.password is not None``：两半
+    各判各的（``https://user@h`` 只有用户名、``https://:pw@h`` 只有密码）。把
+    ``or`` 互换为 ``and`` 后，只有两半同时存在才判为凭证——「只带用户名」或
+    「只带密码」的 URL 整体漏检，凭证边界静默失效。既有用例只覆盖了 query 键名
+    与值内令牌，未覆盖 userinfo 任一半单独出现的形态。
+    """
+    with pytest.raises(ValueError, match="凭证"):
+        validate_secret_free_options({"endpoint": url}, "Provider")
 
 
 # ── 回归：CJK 紧邻时词边界失效导致密钥整体漏检 ──

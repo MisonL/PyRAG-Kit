@@ -271,6 +271,25 @@ def test_coerce_score_still_accepts_convertible_values(value, expected):
     assert coerce_score(value) == expected
 
 
+def test_coerce_score_accepts_numpy_scalars():
+    """numpy 标量必须被转换，不得因「不是 ``float`` 子类」而静默归零。
+
+    守卫是 ``isinstance(value, (int, float)) or hasattr(value, "__float__")``：
+    numpy 标量（``np.float32`` 等）不是 ``float`` 子类，靠后半的 ``__float__``
+    duck-typing 接住。把 ``or`` 互换为 ``and`` 后整条恒假，真实分数被静默降成
+    0.0——既影响融合排序，又被分数阈值全部过滤，从「能检索到」变成「静默返回
+    空结果」。第三方 store 的 score 常是 numpy 标量，而既有用例的取值全是
+    Python 原生数字／字符串／None，这条分支从未被覆盖。
+    """
+    import numpy as np
+
+    from src.ui.display_utils import coerce_score
+
+    assert coerce_score(np.float32(0.5)) == 0.5
+    assert coerce_score(np.float64(0.7)) == 0.7
+    assert coerce_score(np.int64(3)) == 3.0
+
+
 @pytest.mark.parametrize(
     "value",
     ["abc", "", None, True, False, [1], {"v": 1}, float("nan"), float("inf"), float("-inf")],
