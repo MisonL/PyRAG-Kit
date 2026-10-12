@@ -107,6 +107,27 @@ def test_rerank_invalid_index_is_explicit(provider_type):
 
 
 @pytest.mark.parametrize("provider_type", [JinaProvider, SiliconflowRerankProvider])
+def test_rerank_bool_index_is_rejected(provider_type):
+    """``index`` 为 bool 时必须报「index 无效」，不得被当作整数下标。
+
+    ``isinstance(direct_index, bool)`` 那一段是**有意**排除 bool 的（bool 是
+    int 子类，``True`` 会变成下标 ``1``）。把它前面的 ``or`` 互换为 ``and`` 后，
+    ``index=True`` 且 ``len(documents) >= 2`` 时整条判据为假 → bool 被当 index=1
+    接受。既有 ``test_rerank_invalid_index_is_explicit`` 只喂越界整数 4、
+    ``test_rerank_accepts_positive_index_within_range`` 只喂合法整数 1，bool
+    这条分支从未被覆盖（``docs`` 必须 ≥ 2 元素才分岔——单元素时范围判据恰好
+    仍拒绝，掩盖了缺陷）。
+    """
+    provider = object.__new__(provider_type)
+
+    with pytest.raises(RuntimeError, match="index 无效"):
+        provider._parse_response(
+            [{"index": True, "relevance_score": 0.9}],
+            ["one", "two"],
+        )
+
+
+@pytest.mark.parametrize("provider_type", [JinaProvider, SiliconflowRerankProvider])
 def test_rerank_accepts_positive_index_within_range(provider_type):
     """区间内的**正**下标必须被接受并映射到对应文档。
 
