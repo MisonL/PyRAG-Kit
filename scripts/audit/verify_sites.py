@@ -85,6 +85,10 @@ EXPECTED_VERDICTS = (VERDICT_KILLED, VERDICT_SURVIVED, VERDICT_MUTFAIL, VERDICT_
 _SOURCE_INSPECTING_TESTS = (
     # 夹具坐标与源码 AST 的逐位点比对：变异点任一落进夹具引用的节点即必红。
     "tests/scripts/test_audit_tooling.py::test_green39_fixture_sites_resolve_at_head",
+    # 夹具文件本身（scripts/ 下的 .txt）在变异期间不变，这条其实不会变红——但
+    # 判定标准是「读工作区文件而非导入后行为」，登记它无害；真正的保护是反向
+    # 核对「探测器发现的一切都已登记」，见 test_source_inspecting_registry_is_complete。
+    "tests/scripts/test_audit_tooling.py::test_green39_fixture_parses_with_expected_verdicts",
     # 读全仓源码做 AST 级断言（重复装饰符、markup 入口、raw %-logging、
     # provider 的 importlib 隐藏导入、chat 的恢复分支形态）：断言的是源码文本
     # 本身，任何变异都可能让它们变红，与变异点的实际被测行为无关。
@@ -94,7 +98,120 @@ _SOURCE_INSPECTING_TESTS = (
     "tests/test_display_utils.py::test_untrusted_free_argument_allowlist_has_no_stale_entries",
     "tests/test_release_scripts.py::test_registered_provider_modules_have_no_static_import_path",
     "tests/providers/test_security_boundaries.py::test_user_facing_error_paths_do_not_print_raw_exceptions",
+    # 守卫自身：它读仓库源码（测试文件）来核对这份清单，因此也落在探测器里。
+    # 纳入清单使「探测器发现的 ⊆ 清单」这一不变量闭合；它在普通 CI 运行里照常
+    # 执行（扫描期间被 deselect 不影响它把关——静态不变量归 pytest 管，不归扫描）。
+    "tests/scripts/test_audit_tooling.py::test_source_inspecting_tests_are_excluded_from_verdicts",
 )
+
+#: 「读文件/解析/导入」的动作名（按属性名匹配）。与锚点同时出现才算自指测试。
+_SOURCE_READ_ATTRS = frozenset(
+    {"read_text", "read_bytes", "getsource", "getsourcefile", "glob", "rglob", "open"}
+)
+#: 同上，但按完整点号名匹配（``provider.parse`` 这类 SDK 方法不算读源码）。
+_SOURCE_READ_DOTTED = frozenset(
+    {
+        "ast.parse",
+        "importlib.import_module",
+        "tokenize.open",
+        "importlib.util.spec_from_file_location",
+    }
+)
+#: 指向仓库源码的字符串字面量；``Path("src").rglob(...)`` 与 ``"src/x.py"`` 都要覆盖。
+_SOURCE_PATH_LITERALS = ("src", "scripts", "main.py")
+
+
+def _dotted_name(node: ast.AST) -> str:
+    """把 ``a.b.c`` 形态的表达式还原成点号名；其余返回空串。"""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        base = _dotted_name(node.value)
+        return f"{base}.{node.attr}" if base else node.attr
+    return ""
+
+
+def _mentions_source_path(node: ast.AST) -> bool:
+    """表达式里是否出现仓库源码路径（``__file__`` 派生或源码字面量）。"""
+    for inner in ast.walk(node):
+        if isinstance(inner, ast.Name) and inner.id == "__file__":
+            return True
+        if isinstance(inner, ast.Constant) and isinstance(inner.value, str):
+            value = inner.value
+            if value in _SOURCE_PATH_LITERALS or value.startswith(("src/", "scripts/")):
+                return True
+    return False
+
+
+def _strip_docstrings(tree: ast.AST) -> None:
+    """原地去掉模块/类/函数的首条字符串——否则文档里提到 ``read_text`` 会误判。"""
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        body = node.body
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            node.body = body[1:]
+
+
+def detect_source_inspecting_tests(root: pathlib.Path) -> list[str]:
+    """扫描 ``root/tests`` 下所有测试函数，返回「读仓库源码文本」的节点 id。
+
+    判定要**锚点与读取动作同时出现**：只看 ``read_text`` 会把读临时目录产物
+    （快照 pkl、tar 包）的正当行为测试也扫进来，那些测试正是变异的合法判据。
+    锚点有两种：字面量 ``src``/``scripts``/``main.py``，或模块级由 ``__file__``
+    派生的全局（如 ``REPO_ROOT = Path(__file__).resolve().parents[2]``）。
+
+    这是 ``_SOURCE_INSPECTING_TESTS`` 的**完整性**保证：清单只登记了当下已知的
+    自指测试，新增一个读源码的测试不会自己进清单，``--deselect`` 对漏登记的
+    名字静默通过——假 KILLED 就会静默复现。由守卫测试断言
+    「本函数发现的一切 ⊆ 清单」来堵这个口子。
+    """
+    tests_dir = root / "tests"
+    if not tests_dir.is_dir():
+        return []
+    found: list[str] = []
+    for path in sorted(tests_dir.rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (SyntaxError, OSError):
+            continue
+        _strip_docstrings(tree)
+        anchor_globals = set()
+        for stmt in tree.body:
+            targets: list[ast.expr] = []
+            if isinstance(stmt, ast.Assign):
+                targets = list(stmt.targets)
+            elif isinstance(stmt, ast.AnnAssign):
+                targets = [stmt.target]
+            if targets and stmt.value is not None and _mentions_source_path(stmt.value):
+                anchor_globals.update(t.id for t in targets if isinstance(t, ast.Name))
+        relative = path.relative_to(root).as_posix()
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if not node.name.startswith("test_"):
+                continue
+            anchored = reads = False
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Name) and inner.id in anchor_globals:
+                    anchored = True
+                elif isinstance(inner, ast.Constant) and isinstance(inner.value, str):
+                    value = inner.value
+                    if value in _SOURCE_PATH_LITERALS or value.startswith(("src/", "scripts/")):
+                        anchored = True
+                elif isinstance(inner, ast.Call):
+                    func = inner.func
+                    by_attr = isinstance(func, ast.Attribute) and func.attr in _SOURCE_READ_ATTRS
+                    if by_attr or _dotted_name(func) in _SOURCE_READ_DOTTED:
+                        reads = True
+            if anchored and reads:
+                found.append(f"{relative}::{node.name}")
+    return found
 
 
 def classify_pytest_exit(returncode: int) -> str:
@@ -417,6 +534,48 @@ def selftest() -> int:
     tree_tie = ast.parse("x = 1\nif a == b:\n    pass\n    if c == d:\n        pass\n")
     check("同距同列消解平局", find_nearest_site(tree_tie, 3, 3, "eqneq", 10) == (2, 3))
     check("同距异列返回 None", find_nearest_site(tree_tie, 3, 9, "eqneq", 10) is None)
+
+    print("自指测试探测器:")
+    detected = set(detect_source_inspecting_tests(DEFAULT_REPO))
+    registered = set(_SOURCE_INSPECTING_TESTS)
+    # 探测器必须真能命中——一个恒返回空集的探测器会让下面的「⊆」检查变成空转。
+    check(
+        "探测器在真实 tests/ 上非空",
+        len(detected) >= 5,
+        f"只发现 {len(detected)} 个，锚点/读取动作匹配可能已失效",
+    )
+    check(
+        "探测器发现的都已在清单里",
+        detected <= registered,
+        f"未登记（新增自指测试会让假 KILLED 复现）: {sorted(detected - registered)}",
+    )
+    probe_root = pathlib.Path(tempfile.mkdtemp())
+    try:
+        (probe_root / "tests").mkdir()
+        (probe_root / "tests" / "test_probe.py").write_text(
+            "import ast\n"
+            "import pathlib\n"
+            "\n"
+            "REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]\n"
+            "\n"
+            "\n"
+            "def test_reads_source():\n"
+            '    """文档里写 read_text 不算读取动作。"""\n'
+            "    return ast.parse((REPO_ROOT / 'src' / 'a.py').read_text())\n"
+            "\n"
+            "\n"
+            "def test_reads_only_temp_artifacts(tmp_path):\n"
+            "    return (tmp_path / 'chunks.pkl').read_bytes()\n",
+            encoding="utf-8",
+        )
+        probe = set(detect_source_inspecting_tests(probe_root))
+        check("命中读源码的测试", "tests/test_probe.py::test_reads_source" in probe)
+        check(
+            "放过只读临时产物的测试",
+            "tests/test_probe.py::test_reads_only_temp_artifacts" not in probe,
+        )
+    finally:
+        shutil.rmtree(probe_root, ignore_errors=True)
 
     print(f"\nselftest 失败: {len(failures)}")
     return 1 if failures else 0

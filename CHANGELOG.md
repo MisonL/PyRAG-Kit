@@ -6,6 +6,11 @@
 
 ### 修复
 
+- **变异验证器的自指测试排除清单补上完整性核对**（`scripts/audit/verify_sites.py`、`tests/scripts/test_audit_tooling.py`、`scripts/audit/README.md`）。上一轮修好「自指元测试污染判定」后留下一个盲区：`_SOURCE_INSPECTING_TESTS` 只是一份人工清单，守卫测试只验证「清单里的条目**存在**」，没验证「清单**完整**」。`--deselect` 对漏登记/写错的名字**静默通过**——日后有人新增一个读 `src/` 源码的测试，它不会自己进清单，扫描会再次把它算进判定，假 KILLED 静默复现（正是上一轮 4 个 SURVIVED 被误报 KILLED 的同一机制）。
+  - 新增静态探测器 `detect_source_inspecting_tests()`：按「**锚定仓库源码路径**（字面量 `src`/`scripts`/`main.py`，或模块级 `__file__` 派生的全局如 `REPO_ROOT`）+ **读文件/解析/导入动作**（`read_text`/`read_bytes`/`ast.parse`/`glob`/`rglob`/`importlib.import_module`…）」两个条件**同时成立**判定。先剥离各作用域的首条字符串，避免文档里提到 `read_text` 就误判；两个条件缺一不可，否则会把读临时目录产物（快照 pkl、tar 包）的正当行为测试也扫进来。
+  - 新增守卫 `test_source_inspecting_registry_is_complete`，断言「探测器发现的一切 ⊆ 清单」，并在断言前先自证探测器**非空**（否则「⊆」在空集上恒真、用例形同虚设）。清单据此从 7 条补到 9 条（新增 `test_green39_fixture_parses_with_expected_verdicts` 与守卫自身——后者也读仓库源码，纳入使不变量闭合）。
+  - 红验证：临时植入一个读 `src/providers/factory.py` 的未登记测试 → 守卫变红并**点名该 node**；删除后转绿、`git status` 干净。探测器单元用例亦以「去掉锚点条件」注入验证为真 killer（负例立即误报）。`--selftest` 增加同款核对与一组正反例，全绿；全量 4422 passed；8 项质量门全绿。
+
 - **算术运算符互换（`arith`）变异扫描补齐 5 组判据覆盖缺口**（`tests/providers/test_google_genai.py`、`tests/retrieval/test_weighted_fusion.py`、`tests/retrieval_test/test_retrieval_cli.py`、`tests/ui/test_config_menu.py`；工具在 `scripts/audit/mutate.py`、`scripts/audit/README.md`）。补齐最后一个未覆盖的变异面：`+`↔`-`、`*`↔`/`。新 kind 只收数值二元运算（字符串字面量参与的 `BinOp` 排除），站点键取**左操作数结尾**——链式 `a + b + c` 的两层 `BinOp` 起点 `col_offset` 相同，用起点会让 `find_site` 命中两个节点而整片漏扫。对 `src/` 全部 105 个位点做全量扫描（6 worktree 并行，先跑未变异基线），判定 **KILLED=59、SURVIVED=45、TIMEOUT=1**。45 个 SURVIVED 逐一用真实入口探针分诊为 **5 组真缺口（9 个位点）** 与 **等值变异**：
   - **真缺口（补测试，逐条红验证——注入变异后新测试红、还原后绿）**：
     1. `google.py` 2204／2216 `_partial_args_to_mapping` 的中间容器类型由**下一段** token 决定（``[] if isinstance(tokens[position + 1], int) else {}``）。既有用例的 json_path 全是单段（`$.a[0]`／`$.country`），走到那一步时 `position` 已是最后一个 token（`last=True`），`tokens[position + 1]` **从未被读**；把 `+ 1` 变异成 `- 1` 后整套测试仍全绿，而 `$.a[0][1]` 从 `{'a': [[None, 'x']]}` 变成抛 `ValueError`。补 `test_google_partial_args_nested_path_builds_container_from_next_token`（覆盖 list 与 dict 两条分支）与 `test_google_partial_args_nested_index_after_existing_list`。

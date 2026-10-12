@@ -252,6 +252,62 @@ def test_source_inspecting_tests_are_excluded_from_verdicts():
         assert found, f"排除项指向不存在的测试: {node}"
 
 
+def test_source_inspecting_registry_is_complete():
+    """排除清单必须覆盖探测器发现的**每一个**自指测试。
+
+    上面的用例只验证「清单里的条目存在」——一个新增的、读源码的测试不会自己
+    进清单，扫描便再次把它算进判定（假 KILLED 静默复现）。这里用静态探测器
+    做完整性核对：凡「锚定仓库源码 + 读文件/解析/导入」的测试都必须已登记。
+    """
+    from verify_sites import _SOURCE_INSPECTING_TESTS, detect_source_inspecting_tests
+
+    detected = set(detect_source_inspecting_tests(REPO_ROOT))
+    registered = set(_SOURCE_INSPECTING_TESTS)
+    # 探测器先自证非空，否则「⊆」在空集上恒真、这条用例形同虚设。
+    assert len(detected) >= 5, f"探测器只发现 {len(detected)} 个，锚点匹配可能已失效"
+    assert detected <= registered, (
+        "以下测试读仓库源码但未登记进 _SOURCE_INSPECTING_TESTS，"
+        f"变异扫描会把它们算进判定并制造假 KILLED：{sorted(detected - registered)}"
+    )
+
+
+def test_detect_source_inspecting_distinguishes_source_from_artifacts(tmp_path):
+    """探测器要抓读源码的、放过只读临时产物的——后者是变异的合法判据。"""
+    from verify_sites import detect_source_inspecting_tests
+
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_probe.py").write_text(
+        "import ast\n"
+        "import pathlib\n"
+        "\n"
+        "REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]\n"
+        "\n"
+        "\n"
+        "def test_reads_source_via_literal():\n"
+        "    return pathlib.Path('src/providers/factory.py').read_text()\n"
+        "\n"
+        "\n"
+        "def test_reads_source_via_module_global():\n"
+        "    return ast.parse((REPO_ROOT / 'scripts' / 'audit' / 'mutate.py').read_text())\n"
+        "\n"
+        "\n"
+        "def test_reads_only_temp_artifacts(tmp_path):\n"
+        "    return (tmp_path / 'chunks.pkl').read_bytes()\n"
+        "\n"
+        "\n"
+        "def test_docstring_mention_is_not_a_read(tmp_path):\n"
+        '    """这个测试从不真的 read_text，只在文档里提到 src/ 而已。"""\n'
+        "    return tmp_path.name\n",
+        encoding="utf-8",
+    )
+    detected = set(detect_source_inspecting_tests(tmp_path))
+    assert "tests/test_probe.py::test_reads_source_via_literal" in detected
+    assert "tests/test_probe.py::test_reads_source_via_module_global" in detected
+    assert "tests/test_probe.py::test_reads_only_temp_artifacts" not in detected
+    assert "tests/test_probe.py::test_docstring_mention_is_not_a_read" not in detected
+
+
 def _iter_functions(top):
     """遍历模块级 ClassDef 内的函数（含嵌套类里的方法）。"""
     if isinstance(top, (ast.FunctionDef, ast.AsyncFunctionDef)):
