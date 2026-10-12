@@ -26,6 +26,28 @@ def test_build_index_text_keeps_original_content_when_source_missing():
     assert index_text == "只有正文"
 
 
+@pytest.mark.parametrize(
+    "source",
+    [123, ["a.md"], {"path": "a.md"}, b"a.md"],
+    ids=["int", "list", "dict", "bytes"],
+)
+def test_build_index_text_tolerates_non_string_source(source):
+    """``metadata['source']`` 非字符串时必须按「无来源」处理，不得抛 ``TypeError``。
+
+    判据是 ``isinstance(source, str) and source``——前半个 ``isinstance`` 是**有意**
+    短路：只有字符串才进 ``Path(source).stem``。把它后面的 ``and`` 互换为 ``or`` 后，
+    非字符串的真值（``123``／``["a.md"]``／``{"path": ...}``）也命中 →
+    ``Path(123)`` 抛 ``TypeError: expected str, bytes or os.PathLike object``。
+    该路径在索引重建（``_rebuild_indices``）与快照加载都会走到，且检索结果可来自
+    任何 ``VectorStoreBase`` 实现（第三方 store 的 metadata 不受本项目的载入期
+    归一化约束）。既有 ``test_build_index_text_keeps_original_content_when_source_missing``
+    只喂空 metadata（``source`` 缺省为 ``""``，字符串），非字符串分支从未被覆盖。
+    """
+    document = {"page_content": "正文", "metadata": {"source": source}}
+
+    assert FaissStore._build_index_text(document) == "正文"
+
+
 # ── 回归：BM25 分数全 0 时的静默空结果，以及空语料的除零 ──
 
 
