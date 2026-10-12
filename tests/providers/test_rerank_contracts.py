@@ -163,6 +163,33 @@ def test_rerank_invalid_score_is_explicit(provider_type, score):
         )
 
 
+@pytest.mark.parametrize("score", [True, False], ids=["true", "false"])
+@pytest.mark.parametrize("provider_type", [JinaProvider, SiliconflowRerankProvider])
+def test_rerank_bool_score_is_not_reported_as_out_of_range(provider_type, score):
+    """``relevance_score`` 为 bool 时不得报「超出双精度范围」。
+
+    超范围判据是 ``isinstance(raw_score, int) and not isinstance(raw_score, bool)
+    and not is_double_convertible(raw_score)``：中间那个 ``not isinstance(...,
+    bool)`` 是**有意**排除 bool 的（bool 是 int 子类，``float(True) == 1.0`` 会
+    静默变 1.0，走的不是「超范围」这条）。把它前面的 ``and`` 互换为 ``or`` 后，
+    ``raw_score=True`` 会命中 ``(isinstance(int)=True or ...) and not
+    is_double_convertible(True)=True`` → 误报「超出双精度范围」。既有
+    ``test_rerank_invalid_score_is_explicit`` 只喂字符串／nan／inf（都带
+    ``relevance_score`` 键走 float() 路径），``test_rerank_response_score_beyond
+    _double_range_is_explicit`` 只喂超大整数（两种变体都 raise，区分不了），
+     因此 bool 这条独立分支从未被覆盖。
+    """
+    provider = object.__new__(provider_type)
+
+    indices, scores = provider._parse_response(
+        [{"index": 0, "relevance_score": score}],
+        ["one"],
+    )
+
+    assert indices == [0]
+    assert scores == [1.0 if score else 0.0]
+
+
 @pytest.mark.parametrize("timeout", [float("nan"), float("inf"), float("-inf"), 0, -1])
 @pytest.mark.parametrize("provider_type", [JinaProvider, SiliconflowRerankProvider])
 def test_rerank_non_finite_or_non_positive_timeout_is_explicit(provider_type, timeout):
