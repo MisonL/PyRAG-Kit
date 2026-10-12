@@ -30,6 +30,9 @@ uv run python scripts/audit/verify_sites.py \
 - `eqneq`：`==` ↔ `!=`；
 - `cmpdir`：`<` ↔ `>`、`<=` ↔ `>=`（方向反转）；
 - `boolc`：`True` ↔ `False`（布尔字面量互换）；
+- `boolop`：`and` ↔ `or`（只翻每个 BoolOp 组的第一个运算符；站点键取第一个值
+  的结尾以区分链式 `a and b or c`，与 `arith` 同理。运算符夹缝用 tokenize 精确定位，
+  注释里出现 `and`/`or` 文本不会被误翻）；
 - `arith`：`+` ↔ `-`、`*` ↔ `/`（加减互换、乘除互换；只收数值二元运算，
   字符串字面量参与的拼接不算位点，站点键取左操作数结尾以区分链式表达式）。
   AST 无法静态区分类型，因此 `Path / x` 这类**路径拼接除法**也会进位点——其

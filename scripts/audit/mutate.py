@@ -13,6 +13,9 @@
   方向反转；多操作数比较只翻转第一个 ``Lt``/``LtE``/``Gt``/``GtE``。
 * ``boolc``：``True`` → ``False``（反之亦然），只替换布尔字面量本身；``1``／
   ``0``／``"True"`` 等取值不同型，不是本 kind 的位点。
+* ``boolop``：``a and b`` ↔ ``a or b``，只翻转**第一个**运算符；短路语义变了，
+  但两侧取值表达式不变。站点键取**第一个值的结尾**——链式 ``a and b or c``
+  的两层 ``BoolOp`` 起点 ``col_offset`` 都指向 ``a``，用起点会碰撞而整片漏扫。
 * ``arith``：``x + y`` ↔ ``x - y``、``x * y`` ↔ ``x / y``（加减互换、乘除互换）。
   只收**数值**二元运算：任一操作数是字符串字面量的 ``BinOp``（``"a" + "b"``
   这类拼接）不是算术，其变异体在运行期抛 ``TypeError`` 而非改变计算，故排除。
@@ -29,11 +32,13 @@
 """
 
 import ast
+import io
 import pathlib
 import re
 import sys
+import tokenize
 
-KINDS = ("drop", "notin", "isnot", "eqneq", "cmpdir", "boolc", "arith")
+KINDS = ("drop", "notin", "isnot", "eqneq", "cmpdir", "boolc", "boolop", "arith")
 
 _OP_KINDS = {
     "notin": (ast.NotIn,),
@@ -95,6 +100,15 @@ def iter_sites(tree: ast.AST, kind: str):
         for node in ast.walk(tree):
             if isinstance(node, ast.Constant) and isinstance(node.value, bool):
                 yield node.lineno, node.col_offset, node
+        return
+    if kind == "boolop":
+        # 站点键取**第一个值的结尾**（同 ``arith`` 用左操作数结尾的理由）：
+        # ``a and b or c`` 里两层 ``BoolOp`` 的起点 ``col_offset`` 都指向 ``a``。
+        # 实测 src/ 735 个 BoolOp 位点该键零碰撞；即便未来碰撞，``find_site``
+        # 也会因命中 2 个节点而抛 SiteNotFound（MUTFAIL），不会静默错位。
+        for node in ast.walk(tree):
+            if isinstance(node, ast.BoolOp):
+                yield node.values[0].end_lineno, node.values[0].end_col_offset, node
         return
     if kind == "arith":
         # 站点键取**左操作数的结尾**而不是 BinOp 的起点：链式表达式
@@ -175,8 +189,28 @@ def mutate_source(src: str, node: ast.AST, kind: str) -> str:
             end += 1
         return src[:start] + src[end:]
 
-    if kind not in _OP_KINDS and kind != "arith":
+    if kind not in _OP_KINDS and kind != "arith" and kind != "boolop":
         raise ValueError(f"未知 kind: {kind}")
+    if kind == "boolop":
+        # 第一个值与第二个值之间的区段即运算符夹缝（可能跨行、夹注释与括号）。
+        # 不能用正则找关键字——注释里出现 ``and``／``or`` 文本会先命中（实测
+        # 形态：``a  # keep and note\\n    and b``），故用 tokenize 精确取第一个
+        # AND/OR 的 NAME 令牌（注释是 COMMENT、字符串是 STRING，不会误配）。
+        prev, nxt = node.values[0], node.values[1]
+        seg_start = _char_offset(lines, prev.end_lineno, prev.end_col_offset)
+        seg_end = _char_offset(lines, nxt.lineno, nxt.col_offset)
+        target = None
+        for token in tokenize.generate_tokens(io.StringIO(src).readline):
+            if token.type != tokenize.NAME or token.string not in ("and", "or"):
+                continue
+            start = _char_offset(lines, token.start[0], token.start[1])
+            if seg_start <= start < seg_end:
+                target = (start, _char_offset(lines, token.end[0], token.end[1]), token.string)
+                break
+        if target is None:
+            raise SiteNotFound(f"boolop 区段内未找到 and/or: {src[seg_start:seg_end]!r}")
+        start, end, keyword = target
+        return src[:start] + ("or" if keyword == "and" else "and") + src[end:]
     if kind == "arith":
         # 运算符节点（ast.Add 等）不带位置信息，与 ``cmpdir`` 同构：先切出
         # 操作数之间的区段，再在区段内做带边界的正则替换。

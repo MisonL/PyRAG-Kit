@@ -127,6 +127,50 @@ def test_mutate_boolc_ignores_non_boolean_constants():
     assert [(ln, col) for ln, col, _ in mutate.iter_sites(tree, "boolc")] == [(4, 4), (5, 4)]
 
 
+def test_mutate_boolop_swaps_and_or_both_directions(tmp_path):
+    """``and``→``or``、``or``→``and`` 两个方向都可施加。"""
+    target = tmp_path / "mod.py"
+    target.write_text("ok = a and b\n")
+    # 站点键是第一个值 ``a`` 的结尾 (1, 6)。
+    apply_mutation(target, 1, 6, "boolop")
+    assert "ok = a or b" in target.read_text(encoding="utf-8")
+
+    target.write_text("ok = a or b\n")
+    apply_mutation(target, 1, 6, "boolop")
+    assert "ok = a and b" in target.read_text(encoding="utf-8")
+
+
+def test_mutate_boolop_uses_first_value_end_as_site_key():
+    """链式 ``a and b or c`` 的两层 BoolOp 起点相同，故键取第一个值的结尾。"""
+    tree = ast.parse("x = a and b or c\n")
+    assert sorted((ln, col) for ln, col, _ in mutate.iter_sites(tree, "boolop")) == [
+        (1, 5),
+        (1, 11),
+    ]
+
+
+def test_mutate_boolop_flips_only_first_operator(tmp_path):
+    """``a and b and c`` 只翻最内层第一个运算符，后面的保持不变。"""
+    target = tmp_path / "mod.py"
+    target.write_text("ok = a and b and c\n")
+    apply_mutation(target, 1, 6, "boolop")
+    assert "ok = a or b and c" in target.read_text(encoding="utf-8")
+
+
+def test_mutate_boolop_comment_mentioning_keyword_is_not_flipped(tmp_path):
+    """夹缝里有注释且注释含 and/or 文本时，必须翻真运算符而非注释词。
+
+    ``src/`` 生产代码不这么写，但正则按关键字找会先命中注释（实测形态
+    ``a  # keep and note`` 后换行 ``and b``），变异落进注释即无声无效。
+    """
+    target = tmp_path / "mod.py"
+    target.write_text("ok = (\n    a  # keep and note\n    and b\n)\n")
+    apply_mutation(target, 2, 5, "boolop")
+    source = target.read_text(encoding="utf-8")
+    assert "# keep and note" in source  # 注释原样保留
+    assert "    or b\n" in source  # 真运算符被翻转
+
+
 def test_mutate_arith_swaps_add_sub_and_mul_div(tmp_path):
     """加减互换、乘除互换各一条，且各自只翻转到对面运算符。"""
     target = tmp_path / "mod.py"
