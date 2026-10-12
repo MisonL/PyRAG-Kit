@@ -689,6 +689,33 @@ def test_runtime_verified_protocols_rejects_unknown_protocol():
     assert "可选值" in message
 
 
+def test_runtime_verified_protocols_accepts_protocol_in_supported_set():
+    """协议**在**提供商支持列表内时必须接受——这是上面那条拒绝守卫的另一半。
+
+    既有用例只覆盖「协议不在白名单 → 拒绝」（``["nope"]``），从未走 ``and`` 的
+    假分支（``normalized_protocol in supported_protocols`` → 不 raise）。把判据
+    ``supported_protocols is not None and normalized_protocol not in supported_protocols``
+    的 ``and`` 互换为 ``or`` 后，「协议在白名单内」也会 raise——合法配置被误拒，
+    而全量套件仍绿（实测）。这条把「白名单内必须接受」钉死。
+    """
+    result = _ORIGINAL_FACTORY._runtime_verified_protocols(
+        {"server_verified_protocols": ["responses"]}, frozenset({"responses"}), "qwen"
+    )
+    assert result == frozenset({"responses"})
+
+
+def test_runtime_verified_protocols_accepts_any_protocol_when_set_is_none():
+    """``supported_protocols`` 为 ``None`` 时不施加白名单限制。
+
+    ``None`` 是「该提供商未声明限制」的语义；``and`` 的 ``is not None`` 分支
+    被短接，任何合法协议名都应通过。
+    """
+    result = _ORIGINAL_FACTORY._runtime_verified_protocols(
+        {"server_verified_protocols": ["responses"]}, None, "qwen"
+    )
+    assert result == frozenset({"responses"})
+
+
 def test_protocol_status_requires_explicit_role_for_unknown_provider():
     """``role=None`` 且渠道名不存在时必须说「无法推断角色」，而不是「角色不是字符串」。"""
     with pytest.raises(ValueError) as excinfo:
