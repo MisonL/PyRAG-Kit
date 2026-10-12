@@ -6,6 +6,20 @@
 
 ### 修复
 
+- **布尔运算符互换（`boolop`）全量扫描：8 组判据覆盖缺口补齐**（`tests/providers/test_factory.py`、`tests/providers/test_rerank_contracts.py`、`tests/providers/test_security_boundaries.py`、`tests/retrieval/test_weighted_fusion.py`、`tests/retrieval/vdb/test_faiss_index_text.py`、`tests/test_guard_coverage_regressions.py`；工具在 `scripts/audit/mutate.py`、`scripts/audit/README.md`）。沿用既有变异器接口新增 `boolop`（`and`↔`or`，只翻每个 `BoolOp` 组的第一个运算符），站点键取**第一个值的结尾**——链式 `a and b or c` 的两层起点 `col_offset` 相同，用起点会碰撞而整片漏扫；运算符夹缝用 `tokenize` 精确定位（注释里出现 `and`/`or` 文本不会被误翻）。上一轮已扫「`src/` 全部 233 处 **raise 守卫内**的 BoolOp」（见下方历史条目），本轮把面扩到全仓 **735** 处（含非 raise 的赋值/兜底链），分两批扫描（高并行 + 低负载重启，前者因 CPU 争抢产生 7 例假 TIMEOUT）。两批合计 **SURVIVED 17 处**，逐条红验证（注入变异 → 候选测试确实变红 → 还原复绿）后：
+  - **真缺口（8 组 11 位点，补测试）**：
+    1. `factory.py` 435 `runtime_verified_protocols` 的白名单守卫 `supported_protocols is not None and normalized_protocol not in supported_protocols`——`and` 互换后「协议在白名单内」也 raise（合法配置误拒），`supported_protocols=None` 时抛 `TypeError`。既有用例只测「协议不在白名单→拒绝」，从未走 `and` 的假分支。
+    2. `jina.py` 189／`siliconflow_rerank.py` 184 `_parse_response` 的超范围判据 `isinstance(raw_score, int) and not isinstance(raw_score, bool) and not is_double_convertible(raw_score)`——中间 `not isinstance(..., bool)` 有意排除 bool（`float(True)==1.0` 不是「超范围」）；互换后 `raw_score=True` 误报「超出双精度范围」。既有用例只喂字符串/nan/inf/超大整数，bool 分支未覆盖。
+    3. `jina.py` 158／`siliconflow_rerank.py` 128 index 判据 `not isinstance(direct_index, int) or isinstance(direct_index, bool) or ...`——`or` 互换后 `index=True` 且 `len(documents)>=2` 时 bool 被当 index=1 接受。既有用例只喂合法/越界整数。
+    4. `faiss_store.py` 198 `_build_index_text` 的 `isinstance(source, str) and source`——前半 `isinstance` 有意短路（只有字符串才进 `Path(...).stem`）；互换后非字符串 source（`123`/`["a"]`/`dict`/`bytes`）抛 `TypeError`。索引重建与快照加载都会走到该路径。
+    5. `faiss_store.py` 473 `resolve_parent_content` 的 `content if isinstance(content, str) and content else None`——后半个 `and content` 有意把空串归一成 `None`；互换后空串返回 `""`（契约是「无内容→None」）。
+    6. `faiss_store.py` 586 `semantic_search` 的 `if self.faiss_index is None or self.embeddings is None: return []`——两条件不互斥；互换后只有两者同时 None 才短路，半初始化状态落到 `None.search()` 抛 `AttributeError`。
+    7. `display_utils.py` 256 `coerce_score` 的 `isinstance(value, (int, float)) or hasattr(value, "__float__")`——后半接住 numpy 标量；互换后整条恒假，真实分数被静默降成 0.0，既影响融合排序又被分数阈值全部过滤。
+    8. `retrieval_service.py` 942／986 `first_error = first_error or exc`（`close`/`aclose`）——「保留第一个错误」守卫；互换后双失败时报后发生的错误，首个失败原因从栈上消失。既有用例只覆盖单失败。另有 `security.py` 661（URL userinfo 任一半单独出现须判凭证）、650（畸形 URL 回退分支的凭证消息须带真实字段路径）、655（该分支只对**敏感** query 键拒绝，普通键不该误报）。
+  - **等价变异（6 位点，不补测试）**：`snapshot_repository.py` 106（空 `snapshot_id` 被后续「解析到 root 之外」判据兜住）、`faiss_store.py` 202（`"" in 任意字符串` 恒真，`"" not in X` 恒假兜住）、`faiss_store.py` 670（全 0 分时循环体 `if score<=0: continue` 兜住）、`retrieval_service.py` 77（`or` 链后项 `not is_double_convertible` 覆盖前项所有情形）、`config.py` 798（`_coerce_number` 已拒 bool 并保证 int/float，整条是死代码）、`security.py` 663（`scheme`/`netloc` 同真时无分歧）。
+  - **2 例 TIMEOUT 非缺口**：`config_menu.py` 408／422——变异后 `while True` 循环的 break 失效，部分测试耗尽替身队列后死循环，掩盖了「已有测试杀死」的判定；定点复跑确认 4+ 条既有用例变红。
+  - 工具边界：`boolop` 只翻每个 `BoolOp` 组的**第一个**运算符，因此「多运算符同翻」的变体不在面内（判据不要用它构造判别输入）。全量 4450 passed；8 项质量门 + 审计 selftest 全绿。
+
 - **变异验证器的自指测试排除清单补上完整性核对**（`scripts/audit/verify_sites.py`、`tests/scripts/test_audit_tooling.py`、`scripts/audit/README.md`）。上一轮修好「自指元测试污染判定」后留下一个盲区：`_SOURCE_INSPECTING_TESTS` 只是一份人工清单，守卫测试只验证「清单里的条目**存在**」，没验证「清单**完整**」。`--deselect` 对漏登记/写错的名字**静默通过**——日后有人新增一个读 `src/` 源码的测试，它不会自己进清单，扫描会再次把它算进判定，假 KILLED 静默复现（正是上一轮 4 个 SURVIVED 被误报 KILLED 的同一机制）。
   - 新增静态探测器 `detect_source_inspecting_tests()`：按「**锚定仓库源码路径**（字面量 `src`/`scripts`/`main.py`，或模块级 `__file__` 派生的全局如 `REPO_ROOT`）+ **读文件/解析/导入动作**（`read_text`/`read_bytes`/`ast.parse`/`glob`/`rglob`/`importlib.import_module`…）」两个条件**同时成立**判定。先剥离各作用域的首条字符串，避免文档里提到 `read_text` 就误判；两个条件缺一不可，否则会把读临时目录产物（快照 pkl、tar 包）的正当行为测试也扫进来。
   - 新增守卫 `test_source_inspecting_registry_is_complete`，断言「探测器发现的一切 ⊆ 清单」，并在断言前先自证探测器**非空**（否则「⊆」在空集上恒真、用例形同虚设）。清单据此从 7 条补到 9 条（新增 `test_green39_fixture_parses_with_expected_verdicts` 与守卫自身——后者也读仓库源码，纳入使不变量闭合）。
