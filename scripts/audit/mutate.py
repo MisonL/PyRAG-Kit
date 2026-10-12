@@ -13,6 +13,9 @@
   方向反转；多操作数比较只翻转第一个 ``Lt``/``LtE``/``Gt``/``GtE``。
 * ``boolc``：``True`` → ``False``（反之亦然），只替换布尔字面量本身；``1``／
   ``0``／``"True"`` 等取值不同型，不是本 kind 的位点。
+* ``arith``：``x + y`` ↔ ``x - y``、``x * y`` ↔ ``x / y``（加减互换、乘除互换）。
+  只收**数值**二元运算：任一操作数是字符串字面量的 ``BinOp``（``"a" + "b"``
+  这类拼接）不是算术，其变异体在运行期抛 ``TypeError`` 而非改变计算，故排除。
 
 坐标约定：``line`` 为 1 起始行号，``col`` 为 CPython AST 的 ``col_offset``
 （**UTF-8 字节**偏移）。旧版 ``mut_cmp.py`` 把 ``col_offset`` 当字符偏移
@@ -30,13 +33,28 @@ import pathlib
 import re
 import sys
 
-KINDS = ("drop", "notin", "isnot", "eqneq", "cmpdir", "boolc")
+KINDS = ("drop", "notin", "isnot", "eqneq", "cmpdir", "boolc", "arith")
 
 _OP_KINDS = {
     "notin": (ast.NotIn,),
     "isnot": (ast.IsNot,),
     "eqneq": (ast.Eq, ast.NotEq),
     "cmpdir": (ast.Lt, ast.LtE, ast.Gt, ast.GtE),
+}
+
+# ``arith`` 的 BinOp kind 与区段正则。加减互换、乘除互换各归一组；``%``、
+# ``//``、``**`` 不在面内——它们的语义相邻变异（如 ``//``↔``/``）是另一组
+# 方向，且现存位点极少（``//`` 9 处、``%`` 6 处），收益不抵扫描成本。
+_ARITH_GROUP = {
+    "addsub": (ast.Add, ast.Sub),
+    "muldiv": (ast.Mult, ast.Div),
+}
+_ARITH_OPS = tuple({op for ops in _ARITH_GROUP.values() for op in ops})
+_ARITH_PATTERN = {
+    ast.Add: (r"\+", "-"),
+    ast.Sub: (r"-", "+"),
+    ast.Mult: (r"\*", "/"),
+    ast.Div: (r"(?<!/)/(?!/)", "*"),
 }
 
 
@@ -56,6 +74,16 @@ def _char_offset(lines: list[str], lineno: int, byte_col: int) -> int:
     return line_start + len(prefix_bytes.decode("utf-8"))
 
 
+def _is_arith_site(node: ast.BinOp) -> bool:
+    """``arith`` 的位点判据：组内运算符，且不是字符串字面量参与的表达式。"""
+    if not isinstance(node.op, _ARITH_OPS):
+        return False
+    for operand in (node.left, node.right):
+        if isinstance(operand, ast.Constant) and isinstance(operand.value, str):
+            return False
+    return True
+
+
 def iter_sites(tree: ast.AST, kind: str):
     """产出 ``(lineno, col_offset, node)``：全树中所有该 kind 的位点。"""
     if kind == "drop":
@@ -67,6 +95,16 @@ def iter_sites(tree: ast.AST, kind: str):
         for node in ast.walk(tree):
             if isinstance(node, ast.Constant) and isinstance(node.value, bool):
                 yield node.lineno, node.col_offset, node
+        return
+    if kind == "arith":
+        # 站点键取**左操作数的结尾**而不是 BinOp 的起点：链式表达式
+        # ``a + b + c`` 会被解析成两层 BinOp，两层起点的 ``col_offset`` 都指向
+        # 第一个 ``a``，用起点会让 ``find_site`` 命中两个节点而判 MUTFAIL、把
+        # 链式位点整片漏掉。左操作数各自的结尾互不相同（左子树占据不相交的
+        # 源码区间），因此是唯一键；``verify_sites`` 只把它当不透明坐标使用。
+        for node in ast.walk(tree):
+            if isinstance(node, ast.BinOp) and _is_arith_site(node):
+                yield node.left.end_lineno, node.left.end_col_offset, node
         return
     wanted = _OP_KINDS[kind]
     for node in ast.walk(tree):
@@ -137,8 +175,20 @@ def mutate_source(src: str, node: ast.AST, kind: str) -> str:
             end += 1
         return src[:start] + src[end:]
 
-    if kind not in _OP_KINDS:
+    if kind not in _OP_KINDS and kind != "arith":
         raise ValueError(f"未知 kind: {kind}")
+    if kind == "arith":
+        # 运算符节点（ast.Add 等）不带位置信息，与 ``cmpdir`` 同构：先切出
+        # 操作数之间的区段，再在区段内做带边界的正则替换。
+        prev, nxt = node.left, node.right
+        seg_start = _char_offset(lines, prev.end_lineno, prev.end_col_offset)
+        seg_end = _char_offset(lines, nxt.lineno, nxt.col_offset)
+        segment = src[seg_start:seg_end]
+        pattern, replacement = _ARITH_PATTERN[type(node.op)]
+        new_segment, count = re.subn(pattern, replacement, segment, count=1)
+        if count != 1:
+            raise SiteNotFound(f"运算符区段内未找到 {pattern!r}: {segment!r}")
+        return src[:seg_start] + new_segment + src[seg_end:]
     wanted = _OP_KINDS[kind]
     index = next(i for i, op in enumerate(node.ops) if isinstance(op, wanted))
     prev = node.left if index == 0 else node.comparators[index - 1]

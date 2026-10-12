@@ -127,6 +127,57 @@ def test_mutate_boolc_ignores_non_boolean_constants():
     assert [(ln, col) for ln, col, _ in mutate.iter_sites(tree, "boolc")] == [(4, 4), (5, 4)]
 
 
+def test_mutate_arith_swaps_add_sub_and_mul_div(tmp_path):
+    """加减互换、乘除互换各一条，且各自只翻转到对面运算符。"""
+    target = tmp_path / "mod.py"
+    target.write_text("total = a + b\navg = total / n\n")
+    # ``total = a + b``：站点键是左操作数 ``a`` 的结尾 (1, 9)。
+    apply_mutation(target, 1, 9, "arith")
+    assert "total = a - b" in target.read_text(encoding="utf-8")
+
+    target.write_text("total = a - b\navg = total / n\n")
+    apply_mutation(target, 1, 9, "arith")
+    assert "total = a + b" in target.read_text(encoding="utf-8")
+
+    target.write_text("avg = total * n\n")
+    apply_mutation(target, 1, 11, "arith")
+    assert "avg = total / n" in target.read_text(encoding="utf-8")
+
+
+def test_mutate_arith_uses_left_operand_end_as_site_key():
+    """链式 ``a + b + c`` 的两层 BinOp 起点相同，故键取左操作数结尾。
+
+    若按 BinOp 的 ``col_offset`` 作键，两层都指向第一个 ``a``，``find_site``
+    会命中两个节点而判 MUTFAIL，链式位点整片漏掉。
+    """
+    tree = ast.parse("r = a + b + c\n")
+    assert sorted((ln, col) for ln, col, _ in mutate.iter_sites(tree, "arith")) == [
+        (1, 5),
+        (1, 9),
+    ]
+
+
+def test_mutate_arith_ignores_string_concatenation():
+    """字符串字面量参与的 ``+`` 是拼接不是算术，不进 arith 位点。
+
+    其变异体（``"a" - "b"``）在运行期抛 ``TypeError`` 而非改变计算，属噪声。
+    """
+    tree = ast.parse('x = "a" + "b"\ny = a + b\nz = a + "s"\n')
+    assert [(ln, col) for ln, col, _ in mutate.iter_sites(tree, "arith")] == [(2, 5)]
+
+
+def test_mutate_arith_flips_only_first_operator_of_chain(tmp_path):
+    """``x / y / z`` 的两个 ``/`` 各是一个位点，一次只翻一个。"""
+    target = tmp_path / "mod.py"
+    target.write_text("w = x / y / z\n")
+    apply_mutation(target, 1, 5, "arith")
+    assert "w = x * y / z" in target.read_text(encoding="utf-8")
+
+    target.write_text("w = x / y / z\n")
+    apply_mutation(target, 1, 9, "arith")
+    assert "w = x / y * z" in target.read_text(encoding="utf-8")
+
+
 def test_mutate_column_is_utf8_byte_offset(tmp_path):
     """含中文的行：col_offset 是 UTF-8 字节偏移，不是字符偏移。"""
     target = tmp_path / "mod.py"

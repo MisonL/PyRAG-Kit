@@ -29,7 +29,12 @@ uv run python scripts/audit/verify_sites.py \
 - `isnot`：`is not` ↔ `is`；
 - `eqneq`：`==` ↔ `!=`；
 - `cmpdir`：`<` ↔ `>`、`<=` ↔ `>=`（方向反转）；
-- `boolc`：`True` ↔ `False`（布尔字面量互换）。
+- `boolc`：`True` ↔ `False`（布尔字面量互换）；
+- `arith`：`+` ↔ `-`、`*` ↔ `/`（加减互换、乘除互换；只收数值二元运算，
+  字符串字面量参与的拼接不算位点，站点键取左操作数结尾以区分链式表达式）。
+  AST 无法静态区分类型，因此 `Path / x` 这类**路径拼接除法**也会进位点——其
+  变异体（`Path * str`）在运行期抛 `TypeError` 而被杀，只让 KILLED 计数虚高，
+  不产生假结论。
 
 `expected` 可为 `KILLED`、`SURVIVED`、`MUTFAIL` 或 `COLLECT_ERROR`。验证器会在启动时同步每个已注册且干净的 worktree 到主仓 HEAD；先跑未变异**基线套件**，不绿即中止（`--no-baseline` 可跳过，自担风险）；pytest 输出里出现 `No module named pytest`/`INTERNALERROR` 等基础设施故障标记时归为非判定（退出码 1 的「环境不可用」与「测试失败」同码）；选择器预检按 AST 收集函数名（顶格 def、类方法、async def 都识别，旧 `^def` 正则只认顶格）；pytest 退出码 4/5 不会被当成红测；源码行号漂移只在窗口内找到唯一最近节点时自动修正，否则明确报 `MUTFAIL`。每条变异都在 `finally` 中还原，结束时再次检查 worktree 清洁。
 
