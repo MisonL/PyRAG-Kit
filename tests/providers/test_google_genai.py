@@ -653,6 +653,46 @@ def test_google_partial_args_still_accepts_normal_paths():
     assert GoogleProvider._partial_arg_tokens("$") == []
 
 
+# ── 回归：嵌套路径的中间容器类型由**下一个** token 决定 ──
+#
+# ``_partial_args_to_mapping`` 在写入中途遇到「尚未创建的中间容器」时，用
+# ``isinstance(tokens[position + 1], int)`` 决定该填 ``[]`` 还是 ``{}``——路径
+# 下一段是数组下标就建 list，是对象键就建 dict。这条判据此前**从未被任何测试
+# 触达**：既有用例的 json_path 全是单段（``$.a[0]``／``$.country``），走到那
+# 一步时 ``position`` 已是最后一个 token（``last=True``），根本不会读
+# ``tokens[position + 1]``；只有 ``$.a[0][1]``／``$.a[0].b`` 这类**至少三段**
+# 的路径才经过它。把 ``position + 1`` 变异成 ``position - 1``（读上一段而非
+# 下一段的类型）时整套测试仍全绿，而真实行为已经改变——实测 ``$.a[0][1]``
+# 从 ``{'a': [[None, 'x']]}`` 变成抛 ``ValueError``（把内层 list 建成了 dict，
+# 写入时 ``isinstance(current, list)`` 判否）。
+def test_google_partial_args_nested_path_builds_container_from_next_token():
+    """中间容器的类型看**下一段**路径：数组下标建 list，对象键建 dict。"""
+    # ``$.a[0][1]``：在 ``a[0]`` 处下一段是下标 ``1`` -> 该位置建 list。
+    assert GoogleProvider._partial_args_to_mapping(
+        [{"json_path": "$.a[0][1]", "string_value": "x"}]
+    ) == {"a": [[None, "x"]]}
+    # ``$.a[0].b``：在 ``a[0]`` 处下一段是键 ``b`` -> 该位置建 dict。
+    assert GoogleProvider._partial_args_to_mapping(
+        [{"json_path": "$.a[0].b", "string_value": "x"}]
+    ) == {"a": [{"b": "x"}]}
+    # 更深一层：``$.a[0][1][2]`` 每段都按紧随其后的 token 建对应容器。
+    assert GoogleProvider._partial_args_to_mapping(
+        [{"json_path": "$.a[0][1][2]", "string_value": "x"}]
+    ) == {"a": [[None, [None, None, "x"]]]}
+
+
+def test_google_partial_args_nested_index_after_existing_list():
+    """中间容器已存在时按既有形态写入，不重建——区分「新建」与「复用」。"""
+    # 同一份 partial_args 里先建 ``a[0]`` 为 list，再往 ``a[0][1]`` 写。
+    result = GoogleProvider._partial_args_to_mapping(
+        [
+            {"json_path": "$.a[0][0]", "string_value": "first"},
+            {"json_path": "$.a[0][1]", "string_value": "second"},
+        ]
+    )
+    assert result == {"a": [["first", "second"]]}
+
+
 # ── 回归：Google 覆写的 embed_query 必须与基类保持同一兜底 ──
 #
 # ``TextEmbeddingModel`` 的默认 ``embed_query`` 先判 ``if not vectors`` 再取

@@ -810,3 +810,37 @@ def test_retrieval_menu_loops_until_back_is_chosen(monkeypatch):
     config_menu.edit_retrieval_params(chat_config)
 
     assert chat_config["top_k"] == 7, "循环未执行，编辑没有落盘"
+
+
+# ── 回归：权重编辑必须写回补数（``keyword = 1 - vector``，不是 ``1 + vector``）──
+#
+# ``arith`` 变异面扫出的缺口：``edit_retrieval_params`` 的 ``weights`` 分支把
+# ``new_keyword_weight = 1.0 - new_vector_weight`` 写回配置，而既有的 weights
+# 用例一律让 ``questionary.text`` 返回 ``_Choice(None)``（空输入 → 不写回），
+# 从未提交过真实权重值——把 ``-`` 变异成 ``+`` 后整套测试仍全绿，而用户把向量
+# 权重设成 0.2 时关键词权重会变成 1.2（越过 ``SessionConfig`` 的 0..1 上界）。
+def test_weights_selection_writes_complement_to_keyword_weight(monkeypatch):
+    """提交向量权重 0.2 时，关键词权重写回 ``0.8``（补数），不是 ``1.2``。"""
+    from src.ui import config_menu
+
+    answers = iter(["weights", "back"])
+
+    def _select(*_args, **_kwargs):
+        return _Choice(next(answers))
+
+    monkeypatch.setattr(config_menu.questionary, "select", _select)
+    monkeypatch.setattr(config_menu.questionary, "text", lambda *_a, **_k: _Choice("0.2"))
+    chat_config = {
+        "retrieval_method": RetrievalMethod.HYBRID_SEARCH,
+        "hybrid_fusion_strategy": "rrf",
+        "retrieval_candidate_multiplier": 3,
+        "top_k": 5,
+        "vector_weight": 0.5,
+        "keyword_weight": 0.5,
+        "rerank_enabled": False,
+    }
+
+    config_menu.edit_retrieval_params(chat_config)
+
+    assert chat_config["vector_weight"] == 0.2
+    assert chat_config["keyword_weight"] == 0.8

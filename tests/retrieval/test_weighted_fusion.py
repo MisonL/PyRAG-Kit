@@ -642,3 +642,49 @@ def test_merge_hybrid_results_still_accepts_document_lists():
     merged = _merge_hybrid_results(semantic, keyword)
 
     assert len(merged) == 2
+
+
+# ── 回归：权重归一化与 RRF 分母的算术必须被**取值**断言 ──
+#
+# ``arith`` 变异面（`+`↔`-`、`*`↔`/`）扫出的两处缺口。既有用例只覆盖了能
+# 「蒙对」的输入，未钉住实际算式：
+#
+# * ``_weight_tuple`` 的 ``self.vector_weight / total`` 与
+#   ``self.keyword_weight / total``：既有断言（``HybridReranker(0.0, 1.0)``／
+#   ``(0.5, 0.5)``）的 ``total`` 恰好都是 ``1.0``，而 ``x / 1.0`` 与 ``x * 1.0``
+#   恒等——把 ``/`` 变异成 ``*`` 后这些用例仍全绿。只有**非归一化**输入
+#   （两权重和 ≠ 1）才能区分。
+# * ``_rrf_rerank`` 的 ``1.0 / (self.rrf_k + semantic_rank)``（keyword 同）：
+#   既有用例只断言排序与「前者分更高」，而 ``rrf_k + rank`` 变异成
+#   ``rrf_k - rank`` 后**顺序不变**（RRF 由排名位置决定，仍是单调的）。必须
+#   断言具体的 RRF 分值 ``1/(k+rank)``。
+def test_weight_tuple_divides_by_total_not_multiplies():
+    """两权重之和不为 1 时必须**除以**总和归一化，不是乘以总和。
+
+    ``(0.2, 0.3)`` 的 ``total = 0.5``：正解 ``(0.4, 0.6)``；``/``→``*`` 变异
+    得 ``(0.1, 0.15)``。两者逐位不同。
+    """
+    assert HybridReranker(0.2, 0.3)._weight_tuple() == (0.4, 0.6)
+    assert HybridReranker(0.1, 0.4)._weight_tuple() == pytest.approx((0.2, 0.8))
+
+
+def test_rrf_rerank_score_uses_k_plus_rank():
+    """RRF 分值必须是 ``weight / (rrf_k + rank)``，不是 ``rrf_k - rank``。
+
+    **两路都要命中**：``semantic_rrf`` 与 ``keyword_rrf`` 各有一条
+    ``1.0 / (self.rrf_k + <rank>)``，是同一行代码里的两个独立位点。只让一路
+    命中（``keyword_rank=0`` 走 ``else 0.0``）只能覆盖其中一个，另一路的
+    ``+``→``-`` 变异仍存活——本用例让两路 rank 都为正，逐路钉住分值。
+
+    ``semantic_rank=2``、``keyword_rank=4``、``rrf_k=60``、两权重各 0.5：
+    正解 ``0.5/(60+2) + 0.5/(60+4) = 1/124 + 1/128``；任一路变异成
+    ``rrf_k - rank`` 后该路变成 ``1/58`` / ``1/56``，取值断言即红。
+    """
+    reranker = HybridReranker(
+        vector_weight=0.5, keyword_weight=0.5, fusion_strategy="rrf", rrf_k=60
+    )
+    documents = [{"page_content": "only", "semantic_rank": 2, "keyword_rank": 4}]
+
+    ranked = reranker.rerank(documents)
+
+    assert ranked[0]["score"] == pytest.approx(0.5 / (60 + 2) + 0.5 / (60 + 4))

@@ -927,3 +927,69 @@ def test_display_results_renders_the_column_header_row(monkeypatch):
     rendered = buffer.getvalue()
     for column in ("排名", "内容", "来源", "分数"):
         assert column in rendered, f"列头 {column!r} 未渲染：{rendered!r}"
+
+
+# ── 回归：召回结果表的排名必须从 1 起（``index + 1``，不是 ``index - 1``）──
+#
+# ``arith`` 变异面扫出的缺口：``display_results`` 的 ``table.add_row(str(index + 1),
+# ...)`` 决定第一列的排名号，而既有用例只断言正文／来源／查询文本，从未断言
+# 排名列——把 ``+ 1`` 变异成 ``- 1``（首条排名变 ``0`` 或负数）后整套测试仍全绿。
+# 排名是用户读结果表的定位依据，必须钉住。
+def test_display_results_ranks_start_at_one(monkeypatch):
+    """两条结果的排名分别是 ``"1"``、``"2"``（``index + 1`` 的正解）。
+
+    直接捕获 ``Table.add_row`` 的实参，逐行断言排名单元格——比在渲染输出里
+    ``in`` 匹配可靠（``"1"`` 会命中正文/分数里的任意一位数字，``+1``→``-1``
+    变异后那些字符仍在，断言不会红）。
+    """
+    from rich.table import Table
+
+    from src.retrieval_test.core import display_results
+
+    _console_buffer(monkeypatch)
+    added: list[tuple] = []
+    original = Table.add_row
+
+    def _capture(self, *args, **kwargs):
+        added.append(args)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Table, "add_row", _capture)
+
+    display_results(
+        "任意查询",
+        [
+            {"page_content": "第一条", "metadata": {"source": "a.md"}, "score": 0.9},
+            {"page_content": "第二条", "metadata": {"source": "b.md"}, "score": 0.5},
+        ],
+    )
+
+    assert added, "没有向结果表添加任何行"
+    ranks = [str(row[0]) for row in added]
+    assert ranks == ["1", "2"], ranks
+
+
+# ── 回归：Excel 日志的排名列必须从 1 起（``i + 1``，不是 ``i - 1``）──
+#
+# 与 ``display_results`` 的排名同源缺口：``ExcelLogger.log_results`` 的
+# ``rank = i + 1`` 写进第 3 列，而既有 Excel 用例只断言第 2/5/6 列
+# （查询／来源／内容），从未断言排名列——把 ``+ 1`` 变异成 ``- 1`` 后整套测试
+# 仍全绿，日志里的排名会从 ``-1``／``0`` 起，与召回测试界面的 ``1`` 起不一致。
+def test_excel_log_ranks_start_at_one(tmp_path):
+    """两条结果的排名列分别是 ``1``、``2``。"""
+    from openpyxl import load_workbook
+
+    from src.retrieval_test.excel_logger import ExcelLogger
+
+    logger = ExcelLogger(log_dir=str(tmp_path))
+    logger.log_results(
+        "任意查询",
+        [
+            {"page_content": "第一条", "metadata": {"source": "a.md"}, "score": 0.9},
+            {"page_content": "第二条", "metadata": {"source": "b.md"}, "score": 0.5},
+        ],
+    )
+
+    worksheet = load_workbook(logger.filepath).active
+    ranks = [worksheet.cell(row=row, column=3).value for row in (2, 3)]
+    assert ranks == [1, 2], ranks
