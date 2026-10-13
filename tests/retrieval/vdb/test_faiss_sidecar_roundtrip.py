@@ -112,6 +112,13 @@ def _make_valid_snapshot(snapshot_root, snapshot_id="kb-ok", *, activate=True):
     with (snapshot_dir / "parents.pkl").open("wb") as file:
         pickle.dump({}, file)
     np.save(snapshot_dir / "embeddings.npy", np.zeros((1, 4), dtype=np.float32))
+    # 生产 ``save_snapshot`` 恒写出 semantic.index（``faiss_index is None`` 时
+    # RuntimeError），夹具与之对齐——「有矩阵、无索引」现在是载入期拒绝形态。
+    import faiss as _faiss
+
+    index = _faiss.IndexFlatL2(4)
+    index.add(np.zeros((1, 4), dtype=np.float32))
+    _faiss.write_index(index, str(snapshot_dir / "semantic.index"))
     # lexical.index 也要是合法 pickle：空 bytes 会让 pickle.load 抛 EOFError，
     # 那是「文件被截断」而不是本节要测的信任边界。
     with (snapshot_dir / "lexical.index").open("wb") as file:
@@ -187,6 +194,11 @@ def test_load_snapshot_accepts_matching_lexical_index(tmp_path):
     with (snapshot_dir / "lexical.index").open("wb") as file:
         pickle.dump([["内容"], ["另一个分块"]], file)
     np.save(snapshot_dir / "embeddings.npy", np.zeros((2, 4), dtype=np.float32))
+    import faiss as _faiss
+
+    index = _faiss.IndexFlatL2(4)
+    index.add(np.zeros((2, 4), dtype=np.float32))
+    _faiss.write_index(index, str(snapshot_dir / "semantic.index"))
 
     store = FaissStore(file_path=None)
     store.load_snapshot(str(snapshot_dir), snapshot_root=tmp_path)
@@ -1861,3 +1873,74 @@ def test_faiss_store_rejects_non_1d_or_empty_query_vector(query_vector):
 
     with pytest.raises(ValueError, match="一维且非空"):
         store.semantic_search(query_vector, top_k=1)
+
+
+@pytest.mark.parametrize(
+    ("missing", "dim_e", "dim_i", "pattern"),
+    [
+        ("index", 4, 4, "向量矩阵存在而语义索引缺失"),
+        ("embeddings", 4, 4, "向量矩阵缺失而语义索引存在"),
+        (None, 4, 3, "维度与向量矩阵不一致"),
+    ],
+    ids=["missing-index", "missing-embeddings", "dim-mismatch"],
+)
+def test_load_snapshot_rejects_broken_existence_combinations(
+    tmp_path, missing, dim_e, dim_i, pattern
+):
+    """矩阵与索引的存在性组合与维度必须对齐（库级直调不经过 validate_snapshot_dir）。
+
+    三种残缺组合修复前都能载入成功：缺 semantic.index（有 lexical.index 时
+    不重建）→ ``semantic_search`` 静默空结果；缺 embeddings.npy → 矩阵与索引
+    并存的自相矛盾形态，同样静默空；维度错配 → 查询时 FAISS 抛空消息
+    ``AssertionError``。用户看到的都不是「这份快照坏了」。
+    """
+    snapshot_dir = _write_alignment_snapshot(tmp_path / "kb-combo", chunk_count=2, embedding_rows=2)
+    if missing == "index":
+        (snapshot_dir / "semantic.index").unlink()
+        # 缺 semantic.index 时必须同时有 lexical.index 才会走到 else 分支之外
+        # 的静默形态（有 lexical 就不重建索引）。
+        import pickle as _pickle
+
+        with (snapshot_dir / "lexical.index").open("wb") as file:
+            _pickle.dump([["a"], ["b"]], file)
+    elif missing == "embeddings":
+        (snapshot_dir / "embeddings.npy").unlink()
+    else:
+        import faiss as _faiss
+
+        idx = _faiss.IndexFlatL2(dim_i)
+        idx.add(np.zeros((2, dim_i), dtype=np.float32))
+        _faiss.write_index(idx, str(snapshot_dir / "semantic.index"))
+    _activate_snapshot(tmp_path, "kb-combo")
+
+    store = FaissStore(file_path=None)
+    with pytest.raises(ValueError, match=pattern):
+        store.load_snapshot(str(snapshot_dir), snapshot_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("content", "label"),
+    [(b"", "empty"), (b"\x80\x04\x95", "truncated")],
+)
+def test_load_converges_unreadable_pickle_to_value_error(tmp_path, content, label):
+    """空/截断的 legacy pkl 必须收敛为带指引的 ``ValueError``。
+
+    裸 ``EOFError``／``UnpicklingError`` 会穿透 ``Chatbot.__init__`` 被
+    ``main.py`` 的 ``except (KeyboardInterrupt, EOFError)`` 误判为用户中断，
+    程序以「检测到中断信号」正常退出——真因（文件损坏）无任何提示。
+    """
+    with tempfile.TemporaryDirectory() as temp_dir:
+        path = Path(temp_dir) / f"{label}.pkl"
+        path.write_bytes(content)
+        store = FaissStore(file_path=None)
+        with pytest.raises(ValueError, match="无法读取"):
+            store.load(str(path), trusted_paths=[temp_dir])
+
+
+def test_load_converges_directory_path_to_value_error(tmp_path):
+    """pkl_path 指向目录时同样收敛为 ``ValueError``（裸 IsADirectoryError 同链路）。"""
+    target = tmp_path / "adir"
+    target.mkdir()
+    store = FaissStore(file_path=None)
+    with pytest.raises(ValueError, match="无法读取"):
+        store.load(str(target), trusted_paths=[str(tmp_path)])

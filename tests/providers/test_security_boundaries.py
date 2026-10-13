@@ -162,7 +162,7 @@ _PAT_BODY = "11AAA0123aaaaBBBBcccc5678dddd"
 _XOX_BODY = "-123456789012-1234567890123-AbCdEfGhIjKlMnOpQrStUvWx"
 _AKIA_BODY = "IOSFODNN7EXAMPLE"
 _ASIA_BODY = "0123456789ABCDEF12"
-_JINA_BODY = "0123456789abcdef0123456789abcdef"
+_JINA_BODY = "0123456789abcdef0123456789abc123"
 
 
 @pytest.mark.parametrize(
@@ -1056,3 +1056,38 @@ def test_secret_free_options_nested_non_string_key_reports_path():
     """
     with pytest.raises(ValueError, match=r"Jina Rerank options 的 outer\.inner 的键必须是字符串"):
         validate_secret_free_options({"outer": {"inner": {1: "x"}}}, "Jina Rerank")
+
+
+@pytest.mark.parametrize(
+    "credential",
+    [
+        # GitHub 非 PAT 家族：OAuth / server-to-server / user-to-server / refresh。
+        "gho_" + "A" * 36,
+        "ghs_" + "B" * 36,
+        "ghu_" + "C" * 36,
+        "ghr_" + "D" * 36,
+        # Slack refresh 与 app-level token。
+        "xoxe-" + "E" * 30,
+        "xapp-" + "F" * 30,
+    ],
+)
+def test_security_redacts_github_and_slack_prefix_variants(credential):
+    redacted = redact_sensitive_text(credential)
+    assert credential not in redacted
+    assert "[REDACTED]" in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # 知识库正文里的标识符：体不含数字，不得误脱敏（实测修复前误伤）。
+        "jina_" + "a" * 30,
+        "jina_embedding_model_v3_" + "x" * 30,
+        "github_pat_" + "_a" * 15,
+        "github_pat_" + "_" * 25,
+    ],
+)
+def test_security_does_not_redact_prefix_without_digit_in_body(text):
+    """体不含数字的自证前缀长串是普通文本，不是凭证。"""
+    assert "[REDACTED]" not in redact_sensitive_text(text)
+    assert redact_sensitive_text(text) == text

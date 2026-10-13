@@ -350,11 +350,18 @@ _AK_SK_PREFIXED_KEY_RE = re.compile(
 # ``xoxb is a prefix`` 这类不带体的前缀词不命中）。
 _SELF_ATTESTING_PREFIX_RE = re.compile(
     r"(?<![A-Za-z0-9])(?:"
-    r"ghp_[0-9A-Za-z]{30,}"
-    r"|github_pat_[0-9A-Za-z_]{20,}"
-    r"|xox[abposr]-[0-9A-Za-z-]{10,}"
+    # GitHub token 家族共享 ``gh[x]_`` 形态：PAT 之外还有 OAuth（``gho_``）、
+    # server-to-server（``ghs_``）、user-to-server（``ghu_``）与 refresh
+    # （``ghr_``），体同为 36+ 字符——异常回显里哪一种都可能。
+    r"gh[pousr]_[0-9A-Za-z]{30,}"
+    # 体要求**含数字**（前瞻）：真实 token 是随机混合，必然含数字；纯字母/下划线的
+    # ``github_pat_轮换流程_…`` 这类知识库正文标识符不再被误脱敏（实测修复前误伤）。
+    r"|github_pat_(?=[0-9A-Za-z_]{20,}[0-9])[0-9A-Za-z_]{20,}"
+    # Slack 的 refresh（``xoxe-``）与 app-level（``xapp-``）同样自证前缀。
+    r"|xox[abper]-[0-9A-Za-z-]{10,}"
+    r"|xapp-[0-9A-Za-z-]{10,}"
     r"|(?:AKIA|ASIA)[0-9A-Z]{16,}"
-    r"|jina_[0-9A-Za-z]{30,}"
+    r"|jina_(?=[0-9A-Za-z]{30,}[0-9])[0-9A-Za-z]{30,}"
     r")(?![A-Za-z0-9])"
 )
 

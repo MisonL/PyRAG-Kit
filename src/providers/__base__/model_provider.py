@@ -1825,6 +1825,11 @@ def retry_sync_stream(
             # 按 ``is_retryable_error`` 的类名判据决定要不要重试，替身/自定义
             # 迭代器的 ``close`` 抛错会让可重试的 429 被不可重试的关闭异常
             # 顶替（实测只尝试 1 次），或反向让不可重试错误被重发 3 次。
+            #
+            # 底层 response 也要在这里补关（与消费阶段 ``finally`` 同判据）：
+            # openai/anthropic 的 ``Stream.__iter__`` 是生成器函数，包装形态下
+            # ``iterator.close()`` 只终止包装层——validator 拒绝（正是 429 重试
+            # 路径）时每次重试泄漏一条连接（实测 3 次 = 3 个未关闭 response）。
             close = getattr(iterator, "close", None)
             if close is not None:
                 try:
@@ -1832,6 +1837,13 @@ def retry_sync_stream(
                 except Exception as close_exc:  # noqa: BLE001
                     # 清理失败不得顶替原始异常——吞掉但留一条调试日志。
                     logger.debug("建立阶段清理流失败: %s", safe_exception_text(close_exc))
+            if response is not iterator:
+                response_close = getattr(response, "close", None)
+                if response_close is not None:
+                    try:
+                        response_close()
+                    except Exception as close_exc:  # noqa: BLE001
+                        logger.debug("建立阶段清理响应失败: %s", safe_exception_text(close_exc))
             raise
 
     response, iterator, first = retry_sync_call(open_and_peek)

@@ -31,8 +31,8 @@ src/providers/anthropic.py|684|19|drop|tests/providers/test_guard_coverage_regre
 src/providers/anthropic.py|841|71|isnot|tests/providers/test_guard_coverage_regressions.py::test_anthropic_beta_only_fields_rejected_without_beta|KILLED
 src/providers/anthropic.py|972|19|isnot||SURVIVED
 src/providers/anthropic.py|981|19|isnot|tests/providers/test_guard_coverage_regressions.py::test_anthropic_duplicate_sampling_field_with_extra_body|KILLED
-src/ui/config_menu.py|234|15|isnot|tests/ui/test_config_menu.py::test_edit_retrieval_params_writes_rerank_toggle|KILLED
-src/ui/config_menu.py|447|15|isnot|tests/ui/test_config_menu.py::test_edit_model_params_writes_selected_rerank_configuration|KILLED
+src/ui/config_menu.py|243|15|isnot|tests/ui/test_config_menu.py::test_edit_retrieval_params_writes_rerank_toggle|KILLED
+src/ui/config_menu.py|456|15|isnot|tests/ui/test_config_menu.py::test_edit_model_params_writes_selected_rerank_configuration|KILLED
 src/retrieval_test/excel_logger.py|346|84|isnot|tests/retrieval_test/test_retrieval_cli.py::test_excel_log_drops_none_scores_from_all_scores_column|KILLED
 src/providers/factory.py|356|16|isnot||SURVIVED
 src/providers/google.py|1798|27|drop|tests/providers/test_guard_coverage_regressions.py::test_google_tool_result_part_resolves_name_from_call_id|KILLED
@@ -56,8 +56,8 @@ src/providers/openai_compatible.py|5292|15|isnot|tests/providers/test_guard_cove
 src/providers/openai_compatible.py|590|33|isnot|tests/providers/test_guard_coverage_regressions.py::test_openai_response_retrieve_kwargs_drops_none_values|KILLED
 src/providers/openai_compatible.py|996|58|drop|tests/providers/test_guard_coverage_regressions.py::test_openai_compatible_merge_resource_kwargs_keeps_none_by_default|KILLED
 src/providers/openai_compatible.py|996|75|isnot|tests/providers/test_guard_coverage_regressions.py::test_openai_compatible_merge_resource_kwargs_omits_none_when_requested|KILLED
-src/utils/security.py|528|11|isnot|tests/providers/test_security_boundaries.py::test_secret_free_options_keeps_self_copied_sdk_model|KILLED
-src/utils/security.py|709|49|drop|tests/providers/test_security_boundaries.py::test_secret_free_options_nested_non_string_key_reports_path|KILLED
+src/utils/security.py|535|11|isnot|tests/providers/test_security_boundaries.py::test_secret_free_options_keeps_self_copied_sdk_model|KILLED
+src/utils/security.py|716|49|drop|tests/providers/test_security_boundaries.py::test_secret_free_options_nested_non_string_key_reports_path|KILLED
 src/providers/volcengine.py|1428|38|isnot|tests/providers/test_guard_coverage_regressions.py::test_ark_responses_native_kwargs_validate_extra_body_secrets|KILLED
 src/providers/volcengine.py|1841|31|notin|tests/providers/test_guard_coverage_regressions.py::test_ark_responses_sync_deduplicates_tool_call_delivered_by_finish|KILLED
 src/providers/volcengine.py|1876|27|notin|tests/providers/test_guard_coverage_regressions.py::test_ark_responses_sync_emits_completed_before_later_events|KILLED

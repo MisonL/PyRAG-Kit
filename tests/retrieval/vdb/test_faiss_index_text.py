@@ -129,6 +129,11 @@ def test_load_snapshot_tolerates_empty_lexical_index(tmp_path):
         with (snapshot_dir / name).open("wb") as file:
             pickle.dump(payload, file)
     np.save(snapshot_dir / "embeddings.npy", np.zeros((0, 4), dtype=np.float32))
+    # 空 store 也要带空索引（生产 save_snapshot 恒写出该文件；缺它 + 有
+    # lexical.index 现在是载入期拒绝形态）。
+    import faiss
+
+    faiss.write_index(faiss.IndexFlatL2(4), str(snapshot_dir / "semantic.index"))
     (snapshot_root / "ACTIVE_SNAPSHOT").write_text("kb-empty", encoding="utf-8")
 
     store = FaissStore(file_path=None)

@@ -141,6 +141,12 @@ class VectorStoreFactory:
         # 只信任配置里声明的 legacy 文件所在目录：这条路径要 pickle.load，
         # 而路径本身不能证明来源。
         store.load(str(legacy_path), trusted_paths=[legacy_path.parent])
+        # 配置校验放在 ``save_snapshot`` **之前**：空 legacy 文件（合法 pickle、
+        # 无内容）会让 ``save_snapshot`` 抛「当前语义索引为空」的裸
+        # ``RuntimeError``，用户无从知道真实原因是 legacy 文件是空的——若
+        # 配置也缺，先撞哪个取决于磁盘状态而非原因主次。先验配置，空库场景
+        # 给出可读的原因。
+        embedding_detail = VectorStoreFactory._require_embedding_detail(run_config)
         snapshot_id = snapshot_repository.generate_snapshot_id(prefix="legacy")
         temp_dir = snapshot_repository.create_temp_snapshot_dir(snapshot_id)
         finalized = False
@@ -148,7 +154,6 @@ class VectorStoreFactory:
             store.save_snapshot(str(temp_dir))
             # 与活动快照分支同一处取值、同一判据（见 ``_require_embedding_detail``）：
             # 此前这里直接下标，缺配置时抛裸 ``KeyError``。
-            embedding_detail = VectorStoreFactory._require_embedding_detail(run_config)
             manifest = KnowledgeSnapshotManifest.create(
                 snapshot_id=snapshot_id,
                 store_type=run_config.default_vector_store,

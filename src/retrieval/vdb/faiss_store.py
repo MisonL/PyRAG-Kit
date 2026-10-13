@@ -821,8 +821,21 @@ class FaissStore(VectorStoreBase):
         if not os.path.exists(path):
             raise FileNotFoundError(f"向量存储文件未找到: {path}")
         ensure_trusted_source(path, trusted_paths, label="legacy 向量存储文件")
-        with open(path, "rb") as file:
-            data = pickle.load(file)  # nosec B301 - 上方已校验来源
+        # 空/截断文件让 ``pickle.load`` 抛 ``EOFError``／``UnpicklingError``，
+        # 目录/无读权限抛 ``IsADirectoryError``／``PermissionError``——裸异常
+        # 穿透 ``Chatbot.__init__`` 后被 ``main.py`` 的
+        # ``except (KeyboardInterrupt, EOFError)`` **误判为用户中断**，程序以
+        # 「检测到中断信号」正常退出（实测复现），真因（文件损坏）无任何提示。
+        # 本方法其余拒绝路径承诺带指引的 ``ValueError``，这里一并收敛。
+        try:
+            with open(path, "rb") as file:
+                data = pickle.load(file)  # nosec B301 - 上方已校验来源
+        except (OSError, EOFError, pickle.UnpicklingError) as exc:
+            raise ValueError(
+                f"legacy 向量存储文件无法读取（{type(exc).__name__}: {exc}）："
+                f"{path}。文件可能为空、被截断或是目录；请检查该文件，"
+                "或重新构建知识快照。"
+            ) from exc
         # 全部解析、校验到**局部变量**，最后一次性赋给 ``self``。原先先把三个
         # 字段赋进 ``self`` 再调 ``_normalize_loaded_documents``，中途失败就留下
         # 半更新的 store——实测一次被拒的载入之后：``documents`` 换成了新值、
@@ -856,7 +869,14 @@ class FaissStore(VectorStoreBase):
 
     def save_snapshot(self, snapshot_dir: str):
         if self.faiss_index is None or self.embeddings is None:
-            raise RuntimeError("当前语义索引为空，无法保存快照。")
+            # 消息带上「来源是空数据」的可能：legacy 导入分支传入空 legacy
+            # 文件（合法 pickle、``documents: []``）时也会走到这里，裸
+            # 「语义索引为空」让用户无从知道真实原因是**来源文件没有内容**。
+            raise RuntimeError(
+                "当前语义索引为空，无法保存快照。"
+                "若来源是 legacy 向量存储文件，请确认其包含 documents 与"
+                " embeddings 数据（空文件无法构建快照）。"
+            )
         # 与 ``save`` 同一处、同一判据（详见那里的说明）：``Path(5)`` 抛裸
         # ``TypeError``、位数超限的整数抛 ``ValueError: Exceeds the limit``，都绕开
         # 本类的 ``ValueError`` 契约。写入侧入口的形态判据与读取侧对齐。
@@ -998,6 +1018,28 @@ class FaissStore(VectorStoreBase):
         # 缺它是合法状态（下面的 ``else`` 分支就是为它准备的）。``load()`` 早已
         # 是正确的顺序，两处对齐。
         documents, parent_documents = self._normalize_documents(raw_documents, raw_parent_documents)
+        # 维度不变量：矩阵与索引都在时维度必须一致。行数全对齐但维度错配的
+        # 快照能载入成功，查询时 FAISS 抛**空消息** ``AssertionError``（实测）
+        # ——用户看到的不是「这份快照坏了」。生产路径由
+        # ``validate_snapshot_dir`` 挡住，这里是库级契约方法的同类守卫。
+        if embeddings is not None and faiss_index is not None:
+            index_dim = getattr(faiss_index, "d", None)
+            if index_dim is not None and int(index_dim) != int(embeddings.shape[1]):
+                raise ValueError(
+                    "知识快照不自洽：语义索引维度与向量矩阵不一致。"
+                    f" semantic.index.d={int(index_dim)}，"
+                    f"embeddings.shape[1]={int(embeddings.shape[1])}。"
+                    " 请重建知识快照。"
+                )
+        # ``embeddings`` 缺失而索引存在是自相矛盾形态（重建也无从着手），
+        # 同样拦下——但**索引缺失而矩阵存在**是合法形态：下方无
+        # ``lexical.index`` 的分支会从矩阵重建索引。它的缺陷形态（有
+        # lexical 就不重建 → 静默空语义检索）在该分支内拦，见下。
+        if embeddings is None and faiss_index is not None:
+            raise ValueError(
+                "知识快照不自洽：向量矩阵缺失而语义索引存在。"
+                " 快照可能在写入或复制过程中被截断，请重建。"
+            )
         # 三条行数必须对齐：embeddings 行数、``semantic.index`` 条数与
         # ``documents`` 数。此前只校验了索引这一条，embeddings 行数错配仍能
         # 载入成功——``semantic_search`` 的分数来自矩阵行、文档来自下标，错配
@@ -1096,6 +1138,15 @@ class FaissStore(VectorStoreBase):
         if lexical_path.exists():
             self._tokenized_docs_cache = lexical_cache
             self.bm25_index = lexical_bm25
+            # 有 lexical 就不重建索引：矩阵存在而索引缺失的快照在这里会让
+            # ``semantic_search`` 对有文档有向量的数据静默返回 ``[]``（实测）。
+            # 合法快照（本项目写出）二者同在，此形态即「快照残缺」。
+            if embeddings is not None and faiss_index is None:
+                raise ValueError(
+                    "知识快照不自洽：向量矩阵存在而语义索引缺失"
+                    "（且存在 lexical.index，不会触发索引重建）。"
+                    " 快照可能在写入或复制过程中被截断，请重建。"
+                )
         else:
             self._rebuild_indices()
 

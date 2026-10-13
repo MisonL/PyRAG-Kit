@@ -1711,3 +1711,28 @@ def test_validate_snapshot_dir_rejects_non_matrix_embeddings(run_config, shape):
 
     with pytest.raises(ValueError, match="不是二维数组"):
         repository.validate_snapshot_dir(snapshot_dir)
+
+
+def test_get_active_snapshot_dir_raises_when_target_dir_missing(tmp_path):
+    """标记存在、id 合法、目录消失时必须显式报错，不得静默回退为「无快照」。
+
+    返回 ``None`` 会让 ``_load_existing_state`` 落入 legacy/空 store 分支：
+    legacy 文件恰好存在时旧数据被导入并改写激活标记（用户误以为重建了快照），
+    否则静默以空 store 启动、检索永远空结果——真实状态（激活标记已损坏）
+    被掩盖成「没有快照」。
+    """
+    from src.retrieval.snapshot_repository import SnapshotRepository
+    from src.utils.config import get_settings
+
+    repository = SnapshotRepository(build_run_config(get_settings()))
+    snapshot_dir = _write_row_counts_snapshot(
+        repository.root, "kb-vanished", chunk_count=1, embedding_rows=1
+    )
+    (repository.root / "ACTIVE_SNAPSHOT").write_text("kb-vanished", encoding="utf-8")
+    # 目录消失，标记仍在。
+    import shutil
+
+    shutil.rmtree(snapshot_dir)
+
+    with pytest.raises(FileNotFoundError, match="快照目录不存在"):
+        repository.get_active_snapshot_dir()

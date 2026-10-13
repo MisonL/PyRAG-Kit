@@ -6,6 +6,15 @@
 
 ### 修复
 
+- **第二轮四维 agents 复查收口（对抗性复查上一轮修复 + 全链路残缺形态）**。四名 agent 对 `dad5e9a` 复查，逐条探针复现后修复，全部红/绿验证：
+  - **空/截断 legacy pkl 让程序以「检测到中断信号」退出（高）**：`FaissStore.load` 的裸 `EOFError` 穿透 `Chatbot.__init__` 被 `main.py` 的 `except (KeyboardInterrupt, EOFError)` 误判为用户中断，`sys.exit(0)`——真因（文件损坏）无任何提示。`(OSError, EOFError, UnpicklingError)` 收敛为带指引 `ValueError`（空文件/截断/目录三形态实测）。
+  - **「未知」占位串打断 method 子菜单（高）**：非法 `retrieval_method` 时 `default=current_method` 把 `"未知"` 传给 questionary，构造期抛 `Invalid 'default' value`，method 分支（唯一能写回该字段的入口）整个退出——与该改动的救济目标相反。default 不在候选集合时传 `None`（与 `_normalized_fusion_default` 同构）。
+  - **`load_snapshot` 三种残缺组合静默丢语义检索或崩空消息 AssertionError（中）**：缺 `semantic.index`（有 lexical 不重建）、缺 `embeddings.npy`（矩阵与索引并存的自相矛盾形态）、维度错配——库级直调不经 `validate_snapshot_dir` 全部放行。补存在性组合与维度两条不变量（精确到分支：无 lexical 的重建路径仍合法）。
+  - **悬空的 ACTIVE_SNAPSHOT 标记静默降级为空 store（中）**：`get_active_snapshot_dir` 对「标记在、目录消失」返回 `None`，legacy 文件恰好存在时旧数据被导入并改写激活标记。改为显式 `FileNotFoundError` 带重建指引。
+  - **`retry_sync_stream` 建立阶段 validator 失败泄漏连接（中低）**：上一轮只在消费阶段 `finally` 补关 response，429 重试主路径（建立阶段 validator 拒绝）每次重试泄漏一条底层连接（实测 3 次 = 3 个未关闭）。`open_and_peek` 异常分支同判据补关。
+  - **GitHub/Slack 凭证前缀变体与 `jina_`/`github_pat_` 误伤（低）**：`gho_`/`ghs_`/`ghu_`/`ghr_`、`xoxe-`/`xapp-` 不脱敏；纯字母/下划线长体被误 REDACTED（知识库正文破坏）。正则扩 `gh[pousr]_`/`xox[abper]-`/`xapp-`，体加「含数字」前瞻（真实凭证随机混合必含数字，正文标识符不含）；ReDoS 探针全过（对抗输入 ≤7ms）。legacy 空库导入的报错顺序与消息同步修正；green38 夹具两轮漂移重基线（security.py 2 处、config_menu.py 2 处）。
+  - **已核实不修**：base_url 无前缀 hex 路径段（拦截会误伤普通资源 ID，设计取舍）；`/config` 编辑器内 Ctrl+C 终止会话（与主提示符语义一致）；编辑器取消=保存（既有取舍）；set 形态 parent_id 摘要键跨进程不稳定（生产 splitter 只产字符串 id，不可达）。
+
 - **四维 agents 全维度终审（并发/生命周期、数据完整性、安全、错误契约/UI）收口**。四名审查 agent 对分支相对 `origin/main` 的全部改动做对抗性审查，逐条用真实入口探针复现后修复：
   - **裸自证前缀凭证不脱敏（安全·已验证）**：`ghp_`／`github_pat_`／`xox[abposr]-`／`AKIA|ASIA`／`jina_` 开头的裸凭证不落在 `sk-`/`AIza` 等既有模式里，日志与异常文本原样外泄。`src/utils/security.py` 新增 `_SELF_ATTESTING_PREFIX_RE`（前缀 + 主体字符类的正则，前后向断言拒绝普通单词），并入脱敏管线；12 条正/反用例钉死。
   - **键塌缩三处（数据完整性·已验证）**：`_key_text`（`retrieval_service.py`）与 `_parent_key`（`faiss_store.py`）对 repr 超 80 字符的非标量值退回 `safe_repr`，截断后不同值塌成同键，去重/父块字典静默并条；`_parent_key` 对 numpy 2.x 标量（非 `int` 子类）给 `np.int64(3)` 形态键，与 main 时代 `str()` 快照失配、召回静默 miss。修复：超限值对 repr 字节取 sha256 摘要；numpy 标量经 `.item()` 归一为与 main 逐字一致的键。注意判据必须落在**真实 repr** 上——`safe_repr` 截断输出恰好 80 字符，拿 `len(rendered) > 80` 判断永不触发（实测）。快照加载新增 `_validate_row_alignment`：embeddings 行数、`semantic.index` 条数与分块数三量对齐，`load_snapshot` 与 legacy `load` 共用，拒绝保持原子性。

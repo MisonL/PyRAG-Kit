@@ -880,3 +880,72 @@ def test_menu_shows_unknown_for_invalid_retrieval_method(monkeypatch):
     method_item = next(item for item in seen if "检索模式" in str(item))
     assert "未知" in str(method_item)
     assert "None" not in str(method_item)
+
+
+def test_method_submenu_default_is_valid_when_method_is_invalid(monkeypatch):
+    """非法 ``retrieval_method`` 时 method 子菜单的 ``default`` 必须收敛。
+
+    「未知」占位串传给 ``questionary.select(default=...)`` 会在**构造期**抛
+    ``ValueError: Invalid 'default' value``（实测逐字复现），整个编辑器退出
+    ——method 分支是唯一能写 ``retrieval_method`` 的入口，恰是该字段唯一还能
+    被修回合法值的路径。替身校验 ``default`` 必须在候选值集合内或为 ``None``。
+    """
+    from src.ui import config_menu
+
+    seen_defaults: list = []
+    answers = iter(["method", None, "back"])
+
+    def select(_prompt, choices=None, default=None, **_kwargs):
+        if _prompt == "选择新的检索模式:":
+            seen_defaults.append(default)
+            choice_values = {c.value for c in choices}
+            if default is not None and default not in choice_values:
+                raise ValueError(
+                    f"Invalid `default` value passed. The value (`{default}`) "
+                    "does not exist in the set of choices."
+                )
+        return _Choice(next(answers))
+
+    monkeypatch.setattr(config_menu.questionary, "select", select)
+    chat_config = {
+        "retrieval_method": "bogus",
+        "hybrid_fusion_strategy": "rrf",
+        "retrieval_candidate_multiplier": 3,
+        "top_k": 5,
+        "vector_weight": 0.5,
+        "keyword_weight": 0.5,
+        "rerank_enabled": False,
+    }
+
+    config_menu.edit_retrieval_params(chat_config)
+
+    assert seen_defaults == [None]  # 非法时传 None，不预选
+
+
+def test_method_submenu_default_keeps_valid_method(monkeypatch):
+    """合法 method 照旧预选，收紧不能误伤。"""
+    from src.ui import config_menu
+    from src.utils.config import RetrievalMethod
+
+    seen_defaults: list = []
+    answers = iter(["method", None, "back"])
+
+    def select(_prompt, choices=None, default=None, **_kwargs):
+        if _prompt == "选择新的检索模式:":
+            seen_defaults.append(default)
+        return _Choice(next(answers))
+
+    monkeypatch.setattr(config_menu.questionary, "select", select)
+    chat_config = {
+        "retrieval_method": RetrievalMethod.HYBRID_SEARCH,
+        "hybrid_fusion_strategy": "rrf",
+        "retrieval_candidate_multiplier": 3,
+        "top_k": 5,
+        "vector_weight": 0.5,
+        "keyword_weight": 0.5,
+        "rerank_enabled": False,
+    }
+
+    config_menu.edit_retrieval_params(chat_config)
+
+    assert seen_defaults == [RetrievalMethod.HYBRID_SEARCH.value]

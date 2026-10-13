@@ -182,16 +182,25 @@ def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
             break
 
         if choice == "method":
+            # ``default`` 必须是候选集合内的值：非法 ``retrieval_method`` 时
+            # ``current_method`` 是「未知」占位串，直接传给 questionary 会在
+            # **构造期**抛 ``ValueError: Invalid 'default' value``（实测），
+            # 整个编辑器退出——method 分支是唯一能写 ``retrieval_method`` 的
+            # 入口，恰是该字段唯一还能被修回合法值的路径。与
+            # ``_normalized_fusion_default`` 同构：不在候选集合时传 ``None``
+            # （不预选，仍是合法参数）。
+            method_choices = [
+                questionary.Choice("全文检索", value=RetrievalMethod.FULL_TEXT_SEARCH.value),
+                questionary.Choice("向量检索", value=RetrievalMethod.SEMANTIC_SEARCH.value),
+                questionary.Choice(
+                    "混合检索 (全文+向量)", value=RetrievalMethod.HYBRID_SEARCH.value
+                ),
+            ]
+            method_values = {item.value for item in method_choices}
             new_method = questionary.select(
                 "选择新的检索模式:",
-                choices=[
-                    questionary.Choice("全文检索", value=RetrievalMethod.FULL_TEXT_SEARCH.value),
-                    questionary.Choice("向量检索", value=RetrievalMethod.SEMANTIC_SEARCH.value),
-                    questionary.Choice(
-                        "混合检索 (全文+向量)", value=RetrievalMethod.HYBRID_SEARCH.value
-                    ),
-                ],
-                default=current_method,
+                choices=method_choices,
+                default=current_method if current_method in method_values else None,
             ).ask()
             if new_method:
                 chat_config["retrieval_method"] = RetrievalMethod(new_method)

@@ -157,7 +157,20 @@ class SnapshotRepository:
         if not snapshot_id:
             return None
         snapshot_dir = self.root / snapshot_id
-        return snapshot_dir if snapshot_dir.exists() else None
+        if not snapshot_dir.exists():
+            # 标记存在、id 合法、目录消失——激活快照被外部删除。返回 ``None``
+            # 会让 ``_load_existing_state`` 落入 legacy/空 store 分支：legacy
+            # 文件恰好存在时旧数据被导入并**改写激活标记**（用户误以为重建了
+            # 快照），否则静默以空 store 启动、检索永远空结果——两者都把
+            # 「激活标记已损坏」这一真实状态掩盖成「没有快照」（实测）。
+            # 显式报错并给出重建指引。
+            raise FileNotFoundError(
+                f"ACTIVE_SNAPSHOT 标记指向的快照目录不存在: {snapshot_dir}"
+                f"（标记文件: {self.run_config.active_snapshot_marker}，"
+                f"内容: {snapshot_id}）。快照目录可能被移动或删除；"
+                "请重新构建知识快照，或删除该标记后走 legacy 导入。"
+            )
+        return snapshot_dir
 
     def create_temp_snapshot_dir(self, snapshot_id: str) -> Path:
         self._require_snapshot_id_within_root(snapshot_id, source="create_temp_snapshot_dir")

@@ -1282,3 +1282,38 @@ def test_retry_sync_stream_validator_failure_keeps_original_error():
         list(retry(lambda: stream, lambda _first: None))
     assert "原始错误" in str(excinfo.value)
     assert stream.closed is True  # 清理确实执行了
+
+
+def test_retry_sync_stream_validator_failure_closes_underlying_response():
+    """建立阶段 validator 失败时也必须关底层 response，且每次重试都关。
+
+    openai/anthropic 的 ``Stream.__iter__`` 是生成器函数——包装形态下
+    ``iterator.close()`` 只终止包装层。validator 拒绝正是 429 重试路径：
+    修复前 3 次重试各泄漏一条未关闭连接（实测 ``[False, False, False]``）。
+    """
+    closed = []
+
+    class FakeResponse:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+        def __iter__(self):
+            # 生成器函数形态，与 openai.Stream.__iter__ 同构——不是 return self。
+            yield "first"
+            yield "second"
+
+    def factory():
+        response = FakeResponse()
+        closed.append(response)
+        return response
+
+    def validator(_first):
+        raise ConnectionError("429")
+
+    with pytest.raises(ConnectionError):
+        list(retry_sync_stream(factory, validator))
+
+    assert [response.closed for response in closed] == [True, True, True]
