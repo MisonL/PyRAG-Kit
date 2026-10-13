@@ -1944,3 +1944,37 @@ def test_load_converges_directory_path_to_value_error(tmp_path):
     store = FaissStore(file_path=None)
     with pytest.raises(ValueError, match="无法读取"):
         store.load(str(target), trusted_paths=[str(tmp_path)])
+
+
+def test_load_snapshot_existence_rejection_leaves_store_untouched(tmp_path):
+    """「有 lexical 而索引缺失」的拒绝必须原子：store 保持原状。
+
+    该守卫只读局部变量，放批量赋值**之后**时抛 ``ValueError`` 前已把
+    documents/embeddings/faiss_index/_tokenized_docs_cache 全部改写（实测
+    五字段全变）——同文件三处注释声明的「拒绝的载入不改 store」契约被破坏。
+    """
+    import pickle as _pickle
+
+    snapshot_dir = tmp_path / "kb-atomic"
+    snapshot_dir.mkdir()
+    with (snapshot_dir / "chunks.pkl").open("wb") as file:
+        _pickle.dump([{"page_content": "new-doc", "metadata": {}}], file)
+    with (snapshot_dir / "parents.pkl").open("wb") as file:
+        _pickle.dump({}, file)
+    np.save(snapshot_dir / "embeddings.npy", np.zeros((1, 4), dtype=np.float32))
+    with (snapshot_dir / "lexical.index").open("wb") as file:
+        _pickle.dump([["new-doc"]], file)
+    # 不写 semantic.index
+    _activate_snapshot(tmp_path, "kb-atomic")
+
+    store = FaissStore(file_path=None)
+    store.upsert_embeddings(
+        [{"page_content": "old-doc", "metadata": {}}], np.zeros((1, 4), dtype=np.float32)
+    )
+    before = (list(store.documents), store.embeddings.shape, store.faiss_index.ntotal)
+
+    with pytest.raises(ValueError, match="向量矩阵存在而语义索引缺失"):
+        store.load_snapshot(str(snapshot_dir), snapshot_root=tmp_path)
+
+    after = (list(store.documents), store.embeddings.shape, store.faiss_index.ntotal)
+    assert before == after

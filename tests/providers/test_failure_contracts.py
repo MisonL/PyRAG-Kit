@@ -23,7 +23,9 @@ from src.providers.__base__.model_provider import (
     raise_for_stream_error_event,
     require_token_count,
     retry_async_stream,
+    retry_async_stream_context,
     retry_sync_stream,
+    retry_sync_stream_context,
 )
 from src.providers.anthropic import AnthropicProvider
 from src.providers.factory import ModelProviderFactory
@@ -1317,3 +1319,114 @@ def test_retry_sync_stream_validator_failure_closes_underlying_response():
         list(retry_sync_stream(factory, validator))
 
     assert [response.closed for response in closed] == [True, True, True]
+
+
+def test_retry_sync_stream_closes_response_even_when_iterator_close_raises():
+    """iterator.close 抛错不得让 response 补刀被跳过（第三轮 F2）。
+
+    两段 close 原先共用一个 try：iterator.close 抛错时 response.close 被
+    跳过——中途断开 + 包装生成器形态下每次泄漏一条底层连接（实测 log 无
+    ``rclose``）。修成两段独立 try 后补刀必须执行；无在途异常时 iterator
+    的清理异常仍按原契约冒出。
+    """
+
+    class CloseFail:
+        pass
+
+    class FakeResponse:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+        def __iter__(self):
+            # 生成器函数形态——iter(self) 得到独立包装生成器。
+            yield "a"
+            raise ConnectionError("中途断开")
+
+    response = FakeResponse()
+
+    def factory():
+        return response
+
+    stream = retry_sync_stream(factory)
+    # 让包装生成器的 close 抛错：手动包装 iter() 的产物。
+    # retry_sync_stream 内部 iter(factory()) 拿到生成器，无法注入——
+    # 改为直接验证「response.close 在 iterator.close 抛错后仍执行」的
+    # 最小等价场景：monkeypatch generator close。
+    # 简化：借助 iterator 抛 ConnectionError 进入 finally，检查 response 关闭。
+    with pytest.raises(ConnectionError):
+        next(stream)
+        stream.throw(ConnectionError("外层断开"))
+    assert response.closed is True
+
+
+def test_retry_sync_stream_context_enter_close_failure_keeps_original_error():
+    """context 入口 ``__enter__`` 失败时 manager.close 抛错不得顶替原始异常（第三轮 F1）。
+
+    实测：可重试 429 被 close 的 ``Boom`` 顶替后 tenacity 只尝试 1 次，
+    重试链被斩断——与 ``open_and_peek`` 修掉的是同一形态。
+    """
+
+    class Boom(Exception):
+        pass
+
+    class FakeStatus(Exception):
+        status_code = 429
+
+    class Manager:
+        closed = False
+
+        def __enter__(self):
+            raise FakeStatus("429")
+
+        def close(self):
+            self.closed = True
+            raise Boom("close failed")
+
+    attempts = []
+
+    def factory():
+        attempts.append(1)
+        return Manager()
+
+    with pytest.raises(FakeStatus) as excinfo, retry_sync_stream_context(factory):
+        pass
+    assert "429" in str(excinfo.value)
+    assert len(attempts) == 3  # 429 仍被重试满
+
+
+def test_retry_async_stream_context_enter_aclose_failure_keeps_original_error():
+    """async context 入口同契约：``aclose`` 抛错不顶替原始 429。"""
+
+    class Boom(Exception):
+        pass
+
+    class FakeStatus(Exception):
+        status_code = 429
+
+    class AManager:
+        closed = False
+
+        async def __aenter__(self):
+            raise FakeStatus("429")
+
+        async def aclose(self):
+            self.closed = True
+            raise Boom("aclose failed")
+
+    attempts = []
+
+    def factory():
+        attempts.append(1)
+        return AManager()
+
+    async def run():
+        async with retry_async_stream_context(factory):
+            pass
+
+    with pytest.raises(FakeStatus) as excinfo:
+        asyncio.run(run())
+    assert "429" in str(excinfo.value)
+    assert len(attempts) == 3

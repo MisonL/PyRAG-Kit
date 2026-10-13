@@ -6,6 +6,16 @@
 
 ### 修复
 
+- **第三轮四维 agents 复查收口（审查对象收敛为上一轮修复本身）**。四名 agent 对 `6be10c4` 复查，逐条探针复现后修复，全部红/绿验证：
+  - **`github_pat_` 分支平方级 ReDoS（高·安全）**：体类含 `_` 时相邻前缀串被整个吞并，实测 ``"github_pat_"*8000`` 17.8 秒、n=400000 112 秒——日志管道对整条格式化日志做脱敏且行长无上界。体加上界 `{20,120}` 截断回溯空间（实测 n=32000 降至 50ms）；回归测试钉住 n=8000/32000 的耗时上界。
+  - **`load_snapshot` 新守卫破坏原子性（中·数据完整性）**：「有 lexical 而索引缺失」的 ValueError 在批量赋值**之后**触发，抛错前 store 五个字段已被改写为半新半旧状态（实测 before/after 全变）——「拒绝的载入不改 store」契约被第二轮修复自己破坏。判定只读局部变量，移到批量赋值之前；回归测试补 store-untouched 断言（红验证确认）。
+  - **`retry_*_stream_context` 的 `enter` 裸 close 顶替原始异常（中·并发）**：可重试 429 被 manager.close 的异常顶替后重试链被斩断（sync/async 双向实测只尝试 1 次）——与 `open_and_peek` 已修的是同一形态，context 入口漏网。两侧改为独立 try + 吞错记日志；回归测试钉住 429 保留且重试满 3 次。
+  - **sync 消费阶段 `iterator.close` 抛错跳过 response 补刀（中低·并发）**：两段 close 共用一个 try，中途断开 + 包装形态下每次泄漏一条底层连接（实测 log 无 rclose）。拆为两段独立 try。
+  - **`gh[pousr]_` 家族不做纯字母体脱敏的不一致（中低·安全）**：数字前瞻只覆盖 `github_pat_`/`jina_`，`gho_`+36 纯字母体仍被误脱敏——与「正文标识符不误伤」的目标矛盾。前瞻扩到全 gh 家族并统一体上界 `{30,90}`；正例夹具同步为真实 token 形态（含数字）。
+  - **Slack 支持家族显式登记（低·安全）**：注释写 `xox[abposr]-` 而正则是 `xox[abper]-`，`xoxd-`/`xoxo-`/`xoxs-` 的「不支持」从歧义变为显式决策（注释登记）。
+  - **`retrieval_test` 的「数据库加载失败」名实不符（低·错误契约）**：该分支兜住快照/embedding 配置等全部初始化异常，前缀改中性「初始化失败」；悬空标记的指引补「执行主菜单向量化处理重建」可操作路径。
+  - **已核查排除**：写入/读取守卫自洽（`save_snapshot` 不会写出被 `load_snapshot` 拒绝的形态，实测 3 项）；首次构建空场景不被悬空标记守卫误伤（真实 `get_default_vector_store` 探针）；新 `FileNotFoundError` 全部 6 个调用方无吞掉点（grep 零命中 `except FileNotFoundError`）；method 子菜单 `default=None` 对真实 questionary 2.1.1 管道按键实测（不预选、方向键正常）。
+
 - **第二轮四维 agents 复查收口（对抗性复查上一轮修复 + 全链路残缺形态）**。四名 agent 对 `dad5e9a` 复查，逐条探针复现后修复，全部红/绿验证：
   - **空/截断 legacy pkl 让程序以「检测到中断信号」退出（高）**：`FaissStore.load` 的裸 `EOFError` 穿透 `Chatbot.__init__` 被 `main.py` 的 `except (KeyboardInterrupt, EOFError)` 误判为用户中断，`sys.exit(0)`——真因（文件损坏）无任何提示。`(OSError, EOFError, UnpicklingError)` 收敛为带指引 `ValueError`（空文件/截断/目录三形态实测）。
   - **「未知」占位串打断 method 子菜单（高）**：非法 `retrieval_method` 时 `default=current_method` 把 `"未知"` 传给 questionary，构造期抛 `Invalid 'default' value`，method 分支（唯一能写回该字段的入口）整个退出——与该改动的救济目标相反。default 不在候选集合时传 `None`（与 `_normalized_fusion_default` 同构）。

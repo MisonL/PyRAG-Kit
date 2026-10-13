@@ -1865,20 +1865,28 @@ def retry_sync_stream(
             close = getattr(iterator, "close", None)
             if close is not None:
                 close()
-            # ``iter()`` 拿到的常常只是**包装生成器**：openai/anthropic 的
-            # ``Stream.__iter__`` 是生成器函数（``for item in self._iterator:
-            # yield item``），close 它只终止包装层，``Stream.close()``（即
-            # ``response.close()``）从不被调——消费方提前退出或首帧校验失败时
-            # 连接释放退化为 GC 时机（实测复现，async 侧经 ``iterate_async``
-            # 包装则确定性关闭）。这里对底层响应补一刀；``__iter__`` 返回
-            # self 的形态两者同一对象，跳过重复关闭。
-            if response is not iterator:
-                response_close = getattr(response, "close", None)
-                if response_close is not None:
-                    response_close()
-        except Exception:  # 清理失败不得顶替主流程异常
+        except Exception as close_exc:
+            # iterator 关闭失败**不得**让下面的 response 补刀被跳过（两段独立
+            # try，与 ``open_and_peek`` 同构）：中途断开 + 包装形态时跳过补刀
+            # 即每次泄漏一条底层连接（实测 log 无 ``rclose``）。
+            logger.debug("消费阶段清理流失败: %s", safe_exception_text(close_exc))
             if not in_flight:
                 raise
+        # ``iter()`` 拿到的常常只是**包装生成器**：openai/anthropic 的
+        # ``Stream.__iter__`` 是生成器函数（``for item in self._iterator:
+        # yield item``），close 它只终止包装层，``Stream.close()``（即
+        # ``response.close()``）从不被调——消费方提前退出或首帧校验失败时
+        # 连接释放退化为 GC 时机（实测复现，async 侧经 ``iterate_async``
+        # 包装则确定性关闭）。这里对底层响应补一刀；``__iter__`` 返回
+        # self 的形态两者同一对象，跳过重复关闭。
+        if response is not iterator:
+            response_close = getattr(response, "close", None)
+            if response_close is not None:
+                try:
+                    response_close()
+                except Exception:  # 清理失败不得顶替主流程异常
+                    if not in_flight:
+                        raise
 
 
 async def retry_async_stream(
@@ -1937,9 +1945,15 @@ def retry_sync_stream_context(factory: Callable[[], Any]) -> Any:
         try:
             return manager, manager.__enter__()
         except BaseException:
+            # 清理异常不得顶替 ``__enter__`` 的原始异常——与 ``open_and_peek``
+            # 同一契约（实测：可重试 429 被 close 的 ``Boom`` 顶替后重试链
+            # 被斩断，只尝试 1 次）。
             close = getattr(manager, "close", None)
             if close is not None:
-                close()
+                try:
+                    close()
+                except Exception as close_exc:  # noqa: BLE001
+                    logger.debug("建立阶段清理 manager 失败: %s", safe_exception_text(close_exc))
             raise
 
     manager, response = retry_sync_call(enter)
@@ -1961,11 +1975,17 @@ async def retry_async_stream_context(factory: Callable[[], Any]) -> Any:
         try:
             return manager, await manager.__aenter__()
         except BaseException:
+            # 与 sync 侧同一契约：清理异常不得顶替原始异常（``iterate_async``
+            # 包装的 in-flight 守卫在替身形态下不生效，显式吞错对齐——实测
+            # aclose 抛错顶替可重试 429 后只尝试 1 次）。
             close = getattr(manager, "aclose", None)
             if close is not None:
-                result = close()
-                if inspect.isawaitable(result):
-                    await result
+                try:
+                    result = close()
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception as close_exc:  # noqa: BLE001
+                    logger.debug("建立阶段清理 manager 失败: %s", safe_exception_text(close_exc))
             raise
 
     manager, response = await retry_async_call(enter)

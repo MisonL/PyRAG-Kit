@@ -168,7 +168,8 @@ class SnapshotRepository:
                 f"ACTIVE_SNAPSHOT 标记指向的快照目录不存在: {snapshot_dir}"
                 f"（标记文件: {self.run_config.active_snapshot_marker}，"
                 f"内容: {snapshot_id}）。快照目录可能被移动或删除；"
-                "请重新构建知识快照，或删除该标记后走 legacy 导入。"
+                "请执行主菜单「向量化处理」重新构建知识快照，"
+                "或删除该标记后走 legacy 导入。"
             )
         return snapshot_dir
 

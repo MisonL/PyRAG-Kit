@@ -110,7 +110,7 @@ async def run_retrieval_test_async():
         vector_store = VectorStoreFactory.get_default_vector_store()
         retrieval_service = RetrievalService(vector_store, EmbeddingService(run_config))
     except Exception as exc:  # noqa: BLE001 - interactive setup reports all failures
-        console.print(markup_text("[red]数据库加载失败: {}[/red]", safe_exception_text(exc)))
+        console.print(markup_text("[red]初始化失败: {}[/red]", safe_exception_text(exc)))
         return
 
     try:

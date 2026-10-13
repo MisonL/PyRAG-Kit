@@ -1129,6 +1129,19 @@ class FaissStore(VectorStoreBase):
             # 同批进行，避免「缓存已是新值、documents 还是旧值」的中间态。
             lexical_cache = tokenized_docs if tokenized_docs is not None else []
             lexical_bm25 = self._build_bm25_index(lexical_cache)
+        # 有 lexical 就不重建索引：矩阵存在而索引缺失的快照会让
+        # ``semantic_search`` 对有文档有向量的数据静默返回 ``[]``（实测）。
+        # 合法快照（本项目写出）二者同在，此形态即「快照残缺」。判定必须在
+        # **批量赋值之前**：守卫只读局部变量（``embeddings``／``faiss_index``／
+        # ``lexical_path``），放赋值之后会在抛 ``ValueError`` 前把 store 五个
+        # 字段全部改写——「拒绝的载入不改 store」契约被破坏（实测探针：
+        # before/after 五字段全变）。
+        if lexical_path.exists() and embeddings is not None and faiss_index is None:
+            raise ValueError(
+                "知识快照不自洽：向量矩阵存在而语义索引缺失"
+                "（且存在 lexical.index，不会触发索引重建）。"
+                " 快照可能在写入或复制过程中被截断，请重建。"
+            )
         # 全部校验通过，到这里才改动 store。``_rebuild_indices`` 走 ``else`` 分支
         # 时会读 ``self.documents``，因此必须排在这些赋值之后。
         self.documents = documents
@@ -1138,15 +1151,6 @@ class FaissStore(VectorStoreBase):
         if lexical_path.exists():
             self._tokenized_docs_cache = lexical_cache
             self.bm25_index = lexical_bm25
-            # 有 lexical 就不重建索引：矩阵存在而索引缺失的快照在这里会让
-            # ``semantic_search`` 对有文档有向量的数据静默返回 ``[]``（实测）。
-            # 合法快照（本项目写出）二者同在，此形态即「快照残缺」。
-            if embeddings is not None and faiss_index is None:
-                raise ValueError(
-                    "知识快照不自洽：向量矩阵存在而语义索引缺失"
-                    "（且存在 lexical.index，不会触发索引重建）。"
-                    " 快照可能在写入或复制过程中被截断，请重建。"
-                )
         else:
             self._rebuild_indices()
 

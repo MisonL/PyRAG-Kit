@@ -156,8 +156,10 @@ def test_security_redacts_masked_credentials_after_bearer_prefix(value):
 
 # 假凭证主体用 ``"".join`` 拼出而非字面量：GitHub Push Protection 会对
 # 字面量形态的 token 前缀 + 主体整串拦推送，而它们只是合成样本，不指向
-# 任何真实凭证。拼接后的运行时取值与原字面量逐字相同。
-_GHP_BODY = "0123456789abcdefghijklmnopqrstuvwxyzABC"
+# 任何真实凭证。拼接后的运行时取值与原字面量逐字相同。体均**含数字**且
+# 长度在正则上界内（真实 token 是随机混合、必含数字；纯字母体是正文
+# 标识符，按 2026-10 第三轮审查决策显式不脱敏）。
+_GHP_BODY = "0123456789abcdefghijklmnopqrstuvwxyzAB9"
 _PAT_BODY = "11AAA0123aaaaBBBBcccc5678dddd"
 _XOX_BODY = "-123456789012-1234567890123-AbCdEfGhIjKlMnOpQrStUvWx"
 _AKIA_BODY = "IOSFODNN7EXAMPLE"
@@ -1062,10 +1064,10 @@ def test_secret_free_options_nested_non_string_key_reports_path():
     "credential",
     [
         # GitHub 非 PAT 家族：OAuth / server-to-server / user-to-server / refresh。
-        "gho_" + "A" * 36,
-        "ghs_" + "B" * 36,
-        "ghu_" + "C" * 36,
-        "ghr_" + "D" * 36,
+        "gho_" + "A" * 26 + "0123456789" + "X",
+        "ghs_" + "B" * 26 + "0123456789" + "Y",
+        "ghu_" + "C" * 26 + "0123456789" + "Z",
+        "ghr_" + "D" * 26 + "0123456789" + "W",
         # Slack refresh 与 app-level token。
         "xoxe-" + "E" * 30,
         "xapp-" + "F" * 30,
@@ -1091,3 +1093,37 @@ def test_security_does_not_redact_prefix_without_digit_in_body(text):
     """体不含数字的自证前缀长串是普通文本，不是凭证。"""
     assert "[REDACTED]" not in redact_sensitive_text(text)
     assert redact_sensitive_text(text) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # gh 短前缀家族同样不做纯字母体脱敏（第三轮 M1：误伤目标要全家族一致）。
+        "leak: ghp_abcdefghijabcdefghijabcdefghijabcd end",
+        "leak: gho_abcdefghijabcdefghijabcdefghijabcd end",
+        # 体含 _ 的 github_pat_ 正文标识符。
+        "github_pat_" + "_a" * 15,
+    ],
+)
+def test_security_does_not_redact_gh_prefix_without_digit_in_body(text):
+    """gh 家族纯字母体是正文标识符，不是凭证（与 jina_/github_pat_ 同判据）。"""
+    assert "[REDACTED]" not in redact_sensitive_text(text)
+
+
+def test_security_prefix_re_is_linear_on_adjacent_prefix_runs():
+    """相邻 ``github_pat_`` 连串不得平方级回溯（第三轮 H1）。
+
+    体类含 ``_`` 时每个起点能把下一个前缀整个吞进体，直到串尾才失败——
+    无上界时实测 ``"github_pat_"*8000`` 17.8 秒。体上界截断回溯空间后必须
+    保持线性：32000 个前缀（38 万字符）应在百毫秒级。
+    """
+    import time
+
+    from src.utils.security import _SELF_ATTESTING_PREFIX_RE as pattern
+
+    for count in (8000, 32000):
+        text = "github_pat_" * count
+        start = time.perf_counter()
+        pattern.search(text)
+        elapsed = time.perf_counter() - start
+        assert elapsed < 1.0, f"n={count} 耗时 {elapsed:.2f}s，疑似平方回溯"

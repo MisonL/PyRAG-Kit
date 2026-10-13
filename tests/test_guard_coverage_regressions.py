@@ -955,9 +955,11 @@ def test_run_retrieval_test_reports_excel_logger_failure_and_continues(monkeypat
 
 
 def test_run_retrieval_test_reports_database_load_failure(monkeypatch):
-    """数据库加载失败时打印提示并返回，不抛异常。
+    """初始化失败时打印提示并返回，不抛异常。
 
     删除吞掉后初始化异常冒泡——用户拿到裸 traceback 而不是可读的失败原因。
+    前缀用中性的「初始化失败」：该分支兜住的不只是数据库加载（快照目录、
+    embedding 配置等同样走到这里），「数据库加载失败」对后者名实不符。
     """
     from src.retrieval_test import core as retrieval_core
 
@@ -971,7 +973,7 @@ def test_run_retrieval_test_reports_database_load_failure(monkeypatch):
     monkeypatch.setattr(retrieval_core.VectorStoreFactory, "get_default_vector_store", boom)
     monkeypatch.setattr(retrieval_core.console, "print", lambda *a, **k: printed.append(str(a)))
     asyncio.run(retrieval_core.run_retrieval_test_async())
-    assert any("数据库加载失败" in message for message in printed)
+    assert any("初始化失败" in message for message in printed)
 
 
 def test_run_retrieval_test_breaks_on_keyboard_interrupt(monkeypatch):
