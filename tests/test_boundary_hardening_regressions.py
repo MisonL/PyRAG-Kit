@@ -722,6 +722,25 @@ def test_key_text_keeps_normal_values_verbatim():
     assert _key_text(10**18) == str(10**18)
 
 
+def test_key_text_distinguishes_long_non_scalar_values():
+    """非标量取值 repr 超过 80 字符时不得塌成同一个键。
+
+    ``safe_repr`` 把 repr 超 80 字符的值截成 ``text[:77] + "..."``：``b'A'*100``
+    与 ``b'A'*100 + b'B'`` 截断后得到**同一个键**，``_merge_hybrid_results``／
+    ``_deduplicate_parent_documents`` 把两条不同文档并成一条，其中一条静默消失
+    （实测复现）。超限取值改对 ``repr`` 字节取摘要——仅差 1 字节的两个长 bytes
+    必须得到不同键，未超限的取值（``b'x'``、``[1, 2]``）必须原样保留。
+    """
+    long_bytes_a = b"A" * 100
+    long_bytes_b = b"A" * 100 + b"B"
+    assert _key_text(long_bytes_a) != _key_text(long_bytes_b)
+    # 稳定性：同一取值多次调用得到同一键。
+    assert _key_text(long_bytes_a) == _key_text(b"A" * 100)
+    # 未超限取值零破坏。
+    assert _key_text(b"x") == "b'x'"
+    assert _key_text([1, 2]) == "[1, 2]"
+
+
 @pytest.mark.parametrize("raw", ["RRF", " rrf ", "Rrf"])
 def test_fusion_strategy_normalizes_before_the_rrf_check(raw):
     """``"RRF"`` 必须与 ``"rrf"`` 得到同一结论。

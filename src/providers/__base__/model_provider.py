@@ -33,6 +33,8 @@ from tenacity import (
 )
 
 from src.utils.config import is_double_convertible, parse_decimal_int, safe_repr
+from src.utils.log_manager import get_module_logger
+from src.utils.security import safe_exception_text
 from src.utils.security import (
     validate_secret_free_options as _validate_secret_free_options,
 )
@@ -1691,6 +1693,9 @@ async def iterate_async(value: Any) -> AsyncGenerator[Any, None]:
                 raise
 
 
+logger = get_module_logger(__name__)
+
+
 T = TypeVar("T")
 _STREAM_END = object()
 
@@ -1805,22 +1810,31 @@ def retry_sync_stream(
 ) -> Generator[Any, None, None]:
     """只重试同步流在首个事件前的建立阶段，避免重复已输出内容。"""
 
-    def open_and_peek() -> tuple[Any, Any]:
-        iterator = iter(factory())
+    def open_and_peek() -> tuple[Any, Any, Any]:
+        response = factory()
+        iterator = iter(response)
         try:
             first = next(iterator)
             if first is not _STREAM_END and first_event_validator is not None:
                 first_event_validator(first)
-            return iterator, first
+            return response, iterator, first
         except StopIteration:
-            return iterator, _STREAM_END
+            return response, iterator, _STREAM_END
         except BaseException:
+            # 关闭异常**不能**顶替这里正在上抛的原始异常：``retry_sync_call``
+            # 按 ``is_retryable_error`` 的类名判据决定要不要重试，替身/自定义
+            # 迭代器的 ``close`` 抛错会让可重试的 429 被不可重试的关闭异常
+            # 顶替（实测只尝试 1 次），或反向让不可重试错误被重发 3 次。
             close = getattr(iterator, "close", None)
             if close is not None:
-                close()
+                try:
+                    close()
+                except Exception as close_exc:  # noqa: BLE001
+                    # 清理失败不得顶替原始异常——吞掉但留一条调试日志。
+                    logger.debug("建立阶段清理流失败: %s", safe_exception_text(close_exc))
             raise
 
-    iterator, first = retry_sync_call(open_and_peek)
+    response, iterator, first = retry_sync_call(open_and_peek)
     try:
         if first is not _STREAM_END:
             yield first
@@ -1839,6 +1853,17 @@ def retry_sync_stream(
             close = getattr(iterator, "close", None)
             if close is not None:
                 close()
+            # ``iter()`` 拿到的常常只是**包装生成器**：openai/anthropic 的
+            # ``Stream.__iter__`` 是生成器函数（``for item in self._iterator:
+            # yield item``），close 它只终止包装层，``Stream.close()``（即
+            # ``response.close()``）从不被调——消费方提前退出或首帧校验失败时
+            # 连接释放退化为 GC 时机（实测复现，async 侧经 ``iterate_async``
+            # 包装则确定性关闭）。这里对底层响应补一刀；``__iter__`` 返回
+            # self 的形态两者同一对象，跳过重复关闭。
+            if response is not iterator:
+                response_close = getattr(response, "close", None)
+                if response_close is not None:
+                    response_close()
         except Exception:  # 清理失败不得顶替主流程异常
             if not in_flight:
                 raise

@@ -844,3 +844,39 @@ def test_weights_selection_writes_complement_to_keyword_weight(monkeypatch):
 
     assert chat_config["vector_weight"] == 0.2
     assert chat_config["keyword_weight"] == 0.8
+
+
+def test_menu_shows_unknown_for_invalid_retrieval_method(monkeypatch):
+    """非法 ``retrieval_method`` 的菜单项显示「未知」，与 Rerank 项同一契约。
+
+    实测：直写 ``retrieval_method = "bogus"`` 后打开菜单，修复前第一项渲染成
+    ``1. 检索模式 (当前: None)``——裸插值把 ``None`` 直接丢给了用户，而下一项
+    ``_rerank_menu_label`` 对同一类非法取值刻意显示「未知」。两个相邻菜单项
+    必须对同一契约给出同一种显示。
+    """
+    seen: list = []
+    answers = iter([None, "back"])
+
+    def select(_prompt, choices=None, default=None, **_kwargs):
+        for choice in choices or []:
+            seen.append(choice.title if hasattr(choice, "title") else str(choice))
+        return _Choice(next(answers))
+
+    from src.ui import config_menu
+
+    monkeypatch.setattr(config_menu.questionary, "select", select)
+    chat_config = {
+        "retrieval_method": "bogus",
+        "hybrid_fusion_strategy": "rrf",
+        "retrieval_candidate_multiplier": 3,
+        "top_k": 5,
+        "vector_weight": 0.5,
+        "keyword_weight": 0.5,
+        "rerank_enabled": False,
+    }
+
+    config_menu.edit_retrieval_params(chat_config)
+
+    method_item = next(item for item in seen if "检索模式" in str(item))
+    assert "未知" in str(method_item)
+    assert "None" not in str(method_item)

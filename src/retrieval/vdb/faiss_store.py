@@ -28,7 +28,7 @@ except ImportError as exc:
 from ...ui.display_utils import document_source
 from ...utils.config import _MAX_RETRIEVAL_TOP_K, safe_repr
 from ...utils.log_manager import get_module_logger
-from ...utils.security import ensure_trusted_source, resolve_within
+from ...utils.security import ensure_trusted_source, resolve_within, safe_exception_text
 from .base import VectorStoreBase
 
 logger = get_module_logger(__name__)
@@ -50,10 +50,11 @@ def _parent_key(parent_id: Any) -> str:
     **不同**取值塌成**同一**键（``10**4301`` 与 ``10**4301+1`` 得到同一键），
     于是 ``_normalize_documents`` 的父块字典推导让后一条静默覆盖前一条，
     ``resolve_parent_content`` 对两个不同 id 返回同一父块正文——父块内容张冠
-    李戴。按二进制补码取 sha256 摘要才能既稳定又唯一，判据与
-    ``retrieval_service._key_text`` 一致。
-    但摘要形态**只对 ``str()`` 无法表达的超限整数启用**：键是写盘后长期存在
-    的格式，main 时代构建的快照里整数 id 的键是 ``str(parent_id)``（``1`` →
+    李戴。按二进制补码取 sha256 摘要才能既稳定又唯一——**摘要算法**（signed
+    big-endian ``to_bytes`` + sha256）与 ``retrieval_service._key_text`` 一致，
+    但**触发阈值有意不同**：这里只对 ``str()`` 无法表达的超限整数（>4300 位）
+    启用摘要，``_key_text`` 对 repr 超过 80 字符的整数就启用。键是写盘后长期
+    存在的格式，main 时代构建的快照里整数 id 的键是 ``str(parent_id)``（``1`` →
     ``"1"``），无差别换键会让旧快照在载入后召回不到任何整数 id 的父块（实测
     复现）。``str`` 对可表达的整数是**精确**转换，本身不塌键；塌键风险只
     来自 ``safe_repr`` 的截断。因此先试 ``str()``，抛 ``ValueError`` 才落
@@ -70,7 +71,35 @@ def _parent_key(parent_id: Any) -> str:
             raw = parent_id.to_bytes((parent_id.bit_length() + 8) // 8, "big", signed=True)
             digest = hashlib.sha256(raw, usedforsecurity=False).hexdigest()
             return f"<整数，{digest}>"
-    return safe_repr(parent_id)
+    # numpy 标量（``np.int64``／``np.float64``／``np.bool_``）在 numpy 2.x 下
+    # **不是** ``int``／``float`` 的子类，落不进上面的分支。main 用 ``str()``
+    # 得到 ``"3"``，``safe_repr`` 得到 ``"np.int64(3)"``——同一份旧快照在两版
+    # 代码间键形态不同，载入后召回静默 miss（实测复现）。numpy 标量提供
+    # ``.item()``，归一成原生 Python 值后与 main 的 ``str()`` 逐字一致。
+    item_method = getattr(parent_id, "item", None)
+    if callable(item_method):
+        try:
+            return _parent_key(item_method())
+        except Exception as item_exc:  # noqa: BLE001 - item() 不可用即退回通用兜底
+            logger.debug("parent_id 的 item() 归一失败: %s", safe_exception_text(item_exc))
+    # 其余非 str/int 取值不能退回 ``safe_repr``：repr 超 80 字符的取值被截成
+    # ``text[:77] + "..."``，两个不同的长 bytes/tuple 塌成同一个键（实测复现），
+    # 字典推导静默并条。repr 未超限的原样保留，超限的对 repr 字节取摘要。
+    # 判据同样落在真实 repr 上：``safe_repr`` 截断输出恰好 80 字符，拿
+    # ``len(rendered) > 80`` 判断永远不触发（实测复现）。repr 不可用时退回
+    # ``safe_repr``。
+    rendered = safe_repr(parent_id)
+    try:
+        raw_repr = repr(parent_id)
+    except Exception:  # noqa: BLE001 - repr 不可用时只能量级描述
+        return rendered
+    if len(raw_repr) > 80:
+        import hashlib
+
+        raw = raw_repr.encode("utf-8", errors="replace")
+        digest = hashlib.sha256(raw, usedforsecurity=False).hexdigest()
+        return f"<{type(parent_id).__name__}，{digest}>"
+    return rendered
 
 
 def _require_top_k(top_k: Any) -> int:
@@ -324,6 +353,43 @@ class FaissStore(VectorStoreBase):
                 raise ValueError(
                     f"{source}的 embeddings 包含非有限值（NaN 或无穷大）。"
                     " 请重建知识快照或修正数据来源。"
+                )
+
+    @staticmethod
+    def _validate_row_alignment(
+        documents: Any,
+        embeddings: Any,
+        faiss_index: Any,
+        *,
+        source: str,
+    ) -> None:
+        """确认三条行数必须对齐：文档数、embeddings 行数、语义索引条数。
+
+        三者由 ``save_snapshot``／``upsert_embeddings`` 从同一份内存状态写出，
+        行数一致才保证 ``semantic_search`` 的 ``indices`` 下标对应
+        ``documents``。实测 embeddings 两行、文档 2 条但 ``semantic.index`` 只有
+        1 个向量时：载入成功、无任何提示，``semantic_search`` 拿 ``indices``
+        索引 ``documents``——第 2 条文档永远不出现在结果里，用户看到的是
+        「搜不到」而不是「这份快照坏了」。反向（索引或矩阵比文档多）同样危险：
+        ``self.documents[doc_index]`` 抛 ``IndexError``，与「快照不自洽」无关的
+        类型。``embeddings=None`` 表示这份快照没有向量，不参与对齐。
+        """
+        doc_rows = len(documents)
+        if embeddings is not None:
+            matrix_rows = int(embeddings.shape[0])
+            if matrix_rows != doc_rows:
+                raise ValueError(
+                    f"{source}不自洽：向量矩阵行数与分块数不一致。"
+                    f" embeddings={matrix_rows}，chunks.pkl={doc_rows}。"
+                    " 快照可能在写入或复制过程中被截断，请重建。"
+                )
+        if faiss_index is not None:
+            index_rows = int(faiss_index.ntotal)
+            if index_rows != doc_rows:
+                raise ValueError(
+                    f"{source}不自洽：语义索引条数与分块数不一致。"
+                    f" semantic.index={index_rows}，chunks.pkl={doc_rows}。"
+                    " 快照可能在写入或复制过程中被截断，请重建。"
                 )
 
     @staticmethod
@@ -776,6 +842,12 @@ class FaissStore(VectorStoreBase):
         # 形状必须在赋值**之前**判：下面的 ``self.documents = documents`` 之后
         # ``_rebuild_indices`` 才读形状，那时失败已经留下半更新的 store。
         self._validate_embeddings_shape(embeddings, source="legacy 向量存储文件")
+        # legacy pkl 没有独立的 semantic.index（``_rebuild_indices`` 会重建），
+        # 但 **embeddings 行数**仍必须与 documents 对齐：``_rebuild_indices`` 按
+        # ``len(embeddings)`` 建索引，行数错配的 legacy 文件载入后文档与向量
+        # 一一错位，``semantic_search`` 返回的张冠李戴结果。``load_snapshot`` 的
+        # 同一守卫还包含 ``semantic.index`` 条数分支，这里索引恒为 ``None``。
+        self._validate_row_alignment(documents, embeddings, None, source="legacy 向量存储文件")
 
         self.documents = documents
         self.parent_documents = parent_documents
@@ -926,6 +998,11 @@ class FaissStore(VectorStoreBase):
         # 缺它是合法状态（下面的 ``else`` 分支就是为它准备的）。``load()`` 早已
         # 是正确的顺序，两处对齐。
         documents, parent_documents = self._normalize_documents(raw_documents, raw_parent_documents)
+        # 三条行数必须对齐：embeddings 行数、``semantic.index`` 条数与
+        # ``documents`` 数。此前只校验了索引这一条，embeddings 行数错配仍能
+        # 载入成功——``semantic_search`` 的分数来自矩阵行、文档来自下标，错配
+        # 即张冠李戴或 ``IndexError``。``load()`` 的 legacy 路径调用同一守卫。
+        self._validate_row_alignment(documents, embeddings, faiss_index, source="知识快照")
         # ``semantic.index`` 的行数是**第三条**必须与 ``documents`` 对齐的量，
         # 而此前只校验了 ``lexical.index`` 的条数。实测 documents=2、embeddings
         # 两行、但索引里只有 1 个向量时：加载成功、无任何提示，而
@@ -936,6 +1013,7 @@ class FaissStore(VectorStoreBase):
         #
         # 只断言这一条最小不变量，不比对向量内容：``embeddings`` 与索引由
         # ``save_snapshot`` 从同一份内存状态写出，条数一致即可保证下标对应关系。
+        # （断言本体在上方 ``_validate_row_alignment``，索引分支的注释保留在此。）
         if faiss_index is not None:
             index_rows = int(faiss_index.ntotal)
             if index_rows != len(documents):

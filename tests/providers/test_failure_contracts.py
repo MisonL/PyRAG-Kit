@@ -1214,3 +1214,71 @@ def test_retry_sync_stream_keeps_iteration_error_when_close_also_fails():
 
     with pytest.raises(ConnectionError, match="同步流中途断开"):
         consume()
+
+
+def test_retry_sync_stream_closes_underlying_response_not_only_wrapper():
+    """``iter()`` 得到的是包装生成器时，必须关闭底层 SDK 响应对象。
+
+    openai/anthropic 的 ``Stream.__iter__`` 是生成器函数——``iter(stream)``
+    拿到的是包装生成器而非流本身，``close()`` 它只终止包装层，
+    ``response.close()`` 从不被调；消费方提前退出时连接释放退化为 GC 时机
+    （实测复现，对照 async 侧经 ``iterate_async`` 是确定性关闭）。忠实复刻
+    该形态：``__iter__`` 用生成器函数，``close`` 记录在响应对象上。
+    """
+
+    class FakeResponse:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+        def __iter__(self):
+            # 与 openai.Stream.__iter__ 同构：生成器函数，不是 ``return self``。
+            yield "item"
+            yield "item2"
+
+    response = FakeResponse()
+    stream = retry_sync_stream(lambda: response)
+    assert next(stream) == "item"
+    stream.close()  # 消费方提前退出
+
+    assert response.closed is True
+
+
+def test_retry_sync_stream_validator_failure_keeps_original_error():
+    """首帧校验失败时，``close`` 抛异常不得顶替原始异常（双向污染重试分类）。
+
+    实测：首帧是可重试 429 事件且 ``close`` 抛错时，tenacity 只尝试 1 次——
+    原始可重试异常被不可重试的关闭异常顶替；首帧是不可重试 ``Boom`` 时反向
+    被重发 3 次。``open_and_peek`` 的清理必须吞掉自己的失败。
+    """
+
+    from src.providers.__base__.model_provider import retry_sync_stream as retry
+
+    class Boom(Exception):
+        """不可重试的原始异常。"""
+
+    class CloseFail(Exception):
+        """替身 close 的异常——同样不可重试。"""
+
+    class BoomStream:
+        closed = False
+
+        def close(self):
+            self.closed = True
+            raise CloseFail("关闭失败")
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise Boom("原始错误")
+
+    # 原始不可重试异常必须原样上抛——裸 close() 的替身场景下，关闭异常
+    # 不得顶替它（反向污染重试分类：顶替成可重试类时会被重发 3 次）。
+    stream = BoomStream()
+    with pytest.raises(Boom) as excinfo:
+        list(retry(lambda: stream, lambda _first: None))
+    assert "原始错误" in str(excinfo.value)
+    assert stream.closed is True  # 清理确实执行了

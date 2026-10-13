@@ -513,7 +513,27 @@ def _key_text(value: Any) -> str:
             digest = hashlib.sha256(raw, usedforsecurity=False).hexdigest()
             return f"<整数，{digest}>"
         return rendered
-    return safe_repr(value)
+    # 非 str/int 的取值（bytes／tuple／frozenset／numpy 标量等）不能退回
+    # ``safe_repr``：它对 repr 超 80 字符的值截断成 ``text[:77] + "..."``，
+    # ``b'A'*100`` 与 ``b'A'*100+b'B'`` 会塌成同一个键——与上面的超限整数
+    # 是同一类失败，``_merge_hybrid_results``／``_deduplicate_parent_documents``
+    # 同样静默并条（实测复现）。统一走 ``safe_repr`` 的截断阈值：repr 未超限
+    # 的取值原样保留（``b'x'`` 仍是 ``b'x'``），超限的对 repr 字节取摘要——
+    # 摘要输入是文本而非二进制值，但对键唯一性而言等价。
+    # 判据必须落在**真实 repr** 上而不是 ``rendered``：``safe_repr`` 截断后
+    # 的输出恰好是 80 字符（``text[:77] + "..."``），拿 ``len(rendered) > 80``
+    # 判断永远不会触发（实测复现）。repr 本身抛异常的取值退回 ``safe_repr``
+    # 的量级描述——那时没有更好的取值。
+    rendered = safe_repr(value)
+    try:
+        raw_repr = repr(value)
+    except Exception:  # noqa: BLE001 - repr 不可用时只能量级描述
+        return rendered
+    if len(raw_repr) > _KEY_TEXT_TRUNCATE_LIMIT:
+        raw = raw_repr.encode("utf-8", errors="replace")
+        digest = hashlib.sha256(raw, usedforsecurity=False).hexdigest()
+        return f"<{type(value).__name__}，{digest}>"
+    return rendered
 
 
 def _document_key(document: dict[str, Any]) -> str:

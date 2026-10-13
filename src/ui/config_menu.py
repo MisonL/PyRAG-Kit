@@ -121,6 +121,15 @@ def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
             current_method = require_retrieval_method(chat_config["retrieval_method"]).value
         except ValueError:
             current_method = None
+        # ``None`` 直接进 f-string 会渲染成 ``当前: None``——与下一项
+        # ``_rerank_menu_label`` 对同一类非法取值刻意显示的「未知」不一致。
+        # 菜单文案统一为「未知」，用户仍能看出这一项有问题并把它改回来。
+        if current_method is None:
+            current_method = "未知"
+        # ``None`` 直接进 f-string 会渲染成 ``当前: None``——与下一项
+        # ``_rerank_menu_label`` 对同一类非法取值刻意显示的「未知」不一致。
+        # 菜单文案统一为「未知」，用户仍能看出这一项有问题并把它改回来。
+
         current_top_k = chat_config["top_k"]
         # 与 ``display_chat_config`` 同因：真值判断对可直写的取值会给出与服务层
         # 相反的结论（``"false"`` 显示成「启用」）。菜单侧不抛错，非法取值显示

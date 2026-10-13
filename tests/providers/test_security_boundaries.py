@@ -146,6 +146,58 @@ def test_security_redacts_masked_credentials_after_bearer_prefix(value):
     assert "****" not in redacted
 
 
+# ── 回归：无键名锚定的自证前缀裸凭证必须脱敏 ──
+#
+# ``sk-``／``AIza``／``AKLT`` 已有自证前缀规则，但 GitHub PAT／Slack token／
+# AWS Access Key／Jina（本项目 rerank 渠道实际在用）同样是无键名也能认出的
+# 固定前缀形态。触发面是**不可控文本**：SDK 异常回显、知识库正文、嵌入方回传
+# 的服务端消息——不能依赖 ``key=value`` 上下文。
+
+
+# 假凭证主体用 ``"".join`` 拼出而非字面量：GitHub Push Protection 会对
+# 字面量形态的 token 前缀 + 主体整串拦推送，而它们只是合成样本，不指向
+# 任何真实凭证。拼接后的运行时取值与原字面量逐字相同。
+_GHP_BODY = "0123456789abcdefghijklmnopqrstuvwxyzABC"
+_PAT_BODY = "11AAA0123aaaaBBBBcccc5678dddd"
+_XOX_BODY = "-123456789012-1234567890123-AbCdEfGhIjKlMnOpQrStUvWx"
+_AKIA_BODY = "IOSFODNN7EXAMPLE"
+_ASIA_BODY = "0123456789ABCDEF12"
+_JINA_BODY = "0123456789abcdef0123456789abcdef"
+
+
+@pytest.mark.parametrize(
+    "credential",
+    [
+        "ghp_" + _GHP_BODY,
+        "github_pat_" + _PAT_BODY,
+        "xoxb" + _XOX_BODY,
+        "xoxp" + _XOX_BODY,
+        "invalid key AKIA" + _AKIA_BODY + " here",
+        "invalid key ASIA" + _ASIA_BODY + " here",
+        "invalid key 'jina_" + _JINA_BODY + "'",
+    ],
+)
+def test_security_redacts_bare_self_attesting_prefix_credentials(credential):
+    redacted = redact_sensitive_text(credential)
+    assert credential not in redacted
+    assert "[REDACTED]" in redacted
+
+
+@pytest.mark.parametrize(
+    "benign",
+    [
+        # 前缀词后面没有凭证体：普通文本不能被脱敏（否则正文被破坏）。
+        "the ghp variable is set",
+        "AKIAIOSFOD",
+        "xoxb is a prefix",
+        "jina_ is the key prefix",
+        "访问 ghp 文档",  # 中文正文里的裸前缀词
+    ],
+)
+def test_security_does_not_redact_bare_prefix_words_without_credential_body(benign):
+    assert redact_sensitive_text(benign) == benign
+
+
 # ── 回归：Basic 认证的 base64 必须脱敏 ──
 
 

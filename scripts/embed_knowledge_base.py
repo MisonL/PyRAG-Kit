@@ -25,6 +25,7 @@ from src.ui.display_utils import (
 )
 from src.utils.config import get_settings
 from src.utils.log_manager import get_module_logger
+from src.utils.security import safe_exception_text
 
 logger = get_module_logger(__name__)
 
@@ -143,7 +144,20 @@ async def main_async(splitter_structure_mode: str):
         embedding_service=embedding_service,
         snapshot_repository=snapshot_repository,
     )
-    result = await build_service.build(splitter_structure_mode)
+    result = None
+    try:
+        result = await build_service.build(splitter_structure_mode)
+    finally:
+        # 构建成功与失败（建库失败是常态路径）都要释放 provider：``build`` 内
+        # ``embed_in_batches`` 懒加载出 provider（openai/google/ark 等渠道各持有
+        # httpx AsyncClient 连接池），而菜单循环里每选一次「向量化处理」都新建
+        # 一次 ``EmbeddingService``——不释放则连接池随菜单循环逐次累积。失败
+        # 收场只记日志，不顶替构建本身的异常。判据与
+        # ``retrieval_test.core._aclose_quietly`` 一致。
+        try:
+            await embedding_service.aclose()
+        except Exception as exc:  # noqa: BLE001 - teardown 不得顶替主流程异常
+            logger.warning("释放 Embedding 服务失败: %s", safe_exception_text(exc))
 
     console.print(
         markup_text(

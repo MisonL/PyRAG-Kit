@@ -38,8 +38,10 @@ from ..ui.display_utils import (
     markup_text,
 )
 from ..utils.config import get_settings, require_chat_temperature, safe_repr
-from ..utils.log_manager import get_chat_logger
+from ..utils.log_manager import get_chat_logger, get_module_logger
 from ..utils.security import safe_exception_text
+
+logger = get_module_logger(__name__)
 
 
 class Chatbot:
@@ -410,10 +412,6 @@ async def start_chat_session_async():
                             if isinstance(bot.chat_config, SessionConfig)
                             else dict(bot.chat_config)
                         )
-                        llm_needs_reload, updated_config = await asyncio.to_thread(
-                            launch_config_editor,
-                            editable_config,
-                        )
                         # 配置应用失败**不能**终止整个会话。``SessionConfig`` 的
                         # 校验器会拒绝非法取值（``ValueError``），而编辑器的动态
                         # 上界与它是两套独立实现，任一侧演化就会命中这条路径——
@@ -422,7 +420,18 @@ async def start_chat_session_async():
                         # 主菜单并丢失会话。同文件的 ``chat_async`` 对异常是恢复的
                         # （打印后继续下一轮），这里与之对齐：报错、保留原配置、
                         # 回到提示符。
+                        #
+                        # 编辑器调用与配置回显都在 ``try`` **之内**：``launch_config_editor``
+                        # 自身会抛 ``ValueError``（配置段不是映射、``questionary``
+                        # 拿到空候选），``display_chat_config`` 也会对一份自洽性
+                        # 有问题的配置抛 ``ValueError``（如 rerank 段为空表时找不到
+                        # provider key）——两处都是同类可恢复的配置错误，漏接即
+                        # 终止会话，与本块开头声明的契约矛盾（实测复现）。
                         try:
+                            llm_needs_reload, updated_config = await asyncio.to_thread(
+                                launch_config_editor,
+                                editable_config,
+                            )
                             # 真实 Chatbot 使用异步重载以正确释放 SDK 连接池；保留
                             # 同步兼容入口，便于嵌入方或旧版替身实现配置编辑。
                             apply_async = getattr(bot, "apply_config_update_async", None)
@@ -454,9 +463,9 @@ async def start_chat_session_async():
                             # 位置也用 ``getattr`` 探测 ``apply_config_update``／
                             # ``aclose``。诊断日志取不到时不能反过来把恢复路径
                             # 变成新的失败点。
-                            logger = getattr(bot, "logger", None)
-                            if logger is not None:
-                                logger.warning(
+                            bot_logger = getattr(bot, "logger", None)
+                            if bot_logger is not None:
+                                bot_logger.warning(
                                     "配置应用失败，保留原配置: %s", safe_exception_text(exc)
                                 )
                             console.print(
@@ -466,7 +475,25 @@ async def start_chat_session_async():
                                 )
                             )
                             continue
-                        display_chat_config(console, bot.chat_config)
+                        # 配置回显同样收在恢复 ``try`` 内：``display_chat_config``
+                        # 会读取刚保存的 rerank 段，取值不合洽时抛 ``ValueError``
+                        # （实测 rerank 段为空表即触发）——若不接，配置已生效、
+                        # 会话却被终止，用户丢失全部对话。回显失败只报告，不撤销
+                        # 已生效的配置。
+                        try:
+                            display_chat_config(console, bot.chat_config)
+                        except (ValueError, KeyError) as exc:
+                            bot_logger = getattr(bot, "logger", None)
+                            if bot_logger is not None:
+                                bot_logger.warning(
+                                    "配置回显失败（配置已生效）: %s", safe_exception_text(exc)
+                                )
+                            console.print(
+                                markup_text(
+                                    "[bold yellow]配置已生效，但回显失败: {}[/bold yellow]",
+                                    safe_exception_text(exc),
+                                )
+                            )
                         continue
 
                     response_panel = Panel("", title="客服", border_style="green")
@@ -486,7 +513,17 @@ async def start_chat_session_async():
     finally:
         close = getattr(bot, "aclose", None)
         if close is not None:
-            await close()
+            # 与同文件对 ``apply_config_update`` 的探测同一契约：``bot`` 的
+            # ``aclose`` 是运行时可替换的，替身实现抛异常时裸 ``await`` 会
+            # 顶替正常收尾（``/quit`` 后用户看到的是替身的错误而非再见），
+            # 也会顶替在途异常（实测 ExplodingBot 复现）。释放失败只记录，
+            # 不改写本函数的真实退出原因。
+            try:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as exc:  # noqa: BLE001 - teardown 不得顶替主流程
+                logger.warning("释放聊天会话资源失败: %s", safe_exception_text(exc))
 
 
 def start_chat_session():

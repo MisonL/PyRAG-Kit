@@ -1191,3 +1191,125 @@ def test_display_retrieved_docs_renders_the_column_header_row():
     output = buffer.getvalue()
     for column in ("来源", "预览", "得分"):
         assert column in output, f"列头 {column!r} 未渲染：{output!r}"
+
+
+class _SurvivalBot(FakeChatbot):
+    """带真实 ``SessionConfig`` 的替身，rerank 段为空表。"""
+
+    def __init__(self, _console: Console):
+        self.llm_model = object()
+        self.chat_config = SessionConfig(
+            retrieval_method=RetrievalMethod.HYBRID_SEARCH,
+            vector_weight=0.3,
+            keyword_weight=0.7,
+            hybrid_fusion_strategy="rrf",
+            retrieval_candidate_multiplier=3,
+            rerank_enabled=False,
+            top_k=5,
+            score_threshold=0.4,
+            active_llm_configuration="old-model",
+            active_rerank_configuration="siliconflow",
+            llm_configurations={"old-model": ModelDetail(provider="openai", model_name="gpt-4o")},
+            rerank_configurations={},
+            chat_temperature=0.7,
+        )
+
+    def apply_config_update(self, updated_config, _llm_needs_reload):
+        for key, item in updated_config.items():
+            self.chat_config[key] = item
+
+    def reload_llm(self):
+        return False
+
+    async def chat_async(self, _user_input):
+        if False:
+            yield ""
+
+
+def test_start_chat_session_async_survives_config_display_failure(monkeypatch):
+    """配置已生效后，回显抛 ``ValueError`` 也必须让会话存活。
+
+    实测路径（真实 ``SessionConfig`` + 真实 ``display_chat_config``）：rerank 段
+    为空表时，编辑器保存 ``rerank_enabled=True`` 通过 ``set_many`` 校验、apply
+    「成功」，随后 ``display_chat_config`` 在 ``chat/core.py`` 的回显调用点抛
+    ``ValueError: 在Rerank配置中未找到key: ...``。修复前该调用点在恢复 ``try``
+    之外，异常穿透内层只接 ``(KeyboardInterrupt, EOFError)`` 的 ``try``——
+    配置已生效、会话却被终止，用户丢失全部对话，直接违反同块开头声明的
+    「配置应用失败不能终止整个会话」契约。
+    """
+    from src.ui.display_utils import display_chat_config as real_display
+
+    monkeypatch.setattr("src.chat.core.Chatbot", _SurvivalBot)
+    monkeypatch.setattr(
+        "src.chat.core.PromptSession",
+        lambda: FakePromptSession(["/config", "/quit"]),
+    )
+    # 启动横幅里的回显不炸（rerank_enabled=False 时不读 rerank 段），
+    # 只有 /config 保存后的回显要炸——用计数器区分两次调用。
+    display_calls = []
+
+    def exploding_display(_console, chat_config):
+        display_calls.append(1)
+        if len(display_calls) > 1:
+            raise ValueError("在Rerank配置中未找到key: 'siliconflow'")
+        real_display(_console, chat_config)
+
+    monkeypatch.setattr("src.chat.core.display_chat_config", exploding_display)
+    monkeypatch.setattr(
+        "src.chat.core.launch_config_editor",
+        lambda chat_config: (False, {"rerank_enabled": True}),
+    )
+
+    asyncio.run(start_chat_session_async())
+
+    # 启动回显 + /config 后的回显都被调用过——后者抛了异常而会话仍走到 /quit。
+    assert len(display_calls) == 2
+
+
+def test_start_chat_session_async_survives_config_editor_failure(monkeypatch):
+    """编辑器自身抛 ``ValueError``（空候选/配置段非映射）也必须让会话存活。"""
+    monkeypatch.setattr("src.chat.core.Chatbot", _SurvivalBot)
+    monkeypatch.setattr(
+        "src.chat.core.PromptSession",
+        lambda: FakePromptSession(["/config", "/quit"]),
+    )
+    monkeypatch.setattr("src.chat.core.display_chat_config", lambda *_args, **_kwargs: None)
+
+    def exploding_launch(_chat_config):
+        raise ValueError("A list of choices needs to be provided.")
+
+    monkeypatch.setattr("src.chat.core.launch_config_editor", exploding_launch)
+
+    asyncio.run(start_chat_session_async())
+
+
+def test_start_chat_session_async_survives_failing_teardown(monkeypatch):
+    """``finally`` 里的 ``aclose`` 抛异常时不得顶替正常收尾。
+
+    替身 ``aclose`` 是受支持的契约（同函数用 ``getattr`` 探测它）；裸 ``await``
+    会让替身的错误顶替「再见」输出并向上穿透到菜单兜底（实测复现）。
+    释放失败只记录，会话仍正常收尾。
+    """
+
+    class ExplodingTeardownBot(FakeChatbot):
+        last_instance = None
+
+        def __init__(self, console):
+            super().__init__(console)
+            ExplodingTeardownBot.last_instance = self
+            self.closed = False
+
+        async def aclose(self):
+            self.closed = True
+            raise RuntimeError("替身的 aclose 失败")
+
+    monkeypatch.setattr("src.chat.core.Chatbot", ExplodingTeardownBot)
+    monkeypatch.setattr(
+        "src.chat.core.PromptSession",
+        lambda: FakePromptSession(["/quit"]),
+    )
+    monkeypatch.setattr("src.chat.core.display_chat_config", lambda *_args, **_kwargs: None)
+
+    asyncio.run(start_chat_session_async())
+
+    assert ExplodingTeardownBot.last_instance.closed is True

@@ -1,3 +1,4 @@
+import tempfile
 from pathlib import Path
 
 import faiss
@@ -195,6 +196,111 @@ def test_load_snapshot_accepts_matching_lexical_index(tmp_path):
     assert store.bm25_index is not None
 
 
+# ── 回归：embeddings 行数必须与分块数对齐 ──
+#
+# ``load_snapshot``／``load`` 此前只校验了 ``semantic.index`` 条数与
+# ``lexical.index`` 条数，**embeddings 矩阵的行数**从未与 ``documents`` 对齐过。
+# 实测 embeddings 3 行、文档 2 条的快照：载入成功、无任何提示，而
+# ``semantic_search`` 的分数按矩阵行算、文档按下标取——行数错配即张冠李戴或
+# ``IndexError``，报错现场离「这份快照坏了」很远。守卫收敛进
+# ``FaissStore._validate_row_alignment``，两个载入入口共用。
+
+
+def _write_alignment_snapshot(snapshot_dir, chunk_count, embedding_rows, index_rows=None):
+    """按真实结构写一个 chunk／embedding／索引行数可独立指定的快照。"""
+    import pickle
+
+    import faiss
+
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    with (snapshot_dir / "chunks.pkl").open("wb") as file:
+        pickle.dump(
+            [
+                {"page_content": f"chunk {position}", "metadata": {}}
+                for position in range(chunk_count)
+            ],
+            file,
+        )
+    with (snapshot_dir / "parents.pkl").open("wb") as file:
+        pickle.dump({}, file)
+    np.save(snapshot_dir / "embeddings.npy", np.zeros((embedding_rows, 4), dtype=np.float32))
+    index = faiss.IndexFlatL2(4)
+    index.add(
+        np.zeros((index_rows if index_rows is not None else embedding_rows, 4), dtype=np.float32)
+    )
+    faiss.write_index(index, str(snapshot_dir / "semantic.index"))
+    return snapshot_dir
+
+
+@pytest.mark.parametrize(
+    ("embedding_rows", "index_rows", "pattern"),
+    [
+        (3, None, "向量矩阵行数与分块数不一致"),
+        (3, 2, "向量矩阵行数与分块数不一致"),  # 索引对齐也必须拦——矩阵单独错
+        (1, 2, "向量矩阵行数与分块数不一致"),  # 矩阵先拦——索引分支由单独用例覆盖
+    ],
+    ids=["embedding-rows-3", "embedding-rows-3-index-aligned", "embedding-rows-1"],
+)
+def test_load_snapshot_rejects_row_count_mismatch(tmp_path, embedding_rows, index_rows, pattern):
+    """embeddings 行数／语义索引条数与分块数不一致时必须拒绝。"""
+    snapshot_dir = _write_alignment_snapshot(
+        tmp_path / "kb-align", chunk_count=2, embedding_rows=embedding_rows, index_rows=index_rows
+    )
+    _activate_snapshot(tmp_path, "kb-align")
+
+    store = FaissStore(file_path=None)
+    with pytest.raises(ValueError, match=pattern):
+        store.load_snapshot(str(snapshot_dir), snapshot_root=tmp_path)
+
+
+def test_load_snapshot_rejects_index_row_mismatch_alone(tmp_path):
+    """矩阵行数对齐、索引单独少一个向量时必须拦索引分支。"""
+    snapshot_dir = _write_alignment_snapshot(
+        tmp_path / "kb-idx", chunk_count=2, embedding_rows=2, index_rows=1
+    )
+    _activate_snapshot(tmp_path, "kb-idx")
+
+    store = FaissStore(file_path=None)
+    with pytest.raises(ValueError, match="语义索引条数与分块数不一致"):
+        store.load_snapshot(str(snapshot_dir), snapshot_root=tmp_path)
+
+
+def test_load_rejects_embedding_row_mismatch():
+    """legacy ``load`` 同样必须拦 embeddings 行数错配。"""
+    import pickle
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        path = Path(temp_dir) / "legacy.pkl"
+        with path.open("wb") as file:
+            pickle.dump(
+                {
+                    "documents": [
+                        {"page_content": "alpha", "metadata": {}},
+                        {"page_content": "beta", "metadata": {}},
+                    ],
+                    "embeddings": np.zeros((3, 4), dtype=np.float32),
+                    "parent_documents": {},
+                },
+                file,
+            )
+        store = FaissStore(file_path=None)
+        with pytest.raises(ValueError, match="向量矩阵行数与分块数不一致"):
+            store.load(str(path), trusted_paths=[temp_dir])
+
+
+def test_row_alignment_accepts_self_consistent_snapshot(tmp_path):
+    """收紧不能误伤：三量对齐时照常加载。"""
+    snapshot_dir = _write_alignment_snapshot(
+        tmp_path / "kb-align-ok", chunk_count=2, embedding_rows=2, index_rows=2
+    )
+    _activate_snapshot(tmp_path, "kb-align-ok")
+
+    store = FaissStore(file_path=None)
+    store.load_snapshot(str(snapshot_dir), snapshot_root=tmp_path)
+    assert len(store.documents) == 2
+    assert store.faiss_index.ntotal == 2
+
+
 # ── 回归：lexical.index 的**条目**形态也要拦 ──
 #
 # 上面那组用例只覆盖了 ``lexical.index`` 的**顶层**形态。条目本身不是序列时，
@@ -361,6 +467,30 @@ def test_load_snapshot_rejection_leaves_store_untouched(tmp_path):
     after = (list(store.documents), store.embeddings.shape, store.faiss_index.ntotal)
     assert before == after
     assert store.faiss_index.ntotal == len(store.documents)
+
+
+def test_load_snapshot_row_mismatch_rejection_leaves_store_untouched(tmp_path):
+    """行数错配的拒绝同样必须原子：store 保持原状。
+
+    行数校验发生在 ``_normalize_documents`` 之后、批量赋值之前——失败落在局部
+    变量上，``self`` 必须仍是旧快照的完整状态。
+    """
+    snapshot_dir = _write_alignment_snapshot(
+        tmp_path / "kb-align-bad", chunk_count=2, embedding_rows=3
+    )
+    _activate_snapshot(tmp_path, "kb-align-bad")
+
+    store = FaissStore(file_path=None)
+    store.upsert_embeddings(
+        [{"page_content": "alpha", "metadata": {}}], np.zeros((1, 4), dtype=np.float32)
+    )
+    before = (list(store.documents), store.embeddings.shape, store.faiss_index.ntotal)
+
+    with pytest.raises(ValueError, match="向量矩阵行数与分块数不一致"):
+        store.load_snapshot(str(snapshot_dir), snapshot_root=tmp_path)
+
+    after = (list(store.documents), store.embeddings.shape, store.faiss_index.ntotal)
+    assert before == after
 
 
 # ── 回归：embeddings 的形状要在**赋值之前**判 ──
@@ -1132,6 +1262,29 @@ def test_integer_parent_id_key_matches_legacy_snapshots():
     store = FaissStore(file_path=None)
     store.parent_documents = normalized_parents
     assert store.resolve_parent_content(1) == "旧父块正文"
+
+
+def test_parent_key_normalizes_numpy_scalars_and_distinguishes_long_values():
+    """numpy 标量键归一为与 main ``str()`` 一致；长 repr 取值不得塌键。
+
+    numpy 2.x 下 ``np.int64`` **不是** ``int`` 的子类，``safe_repr`` 会给
+    ``"np.int64(3)"``——与 main 时代快照的键 ``"3"`` 不同，载入后召回静默 miss
+    （实测复现）。``.item()`` 归一后必须逐字等于 main 的 ``str()``。同时，
+    repr 超 80 字符的取值不能退回 ``safe_repr`` 的截断形态——两个仅差 1 字节的
+    长 bytes 必须得到不同键，否则父块字典推导静默并条。
+    """
+    import numpy as np
+
+    from src.retrieval.vdb.faiss_store import _parent_key
+
+    # 与 main 时代 ``str(parent_id)`` 逐字一致。
+    assert _parent_key(np.int64(3)) == "3"
+    assert _parent_key(np.float64(2.0)) == "2.0"
+    assert _parent_key(np.bool_(True)) == "True"
+
+    # 长 repr 取值不塌键、未超限零破坏。
+    assert _parent_key(b"B" * 100) != _parent_key(b"B" * 100 + b"C")
+    assert _parent_key(b"x") == "b'x'"
 
 
 # ── 回归：载入侧必须与写入侧一样拒绝非有限向量 ──

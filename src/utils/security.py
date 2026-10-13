@@ -342,6 +342,21 @@ _GOOGLE_API_KEY_RE = re.compile(r"(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{20,}(?![A-Za
 _AK_SK_PREFIXED_KEY_RE = re.compile(
     r"(?<![A-Za-z0-9])(?:AKLT|LTAI)[0-9A-Za-z_-]{12,}(?![A-Za-z0-9])"
 )
+# 同一类「固定前缀、无键名也能自证」的业界通用凭证：GitHub PAT（``ghp_``／
+# ``github_pat_``）、Slack token（``xox[abposr]-``）、AWS Access Key（``AKIA``/
+# ``ASIA``）与 Jina（``jina_``，本项目 rerank 渠道实际在用的形态）。触发面与
+# sk-/AIza 相同——SDK 异常回显、知识库正文、嵌入方回传的服务端消息都是不可控
+# 文本，不能依赖键名锚定。长度下限挡住普通文本里的词（``the ghp variable``、
+# ``xoxb is a prefix`` 这类不带体的前缀词不命中）。
+_SELF_ATTESTING_PREFIX_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:"
+    r"ghp_[0-9A-Za-z]{30,}"
+    r"|github_pat_[0-9A-Za-z_]{20,}"
+    r"|xox[abposr]-[0-9A-Za-z-]{10,}"
+    r"|(?:AKIA|ASIA)[0-9A-Z]{16,}"
+    r"|jina_[0-9A-Za-z]{30,}"
+    r")(?![A-Za-z0-9])"
+)
 
 
 # PEM 私钥块。这是本项目**自己点名要防**的一类凭证——``SENSITIVE_OPTION_KEYS``
@@ -436,6 +451,7 @@ def redact_sensitive_text(value: Any) -> str:
     redacted = _OPENAI_KEY_RE.sub("[REDACTED]", redacted)
     redacted = _GOOGLE_API_KEY_RE.sub("[REDACTED]", redacted)
     redacted = _AK_SK_PREFIXED_KEY_RE.sub("[REDACTED]", redacted)
+    redacted = _SELF_ATTESTING_PREFIX_RE.sub("[REDACTED]", redacted)
     # PEM 块放最后：它的正文是多行 base64，前面几条规则可能已经改写了其中的
     # 片段（例如正文里恰好出现 ``sk-`` 形态），但 BEGIN/END 标记不受影响，
     # 整块仍能被吃掉。放前面则会把已被部分脱敏的块再匹配一次，结果相同但多

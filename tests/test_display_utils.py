@@ -561,15 +561,15 @@ _UNTRUSTED_FREE_ARGUMENTS = {
         "menu_content 是本函数内的字面量拼接（上面的测试已断言它是纯字面量）",
         "Panel(",
     ),
-    "scripts/embed_knowledge_base.py:123": (
+    "scripts/embed_knowledge_base.py:124": (
         "table 是 Table 对象，不是字符串",
         "console.print(table)",
     ),
-    "src/chat/core.py:380": (
+    "src/chat/core.py:382": (
         "f'{document_score(doc):.4f}'：document_score 只返回有限浮点，格式化结果不含 [",
         'f"{document_score(doc):.4f}"',
     ),
-    "src/chat/core.py:381": ("table 是 Table 对象，不是字符串", "self.console.print(table)"),
+    "src/chat/core.py:383": ("table 是 Table 对象，不是字符串", "self.console.print(table)"),
     "src/retrieval_test/core.py:68": (
         "str(index+1) 与 f'{document_score(doc):.4f}' 均为数字，不含 [",
         'f"{document_score(doc):.4f}"',

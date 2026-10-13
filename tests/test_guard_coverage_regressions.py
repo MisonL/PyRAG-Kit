@@ -2197,7 +2197,9 @@ def test_faiss_load_snapshot_rebuilds_when_lexical_index_missing():
     store = object.__new__(FaissStore)
     store.documents = []
     store.parent_documents = {}
-    store.embeddings = np.zeros((1, 4), dtype=np.float32)
+    # 行数必须自洽（``load_snapshot`` 现在会校验 embeddings 行数与分块数对齐）：
+    # 0 个分块配 0 行向量。
+    store.embeddings = np.zeros((0, 4), dtype=np.float32)
     store.faiss_index = None
     store.bm25_index = None
     store._tokenized_docs_cache = None
@@ -2208,8 +2210,6 @@ def test_faiss_load_snapshot_rebuilds_when_lexical_index_missing():
         root = pathlib.Path(tmp)
         snapshot = root / "snap-x"
         snapshot.mkdir()
-        for name in ("chunks.pkl", "parents.pkl", "embeddings.npy", "semantic.index"):
-            pass
         import pickle
 
         (snapshot / "chunks.pkl").write_bytes(pickle.dumps([]))

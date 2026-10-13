@@ -6,6 +6,14 @@
 
 ### 修复
 
+- **四维 agents 全维度终审（并发/生命周期、数据完整性、安全、错误契约/UI）收口**。四名审查 agent 对分支相对 `origin/main` 的全部改动做对抗性审查，逐条用真实入口探针复现后修复：
+  - **裸自证前缀凭证不脱敏（安全·已验证）**：`ghp_`／`github_pat_`／`xox[abposr]-`／`AKIA|ASIA`／`jina_` 开头的裸凭证不落在 `sk-`/`AIza` 等既有模式里，日志与异常文本原样外泄。`src/utils/security.py` 新增 `_SELF_ATTESTING_PREFIX_RE`（前缀 + 主体字符类的正则，前后向断言拒绝普通单词），并入脱敏管线；12 条正/反用例钉死。
+  - **键塌缩三处（数据完整性·已验证）**：`_key_text`（`retrieval_service.py`）与 `_parent_key`（`faiss_store.py`）对 repr 超 80 字符的非标量值退回 `safe_repr`，截断后不同值塌成同键，去重/父块字典静默并条；`_parent_key` 对 numpy 2.x 标量（非 `int` 子类）给 `np.int64(3)` 形态键，与 main 时代 `str()` 快照失配、召回静默 miss。修复：超限值对 repr 字节取 sha256 摘要；numpy 标量经 `.item()` 归一为与 main 逐字一致的键。注意判据必须落在**真实 repr** 上——`safe_repr` 截断输出恰好 80 字符，拿 `len(rendered) > 80` 判断永不触发（实测）。快照加载新增 `_validate_row_alignment`：embeddings 行数、`semantic.index` 条数与分块数三量对齐，`load_snapshot` 与 legacy `load` 共用，拒绝保持原子性。
+  - **`/config` 边界（错误契约·已验证）**：编辑器调用与配置回显原先在恢复 `try` 之外——rerank 段为空表等自洽性缺陷让回显抛 `ValueError`，配置已生效但整个会话被终止（实测复现），违反同块「配置应用失败不能终止会话」契约；`launch_config_editor` 自身的 `ValueError` 同样漏接。两处收进恢复路径，回显失败只报告不回滚。非法 `retrieval_method` 的菜单项从 `当前: None` 改为与 Rerank 项一致的「未知」。
+  - **会话收尾与流清理（并发/生命周期·已验证）**：`start_chat_session_async` 的 `finally` 裸 `await aclose()`——替身实现的异常顶替正常收尾与在途异常（实测复现），改为吞掉并记录；同函数局部 `logger` 与模块级 `logger` 撞名导致 `finally` 在未走 `/config` 路径时 `UnboundLocalError`（红验证暴露），改名 `bot_logger`。`retry_sync_stream` 两处：建立阶段裸 `close()` 让替身的关闭异常顶替原始 429（可重试被顶成不可重试，双向污染重试分类）；`iter()` 拿到的是 openai/anthropic `Stream.__iter__`（生成器函数）的**包装生成器**，close 它不关底层响应——消费方提前退出时连接释放退化为 GC 时机（实测复现），补 `response.close()`。`scripts/embed_knowledge_base.py` 的 `main_async` 补 `finally aclose`——四个建库入口中唯一从不释放 `EmbeddingService` 的一个，菜单循环里每次「向量化处理」泄漏一次连接池。
+  - **文档失实修正（低）**：`_parent_key` docstring「判据与 `_key_text` 一致」改为如实声明：摘要算法一致、触发阈值有意不同（此处仅 `str()` 超限整数，为旧快照键兼容）。
+  - **已核实不修**：`/config` 期间 Ctrl+C 的 to_thread 挂死（main 时代既有行为，非本分支引入，修复需重构 questionary 线程模型，风险大于收益）；`retry_sync_stream_context`/`retry_async_stream_context` 的裸 close（anthropic `MessageStreamManager` 无 close 方法，生产当前不可达）。
+
 - **CodeRabbit 第二轮复核：5 条真问题 + 1 条重复误报**。首轮 17 条修复后复跑，11 条确认消失；新报 6 条逐条核实：
   - **`SessionConfig` 读路径对非字符串键抛 `ValueError`（违反 Mapping 协议）**（`src/runtime/contracts.py`）。`__getitem__` 复用 `_require_known_field`，而 `_collections_abc` 的 `__contains__`／`get` 只接 `KeyError`——实测 `5 in cfg` 抛 `ValueError`（本该 `False`），`10**4301 in cfg` 更在拼消息时二次撞 `Exceeds the limit`。读路径改抛 `KeyError`（消息经 `safe_repr`）；写路径保持 `ValueError`（参数错误语义）。双向契约测试钉死，红验证：还原旧实现后 7 条用例红。
   - **配置编辑器被非法直写值炸死会话**（`src/ui/config_menu.py`）。`_top_k_ceiling`／`_multiplier_ceiling` 对直写的非法倍率抛 `ValueError`，调用点在 `try` 之外（内层只接 `KeyboardInterrupt/EOFError`）→ 整个编辑器会话终止，用户连改回合法值的机会都没有。非法时回落到单字段上界，组合校验推迟给应用配置时的 `SessionConfig` 守卫；`retrieval_method` 非法时显示「未知」并以 `default=None` 进菜单，与 `_rerank_menu_label` 同一契约。
