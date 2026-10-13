@@ -1103,6 +1103,37 @@ def test_parent_id_survives_huge_integer_metadata(tmp_path):
     assert reloaded.resolve_parent_content(huge_parent_id) == "父块正文"
 
 
+def test_integer_parent_id_key_matches_legacy_snapshots():
+    """整数 parent_id 的键必须与 main 时代快照（``str(parent_id)``）一致。
+
+    父块索引是写盘后长期存在的格式：main 上的代码把 ``parent_id=1`` 写成键
+    ``"1"``。中途把整数 id 换成摘要键，旧快照载入后 ``resolve_parent_content``
+    对同一个 id 算出新键——检索 miss、父块召回整体返回 None（实测复现）。
+    ``str()`` 对可表达的整数是精确转换、本身不塌键，塌键风险只来自
+    ``safe_repr`` 的截断，因此键形态必须保持 ``str(parent_id)``。
+    """
+    from src.retrieval.vdb.faiss_store import _parent_key
+
+    assert _parent_key(1) == "1"
+    assert _parent_key(0) == "0"
+    assert _parent_key(-7) == "-7"
+    assert _parent_key(12345678901234567890) == "12345678901234567890"
+
+    # 超限整数（str() 表达不了）仍走摘要键——不塌键、不抛 ValueError。
+    huge = 10**4301
+    assert _parent_key(huge).startswith("<整数，")
+    assert _parent_key(huge) == _parent_key(huge)
+    assert _parent_key(huge + 1) != _parent_key(huge)
+
+    # 旧形态快照数据过 _normalize_documents 后，整数 id 的父块仍可解析。
+    legacy_parents = {"1": {"content": "旧父块正文", "metadata": {}}}
+    legacy_docs = [{"page_content": "chunk", "metadata": {"parent_id": 1}}]
+    _, normalized_parents = FaissStore._normalize_documents(legacy_docs, legacy_parents)
+    store = FaissStore(file_path=None)
+    store.parent_documents = normalized_parents
+    assert store.resolve_parent_content(1) == "旧父块正文"
+
+
 # ── 回归：载入侧必须与写入侧一样拒绝非有限向量 ──
 #
 # 写入侧 ``EmbeddingService._as_float32_matrix`` 明确拒绝 NaN／inf，理由写在

@@ -76,19 +76,19 @@ EXPECTED_VERDICTS = (VERDICT_KILLED, VERDICT_SURVIVED, VERDICT_MUTFAIL, VERDICT_
 
 #: 读**工作区源码文本**（而非导入后行为）的测试节点。变异扫描期间源码处于变异
 #: 态，这类测试会因为「源码长什么样变了」而红，与被测行为无关——把它们算进
-#: 「有没有测试失败」会让假 KILLED。实测：green39 夹具里 4 个 SURVIVED 位点
+#: 「有没有测试失败」会让假 KILLED。实测：green38 夹具里 4 个 SURVIVED 位点
 #: （``anthropic.py:972``、``factory.py:356``、``model_provider.py:1202``／
-#: ``336``）落在 ``test_green39_fixture_sites_resolve_at_head`` 引用的节点上，
+#: ``336``）落在 ``test_green38_fixture_sites_resolve_at_head`` 引用的节点上，
 #: 该元测试在变异下必红，于是 4 个存活点全部被误报 KILLED；去掉它后全量 4420
 #: passed（真·存活）。逐个剔除前要**实测**（同 deselect 跑一次，只剩该测试红才算
 #: 收进来）：盲目的 ``--deselect`` 对不存在的 node id 是静默通过的，不构成保护。
 _SOURCE_INSPECTING_TESTS = (
     # 夹具坐标与源码 AST 的逐位点比对：变异点任一落进夹具引用的节点即必红。
-    "tests/scripts/test_audit_tooling.py::test_green39_fixture_sites_resolve_at_head",
+    "tests/scripts/test_audit_tooling.py::test_green38_fixture_sites_resolve_at_head",
     # 夹具文件本身（scripts/ 下的 .txt）在变异期间不变，这条其实不会变红——但
     # 判定标准是「读工作区文件而非导入后行为」，登记它无害；真正的保护是反向
     # 核对「探测器发现的一切都已登记」，见 test_source_inspecting_registry_is_complete。
-    "tests/scripts/test_audit_tooling.py::test_green39_fixture_parses_with_expected_verdicts",
+    "tests/scripts/test_audit_tooling.py::test_green38_fixture_parses_with_expected_verdicts",
     # 读全仓源码做 AST 级断言（重复装饰符、markup 入口、raw %-logging、
     # provider 的 importlib 隐藏导入、chat 的恢复分支形态）：断言的是源码文本
     # 本身，任何变异都可能让它们变红，与变异点的实际被测行为无关。
@@ -358,7 +358,7 @@ def run_pytest(
     是否命中当前源码）。扫描时工作区正处于变异态，变异点一旦落在元测试引用的
     节点上，元测试必红——它测的不是被测行为，而是「源码本身长什么样」。把它算进
     「有没有测试失败」的判据，会让**任何**指向夹具所引用节点的存活变异被误报
-    KILLED（实测 green39 夹具里 4 个 SURVIVED 位点因此全部假报 KILLED）。
+    KILLED（实测 green38 夹具里 4 个 SURVIVED 位点因此全部假报 KILLED）。
     这些测试对工具自身仍有价值，但只在**未变异**的源码上跑，见
     ``_SOURCE_INSPECTING_TESTS``。
     """

@@ -2084,7 +2084,7 @@ def test_settings_error_message_uses_str_not_repr():
     assert "'Value error" not in message
 
 
-def test_toml_decode_error_message_uses_str_not_repr():
+def test_toml_decode_error_message_uses_str_not_repr(monkeypatch):
     """``TOMLDecodeError`` 消息用 ``str``（``str`` 不是 ``repr``）。
 
     ``repr`` 变异后消息里出现 ``TOMLDecodeError('Invalid value ...')``，
@@ -2096,7 +2096,9 @@ def test_toml_decode_error_message_uses_str_not_repr():
     from src.utils import config
 
     with tempfile.TemporaryDirectory() as tmp:
-        config.CONFIG_TOML_PATH = pathlib.Path(tmp) / "config.toml"
+        # monkeypatch 保证临时目录消失后全局仍指回原路径——直接赋值会把
+        # 指向已删路径的 ``CONFIG_TOML_PATH`` 泄漏给后续全部用例。
+        monkeypatch.setattr(config, "CONFIG_TOML_PATH", pathlib.Path(tmp) / "config.toml")
         config.CONFIG_TOML_PATH.write_text("a = ", encoding="utf-8")
         config.get_settings.cache_clear()
         with pytest.raises(ValueError) as excinfo:
@@ -2106,7 +2108,7 @@ def test_toml_decode_error_message_uses_str_not_repr():
     assert "TOMLDecodeError(" not in message
 
 
-def test_recursion_error_message_uses_str_not_repr():
+def test_recursion_error_message_uses_str_not_repr(monkeypatch):
     """``RecursionError`` 消息用 ``str``（``str`` 不是 ``repr``）。
 
     ``repr`` 变异后消息里出现 ``RecursionError('maximum recursion depth exceeded')``。
@@ -2117,7 +2119,7 @@ def test_recursion_error_message_uses_str_not_repr():
     from src.utils import config
 
     with tempfile.TemporaryDirectory() as tmp:
-        config.CONFIG_TOML_PATH = pathlib.Path(tmp) / "config.toml"
+        monkeypatch.setattr(config, "CONFIG_TOML_PATH", pathlib.Path(tmp) / "config.toml")
         config.CONFIG_TOML_PATH.write_text("a = " + "[" * 600, encoding="utf-8")
         config.get_settings.cache_clear()
         with pytest.raises(ValueError) as excinfo:

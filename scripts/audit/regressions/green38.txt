@@ -1,22 +1,22 @@
-# 否定变异扫描的 39 个存活位点（坐标已重新基线化到当前 HEAD）。
+# 否定变异扫描的 38 个存活位点（坐标已重新基线化到当前 HEAD）。
 #
 # 历史教训：夹具最初记录在扫描当轮的源码位置上，随后源码持续演化（行号漂移、
 # 守卫随修复移动、死代码删除整段移位），到 HEAD 时 10 个位点已无法定位、
 # 10 个需要漂移才能命中——夹具静默失效却仍被按「字段可解析」放行。本版把
-# 每个坐标在 HEAD 上用 mutate.find_site 精确校验过（exact=39，无漂移）。
+# 每个坐标在 HEAD 上用 mutate.find_site 精确校验过（exact=38，无漂移）。
 #
 # 源码再演化时本文件会再次失效：跑一次下面的命令，凡报 MUTFAIL 的行就是
 # 坐标漂移/守卫被移除，需按当轮源码重新定位或删除该行。
 #
 # 用法（需要 1 个以上已注册且干净的 git worktree）：
-#   uv run python scripts/audit/verify_sites.py --worktrees /path/wt scripts/audit/regressions/green39.txt
+#   uv run python scripts/audit/verify_sites.py --worktrees /path/wt scripts/audit/regressions/green38.txt
 #
 # 期望判定来自逐点人工复核（含本轮重新分诊，重跑时剔除自指元测试）：
 # 35 处 KILLED（红验证过的测试，含 google.py:571 与 openai_compatible.py:1391
 # 两处后补的 killer 选择器）、4 处 SURVIVED（确证的等价变异）。
 #
 # 本轮分诊的两个教训（假判定点都出在这里）：
-# 1. 元测试 test_green39_fixture_sites_resolve_at_head 读工作区源码 AST——变异
+# 1. 元测试 test_green38_fixture_sites_resolve_at_head 读工作区源码 AST——变异
 #    点落在它引用的节点上时它必红，导致 4 个 SURVIVED 全部假报 KILLED。它已随
 #    其余读源码的测试一起被 run_pytest 从判定中 --deselect（只在未变异源码上
 #    跑）；因此 SURVIVED 现在是「剔除自指元测试后的全量套件存活」。
@@ -61,6 +61,5 @@ src/utils/security.py|693|49|drop|tests/providers/test_security_boundaries.py::t
 src/providers/volcengine.py|1428|38|isnot|tests/providers/test_guard_coverage_regressions.py::test_ark_responses_native_kwargs_validate_extra_body_secrets|KILLED
 src/providers/volcengine.py|1841|31|notin|tests/providers/test_guard_coverage_regressions.py::test_ark_responses_sync_deduplicates_tool_call_delivered_by_finish|KILLED
 src/providers/volcengine.py|1876|27|notin|tests/providers/test_guard_coverage_regressions.py::test_ark_responses_sync_emits_completed_before_later_events|KILLED
-src/providers/volcengine.py|1941|31|notin|tests/providers/test_guard_coverage_regressions.py::test_ark_responses_async_deduplicates_tool_call_delivered_by_finish|KILLED
 src/providers/volcengine.py|1941|31|notin|tests/providers/test_guard_coverage_regressions.py::test_ark_responses_async_deduplicates_tool_call_delivered_by_finish|KILLED
 src/providers/volcengine.py|1975|27|notin|tests/providers/test_guard_coverage_regressions.py::test_ark_responses_async_emits_completed_before_later_events|KILLED

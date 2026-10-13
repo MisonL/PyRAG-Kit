@@ -273,8 +273,8 @@ def test_find_site_requires_exactly_one_match():
 def test_source_inspecting_tests_are_excluded_from_verdicts():
     """读工作区源码文本的测试必须被排除在判定之外。
 
-    实测：green39 夹具里 4 个 SURVIVED 位点恰好落进
-    ``test_green39_fixture_sites_resolve_at_head`` 引用的节点，元测试在变异下必红
+    实测：green38 夹具里 4 个 SURVIVED 位点恰好落进
+    ``test_green38_fixture_sites_resolve_at_head`` 引用的节点，元测试在变异下必红
     ——扫描于是把 4 个存活点全部误报 KILLED。这些测试在**未变异**的源码上仍然
     有价值，所以是排除而非删除；但排除列表必须是**存在**的，``--deselect`` 对
     不存在的 node id 静默通过，写错名字不会报错。
@@ -376,17 +376,17 @@ def test_verify_sites_selftest_passes():
     assert "selftest 失败: 0" in proc.stdout
 
 
-def test_green39_fixture_parses_with_expected_verdicts():
-    fixture = REPO_ROOT / "scripts" / "audit" / "regressions" / "green39.txt"
+def test_green38_fixture_parses_with_expected_verdicts():
+    fixture = REPO_ROOT / "scripts" / "audit" / "regressions" / "green38.txt"
     sites = parse_sites(fixture.read_text(encoding="utf-8"))
-    assert len(sites) == 39
+    assert len(sites) == 38
     counts: dict[str, int] = {}
     for site in sites:
         counts[site["expected"]] = counts.get(site["expected"], 0) + 1
-    assert counts == {"KILLED": 35, "SURVIVED": 4}
+    assert counts == {"KILLED": 34, "SURVIVED": 4}
 
 
-def test_green39_fixture_sites_resolve_at_head():
+def test_green38_fixture_sites_resolve_at_head():
     """夹具坐标必须在当前 HEAD 上精确命中，否则它在静默失效。
 
     历史翻车：夹具记录在扫描当轮的坐标上，源码后续演化（行号漂移、守卫随修复
@@ -394,7 +394,7 @@ def test_green39_fixture_sites_resolve_at_head():
     夹具却只按「字段可解析」放行，于是「已知答案」失去锚定意义。这条断言把
     「坐标命中当前 HEAD」钉死：凡报 SiteNotFound 即夹具需重新基线化。
     """
-    fixture = REPO_ROOT / "scripts" / "audit" / "regressions" / "green39.txt"
+    fixture = REPO_ROOT / "scripts" / "audit" / "regressions" / "green38.txt"
     sites = parse_sites(fixture.read_text(encoding="utf-8"))
     stale = []
     for site in sites:

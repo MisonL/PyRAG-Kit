@@ -52,15 +52,24 @@ def _parent_key(parent_id: Any) -> str:
     ``resolve_parent_content`` 对两个不同 id 返回同一父块正文——父块内容张冠
     李戴。按二进制补码取 sha256 摘要才能既稳定又唯一，判据与
     ``retrieval_service._key_text`` 一致。
+    但摘要形态**只对 ``str()`` 无法表达的超限整数启用**：键是写盘后长期存在
+    的格式，main 时代构建的快照里整数 id 的键是 ``str(parent_id)``（``1`` →
+    ``"1"``），无差别换键会让旧快照在载入后召回不到任何整数 id 的父块（实测
+    复现）。``str`` 对可表达的整数是**精确**转换，本身不塌键；塌键风险只
+    来自 ``safe_repr`` 的截断。因此先试 ``str()``，抛 ``ValueError`` 才落
+    摘要——旧快照零破坏，超限整数仍唯一稳定。
     """
     if isinstance(parent_id, str):
         return parent_id
-    import hashlib
-
     if isinstance(parent_id, int):
-        raw = parent_id.to_bytes((parent_id.bit_length() + 8) // 8, "big", signed=True)
-        digest = hashlib.sha256(raw, usedforsecurity=False).hexdigest()
-        return f"<整数，{digest}>"
+        try:
+            return str(parent_id)
+        except ValueError:  # 十进制位数超 CPython str() 上限（4300 位）
+            import hashlib
+
+            raw = parent_id.to_bytes((parent_id.bit_length() + 8) // 8, "big", signed=True)
+            digest = hashlib.sha256(raw, usedforsecurity=False).hexdigest()
+            return f"<整数，{digest}>"
     return safe_repr(parent_id)
 
 
