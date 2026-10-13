@@ -299,7 +299,7 @@ def test_excel_logger_keeps_the_plain_name_when_nothing_collides(tmp_path):
     assert re.fullmatch(r"recall_test_log_\d{8}_\d{6}\.xlsx", os.path.basename(logger.filepath))
 
 
-def test_excel_logger_skips_names_taken_by_other_files(tmp_path):
+def test_excel_logger_skips_names_taken_by_other_files(tmp_path, monkeypatch):
     """已存在的同名文件（例如上一次运行留下的）必须被跳过，而不是被覆盖。
 
     判据是 ``O_CREAT | O_EXCL`` 而不是 ``os.path.exists``：后者是「先查后写」，
@@ -310,8 +310,18 @@ def test_excel_logger_skips_names_taken_by_other_files(tmp_path):
 
     from src.retrieval_test.excel_logger import ExcelLogger
 
-    # 预置一个与本次同秒同名的文件，模拟「上一次运行在同一秒留下的日志」。
-    timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
+    # 把时钟钉在固定秒：真实时钟在「预置文件」与 logger 内部第二次取时间之间
+    # 跨秒的话，logger 会用新时间戳、不撞预置名，用例在断言上静默变成空转。
+    frozen = datetime(2026, 10, 13, 12, 0, 0).astimezone()
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen if tz is None else frozen.astimezone(tz)
+
+    monkeypatch.setattr("src.retrieval_test.excel_logger.datetime", _FrozenDatetime)
+
+    timestamp = frozen.strftime("%Y%m%d_%H%M%S")
     occupied = tmp_path / f"recall_test_log_{timestamp}.xlsx"
     occupied.write_bytes(b"PREEXISTING")
 

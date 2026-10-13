@@ -6,6 +6,14 @@
 
 ### 修复
 
+- **CodeRabbit 全量复核：3 处 major + 14 处 minor 逐条分诊修复**。对 PR #3 全量 diff（189 提交／81 文件）跑 CLI 复核，17 条 findings 逐条对照当前代码核实：
+  - **`_parent_key` 破坏旧快照父块召回（major，已复现）**（`src/retrieval/vdb/faiss_store.py`）。main 时代代码把父块索引按 `str(parent_id)` 写盘；本分支把整数 id 无差别换成 sha256 摘要键，而盘上键是字符串、原样保留——实测旧快照过 `_normalize_documents` 后父块键仍是 `"1"`，`resolve_parent_content(1)` 算出 `"<整数，4bf5…>"` 而 miss、返回 `None`，整数 `parent_id` 的父块召回整体失灵。摘要形态改为**只对 `str()` 表达不了的超限整数启用**：`str` 对可表达整数是精确转换、本身不塌键（塌键风险只来自 `safe_repr` 的截断），先试 `str()`、抛 `ValueError` 才落摘要——旧快照零破坏，超限整数仍唯一稳定。新增旧形态快照兼容回归测试（红验证：禁用 `str()` 回退后该测试红）。
+  - **测试把删除的临时路径泄漏进全局（major）**（`tests/test_guard_coverage_regressions.py`）。两个用例直接赋值 `config.CONFIG_TOML_PATH` 且不还原，`TemporaryDirectory` 结束后全局仍指向已删路径。改 `monkeypatch.setattr`。
+  - **`green39.txt` 夹具含重复位点（minor）**：第 64/65 行完全相同（`volcengine.py|1941|31|notin`），39 行实际只有 38 个唯一位点、KILLED 计数把它算两次。删重复行并更名 `green38.txt`（38 个唯一位点，34 KILLED／4 SURVIVED），`test_green38_fixture_parses_with_expected_verdicts` 断言与文档同步；本轮 `_parent_key` 等 `google.py` 修改又使 6 个坐标漂移，按上下文重基线（守卫语义逐一对照确认）。CHANGELOG 历史段保留当时文件名。
+  - **`GoogleProvider` 两处 `safe_repr` 误用（minor，均实测复现）**（`src/providers/google.py`）：`normalized_key` 经 `safe_repr` 规范化后 80 字符截断会把超长键名的 `apikey` 后缀切掉、`endswith` 判据失配而放行凭证键（实测 90 字符键名放行）——字符串直接规范化、非字符串才走 `safe_repr`；标量 `content` 无条件走 `safe_repr` 会把普通长文本消息加引号并截断成 `'前 77 字...'` 发给模型——字符串原样透传、非字符串保持 `safe_repr` 兜底（超限整数仍不崩）。各补长键名拒绝、长文本透传回归测试，均红验证。
+  - **其余 minor**：`load_snapshot` 的词法缓存与 BM25 赋值推迟到全部可失败步骤之后（拒绝的载入不改 store 契约覆盖到最后一步）；`background_poll_*` 错误消息把下界说成 1（实际 0.5 合法）改为「大于 0 且不超过」；`_weight_tuple` 溢出用例改 `pytest.raises` 并按实测把 `10**305` 归入值域判据分支；ExcelLogger 竞态用例冻结时钟（真实时钟跨秒会让断言空转）；`_contents` 装饰器扫描按测试文件位置锚定仓库根（CWD 外启动不再扫空）；`HIDDEN_IMPORTS` 前提检查补 `from X import` 形态；root 下跳过 `chmod 0o500` 权限用例；parse 用例改断言方法专属消息并修复两处 docstring 乱码；CHANGELOG 截断句补全（整数解析判据用例组）、重复段合并、「被红acted」改「被脱敏」。
+  - **误报 1 条**：`httpx2` 不是 `httpx` 笔误——它是 `uv.lock` 声明的真实依赖（httpx2 2.12.0），930 条相关测试实测全过。
+
 - **跨平台测试偏差：`/private/tmp` 不能进公共危险路径参数表**（`tests/test_cleanup.py`）。`test_reject_unsafe_cache_dir_rejects_system_level_roots` 的参数表把 `"/private/tmp"` 与 `"/tmp"` 并列，但两者只在 **macOS** 上解析为同一路径（`/tmp` 是指向 `/private/tmp` 的符号链接）。守卫 `_reject_unsafe_cache_dir` 的判据是「解析后与受保护根**相等**」，Linux 上 `/private` 不是系统目录、该路径也不存在，返回 `None` 是正确行为（`cleanup_temp_files` 在 `rmtree` 前另有 `os.path.exists` 检查，放行无害）。quality workflow 只跑 `ubuntu-24.04`，该参数在 CI 上必红（实测 `1 failed, 4449 passed`）。改为 darwin 专属用例 `test_reject_unsafe_cache_dir_rejects_macos_tmp_resolution_target`（`skipif(platform != "darwin")`），公共表只留跨平台成立的系统根。
 
 - **测试夹具与 CHANGELOG 里的 base64 假凭证字面量改为运行时构造**（`tests/providers/test_security_boundaries.py`、`CHANGELOG.md`）。Basic 认证脱敏用例的夹具值是 `base64("user:password")`，被 GitGuardian 按 `Bearer Token` 检测器报为 PR #3 的硬编码秘密——它并非真实凭证（解码即教材占位符），但字面量本身会持续触发扫描并阻塞合并。夹具改为 `base64.b64encode(b"fixture-user:fixture-password").decode()` 在运行时构造，明文占位符不构成密钥，编码结果与断言语义逐字节不变；CHANGELOG 两处同源字面量一并改为 `<base64 凭证>` 描述。脱敏行为本身与断言强度未变（红/绿验证同前）。

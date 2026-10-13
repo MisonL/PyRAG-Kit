@@ -9795,10 +9795,10 @@ def _anthropic_parse_provider():
     ],
 )
 def test_anthropic_parse_requires_output_format(method, message):
-    """同步两个 parse 入口缺 ``output_format`` 必须给专��消息。"""
+    """同步两个 parse 入口缺 ``output_format`` 必须给专属消息。"""
     provider = _anthropic_parse_provider()
 
-    with pytest.raises(ValueError, match="必须提供 output_format"):
+    with pytest.raises(ValueError, match=message):
         getattr(provider, method)(None)
 
 
@@ -9810,10 +9810,10 @@ def test_anthropic_parse_requires_output_format(method, message):
     ],
 )
 def test_anthropic_async_parse_requires_output_format(method, message):
-    """异步两个 parse 入口是**另一份**实现，同样要有专��消息。"""
+    """异步两个 parse 入口是**另一份**实现，同样要有专属消息。"""
     provider = _anthropic_parse_provider()
 
-    with pytest.raises(ValueError, match="必须提供 output_format"):
+    with pytest.raises(ValueError, match=message):
         asyncio.run(getattr(provider, method)(None))
 
 
@@ -10033,7 +10033,7 @@ def test_openai_compatible_background_timeout_must_be_positive_number(timeout):
     provider = object.__new__(OpenAICompatibleProvider)
     provider._options = {"background_timeout": timeout}
 
-    with pytest.raises(ValueError, match="background_timeout 必须是 1 到 86400 之间的正数"):
+    with pytest.raises(ValueError, match="background_timeout 必须是大于 0 且不超过 86400 的正数"):
         provider._background_poll_config()
 
 
@@ -10046,7 +10046,7 @@ def test_openai_compatible_background_timeout_upper_bound():
     provider = object.__new__(OpenAICompatibleProvider)
     provider._options = {"background_timeout": 1e19}
 
-    with pytest.raises(ValueError, match="background_timeout 必须是 1 到 86400 之间的正数"):
+    with pytest.raises(ValueError, match="background_timeout 必须是大于 0 且不超过 86400 的正数"):
         provider._background_poll_config()
 
 

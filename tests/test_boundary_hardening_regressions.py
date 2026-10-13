@@ -4941,8 +4941,11 @@ def test_no_duplicate_decorators_in_source_tree():
     import ast
     from pathlib import Path
 
+    # 按本测试文件自身位置锚定仓库根：``Path("src")`` 相对进程 CWD，
+    # 从仓库外目录启动 pytest 时会扫错地方（或空转/误报）。
+    repo_root = Path(__file__).resolve().parents[1]
     violations: list[str] = []
-    for path in sorted(Path("src").rglob("*.py")):
+    for path in sorted((repo_root / "src").rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -5307,6 +5310,19 @@ def test_google_contents_keep_small_scalar_content_verbatim():
     contents = GoogleProvider._contents([{"role": "user", "content": 5}], None, None)
 
     assert contents[0].parts[0].text == "5"
+
+
+def test_google_contents_keep_string_content_verbatim_not_safe_repr():
+    """字符串 content 必须原样透传，不经 ``safe_repr`` 的引号与截断。
+
+    ``safe_repr`` 对字符串加引号并在 80 字符处截断——普通长文本消息会被改写成
+    ``'前 77 字...'`` 发给模型。字符串 content 是最常见的合法形态，渲染走
+    ``safe_repr`` 是行为回归而非防护。
+    """
+    long_text = "这是一条超过八十字符的普通用户消息，" * 10
+    contents = GoogleProvider._contents([{"role": "user", "content": long_text}], None, None)
+
+    assert contents[0].parts[0].text == long_text
 
 
 # --- Anthropic 响应文本块的拼接 ---------------------------------------------

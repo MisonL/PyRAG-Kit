@@ -436,24 +436,25 @@ def test_rerank_result_accepts_valid_pairs():
 
 
 @pytest.mark.parametrize(
-    "weight",
+    ("weight", "message"),
     [
-        pytest.param(10**308, id="just-over-double-sum"),
-        pytest.param(10**305, id="large-but-summable"),
+        pytest.param(10**308, "和为正的有限数值", id="just-over-double-sum"),
+        pytest.param(10**305, "必须在 0.0 到 1.0 之间", id="large-but-in-unit-range-violation"),
     ],
 )
-def test_weight_sum_overflow_is_a_value_error(weight):
-    """两个权重各自合法但和超出范围时，收场必须是 ``ValueError``。"""
+def test_weight_sum_overflow_is_a_value_error(weight, message):
+    """两个权重各自合法但**派生值**越界时，收场必须是 ``ValueError``。
+
+    实测两个大整数权重在 ``_weight_tuple`` 的两条守卫上分岔：``10**308 * 2``
+    在派生和的 ``isfinite`` 判据上被拒（转 float 溢出成 ``inf``）；``10**305``
+    的和在 double 内，但单个权重超出 ``[0, 1]`` 值域判据，同样以带指引的
+    ``ValueError`` 收场。两条都必须是 ``ValueError`` 而不是裸
+    ``OverflowError``——守卫被删时用例红。
+    """
     reranker = HybridReranker(weight, weight)
 
-    # 10**305 * 2 仍在 double 范围内，因此那条路径应正常返回；
-    # 10**308 * 2 超出，必须在构造期或 rerank 期抛 ValueError。
-    try:
+    with pytest.raises(ValueError, match=message):
         reranker.rerank([{"metadata": {}, "page_content": "x", "score": 0.5}])
-    except ValueError:
-        pass
-    except ArithmeticError as exc:  # pragma: no cover - 回归失败时触发
-        pytest.fail(f"溢出应以 ValueError 收场，实际是 {type(exc).__name__}: {exc}")
 
 
 @pytest.mark.parametrize(

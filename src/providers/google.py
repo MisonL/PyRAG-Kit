@@ -545,7 +545,13 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         found: list[str] = []
 
         def normalized_key(key: Any) -> str:
-            return "".join(char for char in safe_repr(key).lower() if char.isalnum())
+            # 字符串直接规范化：``safe_repr`` 对字符串加引号、并在 80 字符处
+            # 截断成 ``'xxx...'``，超长键名的后缀（``...apikey``／``...secret``）
+            # 会被截掉，``is_sensitive_key`` 的 ``endswith`` 判据随即失配——
+            # 一个长键名的凭证键就会被放行（实测复现）。非字符串才走
+            # ``safe_repr``（不崩）。
+            text = key if isinstance(key, str) else safe_repr(key)
+            return "".join(char for char in text.lower() if char.isalnum())
 
         def is_sensitive_key(key: Any) -> bool:
             normalized = normalized_key(key)
@@ -1859,14 +1865,21 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                     else:
                         raise ValueError(f"Google 不支持的消息内容块类型: {part_type!r}。")
             else:
-                # 标量 content 的渲染走 ``safe_repr`` 而不是裸 ``str()``：
-                # ``normalize_messages`` 只校验 ``messages`` 是「对象序列」，不校验
-                # content 的形态（实测 ``{"role": "user", "content": 10**4301}``
-                # 原样通过），因此这里是标量 content 的唯一收口。``str(10**4301)``
-                # 抛 ``ValueError: Exceeds the limit``——类型对、内容却与「消息
-                # 内容写错了」无关。判据与同文件的 ``_normalize_finish_reason`` 一致
-                # （非字符串走 ``safe_repr``）。
-                parts = [types.Part(text=safe_repr(raw_content))]
+                # 字符串 content 原样透传；其余标量 content 的渲染走 ``safe_repr``
+                # 而不是裸 ``str()``：``normalize_messages`` 只校验 ``messages``
+                # 是「对象序列」，不校验 content 的形态（实测
+                # ``{"role": "user", "content": 10**4301}`` 原样通过），因此这里
+                # 是标量 content 的唯一收口。``str(10**4301)`` 抛
+                # ``ValueError: Exceeds the limit``——类型对、内容却与「消息
+                # 内容写错了」无关。字符串**必须**排除在 ``safe_repr`` 之外：
+                # 后者会加引号并在 80 字符处截断，把普通长文本消息改写成
+                # ``'前 77 字...'`` 发给模型。非字符串的兜底判据与同文件的
+                # ``_normalize_finish_reason`` 一致。
+                parts = [
+                    types.Part(
+                        text=raw_content if isinstance(raw_content, str) else safe_repr(raw_content)
+                    )
+                ]
             for index, call in enumerate(message.get("tool_calls", []) or []):
                 if not isinstance(call, Mapping):
                     raise ValueError(f"Google assistant tool_calls[{index}] 必须是对象。")

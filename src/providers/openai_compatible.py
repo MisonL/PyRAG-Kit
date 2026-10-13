@@ -561,7 +561,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             or interval > _MAX_CLIENT_TIMEOUT_SECONDS
         ):
             raise ValueError(
-                f"Responses background_poll_interval 必须是 1 到 {_MAX_CLIENT_TIMEOUT_SECONDS:.0f} 之间的正数。"
+                f"Responses background_poll_interval 必须是大于 0 且不超过 {_MAX_CLIENT_TIMEOUT_SECONDS:.0f} 的正数。"
             )
         if (
             isinstance(timeout, bool)
@@ -571,7 +571,7 @@ class OpenAICompatibleProvider(LargeLanguageModel, TextEmbeddingModel):
             or timeout > _MAX_CLIENT_TIMEOUT_SECONDS
         ):
             raise ValueError(
-                f"Responses background_timeout 必须是 1 到 {_MAX_CLIENT_TIMEOUT_SECONDS:.0f} 之间的正数。"
+                f"Responses background_timeout 必须是大于 0 且不超过 {_MAX_CLIENT_TIMEOUT_SECONDS:.0f} 的正数。"
             )
         # 上界与客户端 timeout 同一个常量（``_MAX_CLIENT_TIMEOUT_SECONDS``）：
         # 该常量存在的理由就是「凡在该值上再做算术的下游都会炸」——这里

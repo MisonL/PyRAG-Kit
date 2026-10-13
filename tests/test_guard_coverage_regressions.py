@@ -6,6 +6,7 @@
 """
 
 import asyncio
+import os
 import pathlib
 import tempfile
 
@@ -840,6 +841,10 @@ def test_get_chat_logger_degrades_to_console_when_log_dir_unusable(caplog):
         log_manager.get_settings = original
 
 
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="root 忽略权限位，chmod 0o500 后 remove 仍会成功，守卫不触发",
+)
 def test_cleanup_old_logs_continues_when_one_file_cannot_be_removed(caplog):
     """单个旧日志删除失败只记日志、继续清理，不让异常打断退出钩子。
 

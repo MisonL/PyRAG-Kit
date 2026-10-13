@@ -215,6 +215,9 @@ def test_google_get_client_requires_explicit_auth_without_key_or_vertex_mode(mon
         {"base_url": "https://proxy.invalid/v1?api_key=secret"},
         {"base_url": "https://user:password@proxy.invalid/v1"},
         {"httpx_client": object()},
+        # 长键名尾缀凭证：``normalized_key`` 若经 ``safe_repr`` 规范化，80 字符
+        # 截断会把超长键名的 ``apikey`` 后缀切掉，``endswith`` 判据失配而放行。
+        {"headers": {("x-" + "tooling" * 15 + "apikey"): "secret"}},
     ],
 )
 def test_google_http_options_reject_credentials_or_custom_clients(http_options):

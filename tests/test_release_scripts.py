@@ -398,8 +398,16 @@ def test_registered_provider_modules_have_no_static_import_path():
     from src.providers.factory import ModelProviderFactory
 
     for module in sorted({info["module"] for info in ModelProviderFactory._provider_map.values()}):
+        # ``from X import Y`` 与 ``from .pkg import X`` 都算静态导入，与
+        # ``import X`` 同罪——只 grep ``import {module}`` 会漏掉最常见的
+        # from 形态，前提校验在它声称覆盖的路径上放空。
+        patterns = [
+            f"import {module}",
+            f"from {module} import",
+            f"from {module.rsplit('.', 1)[0]} import",
+        ]
         result = subprocess.run(
-            ["grep", "-rn", f"import {module}", "--include=*.py", "src", "scripts", "main.py"],
+            ["grep", "-rnE", "|".join(patterns), "--include=*.py", "src", "scripts", "main.py"],
             capture_output=True,
             text=True,
             check=False,

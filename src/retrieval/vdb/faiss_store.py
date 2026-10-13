@@ -1002,15 +1002,23 @@ class FaissStore(VectorStoreBase):
                         f"{position} 条语料不是序列（{type(entry).__name__}），"
                         "无法作为关键词索引语料使用。请重建快照。"
                     )
-            self._tokenized_docs_cache = tokenized_docs if tokenized_docs is not None else []
-            self.bm25_index = self._build_bm25_index(self._tokenized_docs_cache)
+            # ``_build_bm25_index`` 的入参已经过上面三道守卫（顶层形态、条数、
+            # 条目形态），是「最后一个可以失败的步骤」——失败也只发生在局部
+            # 变量上，``self`` 仍是旧快照的完整状态（「拒绝的载入不改 store」
+            # 契约覆盖到最后一步）。缓存赋值整体推迟到本块末尾、与新快照字段
+            # 同批进行，避免「缓存已是新值、documents 还是旧值」的中间态。
+            lexical_cache = tokenized_docs if tokenized_docs is not None else []
+            lexical_bm25 = self._build_bm25_index(lexical_cache)
         # 全部校验通过，到这里才改动 store。``_rebuild_indices`` 走 ``else`` 分支
         # 时会读 ``self.documents``，因此必须排在这些赋值之后。
         self.documents = documents
         self.parent_documents = parent_documents
         self.embeddings = embeddings
         self.faiss_index = faiss_index
-        if not lexical_path.exists():
+        if lexical_path.exists():
+            self._tokenized_docs_cache = lexical_cache
+            self.bm25_index = lexical_bm25
+        else:
             self._rebuild_indices()
 
     def import_legacy_snapshot(
