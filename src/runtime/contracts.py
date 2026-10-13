@@ -142,7 +142,18 @@ class SessionConfig(MutableMapping[str, Any]):
         #
         # 复用 ``_require_known_field`` 而不是就地判断：它与写入侧共用同一份
         # 判据与措辞，两侧不会各自演化。
-        self._require_known_field(key)
+        #
+        # 但读路径要把**非字符串**键从 ``ValueError`` 改判 ``KeyError``：
+        # ``Mapping.__contains__`` 只接 ``KeyError``（``_collections_abc`` 里
+        # ``except KeyError: return False``），``ValueError`` 会直接冒出去——
+        # 实测 ``5 in cfg`` 抛 ``ValueError: 字段名必须是字符串``（本该是
+        # ``False``），而 ``10**4301 in cfg`` 更在 ``f"{key!r}"`` 拼 ``ValueError``
+        # 消息时二次撞上 ``Exceeds the limit``，读一个键把整个调用炸死。写路径
+        # 的 ``ValueError`` 语义不变：赋值给非法名字是参数错误。
+        try:
+            self._require_known_field(key)
+        except ValueError:
+            raise KeyError(f"SessionConfig 没有字段 {safe_repr(key)}。") from None
         return getattr(self, key)
 
     def __setitem__(self, key: str, value: Any) -> None:

@@ -31,8 +31,8 @@ src/providers/anthropic.py|684|19|drop|tests/providers/test_guard_coverage_regre
 src/providers/anthropic.py|841|71|isnot|tests/providers/test_guard_coverage_regressions.py::test_anthropic_beta_only_fields_rejected_without_beta|KILLED
 src/providers/anthropic.py|972|19|isnot||SURVIVED
 src/providers/anthropic.py|981|19|isnot|tests/providers/test_guard_coverage_regressions.py::test_anthropic_duplicate_sampling_field_with_extra_body|KILLED
-src/ui/config_menu.py|209|15|isnot|tests/ui/test_config_menu.py::test_edit_retrieval_params_writes_rerank_toggle|KILLED
-src/ui/config_menu.py|436|15|isnot|tests/ui/test_config_menu.py::test_edit_model_params_writes_selected_rerank_configuration|KILLED
+src/ui/config_menu.py|225|15|isnot|tests/ui/test_config_menu.py::test_edit_retrieval_params_writes_rerank_toggle|KILLED
+src/ui/config_menu.py|438|15|isnot|tests/ui/test_config_menu.py::test_edit_model_params_writes_selected_rerank_configuration|KILLED
 src/retrieval_test/excel_logger.py|346|84|isnot|tests/retrieval_test/test_retrieval_cli.py::test_excel_log_drops_none_scores_from_all_scores_column|KILLED
 src/providers/factory.py|356|16|isnot||SURVIVED
 src/providers/google.py|1798|27|drop|tests/providers/test_guard_coverage_regressions.py::test_google_tool_result_part_resolves_name_from_call_id|KILLED

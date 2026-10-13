@@ -6,6 +6,12 @@
 
 ### 修复
 
+- **CodeRabbit 第二轮复核：5 条真问题 + 1 条重复误报**。首轮 17 条修复后复跑，11 条确认消失；新报 6 条逐条核实：
+  - **`SessionConfig` 读路径对非字符串键抛 `ValueError`（违反 Mapping 协议）**（`src/runtime/contracts.py`）。`__getitem__` 复用 `_require_known_field`，而 `_collections_abc` 的 `__contains__`／`get` 只接 `KeyError`——实测 `5 in cfg` 抛 `ValueError`（本该 `False`），`10**4301 in cfg` 更在拼消息时二次撞 `Exceeds the limit`。读路径改抛 `KeyError`（消息经 `safe_repr`）；写路径保持 `ValueError`（参数错误语义）。双向契约测试钉死，红验证：还原旧实现后 7 条用例红。
+  - **配置编辑器被非法直写值炸死会话**（`src/ui/config_menu.py`）。`_top_k_ceiling`／`_multiplier_ceiling` 对直写的非法倍率抛 `ValueError`，调用点在 `try` 之外（内层只接 `KeyboardInterrupt/EOFError`）→ 整个编辑器会话终止，用户连改回合法值的机会都没有。非法时回落到单字段上界，组合校验推迟给应用配置时的 `SessionConfig` 守卫；`retrieval_method` 非法时显示「未知」并以 `default=None` 进菜单，与 `_rerank_menu_label` 同一契约。
+  - **测试名/docstring 与实现不符（2 处）**（`tests/runtime/test_contracts.py`、`tests/test_config.py`）。`test_session_config_constructor_rejects_temperature_beyond_double_range` 声称覆盖构造器路径却只测 `__setitem__`；`test_empty_snapshot_root_does_not_widen_the_pickle_trust_root` 声称走端到端 `build_run_config → load_snapshot` 而体只构造 `Settings`。均改为真走声称的路径。
+  - **误报 1 条**：`httpx2` 被重复报为 `httpx` 笔误，已核实为 `uv.lock` 声明的真实依赖（930 条相关测试全过）。
+
 - **CodeRabbit 全量复核：3 处 major + 14 处 minor 逐条分诊修复**。对 PR #3 全量 diff（189 提交／81 文件）跑 CLI 复核，17 条 findings 逐条对照当前代码核实：
   - **`_parent_key` 破坏旧快照父块召回（major，已复现）**（`src/retrieval/vdb/faiss_store.py`）。main 时代代码把父块索引按 `str(parent_id)` 写盘；本分支把整数 id 无差别换成 sha256 摘要键，而盘上键是字符串、原样保留——实测旧快照过 `_normalize_documents` 后父块键仍是 `"1"`，`resolve_parent_content(1)` 算出 `"<整数，4bf5…>"` 而 miss、返回 `None`，整数 `parent_id` 的父块召回整体失灵。摘要形态改为**只对 `str()` 表达不了的超限整数启用**：`str` 对可表达整数是精确转换、本身不塌键（塌键风险只来自 `safe_repr` 的截断），先试 `str()`、抛 `ValueError` 才落摘要——旧快照零破坏，超限整数仍唯一稳定。新增旧形态快照兼容回归测试（红验证：禁用 `str()` 回退后该测试红）。
   - **测试把删除的临时路径泄漏进全局（major）**（`tests/test_guard_coverage_regressions.py`）。两个用例直接赋值 `config.CONFIG_TOML_PATH` 且不还原，`TemporaryDirectory` 结束后全局仍指向已删路径。改 `monkeypatch.setattr`。

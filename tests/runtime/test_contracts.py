@@ -232,13 +232,63 @@ def test_session_config_getitem_rejects_unknown_fields(session_config, label, ba
     ids=["list", "huge-int", "none"],
 )
 def test_session_config_getitem_rejects_malformed_field_names(session_config, label, bad_key):
-    """字段名形态非法时必须报 ``ValueError``，不能漏出 ``TypeError`` 或位数上限错误。"""
-    with pytest.raises(ValueError) as excinfo:
+    """字段名形态非法时必须报 ``KeyError``，不能漏出 ``TypeError`` 或位数上限错误。
+
+    读路径用 ``KeyError`` 而不是 ``ValueError``：``Mapping`` 协议要求未知键抛
+    ``KeyError``，而 ``_collections_abc`` 的 ``__contains__``／``get`` 只接
+    ``KeyError``——非字符串键抛 ``ValueError`` 会让 ``5 in cfg`` 直接炸，而不是
+    返回 ``False``。写路径（``__setitem__``）保持 ``ValueError``，见下一条用例。
+    """
+    with pytest.raises(KeyError) as excinfo:
         session_config[bad_key]
+
+    message = str(excinfo.value)
+    assert "没有字段" in message, f"{label}: {message}"
+    assert "Exceeds the limit" not in message, f"{label}: {message}"
+
+
+@pytest.mark.parametrize(
+    ("label", "bad_key"),
+    [
+        ("不可哈希的列表", [1, 2]),
+        ("位数超限的整数", 10**4301),
+        ("None", None),
+        ("整数", 5),
+    ],
+    ids=["list", "huge-int", "none", "int"],
+)
+def test_session_config_setitem_keeps_value_error_for_malformed_names(
+    session_config, label, bad_key
+):
+    """写入侧对非法形态仍报 ``ValueError``（参数错误），与读路径的 ``KeyError`` 分离。"""
+    with pytest.raises(ValueError) as excinfo:
+        session_config[bad_key] = 1
 
     message = str(excinfo.value)
     assert "字段名必须是字符串" in message, f"{label}: {message}"
     assert "Exceeds the limit" not in message, f"{label}: {message}"
+
+
+@pytest.mark.parametrize(
+    ("label", "bad_key"),
+    [
+        ("不可哈希的列表", [1, 2]),
+        ("位数超限的整数", 10**4301),
+        ("None", None),
+        ("整数", 5),
+    ],
+    ids=["list", "huge-int", "none", "int"],
+)
+def test_session_config_membership_probe_never_raises_for_malformed_names(
+    session_config, label, bad_key
+):
+    """``in``／``get`` 探测非字符串键必须返回「不存在」而不是抛异常。
+
+    这是上一条修复的**目的**：``10**4301 in cfg`` 此前在拼 ``ValueError`` 消息时
+    二次撞上 ``Exceeds the limit``，读一个键把调用炸死。
+    """
+    assert bad_key not in session_config, label
+    assert session_config.get(bad_key, "dflt") == "dflt", label
 
 
 def test_session_config_mapping_protocol_works_for_unknown_keys(session_config):
@@ -740,10 +790,21 @@ def test_session_config_rejects_weights_beyond_double_range(session_config, fiel
 
 @pytest.mark.parametrize("bad_value", _BEYOND_DOUBLE_INTS)
 def test_session_config_constructor_rejects_temperature_beyond_double_range(bad_value):
-    """构造器与 ``__setitem__`` 走同一组校验器，这条路径也必须收敛成 ``ValueError``。"""
+    """构造器与 ``__setitem__`` 走同一组校验器，**两条**路径都必须收敛成 ``ValueError``。"""
+    from src.runtime.contracts import SessionConfig
+
     config = build_session_config(Settings(_env_file=None))
     with pytest.raises(ValueError, match="chat_temperature"):
         config["chat_temperature"] = bad_value
+    # 用例名承诺的构造器路径：合法实例上逐字段替换出非法值再重建，
+    # ``__init__`` 的校验器注册表必须同样拒绝。
+    with pytest.raises(ValueError, match="chat_temperature"):
+        SessionConfig(
+            **{
+                **config.to_dict(),
+                "chat_temperature": bad_value,
+            }
+        )
 
 
 # ── 回归：快照清单字段是位数超限的整数时不得崩 ──

@@ -2757,12 +2757,19 @@ def test_require_provider_name_accepts_any_string_and_rejects_the_rest():
         pytest.param(_HUGE_INT, id="beyond-int-max-str-digits"),
     ],
 )
-def test_top_k_ceiling_rejects_unusable_multiplier(bad_value):
-    """倍率字段形态不可用时，``_top_k_ceiling`` 必须报错而不是抛裸 ``TypeError``。"""
-    from src.ui.config_menu import _top_k_ceiling
+def test_top_k_ceiling_falls_back_when_multiplier_is_unusable(bad_value):
+    """倍率字段形态不可用时，``_top_k_ceiling`` 回落到单字段上界而不是抛错。
 
-    with pytest.raises(ValueError, match="retrieval_candidate_multiplier"):
-        _top_k_ceiling(bad_value)
+    此前这里断言抛 ``ValueError``（当时修的是「不要抛裸 ``TypeError``」）。但
+    抛出同样终止会话：``edit_retrieval_params`` 的调用链（``chat/core`` 经
+    ``asyncio.to_thread``）内层只接 ``(KeyboardInterrupt, EOFError)``，外层只有
+    ``finally``——与 ``_rerank_menu_label`` 注释里写明的契约一致（菜单是用户唯一
+    还能改回合法值的入口，不能把它炸掉）。非法取值下上界放宽到单字段上界，
+    组合越界由应用配置时的 ``SessionConfig`` 守卫带指引地拒绝。
+    """
+    from src.ui.config_menu import _MAX_RETRIEVAL_TOP_K, _top_k_ceiling
+
+    assert _top_k_ceiling(bad_value) == _MAX_RETRIEVAL_TOP_K
 
 
 @pytest.mark.parametrize(
@@ -2774,12 +2781,11 @@ def test_top_k_ceiling_rejects_unusable_multiplier(bad_value):
         pytest.param(True, id="bool"),
     ],
 )
-def test_multiplier_ceiling_rejects_unusable_top_k(bad_value):
-    """对称方向：``top_k`` 形态不可用时 ``_multiplier_ceiling`` 同样报错。"""
-    from src.ui.config_menu import _multiplier_ceiling
+def test_multiplier_ceiling_falls_back_when_top_k_is_unusable(bad_value):
+    """对称方向：``top_k`` 形态不可用时 ``_multiplier_ceiling`` 同样回落。"""
+    from src.ui.config_menu import _MAX_RETRIEVAL_MULTIPLIER, _multiplier_ceiling
 
-    with pytest.raises(ValueError, match="top_k"):
-        _multiplier_ceiling(bad_value)
+    assert _multiplier_ceiling(bad_value) == _MAX_RETRIEVAL_MULTIPLIER
 
 
 @pytest.mark.parametrize(
@@ -2795,10 +2801,14 @@ def test_ceilings_keep_working_for_valid_scale_fields(multiplier, top_k):
 
 
 def test_edit_retrieval_params_survives_broken_scale_field():
-    """端到端：字段被直写坏掉时，菜单必须给出可读错误而不是终止会话。
+    """端到端：字段被直写坏掉时，菜单必须**走完流程**而不是终止会话。
 
     这条走的是真实入口（``edit_retrieval_params`` 的选择分支），而不是只调
-    ``_top_k_ceiling``——「助手修好了但调用点没接上」是另一类漏网。
+    ``_top_k_ceiling``——「助手修好了但调用点没接上」是另一类漏网。此前断言的是
+    「抛 ``ValueError``」，而该异常在 ``chat/core`` 的 ``asyncio.to_thread`` 调用点
+    落在只接 ``(KeyboardInterrupt, EOFError)`` 的内层 ``try`` 之外、外层只有
+    ``finally``——抛出即终止会话，与用例名里的 "survives" 直接矛盾。现在断言
+    真正走完（不抛异常、回到循环），用户仍能改回合法值。
     """
     from unittest.mock import patch
 
@@ -2818,8 +2828,7 @@ def test_edit_retrieval_params_survives_broken_scale_field():
         select.return_value.ask.side_effect = lambda: next(choices, "back")
         text.return_value.ask.return_value = None
 
-        with pytest.raises(ValueError, match="retrieval_candidate_multiplier"):
-            config_menu.edit_retrieval_params(config)
+        config_menu.edit_retrieval_params(config)
 
 
 def test_require_scale_field_matches_the_service_layer_semantics():

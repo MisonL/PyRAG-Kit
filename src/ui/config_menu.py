@@ -58,25 +58,33 @@ def _rerank_default(chat_config: dict[str, Any]) -> bool | None:
 
 
 def _top_k_ceiling(multiplier: int) -> int:
-    """返回当前倍率下 ``top_k`` 可用的上界。
+    """返回当前倍率下 ``top_k`` 可用的上界；当前倍率非法时回落到单字段上界。
 
     真正送进 ``faiss_index.search()`` 的是 ``top_k × multiplier``（FAISS 既不
     报错也不截断），因此单字段上界不够——UI 放行一个组合越界的值，会在应用
     配置时抛 ``ValueError`` 并终止会话。
     """
-    # 收敛后再算：``multiplier`` 是可直写字段，非数值在 ``max()`` 处抛裸
-    # ``TypeError``，而菜单在主循环的 ``try`` 之外——内层只接
-    # ``(KeyboardInterrupt, EOFError)``、外层只有 ``finally``，因此这会以裸
-    # traceback 终止整个会话。实测「倍率被直写成 ``"abc"``、用户选『调整
-    # Top K』」即复现。
-    multiplier = require_scale_field(multiplier, "retrieval_candidate_multiplier")
+    # 收敛后再算：``multiplier`` 是可直写字段，非法取值让 ``require_scale_field``
+    # 抛 ``ValueError``，而菜单在主循环的 ``try`` 之外——内层只接
+    # ``(KeyboardInterrupt, EOFError)``、外层只有 ``finally``，抛出去会以裸
+    # traceback 终止整个会话（实测「倍率被直写成 ``"abc"``、用户选『调整
+    # Top K』」即复现）。回落到单字段上界：上界放得比「组合判据」宽只会把
+    # 校验推给应用配置时的 ``SessionConfig`` 守卫（那里会拒绝并提示），菜单
+    # 仍可用；直接炸掉则用户连改回合法值的机会都没有。
+    try:
+        multiplier = require_scale_field(multiplier, "retrieval_candidate_multiplier")
+    except ValueError:
+        return _MAX_RETRIEVAL_TOP_K
     return min(_MAX_RETRIEVAL_TOP_K, _MAX_RETRIEVAL_CANDIDATES // max(1, multiplier))
 
 
 def _multiplier_ceiling(top_k: int) -> int:
-    """返回当前 ``top_k`` 下候选倍率可用的上界。"""
+    """返回当前 ``top_k`` 下候选倍率可用的上界；当前 ``top_k`` 非法时同上回落。"""
     # 与 ``_top_k_ceiling`` 同因：``top_k`` 同样可直写。
-    top_k = require_scale_field(top_k, "top_k")
+    try:
+        top_k = require_scale_field(top_k, "top_k")
+    except ValueError:
+        return _MAX_RETRIEVAL_MULTIPLIER
     return min(_MAX_RETRIEVAL_MULTIPLIER, _MAX_RETRIEVAL_CANDIDATES // max(1, top_k))
 
 
@@ -104,7 +112,15 @@ def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
     while True:
         # 与 ``display_chat_config`` 同因：直读 ``.value`` 对可直写的非枚举取值抛裸
         # ``AttributeError``，菜单渲染不出来。收敛后 ``default=`` 也拿到规范取值。
-        current_method = require_retrieval_method(chat_config["retrieval_method"]).value
+        # ``require_retrieval_method`` 对**非法取值**抛 ``ValueError``（在
+        # ``KeyboardInterrupt/EOFError`` 之外），会让整个编辑器会话终止——与
+        # ``_rerank_menu_label`` 同一契约：菜单是用户唯一还能改回合法值的入口，
+        # 不能把它炸掉。非法取值显示「未知」，questionary 拿不到 ``default``
+        # 时传 ``None``（不预选，仍是合法参数）。
+        try:
+            current_method = require_retrieval_method(chat_config["retrieval_method"]).value
+        except ValueError:
+            current_method = None
         current_top_k = chat_config["top_k"]
         # 与 ``display_chat_config`` 同因：真值判断对可直写的取值会给出与服务层
         # 相反的结论（``"false"`` 显示成「启用」）。菜单侧不抛错，非法取值显示

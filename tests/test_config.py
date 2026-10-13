@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from src.retrieval.vdb.faiss_store import FaissStore
+from src.runtime.contracts import build_run_config
 from src.utils.config import (
     ModelDetail,
     ModelProtocol,
@@ -1319,15 +1321,30 @@ def test_path_settings_reject_whitespace_only_string():
     assert "snapshot_root" in str(excinfo.value)
 
 
-def test_empty_snapshot_root_does_not_widen_the_pickle_trust_root():
+def test_empty_snapshot_root_does_not_widen_the_pickle_trust_root(tmp_path):
     """端到端：空 ``snapshot_root`` 不得让 CWD 成为 pickle 的来源信任根。
 
-    这条断言走的是真实加载路径（``build_run_config`` → ``FaissStore.load_snapshot``），
+    走真实加载路径（``build_run_config`` → ``FaissStore.load_snapshot``），
     而不是只看 ``Settings`` 的取值——只看取值的话，一个把空值换成 ``"."`` 的
-    实现仍然会让信任根落在 CWD 上。
+    实现仍然会让信任根落在 CWD 上。``Settings`` 层面空串被拒后，再把
+    ``snapshot_root`` 指到 CWD（``"."`` 的运行时形态）上验证 ``load_snapshot``
+    的信任根守卫确实拒绝加载仓库内目录——两层守卫各自钉住。
     """
     with pytest.raises(ValidationError):
         Settings(snapshot_root="")
+
+    settings = Settings(
+        snapshot_root=str(tmp_path),
+        _env_file=None,
+    )
+    run_config = build_run_config(settings)
+    store = FaissStore(file_path=None)
+
+    # 仓库根下的目录不在受信快照根（tmp_path）之内：断言**归属判据**的专有消息——
+    # 宽到「知识快照」的话，成员判定被禁用后后一道 ACTIVE_SNAPSHOT 守卫的消息
+    # 同样匹配，这个断言就区分不出是哪道守卫在拦（实测注入禁用变异后仍绿）。
+    with pytest.raises(ValueError, match="必须位于受信根目录内"):
+        store.load_snapshot(Path(__file__).resolve().parent, snapshot_root=run_config.snapshot_root)
 
 
 # ── 回归：路径字段的符号链接环必须收敛成 ``ValueError`` ──
