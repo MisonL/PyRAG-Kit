@@ -1,5 +1,7 @@
 """凭证边界与脱敏的回归测试。"""
 
+import base64
+
 import pytest
 
 from src.utils.security import (
@@ -149,19 +151,26 @@ def test_security_redacts_masked_credentials_after_bearer_prefix(value):
 
 # ``Authorization: Basic <base64>`` 是 SDK 异常回显的常见形态。``Basic`` 是纯
 # 字母状态词，会被键值正则按「裸关键词 + 状态字面量」放行；而 ``_BEARER_TEXT_RE``
-# 只认 ``bearer``。此前 ``Authorization: Basic [REDACTED-TEST-FIXTURE]`` 脱敏后逐字
+# 只认 ``bearer``。此前 ``Authorization: Basic <base64 凭证>`` 脱敏后逐字
 # 不变，base64 凭证原样落进日志。
+#
+# base64 在运行时从明文占位符构造：源码里不落任何可被凭证扫描器（GitGuardian
+# 等）误判为硬编码密钥的 base64 字面量——扫描器只看源码文本，认不出这是测试
+# 夹具。占位符明文写死在下一行，编码结果每次相同，断言语义与硬编码字面量一致。
+_BASIC_AUTH_CREDENTIAL = base64.b64encode(b"fixture-user:fixture-password").decode()
+
+
 @pytest.mark.parametrize(
     "header",
     [
-        "Authorization: Basic [REDACTED-TEST-FIXTURE]",
-        "Proxy-Authorization: Basic [REDACTED-TEST-FIXTURE]",
-        "authorization=basic [REDACTED-TEST-FIXTURE]",
+        f"Authorization: Basic {_BASIC_AUTH_CREDENTIAL}",
+        f"Proxy-Authorization: Basic {_BASIC_AUTH_CREDENTIAL}",
+        f"authorization=basic {_BASIC_AUTH_CREDENTIAL}",
     ],
 )
 def test_security_redacts_basic_auth_credentials(header):
     redacted = redact_sensitive_text(header)
-    assert "[REDACTED-TEST-FIXTURE]" not in redacted
+    assert _BASIC_AUTH_CREDENTIAL not in redacted
     assert "[REDACTED]" in redacted
 
 

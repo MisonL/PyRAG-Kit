@@ -6,6 +6,7 @@
 """
 
 from pathlib import Path
+from sys import platform
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -266,7 +267,6 @@ def test_symlink_loop_does_not_break_cleanup_temp_files(tmp_path, monkeypatch):
     "dangerous",
     [
         "/tmp",
-        "/private/tmp",
         "/Users",
         "/home",
         "/opt",
@@ -286,6 +286,18 @@ def test_symlink_loop_does_not_break_cleanup_temp_files(tmp_path, monkeypatch):
 def test_reject_unsafe_cache_dir_rejects_system_level_roots(dangerous):
     """系统级目录（含用户家目录的父目录）一律拒绝。"""
     assert _reject_unsafe_cache_dir(dangerous) is not None
+
+
+# ``/private/tmp`` 只在 macOS 上是 ``/tmp`` 的符号链接目标（守卫经由 ``/tmp``
+# 的解析结果命中它）。Linux 上 ``/private`` 不是系统目录、该路径不存在，守卫
+# 按相等判据放行才是正确行为（``cleanup_temp_files`` 在 rmtree 前有 exists
+# 检查，放行无害）——quality workflow 只跑 ubuntu，此断言不能进公共参数表。
+@pytest.mark.skipif(
+    platform != "darwin",
+    reason="/private/tmp 是 macOS 上 /tmp 的解析形态，Linux 上不是系统目录",
+)
+def test_reject_unsafe_cache_dir_rejects_macos_tmp_resolution_target():
+    assert _reject_unsafe_cache_dir("/private/tmp") is not None
 
 
 @pytest.mark.parametrize(

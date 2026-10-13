@@ -6,6 +6,10 @@
 
 ### 修复
 
+- **跨平台测试偏差：`/private/tmp` 不能进公共危险路径参数表**（`tests/test_cleanup.py`）。`test_reject_unsafe_cache_dir_rejects_system_level_roots` 的参数表把 `"/private/tmp"` 与 `"/tmp"` 并列，但两者只在 **macOS** 上解析为同一路径（`/tmp` 是指向 `/private/tmp` 的符号链接）。守卫 `_reject_unsafe_cache_dir` 的判据是「解析后与受保护根**相等**」，Linux 上 `/private` 不是系统目录、该路径也不存在，返回 `None` 是正确行为（`cleanup_temp_files` 在 `rmtree` 前另有 `os.path.exists` 检查，放行无害）。quality workflow 只跑 `ubuntu-24.04`，该参数在 CI 上必红（实测 `1 failed, 4449 passed`）。改为 darwin 专属用例 `test_reject_unsafe_cache_dir_rejects_macos_tmp_resolution_target`（`skipif(platform != "darwin")`），公共表只留跨平台成立的系统根。
+
+- **测试夹具与 CHANGELOG 里的 base64 假凭证字面量改为运行时构造**（`tests/providers/test_security_boundaries.py`、`CHANGELOG.md`）。Basic 认证脱敏用例的夹具值是 `base64("user:password")`，被 GitGuardian 按 `Bearer Token` 检测器报为 PR #3 的硬编码秘密——它并非真实凭证（解码即教材占位符），但字面量本身会持续触发扫描并阻塞合并。夹具改为 `base64.b64encode(b"fixture-user:fixture-password").decode()` 在运行时构造，明文占位符不构成密钥，编码结果与断言语义逐字节不变；CHANGELOG 两处同源字面量一并改为 `<base64 凭证>` 描述。脱敏行为本身与断言强度未变（红/绿验证同前）。
+
 - **布尔运算符互换（`boolop`）全量扫描：8 组判据覆盖缺口补齐**（`tests/providers/test_factory.py`、`tests/providers/test_rerank_contracts.py`、`tests/providers/test_security_boundaries.py`、`tests/retrieval/test_weighted_fusion.py`、`tests/retrieval/vdb/test_faiss_index_text.py`、`tests/test_guard_coverage_regressions.py`；工具在 `scripts/audit/mutate.py`、`scripts/audit/README.md`）。沿用既有变异器接口新增 `boolop`（`and`↔`or`，只翻每个 `BoolOp` 组的第一个运算符），站点键取**第一个值的结尾**——链式 `a and b or c` 的两层起点 `col_offset` 相同，用起点会碰撞而整片漏扫；运算符夹缝用 `tokenize` 精确定位（注释里出现 `and`/`or` 文本不会被误翻）。上一轮已扫「`src/` 全部 233 处 **raise 守卫内**的 BoolOp」（见下方历史条目），本轮把面扩到全仓 **735** 处（含非 raise 的赋值/兜底链），分两批扫描（高并行 + 低负载重启，前者因 CPU 争抢产生 7 例假 TIMEOUT）。两批合计 **SURVIVED 17 处**，逐条红验证（注入变异 → 候选测试确实变红 → 还原复绿）后：
   - **真缺口（8 组 11 位点，补测试）**：
     1. `factory.py` 435 `runtime_verified_protocols` 的白名单守卫 `supported_protocols is not None and normalized_protocol not in supported_protocols`——`and` 互换后「协议在白名单内」也 raise（合法配置误拒），`supported_protocols=None` 时抛 `TypeError`。既有用例只测「协议不在白名单→拒绝」，从未走 `and` 的假分支。
@@ -61,7 +65,7 @@
 
 - **全维度审查：6 处守卫不对称与安全/入口缺陷修复**。对分支的 162 提交、`src/` 8104 行改动做分维度对抗审查（7 个独立审查 + 逐条实测复现），修的是「成对路径只修了一侧」这一类系统性缺陷：
 
-  - **`security.redact_sensitive_text` 漏 Basic 凭证**（`src/utils/security.py`）。`Authorization: Basic <base64>` 脱敏后逐字不变——`Basic` 是纯字母状态词，被键值正则按「裸关键词 + 状态字面量」（`_NON_CREDENTIAL_VALUE` 含 `basic`）放行，而 `_BEARER_TEXT_RE` 只认 `bearer`。新增 `_BASIC_AUTH_TEXT_RE`，要求前置 `(proxy-)?authorization` 键名以免误伤 `basic understanding` 这类普通文本。实测原 `Authorization: Basic [REDACTED-TEST-FIXTURE]` → `Authorization: Basic [REDACTED]`。
+  - **`security.redact_sensitive_text` 漏 Basic 凭证**（`src/utils/security.py`）。`Authorization: Basic <base64>` 脱敏后逐字不变——`Basic` 是纯字母状态词，被键值正则按「裸关键词 + 状态字面量」（`_NON_CREDENTIAL_VALUE` 含 `basic`）放行，而 `_BEARER_TEXT_RE` 只认 `bearer`。新增 `_BASIC_AUTH_TEXT_RE`，要求前置 `(proxy-)?authorization` 键名以免误伤 `basic understanding` 这类普通文本。实测原 `Authorization: Basic <base64 凭证>` → `Authorization: Basic [REDACTED]`。
   - **`coerce_score` 把 numpy 标量分数静默归零**（`src/ui/display_utils.py`）。`np.float32` 不是 `float` 子类，只判 `(int, float)` 会走兜底归零——第三方 store 的 score 常是 numpy 标量，实测 `coerce_score(np.float32(0.9))` 返回 `0.0`（`np.float64` 正常）。改为对带 `__float__` 的取值实测 `float()`，异常才归零。
   - **去重键/父块键把不同大整数塌成同一键**（`src/services/retrieval_service.py`、`src/retrieval/vdb/faiss_store.py`）。`_key_text` 对 >80 字符的整数走 `safe_repr` 截断、`_parent_key` 对整个非字符串 `parent_id` 走 `safe_repr`（量级描述），`10**100` 与 `10**100+1`、`10**4301` 与 `10**4301+1` 都得到同一键——`_merge_hybrid_results`／`_deduplicate_parent_documents` 静默并条、`resolve_parent_content` 张冠李戴。两处改为按二进制补码取 sha256 摘要；小整数（`chunk_index=3`）仍原样保留。
   - **Ark Classification 动态路径恒拒唯一合法用法**（`src/providers/volcengine.py`）。`_ARK_CLASSIFICATION_KEYS` 只含扩展字段，而动态路径 `resources.classification.create(...)` 把业务参数放进 `kwargs` → `create(query=..., labels=..., model=...)` 必抛「不支持请求参数」，与静态 `classify()`（这三个走命名参数、不经校验）结论相反。白名单补入 `query`/`model`/`labels`。
@@ -91,7 +95,7 @@
   新增/修改回归断言 6 处；全量 4380 passed；8 项质量门全绿。
 
 - **补漏：异常兜底分支脱敏、embeddings object dtype 收敛、夹具二次基线化**。存疑清单里逐条实测后确认 2 条真缺陷：
-  - **`safe_exception_text` 兜底分支跳过脱敏**（`src/utils/security.py`）。``str(exc)`` 抛异常（args 含超限整数）时，兜底分支逐元素 ``safe_repr`` 后**直接返回**，不经 ``redact_sensitive_text``——实测 `ValueError(10**4301, "Authorization: Basic [REDACTED-TEST-FIXTURE]")` 的输出里 base64 凭证明文。该函数 docstring 自称「最后一道展示边界」，22 处 ``except`` 依赖它，与主分支的收场不一致。兜底分支补上脱敏，实测 Basic/Bearer 凭证均被红acted。
+  - **`safe_exception_text` 兜底分支跳过脱敏**（`src/utils/security.py`）。``str(exc)`` 抛异常（args 含超限整数）时，兜底分支逐元素 ``safe_repr`` 后**直接返回**，不经 ``redact_sensitive_text``——实测 `ValueError(10**4301, "Authorization: Basic <base64 凭证>")` 的输出里 base64 凭证明文。该函数 docstring 自称「最后一道展示边界」，22 处 ``except`` 依赖它，与主分支的收场不一致。兜底分支补上脱敏，实测 Basic/Bearer 凭证均被红acted。
   - **`_validate_embeddings_shape` 对 ``dtype=object`` 抛裸 `OverflowError`**（`src/retrieval/vdb/faiss_store.py`）。``embeddings.astype(np.float32)`` 对含 ``10**400`` 的 object 数组抛 ``OverflowError: int too large to convert to float``（不是 ``ValueError``，穿透调用方的错误分类）；pickle 二进制格式让这种数组能正常往返。包成带指引的 ``ValueError``，与写入侧 ``_as_float32_matrix`` 一致。
   - **`green39.txt` 夹具二次漂移**：本轮新增的 ``security.py`` 两处位点（507:11、688:49）因 ``safe_exception_text`` 修改而失效，夹具核对用例当场报出。按当前源码重新定位到 512:11、693:49（列不变，守卫语义一致），39/39 精确命中。
   - **Responses 后台轮询无上界 → `time.sleep` 抛裸 `OverflowError`**（`src/providers/openai_compatible.py`）。``background_poll_interval``／``background_timeout`` 只判「是正数」，``1e19`` 通过校验后 ``time.sleep(1e19)`` 抛 ``OverflowError: timestamp out of range for platform time_t``（实测）——不是 ``TimeoutError``，也不在调用方按 ``ValueError`` 建立的分类里。两处补上界 ``_MAX_CLIENT_TIMEOUT_SECONDS``（与客户端 timeout 同一常量，该常量的存在理由正是「凡在其上做算术的下游都会炸」）。同步收紧既有测试的消息断言（``background_timeout 必须是正数`` → 含上界）并新增上界用例。
