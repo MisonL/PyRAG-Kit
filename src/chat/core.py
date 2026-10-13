@@ -390,7 +390,19 @@ async def start_chat_session_async():
         session = PromptSession()
 
         if bot.llm_model:
-            display_chat_config(console, bot.chat_config)
+            # 启动横幅的回显失败不该以「程序级错误」呈现——``chat_rerank_enabled``
+            # 启用而 rerank 段为空/键不对应时 ``display_chat_config`` 抛
+            # ``ValueError``（实测），裸抛会把一个**可修复的配置问题**顶成
+            # 「程序运行期间发生错误」再打回主菜单。配置已生效，只报原因即可。
+            try:
+                display_chat_config(console, bot.chat_config)
+            except (ValueError, KeyError) as exc:
+                console.print(
+                    markup_text(
+                        "[bold yellow]配置显示失败（会话仍将启动）: {}[/bold yellow]",
+                        safe_exception_text(exc),
+                    )
+                )
             console.print(
                 markup_text(
                     "客服已就绪 ([bold green]{}[/bold green])",

@@ -1430,3 +1430,42 @@ def test_retry_async_stream_context_enter_aclose_failure_keeps_original_error():
         asyncio.run(run())
     assert "429" in str(excinfo.value)
     assert len(attempts) == 3
+
+
+def test_retry_sync_stream_response_close_runs_even_when_iterator_close_raises():
+    """正常耗尽 + iterator.close 抛错（无在途异常）时 response 补刀必须执行。
+
+    第三轮的两段独立 try 修好了「iterator 抛错跳过补刀」的中途断开方向，
+    但 re-raise（``not in_flight`` 时上抛 iterator 清理异常）会跳过顺序结构
+    中位于其后的 response 补刀——换方向复现同一泄漏（实测 log 只有
+    ``iclose``）。补刀移入外层 finally 后无条件执行。
+    """
+
+    class IteratorCloseFail:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise StopIteration
+
+        def close(self):
+            raise RuntimeError("close boom")
+
+    class FakeResponse:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+        def __iter__(self):
+            return IteratorCloseFail()
+
+    response = FakeResponse()
+    stream = retry_sync_stream(lambda: response)
+
+    with pytest.raises(RuntimeError, match="close boom"):
+        for _ in stream:
+            pass
+
+    assert response.closed is True

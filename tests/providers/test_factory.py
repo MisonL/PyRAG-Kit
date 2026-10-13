@@ -177,7 +177,7 @@ def test_get_llm_provider_success():
 
 def test_get_llm_provider_not_found():
     """测试获取不存在的 LLM 提供商时抛出 ValueError"""
-    with pytest.raises(ValueError, match="在LLM配置中未找到key: non_existent_key"):
+    with pytest.raises(ValueError, match="在LLM配置中未找到key: 'non_existent_key'"):
         ModelProviderFactory.get_llm_provider("non_existent_key")
 
 
@@ -234,7 +234,7 @@ def test_get_embedding_provider_success():
 
 def test_get_embedding_provider_not_found():
     """测试获取不存在的 Embedding 提供商时抛出 ValueError"""
-    with pytest.raises(ValueError, match="在Embedding配置中未找到key: non_existent_key"):
+    with pytest.raises(ValueError, match="在Embedding配置中未找到key: 'non_existent_key'"):
         ModelProviderFactory.get_embedding_provider("non_existent_key")
 
 
@@ -283,7 +283,7 @@ def test_get_rerank_provider_siliconflow_mapping():
 
 def test_get_rerank_provider_not_found():
     """测试获取不存在的 Rerank 提供商时抛出 ValueError"""
-    with pytest.raises(ValueError, match="在Rerank配置中未找到key: non_existent_key"):
+    with pytest.raises(ValueError, match="在Rerank配置中未找到key: 'non_existent_key'"):
         ModelProviderFactory.get_rerank_provider("non_existent_key")
 
 
@@ -350,7 +350,7 @@ def test_get_embedding_provider_rejects_malformed_key_readably(bad_key):
 
 def test_get_llm_provider_still_reports_missing_key():
     """收紧不能误伤：合法的字符串 key 照常给出原有消息。"""
-    with pytest.raises(ValueError, match="在LLM配置中未找到key: nope"):
+    with pytest.raises(ValueError, match="在LLM配置中未找到key: 'nope'"):
         ModelProviderFactory.get_llm_provider("nope", {})
 
 

@@ -1313,3 +1313,26 @@ def test_start_chat_session_async_survives_failing_teardown(monkeypatch):
     asyncio.run(start_chat_session_async())
 
     assert ExplodingTeardownBot.last_instance.closed is True
+
+
+def test_start_chat_session_survives_banner_display_failure(monkeypatch):
+    """启动横幅回显失败（rerank 启用而段为空）只报黄字，会话照常启动。
+
+    修复前 ``display_chat_config`` 在任何提示符之前裸抛 ``ValueError``，
+    以「程序运行期间发生错误」打回主菜单——可修复的配置问题被顶成程序级
+    错误，与 ``/config`` 路径对同一类错误的恢复处理不对称。
+    """
+    from src.ui.display_utils import display_chat_config as real_display
+
+    def exploding_display(_console, chat_config):
+        real_display(_console, chat_config)
+        raise ValueError("在Rerank配置中未找到key: 'siliconflow'")
+
+    monkeypatch.setattr("src.chat.core.Chatbot", _SurvivalBot)
+    monkeypatch.setattr(
+        "src.chat.core.PromptSession",
+        lambda: FakePromptSession(["/quit"]),
+    )
+    monkeypatch.setattr("src.chat.core.display_chat_config", exploding_display)
+
+    asyncio.run(start_chat_session_async())

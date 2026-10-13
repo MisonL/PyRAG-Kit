@@ -1055,15 +1055,8 @@ class FaissStore(VectorStoreBase):
         #
         # 只断言这一条最小不变量，不比对向量内容：``embeddings`` 与索引由
         # ``save_snapshot`` 从同一份内存状态写出，条数一致即可保证下标对应关系。
-        # （断言本体在上方 ``_validate_row_alignment``，索引分支的注释保留在此。）
-        if faiss_index is not None:
-            index_rows = int(faiss_index.ntotal)
-            if index_rows != len(documents):
-                raise ValueError(
-                    "知识快照不自洽：语义索引条数与分块数不一致。"
-                    f" semantic.index={index_rows}，chunks.pkl={len(documents)}。"
-                    " 快照可能在写入或复制过程中被截断，请重建。"
-                )
+        # （断言本体在上方 ``_validate_row_alignment``——索引条数分支已由它覆盖，
+        # 此处不再重复。）
         lexical_path = snapshot_path / "lexical.index"
         if lexical_path.exists():
             with lexical_path.open("rb") as file:

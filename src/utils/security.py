@@ -305,7 +305,7 @@ def _redact_masked_credential(match: re.Match[str]) -> str:
 
     没有分隔符时，游程可能是凭证的可见片段（``sk-abc***xyz``），不能整段
     留下；但敏感键名（``token``/``myApiKey``）要保留，让
-    ``_KEY_VALUE_TEXT_RE`` 接续处理 ``sk-abc***token: <secret>`` 这类写法。
+    ``_CREDENTIAL_KEY_VALUE_RE`` 接续处理 ``sk-abc***token: <secret>`` 这类写法。
     """
     # 键名游程由正则的 ``([A-Za-z0-9_.*-]*)`` 捕获（``*``/``.``/``…`` 等掩码
     # 占位符不在其中），整段判断是否为敏感键：``token``/``myApiKey`` 命中并保留，
@@ -314,7 +314,7 @@ def _redact_masked_credential(match: re.Match[str]) -> str:
     # 把 ``sk-abc***`` 切碎。
     run = match.group(1)
     # 键值尾部：游程是键名，后面的值同样属于凭证的可见尾部，一并脱敏。
-    # 这里不能只保留键名交给 ``_KEY_VALUE_TEXT_RE``——键名可能不是敏感键
+    # 这里不能只保留键名交给 ``_CREDENTIAL_KEY_VALUE_RE``——键名可能不是敏感键
     # （``xxxtoken``/``oauth``），那条规则不会接手，值就明文落进日志。
     if match.group(2) is not None:
         return "[REDACTED]" + run + "=[REDACTED]"
@@ -343,7 +343,8 @@ _AK_SK_PREFIXED_KEY_RE = re.compile(
     r"(?<![A-Za-z0-9])(?:AKLT|LTAI)[0-9A-Za-z_-]{12,}(?![A-Za-z0-9])"
 )
 # 同一类「固定前缀、无键名也能自证」的业界通用凭证：GitHub PAT（``ghp_``／
-# ``github_pat_``）、Slack token（``xox[abposr]-``）、AWS Access Key（``AKIA``/
+# ``github_pat_``）、Slack token（``xox[abper]-`` 与 ``xapp-``，支持家族见
+# ``_SELF_ATTESTING_PREFIX_RE`` 处注释）、AWS Access Key（``AKIA``/
 # ``ASIA``）与 Jina（``jina_``，本项目 rerank 渠道实际在用的形态）。触发面与
 # sk-/AIza 相同——SDK 异常回显、知识库正文、嵌入方回传的服务端消息都是不可控
 # 文本，不能依赖键名锚定。长度下限挡住普通文本里的词（``the ghp variable``、
@@ -436,22 +437,11 @@ def _require_string_keys(mapping: Mapping[Any, Any], label: str) -> None:
 def redact_sensitive_text(value: Any) -> str:
     """脱敏异常、日志和请求错误中的常见凭证表示。"""
     if not isinstance(value, str):
-        # ``str(10**4301)`` 撞上 CPython 的整数位数上限抛 ``ValueError``。这个
-        # 分支明确声明支持非字符串（调用方有传异常、URL、映射的），而 pickle 是
-        # 二进制格式、不受十进制位数限制，畸形快照能带进这种值。
-        #
-        # 这里内联判据而**不**导入 ``config.safe_repr``：``config`` 反过来从本模块
-        # 导入 ``redact_sensitive_text`` 与 ``validate_secret_free_options``，跨模块
-        # 引用会形成循环导入。判据与 ``safe_repr`` 一致（位数超限时用
-        # ``bit_length()`` 给出量级），改一处时两处都要看。
-        try:
-            value = str(value)
-        except (ValueError, RuntimeError, RecursionError):
-            if isinstance(value, int):
-                digits = value.bit_length() * 30103 // 100000 + 1  # log10(2) ≈ 0.30103
-                value = f"<整数，约 {digits} 位十进制>"
-            else:
-                value = f"<{type(value).__name__}>"
+        # 非字符串（调用方有传异常、URL、映射的），而 pickle 是二进制格式、
+        # 不受十进制位数限制，畸形快照能带进超限整数这类值。
+        # 循环导入限制（不能导入 ``config.safe_repr``）由 ``_display_repr`` 统一
+        # 承担，这里不再内联同一份判据。
+        value = _display_repr(value)
     # 掩码形态必须最先处理：``_BEARER_TEXT_RE`` 会先吃掉 ``Bearer sk-abc``
     # 的可见前缀，使后续的 ``sk-`` 锚点失效，尾部掩码片段就会残留。
     redacted = _MASKED_CREDENTIAL_RE.sub(_redact_masked_credential, value)

@@ -126,9 +126,6 @@ def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
         # 菜单文案统一为「未知」，用户仍能看出这一项有问题并把它改回来。
         if current_method is None:
             current_method = "未知"
-        # ``None`` 直接进 f-string 会渲染成 ``当前: None``——与下一项
-        # ``_rerank_menu_label`` 对同一类非法取值刻意显示的「未知」不一致。
-        # 菜单文案统一为「未知」，用户仍能看出这一项有问题并把它改回来。
 
         current_top_k = chat_config["top_k"]
         # 与 ``display_chat_config`` 同因：真值判断对可直写的取值会给出与服务层
@@ -152,7 +149,13 @@ def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
         # 裸 ``.upper()`` 对非字符串抛 ``AttributeError``，冲穿聊天主循环的
         # ``except ValueError`` 分类；``str(10**4301)`` 则抛 ``ValueError:
         # Exceeds the limit``，菜单根本渲染不出来。
-        current_fusion_strategy = _render_value(chat_config["hybrid_fusion_strategy"]).upper()
+        raw_fusion_strategy = _render_value(chat_config["hybrid_fusion_strategy"])
+        # 非法取值（直写 ``None``/非字符串渲染成量级描述）与 method/rerank 项
+        # 统一为「未知」——``NONE`` 这类大写形态对用户没有指向性。合法融合
+        # 策略只可能是 rrf/weight，二者经 ``.upper()`` 照常显示。
+        current_fusion_strategy = (
+            raw_fusion_strategy if raw_fusion_strategy.lower() in ("rrf", "weight") else "未知"
+        )
         current_candidate_multiplier = chat_config["retrieval_candidate_multiplier"]
 
         choice = questionary.select(

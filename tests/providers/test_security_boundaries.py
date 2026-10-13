@@ -106,7 +106,7 @@ def test_security_redacts_every_sensitive_key_name_in_text(key):
 def test_security_redacts_sensitive_key_names_in_url_query(key):
     """URL query 形态同样要覆盖，不能只处理 key=value。
 
-    值必须**短到只有 ``_URL_QUERY_SECRET_RE`` 能覆盖**：``_KEY_VALUE_TEXT_RE``
+    值必须**短到只有 ``_URL_QUERY_SECRET_RE`` 能覆盖**：``_CREDENTIAL_KEY_VALUE_RE``
     的空白/标点形态要求值至少 12 字符且含数字或符号，用一个长值会让这条断言
     由另一条规则满足——删掉 URL query 规则测试照样通过，即测错了对象。
     """

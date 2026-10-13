@@ -615,8 +615,16 @@ class ModelProviderFactory:
                 f" 请检查 {role_label} 的当前配置项。"
             )
         if provider_key not in configurations:
-            logger.error(f"在{role_label}配置中未找到key: {provider_key}")
-            raise ValueError(f"在{role_label}配置中未找到key: {provider_key}")
+            # 消息与 ``display_utils._require_model_detail`` 的同名守卫对齐：
+            # 带可选值与指引——同一判据两套消息会让用户经 ``reload_llm`` 看到
+            # 残缺版（只有「未找到 key」），无从知道有哪些可填的键。
+            available = "、".join(sorted(str(k) for k in configurations)) or "无"
+            logger.error(f"在{role_label}配置中未找到key: {provider_key}。可选值: {available}。")
+            raise ValueError(
+                f"在{role_label}配置中未找到key: {safe_repr(provider_key)}。"
+                f"可选值: {available}。"
+                " 请检查 config.toml 里的 default_*_provider 与 *_configurations 是否对应。"
+            )
         # 取值的形态也要在这里收敛：``key in mapping`` 只证明**键**在，不证明值
         # 可用。``{"k": None}`` 的键确实存在，于是不会走上面「未找到key」的分支，
         # 而是把 ``None`` 原样返回给调用方——三个入口紧接着都读 ``config.provider``

@@ -1861,17 +1861,6 @@ def retry_sync_stream(
         # 内层 ``except``：放到 ``try`` 之前取会恒为 ``None``（那时还没有异常），
         # 进到内层 ``except`` 之后取则返回关闭异常本身。两种都会让判据失效。
         in_flight = sys.exc_info()[0] is not None
-        try:
-            close = getattr(iterator, "close", None)
-            if close is not None:
-                close()
-        except Exception as close_exc:
-            # iterator 关闭失败**不得**让下面的 response 补刀被跳过（两段独立
-            # try，与 ``open_and_peek`` 同构）：中途断开 + 包装形态时跳过补刀
-            # 即每次泄漏一条底层连接（实测 log 无 ``rclose``）。
-            logger.debug("消费阶段清理流失败: %s", safe_exception_text(close_exc))
-            if not in_flight:
-                raise
         # ``iter()`` 拿到的常常只是**包装生成器**：openai/anthropic 的
         # ``Stream.__iter__`` 是生成器函数（``for item in self._iterator:
         # yield item``），close 它只终止包装层，``Stream.close()``（即
@@ -1879,14 +1868,29 @@ def retry_sync_stream(
         # 连接释放退化为 GC 时机（实测复现，async 侧经 ``iterate_async``
         # 包装则确定性关闭）。这里对底层响应补一刀；``__iter__`` 返回
         # self 的形态两者同一对象，跳过重复关闭。
-        if response is not iterator:
-            response_close = getattr(response, "close", None)
-            if response_close is not None:
-                try:
-                    response_close()
-                except Exception:  # 清理失败不得顶替主流程异常
-                    if not in_flight:
-                        raise
+        #
+        # 补刀必须放在**外层 finally**（嵌套 try/finally）：iterator.close
+        # 抛错且无在途异常时按契约 re-raise——裸的顺序结构在 re-raise 时
+        # 会跳过补刀（实测 log 只有 ``iclose``），response 泄漏。嵌套
+        # finally 保证补刀无条件执行，iterator 的清理异常仍按原语义上抛。
+        try:
+            try:
+                close = getattr(iterator, "close", None)
+                if close is not None:
+                    close()
+            except Exception as close_exc:
+                logger.debug("消费阶段清理流失败: %s", safe_exception_text(close_exc))
+                if not in_flight:
+                    raise
+        finally:
+            if response is not iterator:
+                response_close = getattr(response, "close", None)
+                if response_close is not None:
+                    try:
+                        response_close()
+                    except Exception:  # 清理失败不得顶替主流程异常
+                        if not in_flight:
+                            raise
 
 
 async def retry_async_stream(
