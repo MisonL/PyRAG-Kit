@@ -633,6 +633,31 @@ def test_validate_snapshot_dir_accepts_matching_lexical_rows(tmp_path):
     repository.validate_snapshot_dir(snapshot_dir)
 
 
+@pytest.mark.parametrize("unordered_type", [set, frozenset])
+def test_validate_snapshot_dir_rejects_unordered_lexical_top_level(tmp_path, unordered_type):
+    """``set``/``frozenset`` 顶层的 lexical.index 必须被拒绝。
+
+    它们有 ``__len__``、不是 str/bytes/dict，能穿过形态守卫，但**没有稳定
+    下标语义**：BM25 按迭代序收语料、``keyword_search`` 按下标读文档，顺序
+    不同即静默错配——且 set 迭代序随 ``PYTHONHASHSEED`` 跨进程翻转（实测
+    同一对象 seed=0/1 与 seed=2 顺序相反），同一份坏快照每次启动可能给出
+    不同的错误召回。
+    """
+    from src.retrieval.snapshot_repository import SnapshotRepository
+    from src.utils.config import get_settings
+
+    repository = SnapshotRepository(build_run_config(get_settings()))
+    snapshot_dir = _write_row_counts_snapshot(
+        repository.root, "kb-lexical-set", chunk_count=2, embedding_rows=2
+    )
+    import pickle
+
+    (snapshot_dir / "lexical.index").write_bytes(pickle.dumps(unordered_type([("苹",), ("香",)])))
+
+    with pytest.raises(ValueError, match="顶层不是列表"):
+        repository.validate_snapshot_dir(snapshot_dir)
+
+
 # ── 回归：parents.pkl 与另外两个 pickle 一样必须可解析、形态正确 ──
 #
 # ``validate_snapshot_dir`` 把 ``chunks.pkl`` 与 ``lexical.index`` 的解析失败都

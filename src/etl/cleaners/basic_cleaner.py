@@ -94,6 +94,17 @@ class BasicCleaner(BaseCleaner):
                     continue
                 placeholder = candidate
                 break
+            # 哨兵候选耗尽（正文包含全部非空白码点，实测可构造）时
+            # ``placeholder`` 停留初始值 ``"\x00"``：它不是空白、不参与第 3 步的
+            # ``\s+`` 替换，第 4 步却会把正文里**原本就有**的 NUL 全部换成
+            # 双换行——内容静默损坏。耗尽即放弃占位保护，让 NUL 与其他控制
+            # 字符一样走 ``\s+`` 路径：第 3 步不会替换它（``\s`` 不匹配 NUL），
+            # 原文按原样保留，与「清洗不增删语义」的职责一致。
+            if placeholder in present:
+                content = re.sub(r"\s+", " ", content)
+                content = content.strip()
+                cleaned_documents.append(Document(content=content, metadata=doc.metadata))
+                continue
             content = content.replace("\n\n", placeholder)
 
             # 3. 将所有连续的空白字符（包括单个换行符、制表符、多个空格）替换为单个空格

@@ -200,6 +200,32 @@ def test_basic_cleaner_does_not_rewrite_content_that_looks_like_its_sentinel(tex
     assert cleaned[0].content == text.strip()
 
 
+def test_basic_cleaner_keeps_original_nul_when_sentinel_candidates_exhausted():
+    """哨兵候选耗尽时不得把正文里原有的 NUL 改写成双换行。
+
+    候选扫描在「正文缺失的非空白码点」里找哨兵；正文包含**全部**非空白码点时
+    扫描耗尽，``placeholder`` 停留初始值 ``"\x00"``——第 4 步的还原替换会把
+    正文里原本就有的 NUL 全部换成双换行（实测复现），内容静默损坏。耗尽时
+    应放弃占位保护、让原文原样保留。
+    """
+    from src.etl.cleaners import basic_cleaner as bc
+
+    all_non_whitespace = []
+    for code in range(0x110000):
+        if 0xD800 <= code <= 0xDFFF:
+            continue  # 孤立代理项
+        char = chr(code)
+        if bc._WHITESPACE_RE.match(char):
+            continue
+        all_non_whitespace.append(char)
+    content = "".join(all_non_whitespace) + "\x00tail" + "\n\nend"
+
+    cleaned = BasicCleaner().clean([Document(content=content, metadata={})])
+
+    assert "\x00tail" in cleaned[0].content  # 原始 NUL 原样保留
+    assert "\n\ntail" not in cleaned[0].content  # 未被改写成双换行
+
+
 # 复杂度判据的规模与阈值。基准取 20k 而不是 2k：2k 的耗时约 0.1ms，已接近
 # ``time.perf_counter()`` 的可靠量级，机器负载的抖动会让比值从 ~50 跳到 ~900
 # （实测同一台机器上 8 次采样出现 967、598 两个越界值），是一条会间歇误报的

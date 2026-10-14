@@ -1078,7 +1078,14 @@ class FaissStore(VectorStoreBase):
             # ``_build_bm25_index(None)`` 返回 ``None``，``keyword_search`` 于是
             # 对一份有 2 条文档的快照静默返回空结果，用户看到的是「搜不到」而不是
             # 「快照坏了」。
-            if isinstance(tokenized_docs, (str, bytes, dict)) or (
+            # ``set``/``frozenset`` 必须单列拒绝：它们有 ``__len__``、不是
+            # str/bytes/dict，能穿过下面的全部守卫（实测），但**没有稳定下标
+            # 语义**——``_build_bm25_index`` 按迭代序把语料喂给 BM25，而
+            # ``keyword_search`` 按下标读 ``self.documents``，两条顺序一旦
+            # 不同，分数就静默绑定到错误文档。这不是理论边界：set 迭代序
+            # 随 ``PYTHONHASHSEED`` 跨进程翻转（实测同一对象 seed=0/1 与
+            # seed=2 顺序相反），同一份坏快照每次启动可能给出不同的错误召回。
+            if isinstance(tokenized_docs, (str, bytes, dict, set, frozenset)) or (
                 tokenized_docs is not None and not hasattr(tokenized_docs, "__len__")
             ):
                 raise ValueError(

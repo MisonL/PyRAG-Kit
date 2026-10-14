@@ -579,7 +579,12 @@ class SnapshotRepository:
             # ``TypeError: object of type 'int' has no len()``——无「快照不自洽」
             # 语义、无重建指引，与该文件其它三个 pickle 的收场方式不一致。
             # 字符串形态更隐蔽：``len("ab") == 2`` 会被当成 2 条语料静默通过。
-            if isinstance(tokenized, (str, bytes, dict)) or (
+            # ``set``/``frozenset`` 必须单列拒绝：有 ``__len__``、不是
+            # str/bytes/dict，能穿过本守卫，但**没有稳定下标语义**——BM25 按
+            # 迭代序收语料、``keyword_search`` 按下标读文档，顺序不同即静默
+            # 错配。set 迭代序随 ``PYTHONHASHSEED`` 跨进程翻转（实测），必须
+            # 在激活之前拦下，否则同一份坏快照每次启动给出不同的错误召回。
+            if isinstance(tokenized, (str, bytes, dict, set, frozenset)) or (
                 tokenized is not None and not hasattr(tokenized, "__len__")
             ):
                 raise ValueError(
