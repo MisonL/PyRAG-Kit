@@ -52,6 +52,7 @@ import src.utils.log_manager
 # 导入UI工具
 from src.models.document import Document
 from src.ui.display_utils import CONSOLE_WIDTH, markup_text
+from src.ui.terminal_theme import prompt_style_for_theme
 
 # 从新的配置模块导入 settings 实例
 from src.utils.config import get_settings, resolve_app_root
@@ -398,8 +399,13 @@ def main():
     while True:
         display_menu()
         try:
-            # 使用 prompt_toolkit 替代 console.input，并优化样式
-            choice = prompt(HTML("<skyblue><b>请输入选项 (1-4): </b></skyblue>"))
+            # 使用 prompt_toolkit 替代 console.input，并优化样式。
+            # 提示色按终端亮/暗主题适配：固定浅色（xterm 116 skyblue1）在
+            # 白底上对比度仅 1.7:1（WCAG AA 4.5:1），亮色终端几乎不可读。
+            choice = prompt(
+                HTML("<prompt><b>请输入选项 (1-4): </b></prompt>"),
+                style=prompt_style_for_theme(),
+            )
             if choice == "1":
                 console.print(
                     Panel(

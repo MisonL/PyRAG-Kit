@@ -19,6 +19,7 @@ from ..utils.config import (
 )
 from ..utils.log_manager import get_module_logger  # 导入日志管理器
 from .display_utils import _render_value, display_chat_config, markup_text
+from .terminal_theme import questionary_style_for_theme
 
 logger = get_module_logger(__name__)  # 获取当前模块的日志器
 console = Console()
@@ -180,7 +181,7 @@ def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
                 questionary.Separator(),
                 questionary.Choice("返回主菜单", value="back"),
             ],
-            style=questionary.Style([("pointer", "bold fg:yellow")]),
+            style=questionary_style_for_theme(),
         ).ask()
 
         if choice == "back" or choice is None:
@@ -453,7 +454,7 @@ def edit_model_params(chat_config: dict[str, Any]) -> bool:
                 questionary.Separator(),
                 questionary.Choice("返回主菜单", value="back"),
             ],
-            style=questionary.Style([("pointer", "bold fg:yellow")]),
+            style=questionary_style_for_theme(),
         ).ask()
 
         if choice == "back" or choice is None:
@@ -551,7 +552,7 @@ def _run_config_editor_loop(chat_config: dict[str, Any], state: dict[str, bool])
                 questionary.Separator(),
                 questionary.Choice("4. 保存并返回聊天", value="exit"),
             ],
-            style=questionary.Style([("pointer", "bold fg:cyan")]),
+            style=questionary_style_for_theme(),
         ).ask()
 
         if choice == "exit" or choice is None:
