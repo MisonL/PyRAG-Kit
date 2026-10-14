@@ -296,10 +296,14 @@ def safe_repr(value: Any, *, limit: int = 80) -> str:
     """
     try:
         text = repr(value)
-    except (ValueError, RuntimeError, RecursionError):
-        # 走到这里只有一种已知情形：整数的十进制位数超过
-        # ``sys.get_int_max_str_digits()``。``bit_length()`` 不经过十进制
-        # 转换，可以安全地给出量级。
+    except Exception:  # noqa: BLE001 - 最后一道展示边界，任何 repr 异常都收敛
+        # 常见情形是整数的十进制位数超过 ``sys.get_int_max_str_digits()``
+        # （``ValueError``）——``bit_length()`` 不经过十进制转换，可以安全地
+        # 给出量级。但 ``repr`` 是任意对象的自定义方法，``__repr__`` 抛
+        # ``KeyError``／``TypeError`` 等任何异常都可能（pickle 快照/嵌入方可
+        # 注入任意键对象）：本函数是 209 处调用点的「最后一道展示边界」，
+        # 自己再抛就是裸 traceback——比消息难看更糟，捕获面因此放宽到
+        # ``Exception``，与 ``_key_text``/``_display_repr`` 的终态判据一致。
         if isinstance(value, int):
             digits = value.bit_length() * 30103 // 100000 + 1  # log10(2) ≈ 0.30103
             return f"<整数，约 {digits} 位十进制>"

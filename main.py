@@ -269,10 +269,14 @@ def _prepare_cache_dir(configured_path: str) -> Path:
     try:
         fallback.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        # 系统临时目录也不可用（极少数硬化容器）。jieba 对不可写的 tmp_dir
-        # 是容错的（实测仍能分词），因此这里只警告并把路径交出去，不因为
-        # 一个可选优化而让程序起不来。
-        console.print(markup_text("[yellow]缓存目录不可用，且无法创建临时目录：{}[/yellow]", exc))
+        # 与全仓「面向用户的异常输出一律经 safe_exception_text」一致（脱敏 +
+        # 240 截断），不直接把异常对象交给 markup_text。
+        console.print(
+            markup_text(
+                "[yellow]缓存目录不可用，且无法创建临时目录：{}[/yellow]",
+                safe_exception_text(exc),
+            )
+        )
     else:
         console.print(
             markup_text(

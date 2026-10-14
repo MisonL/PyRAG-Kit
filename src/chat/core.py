@@ -410,12 +410,13 @@ async def start_chat_session_async():
                         bot.chat_config["active_llm_configuration"],
                     )
                 )
-            except (ValueError, KeyError) as exc:
+            except (ValueError, KeyError, TypeError) as exc:
                 # 「就绪」行同样只读配置展示：替身 bot 的 ``chat_config=None``
-                # /缺键形态在此裸崩（``TypeError``/``KeyError``）会顶替上一段
-                # 「回显失败只报黄字」的恢复契约——同一契约覆盖到最后一行。
-                # （``TypeError`` 源自 ``markup_text`` 对 ``None`` 下标的替身
-                # 形态；真实 ``SessionConfig`` 经 pydantic 校验不可达。）
+                # 形态在下标处抛 **TypeError**（``'NoneType' object is not
+                # subscriptable``，实测穿透 ``(ValueError, KeyError)``）、缺键
+                # 形态抛 ``KeyError``——都会顶替上一段「回显失败只报黄字」的
+                # 恢复契约，同一契约覆盖到最后一行。（真实 ``SessionConfig``
+                # 经 pydantic 校验不可达这些形态，仅替身可达。）
                 console.print(
                     markup_text(
                         "[bold yellow]配置读取失败（会话仍将启动）: {}[/bold yellow]",

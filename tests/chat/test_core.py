@@ -1336,3 +1336,33 @@ def test_start_chat_session_survives_banner_display_failure(monkeypatch):
     monkeypatch.setattr("src.chat.core.display_chat_config", exploding_display)
 
     asyncio.run(start_chat_session_async())
+
+
+def test_ready_line_survives_none_chat_config(monkeypatch):
+    """替身 bot 的 ``chat_config=None`` 在就绪行抛 ``TypeError``——必须在捕获面内。
+
+    实测 ``bot.chat_config["active_llm_configuration"]`` 对 ``None`` 抛
+    ``TypeError: 'NoneType' object is not subscriptable``，不在
+    ``(ValueError, KeyError)`` 捕获面——注释声称要堵的形态恰好漏接。
+    """
+
+    class NoneConfigBot(FakeChatbot):
+        def __init__(self, console):
+            self.chat_config = None
+            self.llm_model = object()
+
+        async def chat_async(self, _user_input):
+            if False:
+                yield ""
+
+    monkeypatch.setattr("src.chat.core.Chatbot", NoneConfigBot)
+    monkeypatch.setattr(
+        "src.chat.core.PromptSession",
+        lambda: FakePromptSession(["/quit"]),
+    )
+    monkeypatch.setattr(
+        "src.chat.core.display_chat_config",
+        lambda *_args, **_kwargs: None,
+    )
+
+    asyncio.run(start_chat_session_async())

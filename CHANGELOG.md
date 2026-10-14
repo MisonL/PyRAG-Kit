@@ -6,6 +6,12 @@
 
 ### 修复
 
+- **第六轮四维 agents 复查：换角度横向扫描，安全/并发/错误契约继续收敛**。数据完整性、并发、错误契约三个维度零需修复项（脏输入端到端、1000 次编辑 + 3000 轮对话 tracemalloc 无泄漏、rich markup 注入面 56 处穷举核查、NUL/RTL 控制字符注入全过）；安全维度收尾 2 处：
+  - **``safe_repr`` 捕获面过窄（中低）**：``__repr__`` 抛 ``KeyError`` 等非预期异常的对象作键（pickle 快照/嵌入方可注入）时，209 处调用点的「最后一道展示边界」自己崩出裸异常——捕获面放宽到 ``Exception``，与 ``_key_text``/``_display_repr`` 终态判据一致。
+  - **「就绪行」``TypeError`` 穿透（低）**：第四轮注释声称覆盖的 ``chat_config=None`` 形态实测不在 ``(ValueError, KeyError)`` 捕获面（``'NoneType' object is not subscriptable``）——捕获面补 ``TypeError``，注释改为如实描述。
+  - **卫生**：``main.py:275`` 缓存目录警告改经 ``safe_exception_text``（与全仓约定一致）。
+  - **记录不修**：多消费方共享流生成器的交错消费（现存无此调用形态，边界说明）；SIGTERM 下 atexit 不执行（Python 固有，后果仅 ``.cache`` 残留）；显示层 fusion 对带空白形态显示「未知」而运行期归一化放行（仅属性直写可达的显示毛刺）。
+
 - **第五轮四维 agents 复查：三维度零缺陷收官，错误契约收尾 3 处**。安全（约 70 探针矩阵全过）、数据完整性（真实 39 文档端到端全链路：build→落盘→重载→混合检索→688/688 父块召回、embeddings 位级一致）、并发（嵌套 finally 六路径 + 5×6 终态矩阵实测，无新单元格退化）均为零需修复项；错误契约维度收尾：
   - **fusion 显示白名单误写（中·回归）**：第四轮统一「未知」时把合法默认 ``weighted`` 误写成 ``weight``，合法配置在菜单显示「未知」（实测复现）。修正为与 ``SessionConfig`` validator/questionary 候选一致的 ``("rrf", "weighted")``；补 ``weighted`` 不误伤用例（回归测试只测了 ``None``，4519 全绿没拦住——判别输入要覆盖每个合法值）。
   - **factory 可选值拼接裸 ``str(k)`` 守卫自崩（中）**：configurations 含超限整数键（pickle 可携带 ``10**4301``）时拼消息抛 ``Exceeds the limit``，用户看到的语义从「未找到key」错位成整数转换失败；``display_utils`` 同场景早已 ``safe_repr``。对齐并加回归用例。
