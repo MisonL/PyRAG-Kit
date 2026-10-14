@@ -1060,6 +1060,76 @@ def test_editor_converges_eof_to_save_and_return(monkeypatch):
     assert returned is chat_config  # 配置按原样返回（未生效任何改动）
 
 
+def test_editor_eof_reverts_partial_edits(monkeypatch):
+    """EOF 前已确认写回的编辑必须被还原——「按原样保存返回」的承诺要成立。
+
+    编辑器全程原地修改 ``chat_config``（``/config`` 入口随后把它应用到
+    bot）。EOF 前成功写入的每一项原本都会留在字典里随返回生效，且 reload
+    标志只在 ``edit_model_params`` 正常走完才置位——若不还原，EOF 前切换过
+    LLM 的残留键会以「已切换但未重载」的形态继续服务（实测复现）。
+    """
+    from src.ui import config_menu
+
+    _EOF_SENTINEL = object()
+
+    # 主菜单 → 检索参数 → top_k → 输入 7（写回）→ EOF。
+    # 替身必须按调用序出队：恒返回同一值的替身会让子菜单循环永远拿到
+    # "top_k" 而无限旋转（实测挂死），与真实交互序列不符。
+    sequence = [
+        "1. 调整检索参数",  # 主菜单
+        "top_k",  # 检索参数子菜单
+        "7",  # Top K 输入框（text）
+        _EOF_SENTINEL,  # 下一层任何 .ask() 抛 EOFError
+    ]
+
+    class SequenceAsk:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def ask(self):
+            value = sequence.pop(0)
+            if value is _EOF_SENTINEL:
+                raise EOFError()
+            return value
+
+    monkeypatch.setattr(config_menu.questionary, "select", SequenceAsk)
+    monkeypatch.setattr(config_menu.questionary, "text", SequenceAsk)
+    monkeypatch.setattr(config_menu.questionary, "Separator", lambda *a, **k: object())
+
+    chat_config = {
+        "top_k": 5,
+        "retrieval_method": "vector",
+        "rerank_enabled": True,
+        "vector_weight": 0.7,
+        "keyword_weight": 0.3,
+        "hybrid_fusion_strategy": "rrf",
+        "retrieval_candidate_multiplier": 5,
+        "rerank_configurations": {},
+        "llm_configurations": {},
+        "active_llm_configuration": "a",
+        "active_rerank_configuration": "b",
+    }
+
+    llm_needs_reload, returned = config_menu.launch_config_editor(chat_config)
+
+    assert llm_needs_reload is False
+    assert returned is chat_config
+    assert chat_config["top_k"] == 5  # EOF 前写入的 7 已还原
+    assert set(chat_config) == {
+        "top_k",
+        "retrieval_method",
+        "rerank_enabled",
+        "vector_weight",
+        "keyword_weight",
+        "hybrid_fusion_strategy",
+        "retrieval_candidate_multiplier",
+        "rerank_configurations",
+        "llm_configurations",
+        "active_llm_configuration",
+        "active_rerank_configuration",
+    }  # 键集合不变（无残留、无丢失）
+
+
 def test_editor_keeps_reload_flag_through_normal_exit(monkeypatch):
     """正常退出路径的重载标记不受 EOF 收敛重构影响。"""
 

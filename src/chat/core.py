@@ -489,25 +489,6 @@ async def start_chat_session_async():
                             # EOFError 的兜底：与 ``KeyboardInterrupt`` 同语义
                             # （用户中断输入），不应走到下面的通用恢复分支。
                             raise KeyboardInterrupt from exc
-                        except Exception as exc:  # noqa: BLE001
-                            # 编辑器线程内的**意外**异常（questionary/prompt_toolkit
-                            # 在异常态下可能抛非 ``(ValueError, KeyError)`` 类型）
-                            # 原先直接穿透——内层 ``except (KeyboardInterrupt,
-                            # EOFError)`` 不接，会话被静默终止且无任何提示（实测
-                            # 复现），与「配置应用失败不能终止整个会话」契约矛盾。
-                            # 兜底报告后回到提示符，与通用恢复分支同语义。
-                            bot_logger = getattr(bot, "logger", None)
-                            if bot_logger is not None:
-                                bot_logger.warning(
-                                    "配置编辑器异常，保留原配置: %s", safe_exception_text(exc)
-                                )
-                            console.print(
-                                markup_text(
-                                    "[bold yellow]配置编辑器异常: {}[/bold yellow] 已保留当前配置。",
-                                    safe_exception_text(exc),
-                                )
-                            )
-                            continue
                         except (ValueError, KeyError) as exc:
                             # 经 ``getattr`` 取 logger：``bot`` 的类型是运行时
                             # 可替换的（嵌入方可以传入自己的实现），同文件其它
@@ -526,6 +507,21 @@ async def start_chat_session_async():
                                 )
                             )
                             continue
+                        except Exception as exc:  # noqa: BLE001
+                            # 编辑器线程内的**意外**异常（questionary/prompt_toolkit
+                            # 在异常态下可能抛非 ``(ValueError, KeyError)`` 类型）
+                            # 原先直接穿透——内层 ``except (KeyboardInterrupt,
+                            # EOFError)`` 不接，会话被静默终止且无任何提示（实测
+                            # 复现），与「配置应用失败不能终止整个会话」契约矛盾。
+                            # 兜底报告后回到提示符，与通用恢复分支同语义。注意
+                            # 必须排在 ``(ValueError, KeyError)`` 之后：该分支
+                            # 报「配置未生效」、本分支报「配置编辑器异常」，是
+                            # 两条不同的用户可见消息，反序会把前者整个遮蔽。
+                            bot_logger = getattr(bot, "logger", None)
+                            if bot_logger is not None:
+                                bot_logger.warning(
+                                    "配置编辑器异常，保留原配置: %s", safe_exception_text(exc)
+                                )
                         # 配置回显同样收在恢复 ``try`` 内：``display_chat_config``
                         # 会读取刚保存的 rerank 段，取值不合洽时抛 ``ValueError``
                         # （实测 rerank 段为空表即触发）——若不接，配置已生效、

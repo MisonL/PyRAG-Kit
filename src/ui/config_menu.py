@@ -1,3 +1,4 @@
+import copy
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -493,6 +494,16 @@ def launch_config_editor(chat_config: dict[str, Any]) -> tuple[bool, dict[str, A
 
     state = {"llm_needs_reload": False}
 
+    # 编辑器全程**原地**写 ``chat_config``（``editable_config`` 是 ``/config``
+    # 入口浅拷贝出来、随后会被 ``apply_config_update`` 应用到 bot 的同一份
+    # 字典）。EOF 收敛承诺「按原样保存返回」，但 EOF 前已确认写入的每一项
+    # （Top K、切换的 LLM 等）都留在这份字典里并随返回生效——实测「Top K
+    # 输入 7 → EOF」返回 top_k=7 且提示「按原样」。因此入口先快照，EOF 时
+    # 还原；这同时解决 reload 标志问题：EOF 前若切换过 LLM，标志尚未置位
+    # （只在 ``edit_model_params`` 正常走完才置位），还原后残留的 LM 键不再
+    # 以「已切换但未重载」的形态继续服务。
+    snapshot = copy.deepcopy(chat_config)
+
     try:
         _run_config_editor_loop(chat_config, state)
     except EOFError:
@@ -501,11 +512,13 @@ def launch_config_editor(chat_config: dict[str, Any]) -> tuple[bool, dict[str, A
         # （实测 /dev/null 与 \x04 均复现）。它经 ``asyncio.to_thread`` 到达
         # 聊天主循环的 ``except (KeyboardInterrupt, EOFError): break``——
         # 在最深的 Top K 输入框按一次 Ctrl+D 会**终止整个聊天会话**，与
-        # Ctrl+C 的「退一层」语义不对称。配置只改内存副本、编辑器正常退出
-        # 才生效，EOF 中断时原配置原样保留，因此按「放弃编辑、保存返回」
-        # 收敛最安全。
+        # Ctrl+C 的「退一层」语义不对称。EOF 中断按「放弃全部编辑、保存返回」
+        # 收敛：还原快照使承诺与写回事实一致。
+        chat_config.clear()
+        chat_config.update(snapshot)
+        state["llm_needs_reload"] = False
         console.print(markup_text("[yellow]输入已结束（EOF），配置编辑器按原样保存返回。[/yellow]"))
-        logger.info("配置编辑器因 EOF 提前退出，配置保持原样。")
+        logger.info("配置编辑器因 EOF 提前退出，已还原 EOF 前的全部修改。")
 
     return state["llm_needs_reload"], chat_config
 
