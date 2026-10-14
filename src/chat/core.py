@@ -37,6 +37,7 @@ from ..ui.display_utils import (
     get_relative_path,
     markup_text,
 )
+from ..ui.terminal_theme import prompt_style_for_theme
 from ..utils.config import get_settings, require_chat_temperature, safe_repr
 from ..utils.log_manager import get_chat_logger, get_module_logger
 from ..utils.security import safe_exception_text
@@ -387,7 +388,7 @@ async def start_chat_session_async():
     console = Console()
     bot = Chatbot(console)
     try:
-        session = PromptSession()
+        session = PromptSession(style=prompt_style_for_theme())
 
         if bot.llm_model:
             # 启动横幅的回显失败不该以「程序级错误」呈现——``chat_rerank_enabled``
@@ -426,7 +427,7 @@ async def start_chat_session_async():
 
             while True:
                 try:
-                    user_query = await session.prompt_async(HTML("<skyblue><b>你: </b></skyblue>"))
+                    user_query = await session.prompt_async(HTML("<prompt><b>你: </b></prompt>"))
                     if not user_query.strip():
                         continue
                     if user_query.lower() == "/quit":

@@ -52,6 +52,7 @@ import src.utils.log_manager
 # 导入UI工具
 from src.models.document import Document
 from src.ui.display_utils import CONSOLE_WIDTH, markup_text
+from src.ui.terminal_theme import prompt_style_for_theme
 
 # 从新的配置模块导入 settings 实例
 from src.utils.config import get_settings, resolve_app_root
@@ -375,8 +376,19 @@ def run_cli(argv: list[str] | None = None) -> int:
         # 交互式程序被静默吞参数的体验很差：新用户照惯例敲 ``--help`` 时
         # 直接进了交互菜单（实测），只能 Ctrl+C 退出重来。给出简明用法
         # 后退出，不初始化依赖（``--help`` 必须瞬时返回）。
+        #
+        # 同时注销退出清理钩子：``import src.utils.cleanup`` 的模块级
+        # ``atexit.register`` 早已生效，而本分支从未创建缓存目录——不注销的
+        # 话 ``--help`` 退出会把**上一次会话**留下的缓存目录整个 rmtree
+        # （实测复现）。``--help`` 是只读查询，不应有任何副作用。
+        import atexit
+
+        import src.utils.cleanup as _cleanup_module
+
+        atexit.unregister(_cleanup_module.cleanup_temp_files)
         console.print(markup_text("PyRAG-Kit {}", VERSION))
-        console.print("用法: python main.py [选项]")
+        usage_name = "PyRAG-Kit" if getattr(sys, "frozen", False) else "python main.py"
+        console.print(markup_text("用法: {} [选项]", usage_name))
         console.print("  --smoke-test   非交互式启动自检（构建验证用）")
         console.print("  -h, --help     显示本帮助并退出")
         console.print("  无参数          进入交互式菜单（向量化 / 召回测试 / 聊天）")
@@ -398,8 +410,13 @@ def main():
     while True:
         display_menu()
         try:
-            # 使用 prompt_toolkit 替代 console.input，并优化样式
-            choice = prompt(HTML("<skyblue><b>请输入选项 (1-4): </b></skyblue>"))
+            # 使用 prompt_toolkit 替代 console.input，并优化样式。
+            # 提示色按终端亮/暗主题适配：固定浅色（xterm 116 skyblue1）在
+            # 白底上对比度仅 1.7:1（WCAG AA 4.5:1），亮色终端几乎不可读。
+            choice = prompt(
+                HTML("<prompt><b>请输入选项 (1-4): </b></prompt>"),
+                style=prompt_style_for_theme(),
+            )
             if choice == "1":
                 console.print(
                     Panel(

@@ -5,7 +5,7 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 
 from src.utils.config import get_settings
-from src.utils.security import redact_sensitive_text
+from src.utils.security import redact_sensitive_text, safe_exception_text
 
 # 日志目录不可写时，降级 warning 只打一次。
 #
@@ -112,7 +112,20 @@ def get_module_logger(name: str) -> logging.Logger:
     日志将输出到控制台和文件。
     """
     logger = logging.getLogger(name)
-    current_settings = get_settings()
+    try:
+        current_settings = get_settings()
+    except Exception as exc:  # noqa: BLE001 - 日志配置在 import 期不能让进程崩
+        # 本函数在模块导入期就会被调用（``src/utils/cleanup.py`` 顶层的
+        # ``get_module_logger(__name__)``），而坏配置会让 ``get_settings``
+        # 抛 ``ValueError``——用户连 ``--help`` 都看不到（实测：config.toml
+        # 加一行语法错误后 ``main.py --help`` 以裸 traceback 收场）。日志
+        # 级别取不到就退回默认值，主流程稍后调用 ``get_settings()`` 时
+        # 仍会以脱敏的配置错误正常报错。
+        logger.setLevel(logging.INFO)
+        if not logger.handlers:
+            logger.addHandler(logging.StreamHandler())
+        logger.warning("配置尚未可用，日志按默认级别初始化: %s", safe_exception_text(exc))
+        return logger
     logger.setLevel(current_settings.log_level)  # 从配置中获取日志级别
 
     # 避免重复添加处理器

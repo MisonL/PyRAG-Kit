@@ -10,6 +10,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from src.ui.terminal_theme import prompt_style_for_theme
+
 os.environ.setdefault("PROMPT_TOOLKIT_NO_CPR", "1")
 
 from ..retrieval.vdb.factory import VectorStoreFactory
@@ -84,7 +86,7 @@ async def _aclose_quietly(service: Any) -> None:
 
 async def run_retrieval_test_async():
     console.print(Panel("进入异步召回测试模式。输入 '/quit' 退出。", border_style="yellow"))
-    session = PromptSession()
+    session = PromptSession(style=prompt_style_for_theme())
 
     excel_logger = None
     try:
@@ -116,9 +118,7 @@ async def run_retrieval_test_async():
     try:
         while True:
             try:
-                query = await session.prompt_async(
-                    HTML("<deepskyblue><b>测试查询: </b></deepskyblue>")
-                )
+                query = await session.prompt_async(HTML("<prompt><b>测试查询: </b></prompt>"))
                 if query.lower() == "/quit":
                     break
                 if not query:

@@ -670,7 +670,7 @@ def test_run_retrieval_test_skips_empty_query(monkeypatch):
     calls = []
 
     class FakePromptSession:
-        def __init__(self, responses):
+        def __init__(self, responses, **_kwargs):
             self._responses = iter(responses)
 
         async def prompt_async(self, *_args, **_kwargs):
@@ -684,11 +684,13 @@ def test_run_retrieval_test_skips_empty_query(monkeypatch):
             calls.append(query)
             return []
 
-    monkeypatch.setattr(retrieval_core, "PromptSession", lambda: FakePromptSession(["", "/quit"]))
+    monkeypatch.setattr(
+        retrieval_core, "PromptSession", lambda **_kwargs: FakePromptSession(["", "/quit"])
+    )
     monkeypatch.setattr(retrieval_core, "RetrievalService", RecordingService)
     monkeypatch.setattr(retrieval_core, "EmbeddingService", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(
-        retrieval_core.VectorStoreFactory, "get_default_vector_store", lambda: object()
+        retrieval_core.VectorStoreFactory, "get_default_vector_store", lambda **_kwargs: object()
     )
     monkeypatch.setattr(retrieval_core, "ExcelLogger", lambda: None)
     asyncio.run(retrieval_core.run_retrieval_test_async())
@@ -932,7 +934,7 @@ def test_run_retrieval_test_reports_excel_logger_failure_and_continues(monkeypat
     printed = []
 
     class FakePromptSession:
-        def __init__(self, responses):
+        def __init__(self, responses, **_kwargs):
             self._responses = iter(responses)
 
         async def prompt_async(self, *_args, **_kwargs):
@@ -942,12 +944,14 @@ def test_run_retrieval_test_reports_excel_logger_failure_and_continues(monkeypat
         def __init__(self):
             raise RuntimeError("初始化失败")
 
-    monkeypatch.setattr(retrieval_core, "PromptSession", lambda: FakePromptSession(["/quit"]))
+    monkeypatch.setattr(
+        retrieval_core, "PromptSession", lambda **_kwargs: FakePromptSession(["/quit"])
+    )
     monkeypatch.setattr(retrieval_core, "ExcelLogger", BoomLogger)
     monkeypatch.setattr(retrieval_core, "RetrievalService", lambda *_a, **_k: object())
     monkeypatch.setattr(retrieval_core, "EmbeddingService", lambda *_a, **_k: object())
     monkeypatch.setattr(
-        retrieval_core.VectorStoreFactory, "get_default_vector_store", lambda: object()
+        retrieval_core.VectorStoreFactory, "get_default_vector_store", lambda **_kwargs: object()
     )
     monkeypatch.setattr(retrieval_core.console, "print", lambda *a, **k: printed.append(str(a)))
     asyncio.run(retrieval_core.run_retrieval_test_async())
@@ -968,7 +972,7 @@ def test_run_retrieval_test_reports_database_load_failure(monkeypatch):
     def boom():
         raise RuntimeError("加载失败")
 
-    monkeypatch.setattr(retrieval_core, "PromptSession", lambda: object())
+    monkeypatch.setattr(retrieval_core, "PromptSession", lambda **_kwargs: object())
     monkeypatch.setattr(retrieval_core, "ExcelLogger", lambda: None)
     monkeypatch.setattr(retrieval_core.VectorStoreFactory, "get_default_vector_store", boom)
     monkeypatch.setattr(retrieval_core.console, "print", lambda *a, **k: printed.append(str(a)))
@@ -984,6 +988,9 @@ def test_run_retrieval_test_breaks_on_keyboard_interrupt(monkeypatch):
     from src.retrieval_test import core as retrieval_core
 
     class InterruptingSession:
+        def __init__(self, **_kwargs):
+            pass
+
         async def prompt_async(self, *_args, **_kwargs):
             raise KeyboardInterrupt
 
@@ -992,7 +999,7 @@ def test_run_retrieval_test_breaks_on_keyboard_interrupt(monkeypatch):
     monkeypatch.setattr(retrieval_core, "RetrievalService", lambda *_a, **_k: object())
     monkeypatch.setattr(retrieval_core, "EmbeddingService", lambda *_a, **_k: object())
     monkeypatch.setattr(
-        retrieval_core.VectorStoreFactory, "get_default_vector_store", lambda: object()
+        retrieval_core.VectorStoreFactory, "get_default_vector_store", lambda **_kwargs: object()
     )
     asyncio.run(retrieval_core.run_retrieval_test_async())
 

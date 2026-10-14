@@ -7,7 +7,7 @@ from tests.chat.test_core import FakeChatbot
 
 
 class _PromptSession:
-    def __init__(self, responses):
+    def __init__(self, responses, **_kwargs):
         self._responses = iter(responses)
 
     async def prompt_async(self, *_args, **_kwargs):
@@ -30,7 +30,7 @@ def test_chat_session_breaks_cleanly_on_interrupt(monkeypatch):
     monkeypatch.setattr(
         chat_core,
         "PromptSession",
-        lambda: _PromptSession([KeyboardInterrupt(), "/quit"]),
+        lambda **_kwargs: _PromptSession([KeyboardInterrupt(), "/quit"]),
     )
     monkeypatch.setattr(chat_core, "display_chat_config", lambda *_a, **_k: None)
     asyncio.run(start_chat_session_async())
@@ -57,7 +57,7 @@ def test_start_chat_session_survives_keyerror_from_config_update(monkeypatch):
     monkeypatch.setattr("src.chat.core.Chatbot", KeyErrorChatbot)
     monkeypatch.setattr(
         "src.chat.core.PromptSession",
-        lambda: FakePromptSession(["/config", "/quit"]),
+        lambda **_kwargs: FakePromptSession(["/config", "/quit"]),
     )
     monkeypatch.setattr("src.chat.core.display_chat_config", lambda *_a, **_k: None)
     monkeypatch.setattr(
@@ -83,7 +83,7 @@ def test_start_chat_session_exits_cleanly_on_eof(monkeypatch):
             raise EOFError()
 
     monkeypatch.setattr("src.chat.core.Chatbot", FakeChatbot)
-    monkeypatch.setattr("src.chat.core.PromptSession", lambda: EofSession([]))
+    monkeypatch.setattr("src.chat.core.PromptSession", lambda **_kwargs: EofSession([]))
     monkeypatch.setattr("src.chat.core.display_chat_config", lambda *_a, **_k: None)
     asyncio.run(__import__("src.chat.core", fromlist=["x"]).start_chat_session_async())
 
@@ -113,7 +113,7 @@ def test_start_chat_session_survives_bot_without_config_update_methods(monkeypat
     monkeypatch.setattr("src.chat.core.Chatbot", NoUpdateChatbot)
     monkeypatch.setattr(
         "src.chat.core.PromptSession",
-        lambda: FakePromptSession(["/config", "/quit"]),
+        lambda **_kwargs: FakePromptSession(["/config", "/quit"]),
     )
     monkeypatch.setattr("src.chat.core.display_chat_config", lambda *_a, **_k: None)
     monkeypatch.setattr(

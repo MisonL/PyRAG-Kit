@@ -68,7 +68,7 @@ def test_chatbot_close_disposes_llm_and_retrieval_service():
 
 
 class FakePromptSession:
-    def __init__(self, responses):
+    def __init__(self, responses, **_kwargs):
         self._responses = iter(responses)
 
     async def prompt_async(self, *_args, **_kwargs):
@@ -113,7 +113,7 @@ def test_start_chat_session_async_can_exit(monkeypatch):
     monkeypatch.setattr("src.chat.core.Chatbot", FakeChatbot)
     monkeypatch.setattr(
         "src.chat.core.PromptSession",
-        lambda: FakePromptSession(["/quit"]),
+        lambda **_kwargs: FakePromptSession(["/quit"]),
     )
     monkeypatch.setattr("src.chat.core.display_chat_config", lambda *_args, **_kwargs: None)
 
@@ -126,7 +126,7 @@ def test_start_chat_session_async_can_open_config(monkeypatch):
     monkeypatch.setattr("src.chat.core.Chatbot", FakeChatbot)
     monkeypatch.setattr(
         "src.chat.core.PromptSession",
-        lambda: FakePromptSession(["/config", "/quit"]),
+        lambda **_kwargs: FakePromptSession(["/config", "/quit"]),
     )
     monkeypatch.setattr("src.chat.core.display_chat_config", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
@@ -170,7 +170,7 @@ def test_start_chat_session_async_survives_a_rejected_config_update(monkeypatch)
     monkeypatch.setattr("src.chat.core.Chatbot", RejectingChatbot)
     monkeypatch.setattr(
         "src.chat.core.PromptSession",
-        lambda: RecordingPromptSession(["/config", "/quit"]),
+        lambda **_kwargs: RecordingPromptSession(["/config", "/quit"]),
     )
     monkeypatch.setattr("src.chat.core.display_chat_config", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
@@ -200,7 +200,7 @@ def test_start_chat_session_async_reports_rejected_config_without_credentials(mo
     monkeypatch.setattr("src.chat.core.Chatbot", RejectingChatbot)
     monkeypatch.setattr(
         "src.chat.core.PromptSession",
-        lambda: FakePromptSession(["/config", "/quit"]),
+        lambda **_kwargs: FakePromptSession(["/config", "/quit"]),
     )
     monkeypatch.setattr("src.chat.core.display_chat_config", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
@@ -234,7 +234,7 @@ def test_start_chat_session_async_skips_empty_input(monkeypatch):
     monkeypatch.setattr("src.chat.core.Chatbot", EmptySafeChatbot)
     monkeypatch.setattr(
         "src.chat.core.PromptSession",
-        lambda: FakePromptSession(["", "   ", "/quit"]),
+        lambda **_kwargs: FakePromptSession(["", "   ", "/quit"]),
     )
     monkeypatch.setattr("src.chat.core.display_chat_config", lambda *_args, **_kwargs: None)
 
@@ -468,7 +468,7 @@ def test_start_chat_session_async_reverts_llm_after_editor_mutation(monkeypatch)
     monkeypatch.setattr("src.chat.core.Chatbot", RealishChatbot)
     monkeypatch.setattr(
         "src.chat.core.PromptSession",
-        lambda: FakePromptSession(["/config", "/quit"]),
+        lambda **_kwargs: FakePromptSession(["/config", "/quit"]),
     )
     monkeypatch.setattr("src.chat.core.display_chat_config", lambda *_args, **_kwargs: None)
 
@@ -1242,7 +1242,7 @@ def test_start_chat_session_async_survives_config_display_failure(monkeypatch):
     monkeypatch.setattr("src.chat.core.Chatbot", _SurvivalBot)
     monkeypatch.setattr(
         "src.chat.core.PromptSession",
-        lambda: FakePromptSession(["/config", "/quit"]),
+        lambda **_kwargs: FakePromptSession(["/config", "/quit"]),
     )
     # 启动横幅里的回显不炸（rerank_enabled=False 时不读 rerank 段），
     # 只有 /config 保存后的回显要炸——用计数器区分两次调用。
@@ -1271,7 +1271,7 @@ def test_start_chat_session_async_survives_config_editor_failure(monkeypatch):
     monkeypatch.setattr("src.chat.core.Chatbot", _SurvivalBot)
     monkeypatch.setattr(
         "src.chat.core.PromptSession",
-        lambda: FakePromptSession(["/config", "/quit"]),
+        lambda **_kwargs: FakePromptSession(["/config", "/quit"]),
     )
     monkeypatch.setattr("src.chat.core.display_chat_config", lambda *_args, **_kwargs: None)
 
@@ -1306,7 +1306,7 @@ def test_start_chat_session_async_survives_failing_teardown(monkeypatch):
     monkeypatch.setattr("src.chat.core.Chatbot", ExplodingTeardownBot)
     monkeypatch.setattr(
         "src.chat.core.PromptSession",
-        lambda: FakePromptSession(["/quit"]),
+        lambda **_kwargs: FakePromptSession(["/quit"]),
     )
     monkeypatch.setattr("src.chat.core.display_chat_config", lambda *_args, **_kwargs: None)
 
@@ -1331,7 +1331,7 @@ def test_start_chat_session_survives_banner_display_failure(monkeypatch):
     monkeypatch.setattr("src.chat.core.Chatbot", _SurvivalBot)
     monkeypatch.setattr(
         "src.chat.core.PromptSession",
-        lambda: FakePromptSession(["/quit"]),
+        lambda **_kwargs: FakePromptSession(["/quit"]),
     )
     monkeypatch.setattr("src.chat.core.display_chat_config", exploding_display)
 
@@ -1358,7 +1358,7 @@ def test_ready_line_survives_none_chat_config(monkeypatch):
     monkeypatch.setattr("src.chat.core.Chatbot", NoneConfigBot)
     monkeypatch.setattr(
         "src.chat.core.PromptSession",
-        lambda: FakePromptSession(["/quit"]),
+        lambda **_kwargs: FakePromptSession(["/quit"]),
     )
     monkeypatch.setattr(
         "src.chat.core.display_chat_config",

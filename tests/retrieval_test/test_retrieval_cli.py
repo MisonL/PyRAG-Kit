@@ -7,7 +7,7 @@ from src.retrieval_test.core import run_retrieval_test_async
 
 
 class FakePromptSession:
-    def __init__(self, responses):
+    def __init__(self, responses, **_kwargs):
         self._responses = iter(responses)
 
     async def prompt_async(self, *_args, **_kwargs):
@@ -17,7 +17,7 @@ class FakePromptSession:
 def test_run_retrieval_test_async_can_exit(monkeypatch):
     monkeypatch.setattr(
         "src.retrieval_test.core.PromptSession",
-        lambda: FakePromptSession(["/quit"]),
+        lambda **_kwargs: FakePromptSession(["/quit"]),
     )
     monkeypatch.setattr(
         "src.retrieval_test.core.VectorStoreFactory.get_default_vector_store",
@@ -40,7 +40,7 @@ def test_run_retrieval_test_async_prints_error_when_retrieval_fails(monkeypatch)
 
     monkeypatch.setattr(
         "src.retrieval_test.core.PromptSession",
-        lambda: FakePromptSession(["query", "/quit"]),
+        lambda **_kwargs: FakePromptSession(["query", "/quit"]),
     )
     monkeypatch.setattr("src.retrieval_test.core.ExcelLogger", lambda: None)
     monkeypatch.setattr("src.retrieval_test.core.RetrievalService", FailingRetrievalService)
@@ -80,7 +80,7 @@ def test_retrieval_failure_output_redacts_credentials(monkeypatch):
 
     monkeypatch.setattr(
         "src.retrieval_test.core.PromptSession",
-        lambda: FakePromptSession(["query", "/quit"]),
+        lambda **_kwargs: FakePromptSession(["query", "/quit"]),
     )
     monkeypatch.setattr("src.retrieval_test.core.ExcelLogger", lambda: None)
     monkeypatch.setattr("src.retrieval_test.core.RetrievalService", FailingRetrievalService)
@@ -184,7 +184,7 @@ def test_retrieval_error_path_survives_markup_like_exception(monkeypatch):
 
     monkeypatch.setattr(
         "src.retrieval_test.core.PromptSession",
-        lambda: FakePromptSession(["query", "/quit"]),
+        lambda **_kwargs: FakePromptSession(["query", "/quit"]),
     )
     monkeypatch.setattr("src.retrieval_test.core.ExcelLogger", lambda: None)
     monkeypatch.setattr("src.retrieval_test.core.RetrievalService", MarkupLikeFailure)
@@ -847,7 +847,7 @@ def test_run_retrieval_test_async_exits_cleanly_on_eof(monkeypatch):
 
     monkeypatch.setattr(
         "src.retrieval_test.core.PromptSession",
-        lambda: EofPromptSession(),
+        lambda **_kwargs: EofPromptSession(),
     )
     monkeypatch.setattr(
         "src.retrieval_test.core.VectorStoreFactory.get_default_vector_store",
@@ -894,7 +894,7 @@ def test_quit_command_exits_before_running_retrieval(monkeypatch):
             return []
 
     class QuitOnceSession:
-        def __init__(self):
+        def __init__(self, **_kwargs):
             self._first = True
 
         async def prompt_async(self, *_args, **_kwargs):
