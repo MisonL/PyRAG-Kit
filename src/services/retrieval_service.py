@@ -647,7 +647,16 @@ def _deduplicate_parent_documents(documents: list[dict[str, Any]]) -> list[dict[
             existing.get("score")
         ):
             deduplicated[key] = copy.deepcopy(document)
-    return list(deduplicated.values())
+    # 输出必须恢复分数降序：输入是有序的，但去重把代表文档留在**首次出现**
+    # 的位置——「先见低分、后见高分」的同组文档会让输出不再有序，而调用方
+    # 直接 ``[:top_k]`` 截断，实测会丢弃全局最高分文档（探针：候选
+    # s1(P1,0.40)→s2(P2,0.45)→s3(P3,0.50)、top_k=2 返回 s1+s2 而丢掉 s3）。
+    # 排序在截断之前做，rerank 路径随后会按自己的分数重排，不受影响。
+    return sorted(
+        deduplicated.values(),
+        key=lambda document: coerce_score(document.get("score")),
+        reverse=True,
+    )
 
 
 class RetrievalService:

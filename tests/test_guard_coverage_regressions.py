@@ -1418,6 +1418,26 @@ def test_deduplicate_parent_documents_keeps_first_on_equal_scores():
     assert [d["page_content"] for d in _deduplicate_parent_documents(documents)] == ["first"]
 
 
+def test_deduplicate_parent_documents_restores_score_order():
+    """去重输出必须恢复分数降序，否则 top_k 截断会丢弃全局最高分文档。
+
+    去重把同组的代表文档留在**首次出现**的位置：候选 s1(P1,0.40) →
+    s2(P2,0.45) → s3(P3,0.50) 各属不同父块、无需合并，但若不重排，
+    ``[:top_k]``（top_k=2）返回 s1+s2 而丢掉最高分的 s3（实测复现）。
+    """
+    from src.services.retrieval_service import _deduplicate_parent_documents
+
+    documents = [
+        {"page_content": "s1", "metadata": {"parent_id": "P1"}, "score": 0.40},
+        {"page_content": "s2", "metadata": {"parent_id": "P2"}, "score": 0.45},
+        {"page_content": "s3", "metadata": {"parent_id": "P3"}, "score": 0.50},
+    ]
+    result = _deduplicate_parent_documents(documents)
+
+    assert [d["page_content"] for d in result] == ["s3", "s2", "s1"]
+    assert [d["score"] for d in result] == [0.50, 0.45, 0.40]
+
+
 def test_keyword_search_stops_exactly_at_top_k():
     """结果数恰好达到 ``top_k`` 时停止（``>=`` 不是 ``>``），不多取一条。"""
     import jieba

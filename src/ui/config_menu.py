@@ -275,9 +275,20 @@ def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
 
             if new_vector_weight_str:
                 new_vector_weight = float(new_vector_weight_str)
-                new_keyword_weight = 1.0 - new_vector_weight
-                chat_config["vector_weight"] = new_vector_weight
-                chat_config["keyword_weight"] = round(new_keyword_weight, 2)
+                new_keyword_weight = round(1.0 - new_vector_weight, 2)
+                # 两条写回有**顺序陷阱**：``SessionConfig``/编辑器共享的组合守卫
+                # 「vector_weight 与 keyword_weight 不能同时为 0」按中间态判，
+                # 固定先写 vector 会拒绝合法终态——默认 (1.0, 0.0) 下用户把
+                # 向量权重改成 0（切纯关键词检索）实测报「不能同时为 0」，而
+                # 反序写通过。先写**非零侧**使中间态永远不落入双 0：
+                # (v=0, k=1) 先写 keyword、(v=1, k=0) 先写 vector，其余两侧
+                # 均非 0 顺序无关。
+                if new_vector_weight == 0.0:
+                    chat_config["keyword_weight"] = new_keyword_weight
+                    chat_config["vector_weight"] = new_vector_weight
+                else:
+                    chat_config["vector_weight"] = new_vector_weight
+                    chat_config["keyword_weight"] = new_keyword_weight
                 console.print(
                     markup_text(
                         "[green]混合搜索权重已更新为 -> 向量: {}, 关键词: {}[/green]",

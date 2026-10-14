@@ -846,6 +846,50 @@ def test_weights_selection_writes_complement_to_keyword_weight(monkeypatch):
     assert chat_config["keyword_weight"] == 0.8
 
 
+def test_weights_edge_zero_vector_writes_keyword_first(monkeypatch):
+    """向量权重改 0 时先写 keyword 侧——组合守卫按中间态判，固定先写
+    vector 会拒绝合法终态 (0.0, 1.0)。
+
+    实测复现：默认 (1.0, 0.0) 会话里用户把向量权重改成 0（切纯关键词检索），
+    原顺序报「vector_weight 与 keyword_weight 不能同时为 0」——终态完全合法，
+    中间态 (0.0, 0.0) 撞上了双 0 守卫。两个边界方向都要断言。
+    """
+    from src.ui import config_menu
+
+    cases = [
+        # (初始 vector, 初始 keyword, 输入, 期望 (vector, keyword))
+        (1.0, 0.0, "0", (0.0, 1.0)),  # 默认组合切纯关键词——缺陷方向
+        (0.0, 1.0, "1", (1.0, 0.0)),  # 反向：纯关键词切回
+        (0.5, 0.5, "0.3", (0.3, 0.7)),  # 常规路径不回归
+    ]
+    for initial_vector, initial_keyword, answer, expected in cases:
+        answers = iter(["weights", "back"])
+
+        def _select(prompt, *, _answers=answers, **_kwargs):
+            return _Choice(next(_answers))
+
+        def _text(prompt, *, _answer=answer, **_kwargs):
+            return _Choice(_answer)
+
+        monkeypatch.setattr(config_menu.questionary, "select", _select)
+        monkeypatch.setattr(config_menu.questionary, "text", _text)
+        chat_config = {
+            "retrieval_method": RetrievalMethod.HYBRID_SEARCH,
+            "hybrid_fusion_strategy": "rrf",
+            "retrieval_candidate_multiplier": 3,
+            "top_k": 5,
+            "vector_weight": initial_vector,
+            "keyword_weight": initial_keyword,
+            "rerank_enabled": False,
+        }
+
+        config_menu.edit_retrieval_params(chat_config)
+
+        assert (chat_config["vector_weight"], chat_config["keyword_weight"]) == expected, (
+            f"初始 ({initial_vector}, {initial_keyword}) 输入 {answer}"
+        )
+
+
 def test_menu_shows_unknown_for_invalid_retrieval_method(monkeypatch):
     """非法 ``retrieval_method`` 的菜单项显示「未知」，与 Rerank 项同一契约。
 
