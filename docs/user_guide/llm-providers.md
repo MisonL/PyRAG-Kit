@@ -171,6 +171,11 @@ OPENAI_API_BASE="https://api.openai.com/v1"
 DEFAULT_LLM_PROVIDER="openai"
 ```
 
+注意：`.env` 的 `DEFAULT_LLM_PROVIDER` 会覆盖 `config.toml` 的零凭证默认值，
+若尚未配置好对应渠道的模型定义与密钥，14 条模型配置会在运行期因密钥为空串
+而失败（`.env.example` 因此默认注释掉这一行）。照抄本示例前请先完成
+`config.toml` 中的 OpenAI 兼容渠道定义。
+
 并在 `config.toml` 中保留对应模型定义：
 
 ```toml
