@@ -772,3 +772,16 @@ def test_get_llm_provider_propagates_creation_failure():
 
     with pytest.raises(ValueError, match="不支持的模型提供商"):
         ModelProviderFactory.get_llm_provider("k", configurations)
+
+
+def test_get_model_detail_available_keys_survive_huge_int_key():
+    """可选值拼接必须经 ``safe_repr``：超限整数键不得让守卫自崩。
+
+    configations 是可直写映射，pickle 快照可携带 ``10**4301`` 这样的键——
+    裸 ``str(k)`` 在拼消息时抛 ``Exceeds the limit``，用户看到的语义从
+    「未找到key」错位成整数转换失败。``display_utils._require_model_detail``
+    同场景已用 ``safe_repr`` 正常降级，两侧对齐。
+    """
+    huge = 10**4301
+    with pytest.raises(ValueError, match="可选值: <整数，约 4302 位十进制>"):
+        ModelProviderFactory._get_model_detail("x", {huge: "v"}, "llm_configurations", "LLM")

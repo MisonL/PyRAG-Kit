@@ -152,9 +152,11 @@ def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
         raw_fusion_strategy = _render_value(chat_config["hybrid_fusion_strategy"])
         # 非法取值（直写 ``None``/非字符串渲染成量级描述）与 method/rerank 项
         # 统一为「未知」——``NONE`` 这类大写形态对用户没有指向性。合法融合
-        # 策略只可能是 rrf/weight，二者经 ``.upper()`` 照常显示。
+        # 策略是 ``rrf``／``weighted``（判据与 ``SessionConfig._validate_fusion_strategy``
+        # 及 questionary Choice value 一致——此前误写 ``weight``，合法默认
+        # ``weighted`` 被显示成「未知」，实测复现），二者照常显示。
         current_fusion_strategy = (
-            raw_fusion_strategy if raw_fusion_strategy.lower() in ("rrf", "weight") else "未知"
+            raw_fusion_strategy if raw_fusion_strategy.lower() in ("rrf", "weighted") else "未知"
         )
         current_candidate_multiplier = chat_config["retrieval_candidate_multiplier"]
 

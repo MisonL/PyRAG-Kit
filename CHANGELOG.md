@@ -6,6 +6,12 @@
 
 ### 修复
 
+- **第五轮四维 agents 复查：三维度零缺陷收官，错误契约收尾 3 处**。安全（约 70 探针矩阵全过）、数据完整性（真实 39 文档端到端全链路：build→落盘→重载→混合检索→688/688 父块召回、embeddings 位级一致）、并发（嵌套 finally 六路径 + 5×6 终态矩阵实测，无新单元格退化）均为零需修复项；错误契约维度收尾：
+  - **fusion 显示白名单误写（中·回归）**：第四轮统一「未知」时把合法默认 ``weighted`` 误写成 ``weight``，合法配置在菜单显示「未知」（实测复现）。修正为与 ``SessionConfig`` validator/questionary 候选一致的 ``("rrf", "weighted")``；补 ``weighted`` 不误伤用例（回归测试只测了 ``None``，4519 全绿没拦住——判别输入要覆盖每个合法值）。
+  - **factory 可选值拼接裸 ``str(k)`` 守卫自崩（中）**：configurations 含超限整数键（pickle 可携带 ``10**4301``）时拼消息抛 ``Exceeds the limit``，用户看到的语义从「未找到key」错位成整数转换失败；``display_utils`` 同场景早已 ``safe_repr``。对齐并加回归用例。
+  - **「客服已就绪」行裸读配置（低）**：替身 bot 的 ``chat_config=None``/缺键形态穿透第四轮「回显失败只报黄字」的恢复契约——同一契约覆盖到最后一行。
+  - **记录不修**：factory 消息「可选值」无上界（与 display_utils 形态一致、240 字符截断兜底）；sync/async 无在途时清理异常上抛契约不对称（诊断级边界）；双故障时 response 异常顶替 iterator 清理异常（无资源后果）。
+
 - **第四轮（收尾轮）四维 agents 复查：终态完整性与自洽性**。四名 agent 对 `c76a169` 复查四轮修复叠加后的最终形态，修复 2 处真缺陷 + 6 处卫生问题，全部红/绿验证或探针确认：
   - **`retry_sync_stream` 消费阶段 re-raise 跳过 response 补刀（中·并发）**：第三轮拆两段独立 try 修好了中途断开方向，但「正常耗尽 + iterator.close 抛错 + 无在途异常」时按契约 re-raise 会跳过顺序结构中位于其后的补刀（实测 log 只有 iclose）——同一泄漏换方向复现。补刀移入外层 finally（嵌套 try/finally）保证无条件执行；回归测试钉住（红验证确认）。关闭形态终态矩阵 5 函数 × 4 场景 × close 抛错/不抛全实测，唯一残留即此处。
   - **启动横幅回显裸抛（低-中·错误契约）**：`chat_rerank_enabled=true` 而 rerank 段空/键不对应时 `display_chat_config` 在任何提示符之前抛 `ValueError`，以「程序级错误」打回主菜单——与 `/config` 路径对同一类错误的恢复处理不对称。启动回显收进 try，失败只报黄字、会话照常启动。

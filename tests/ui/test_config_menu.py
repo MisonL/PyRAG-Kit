@@ -951,6 +951,41 @@ def test_method_submenu_default_keeps_valid_method(monkeypatch):
     assert seen_defaults == [RetrievalMethod.HYBRID_SEARCH.value]
 
 
+def test_menu_shows_weighted_verbatim(monkeypatch):
+    """收紧不能误伤：合法默认 ``weighted`` 照常显示，不得被「未知」吞掉。
+
+    显示白名单曾误写 ``("rrf", "weight")``——合法默认 ``weighted`` 在菜单
+    显示「未知」（实测复现）。合法字面量以 ``SessionConfig._validate_fusion_strategy``
+    与 questionary Choice value 为准。
+    """
+    seen: list = []
+    answers = iter([None, "back"])
+
+    def select(_prompt, choices=None, default=None, **_kwargs):
+        for choice in choices or []:
+            seen.append(choice.title if hasattr(choice, "title") else str(choice))
+        return _Choice(next(answers))
+
+    from src.ui import config_menu
+
+    monkeypatch.setattr(config_menu.questionary, "select", select)
+    chat_config = {
+        "retrieval_method": RetrievalMethod.HYBRID_SEARCH,
+        "hybrid_fusion_strategy": "weighted",
+        "retrieval_candidate_multiplier": 3,
+        "top_k": 5,
+        "vector_weight": 0.5,
+        "keyword_weight": 0.5,
+        "rerank_enabled": False,
+    }
+
+    config_menu.edit_retrieval_params(chat_config)
+
+    fusion_item = next(item for item in seen if "融合策略" in str(item))
+    assert "weighted" in str(fusion_item)
+    assert "未知" not in str(fusion_item)
+
+
 def test_menu_shows_unknown_for_invalid_fusion_strategy(monkeypatch):
     """非法 ``hybrid_fusion_strategy``（如直写 ``None``）的菜单项显示「未知」。
 

@@ -617,8 +617,12 @@ class ModelProviderFactory:
         if provider_key not in configurations:
             # 消息与 ``display_utils._require_model_detail`` 的同名守卫对齐：
             # 带可选值与指引——同一判据两套消息会让用户经 ``reload_llm`` 看到
-            # 残缺版（只有「未找到 key」），无从知道有哪些可填的键。
-            available = "、".join(sorted(str(k) for k in configurations)) or "无"
+            # 残缺版（只有「未找到 key」），无从知道有哪些可填的键。键名必须经
+            # ``safe_repr``：configurations 是可直写映射，pickle 快照可携带
+            # 位数超限的整数键，裸 ``str(k)`` 会让**守卫自己**崩在拼消息时
+            # （实测消息语义从「未找到key」错位成 ``Exceeds the limit``），
+            # 与 ``display_utils._require_model_detail`` 的既有处理对齐。
+            available = "、".join(sorted(safe_repr(k) for k in configurations)) or "无"
             logger.error(f"在{role_label}配置中未找到key: {provider_key}。可选值: {available}。")
             raise ValueError(
                 f"在{role_label}配置中未找到key: {safe_repr(provider_key)}。"
