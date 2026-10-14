@@ -22,8 +22,15 @@ class TestDetectLightBackground:
     def test_light_when_background_component_high(self):
         assert detect_light_background({"COLORFGBG": "0;15"}) is True
 
-    def test_konsole_three_segment_form(self):
-        assert detect_light_background({"COLORFGBG": "0;15;0"}) is False
+    def test_konsole_three_segment_form_reads_bg_segment(self):
+        # 三段式 "fg;bg;mode"：bg 是第二段，mode=0 不应让亮色终端误判暗色
+        assert detect_light_background({"COLORFGBG": "0;15;0"}) is True
+        assert detect_light_background({"COLORFGBG": "15;0;1"}) is False
+
+    def test_non_ascii_digit_segment_does_not_crash(self):
+        # str.isdigit 接受 '²' 而 int() 不解析——判据必须只认 ASCII 数字
+        assert detect_light_background({"COLORFGBG": "²;15"}) is False
+        assert detect_light_background({"COLORFGBG": "1;15;²"}) is True
 
     def test_missing_signal_defaults_to_dark(self):
         assert detect_light_background({}) is False

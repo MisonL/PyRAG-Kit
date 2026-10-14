@@ -208,6 +208,7 @@ def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
                 "选择新的检索模式:",
                 choices=method_choices,
                 default=current_method if current_method in method_values else None,
+                style=questionary_style_for_theme(),
             ).ask()
             if new_method:
                 chat_config["retrieval_method"] = RetrievalMethod(new_method)
@@ -315,6 +316,7 @@ def edit_retrieval_params(chat_config: dict[str, Any]) -> None:
                     questionary.Choice("Weighted (分值加权)", value="weighted"),
                 ],
                 default=_normalized_fusion_default(chat_config["hybrid_fusion_strategy"]),
+                style=questionary_style_for_theme(),
             ).ask()
             if new_strategy:
                 chat_config["hybrid_fusion_strategy"] = new_strategy
@@ -467,6 +469,7 @@ def edit_model_params(chat_config: dict[str, Any]) -> bool:
                 "选择新的LLM配置:",
                 choices=llm_options,
                 default=_choice_default(llm_options, active_llm),
+                style=questionary_style_for_theme(),
             ).ask()
             # 与**原始**键比较，不与渲染后的 ``current_llm`` 比较：非字符串键
             # （或位数超限的整数键）渲染成量级描述后永不等于自身，会让「选中
@@ -484,6 +487,7 @@ def edit_model_params(chat_config: dict[str, Any]) -> bool:
                 "选择新的Rerank配置:",
                 choices=rerank_options,
                 default=_choice_default(rerank_options, active_rerank),
+                style=questionary_style_for_theme(),
             ).ask()
             if new_rerank is not None:
                 chat_config["active_rerank_configuration"] = new_rerank

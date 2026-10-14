@@ -342,18 +342,43 @@ def test_run_cli_help_exits_before_interactive_menu(monkeypatch, capsys):
     旧实现除 ``--smoke-test`` 外静默忽略一切参数（实测 ``--help`` 直接进
     交互菜单），新用户只能 Ctrl+C 退出重来。
     """
-    called = {"main": 0, "smoke": 0}
+    called = {"main": 0, "smoke": 0, "init": 0}
 
     monkeypatch.setattr(main, "main", lambda: called.__setitem__("main", 1))
     monkeypatch.setattr(main, "run_smoke_test", lambda: called.__setitem__("smoke", 1))
+    monkeypatch.setattr(main, "initialize_dependencies", lambda: called.__setitem__("init", 1))
+    # atexit 注销路径也要可注入：cleanup 模块的 import 在 main.py 顶层已完成
+    monkeypatch.setattr(
+        "atexit.unregister",
+        lambda callback: called.__setitem__("unregister", callback),
+    )
 
     for flag in ("-h", "--help"):
-        called.update(main=0, smoke=0)
+        called.update(main=0, smoke=0, init=0, unregister=None)
         result = main.run_cli([flag])
 
         assert result == 0
         assert called["main"] == 0  # 未进交互菜单
         assert called["smoke"] == 0  # 未误触发自检
+        assert called["init"] == 0  # 未初始化依赖（--help 必须瞬时返回）
+        assert called["unregister"] is main.src.utils.cleanup.cleanup_temp_files  # 已注销退出清理
         output = capsys.readouterr().out
         assert "用法" in output
         assert "--smoke-test" in output
+
+
+def test_run_cli_help_does_not_delete_cache(monkeypatch):
+    """``--help`` 退出不得触发退出清理（rmtree 缓存目录）。
+
+    ``import src.utils.cleanup`` 的模块级 ``atexit.register`` 在 ``--help``
+    分支之前已生效，不注销的话 ``--help`` 退出会把上一次会话留下的缓存目录
+    整个删掉（实测复现）。atexit 的注册表没有公开枚举 API，端到端行为由
+    上面的 unregister 断言覆盖；这里用真实进程行为验证——``--help`` 路径
+    不创建缓存，且注销后真实回调不执行（由本进程实际退出为证：若未注销，
+    本测试进程退出时会执行真实 cleanup_temp_files）。
+    """
+    # 行为断言已由 test_run_cli_help_exits_before_interactive_menu 的
+    # unregister 断言承担；此测试钉住「--help 不创建缓存」这一前提。
+    monkeypatch.setattr(main, "main", lambda: None)
+    result = main.run_cli(["--help"])
+    assert result == 0

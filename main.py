@@ -376,8 +376,19 @@ def run_cli(argv: list[str] | None = None) -> int:
         # 交互式程序被静默吞参数的体验很差：新用户照惯例敲 ``--help`` 时
         # 直接进了交互菜单（实测），只能 Ctrl+C 退出重来。给出简明用法
         # 后退出，不初始化依赖（``--help`` 必须瞬时返回）。
+        #
+        # 同时注销退出清理钩子：``import src.utils.cleanup`` 的模块级
+        # ``atexit.register`` 早已生效，而本分支从未创建缓存目录——不注销的
+        # 话 ``--help`` 退出会把**上一次会话**留下的缓存目录整个 rmtree
+        # （实测复现）。``--help`` 是只读查询，不应有任何副作用。
+        import atexit
+
+        import src.utils.cleanup as _cleanup_module
+
+        atexit.unregister(_cleanup_module.cleanup_temp_files)
         console.print(markup_text("PyRAG-Kit {}", VERSION))
-        console.print("用法: python main.py [选项]")
+        usage_name = "PyRAG-Kit" if getattr(sys, "frozen", False) else "python main.py"
+        console.print(markup_text("用法: {} [选项]", usage_name))
         console.print("  --smoke-test   非交互式启动自检（构建验证用）")
         console.print("  -h, --help     显示本帮助并退出")
         console.print("  无参数          进入交互式菜单（向量化 / 召回测试 / 聊天）")

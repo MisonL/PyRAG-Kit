@@ -570,11 +570,11 @@ _UNTRUSTED_FREE_ARGUMENTS = {
         'f"{document_score(doc):.4f}"',
     ),
     "src/chat/core.py:384": ("table 是 Table 对象，不是字符串", "self.console.print(table)"),
-    "src/retrieval_test/core.py:68": (
+    "src/retrieval_test/core.py:70": (
         "str(index+1) 与 f'{document_score(doc):.4f}' 均为数字，不含 [",
         'f"{document_score(doc):.4f}"',
     ),
-    "src/retrieval_test/core.py:69": ("table 是 Table 对象，不是字符串", "console.print(table)"),
+    "src/retrieval_test/core.py:71": ("table 是 Table 对象，不是字符串", "console.print(table)"),
 }
 
 

@@ -54,11 +54,16 @@ def detect_light_background(environ: dict[str, str] | None = None) -> bool:
     colorfgbg = env.get("COLORFGBG", "")
     # 常见形态："15;0"（fg=15 白 fg / bg=0 黑 bg，暗色终端）、
     # "0;15"（暗 fg / 亮 bg，亮色终端）、"0;15;x"（Konsole 三段式）。
-    # 取**最后一个**数值段作背景（两段式里它是 bg；三段式里 mode 不可能
-    # 出现在 bg 之前）。
-    parts = [segment for segment in colorfgbg.split(";") if segment.strip().isdigit()]
+    parts = [
+        segment
+        for segment in colorfgbg.split(";")
+        if segment and all(character in "0123456789" for character in segment)
+    ]
     if len(parts) >= 2:
-        return int(parts[-1]) >= 8
+        # bg 永远是**第二段**：两段式 "fg;bg" 自不必说，三段式（Konsole 的
+        # "fg;bg;mode"）里 mode 在 bg 之后——取最后一段会把 mode=0 的亮色
+        # 终端误判成暗色（实测 "0;15;0" 判 False）。已探针核实。
+        return int(parts[1]) >= 8
     return False
 
 
