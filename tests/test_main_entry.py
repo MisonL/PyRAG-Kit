@@ -334,3 +334,26 @@ def test_splitter_self_check_rejects_empty_chunks(monkeypatch):
 def test_splitter_self_check_passes_in_real_environment():
     """正常环境下真实分片器必须产出分片（守卫的绿色一侧）。"""
     main._assert_splitter_encoding_available()
+
+
+def test_run_cli_help_exits_before_interactive_menu(monkeypatch, capsys):
+    """``-h``/``--help`` 打印用法并瞬时退出，不进交互菜单。
+
+    旧实现除 ``--smoke-test`` 外静默忽略一切参数（实测 ``--help`` 直接进
+    交互菜单），新用户只能 Ctrl+C 退出重来。
+    """
+    called = {"main": 0, "smoke": 0}
+
+    monkeypatch.setattr(main, "main", lambda: called.__setitem__("main", 1))
+    monkeypatch.setattr(main, "run_smoke_test", lambda: called.__setitem__("smoke", 1))
+
+    for flag in ("-h", "--help"):
+        called.update(main=0, smoke=0)
+        result = main.run_cli([flag])
+
+        assert result == 0
+        assert called["main"] == 0  # 未进交互菜单
+        assert called["smoke"] == 0  # 未误触发自检
+        output = capsys.readouterr().out
+        assert "用法" in output
+        assert "--smoke-test" in output
