@@ -4,6 +4,7 @@
 
 import time
 from pathlib import Path
+from typing import Any
 
 from src.etl.cleaners.base import BaseCleaner
 from src.etl.cleaners.basic_cleaner import BasicCleaner
@@ -12,9 +13,42 @@ from src.etl.extractors.markdown_extractor import MarkdownExtractor
 from src.etl.splitters.base import BaseSplitter
 from src.etl.splitters.recursive_text_splitter import RecursiveTextSplitter
 from src.models.document import Document
+from src.utils.config import safe_repr
 from src.utils.log_manager import get_module_logger
 
 logger = get_module_logger(__name__)
+
+
+def _require_chunk_list(chunks: Any, stage: str) -> list[Document]:
+    """确认流水线某阶段返回的是「文档列表」。
+
+    与 ``RetrievalService._require_document_list`` 同一判据、同一收场：三个阶段
+    都是 ``BaseExtractor``／``BaseCleaner``／``BaseSplitter`` 的实现，抽象基类
+    正是为替换实现而存在的，而 ``Pipeline.__init__`` 接受任意实现。实测
+    ``split`` 返回 ``None`` 时，下面那条日志里的 ``len(final_chunks)`` 抛裸
+    ``TypeError: object of type 'NoneType' has no len()``——报错现场在日志行，
+    消息里既没有阶段名也没有「是谁违反了契约」。
+
+    这里抛 ``TypeError`` 而不是 ``ValueError``，理由与
+    ``_require_document_list`` 逐字相同：这是**接口契约**问题，不是数据内容
+    问题。入参 ``document`` 形态错误（调用方给了非 ``Document``）才是数据问题，
+    那一处用 ``ValueError``。
+
+    不静默丢弃不合规条目：丢弃会让「实现错了」表现为「分片变少了」。
+    """
+    if not isinstance(chunks, list):
+        raise TypeError(
+            f"{stage}返回的必须是文档列表，但得到 {type(chunks).__name__}。"
+            " 请检查 BaseExtractor/BaseCleaner/BaseSplitter 实现是否遵守契约。"
+        )
+    for position, chunk in enumerate(chunks):
+        if not isinstance(chunk, Document):
+            raise TypeError(
+                f"{stage}返回的第 {position} 项不是 Document"
+                f"（{type(chunk).__name__}）。"
+                " 请检查 BaseExtractor/BaseCleaner/BaseSplitter 实现是否遵守契约。"
+            )
+    return chunks
 
 
 class Pipeline:
@@ -59,24 +93,42 @@ class Pipeline:
         """
         处理单个文档，并监控每一步的耗时 (CSE Sensor)。
         """
-        source = document.metadata.get("source", "未知来源")
+        # 形态校验先做：``process`` 的第一行就读 ``document.metadata``，此前
+        # ``5``／``"abc"``／``[5]``／``None`` 全部抛裸
+        # ``AttributeError: ... object has no attribute 'metadata'``——不在
+        # ``KnowledgeBuildService.build`` 按 ``ValueError`` 建立的分类内，而
+        # 那是建库主路径（``_process_file`` 对知识库里的每个文件调一次）。
+        # 判据与 ``RecursiveTextSplitter._require_documents`` 一致：要求
+        # ``Document`` 实例而不是鸭子类型，本方法后续每一步都读它的
+        # ``content``／``metadata``。
+        if not isinstance(document, Document):
+            raise ValueError(f"Pipeline 处理的文档必须是 Document，但得到 {safe_repr(document)}。")
+        # ``metadata`` 声明为 ``dict[str, Any]``，取值不受控；而下面每一行日志都
+        # 把它插进 f-string。``str(10**4301)`` 撞 CPython 的整数位数上限，抛
+        # ``ValueError: Exceeds the limit (4300 digits)``——一条**日志**让建库
+        # 主路径崩掉，而 ``KnowledgeBuildService._process_file`` 的 ``except``
+        # 只按 ``ValueError`` 分类，收场是「建库失败：整数转换超限」，与真实
+        # 原因（来源字段形态异常）毫无关系。只在非字符串时兜底：正常路径的
+        # 输出逐字不变（``safe_repr`` 会给字符串加引号），异常形态退回量级描述。
+        source_value = document.metadata.get("source", "未知来源")
+        source = source_value if isinstance(source_value, str) else safe_repr(source_value)
         logger.info(f"开始处理文档: {source}")
 
         start_total = time.perf_counter()
 
         # 抽取
         start_step = time.perf_counter()
-        extracted_docs = self.extractor.extract(document)
+        extracted_docs = _require_chunk_list(self.extractor.extract(document), "抽取阶段")
         logger.info(f"抽取完成: {source}, 耗时: {time.perf_counter() - start_step:.4f}s")
 
         # 清洗
         start_step = time.perf_counter()
-        cleaned_docs = self.cleaner.clean(extracted_docs)
+        cleaned_docs = _require_chunk_list(self.cleaner.clean(extracted_docs), "清洗阶段")
         logger.info(f"清洗完成: {source}, 耗时: {time.perf_counter() - start_step:.4f}s")
 
         # 分割
         start_step = time.perf_counter()
-        final_chunks = self.splitter.split(cleaned_docs)
+        final_chunks = _require_chunk_list(self.splitter.split(cleaned_docs), "分割阶段")
         logger.info(
             f"分割完成: {source}, 耗时: {time.perf_counter() - start_step:.4f}s, 分片数: {len(final_chunks)}"
         )

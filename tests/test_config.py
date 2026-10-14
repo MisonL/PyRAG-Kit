@@ -1,14 +1,21 @@
 import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
+from src.retrieval.vdb.faiss_store import FaissStore
+from src.runtime.contracts import build_run_config
 from src.utils.config import (
     ModelDetail,
     ModelProtocol,
     RetrievalMethod,
     Settings,
+    _redacted_settings_error,
     get_settings,
+    parse_decimal_int,
     resolve_app_root,
 )
 
@@ -44,6 +51,12 @@ def isolated_config(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("src.utils.config.ROOT_DIR", tmp_path)
     monkeypatch.setattr("src.utils.config.CONFIG_TOML_PATH", tmp_path / "config.toml")
+    # 注意这里**只能**改类配置，不能只改模块常量：``env_file`` 在 Settings
+    # 类定义期就被求值成字符串，``monkeypatch.setattr`` 打模块级
+    # ``ENV_FILE_PATH`` 对它毫无影响（曾经同时写两行，其中一行是死代码，
+    # 谁删掉真正起作用的那行都会让隔离静默失效）。生产代码里 .env 与
+    # config.toml 都以 ROOT_DIR 为基准，测试必须显式对齐。
+    monkeypatch.setitem(Settings.model_config, "env_file", str(tmp_path / ".env"))
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("KNOWLEDGE_BASE_PATH", raising=False)
     monkeypatch.delenv("CHAT_RETRIEVAL_METHOD", raising=False)
@@ -87,6 +100,26 @@ def test_settings_model_validation():
         ("kb_chunk_overlap", -1, "kb_chunk_overlap/kb_child_chunk_overlap 必须是非负整数"),
         ("kb_child_chunk_size", 0, "kb_chunk_size/kb_child_chunk_size/kb_embedding_batch_size"),
         ("kb_child_chunk_overlap", -1, "kb_chunk_overlap/kb_child_chunk_overlap 必须是非负整数"),
+        # 上界缺失时超大整数会被静默接受（实测 ``10**400`` 走真实 TOML 路径也
+        # 通过），配置加载成功、直到分片期才在 ``_validate_hierarchical_sizes``
+        # 抛错——报错现场离写错的配置很远。上界与 kb_chunk_size 同源。
+        #
+        # 用 ``10**4301`` 而不是 ``10**400``：两者都会被新上界拒绝，但 4301 位
+        # 同时覆盖「消息插值自己会抛」那一面。必须显式给 id——pytest 自动生成 id
+        # 时会对参数调 ``str()``，而 ``str(10**4301)`` 抛 ``ValueError``，测试在
+        # **收集阶段**就崩掉。
+        pytest.param(
+            "kb_chunk_overlap",
+            10**4301,
+            "kb_chunk_overlap/kb_child_chunk_overlap 必须小于",
+            id="kb_chunk_overlap-beyond-conversion-limit",
+        ),
+        pytest.param(
+            "kb_child_chunk_overlap",
+            10**4301,
+            "kb_chunk_overlap/kb_child_chunk_overlap 必须小于",
+            id="kb_child_chunk_overlap-beyond-conversion-limit",
+        ),
         ("kb_embedding_batch_size", 0, "kb_chunk_size/kb_child_chunk_size/kb_embedding_batch_size"),
         (
             "kb_embedding_batch_size",
@@ -115,11 +148,14 @@ def test_numeric_settings_reject_illegal_values(field_name, bad_value, expected_
 
 
 def test_chunk_overlap_must_be_strictly_smaller_than_chunk_size():
-    """overlap 必须严格小于 size，否则分片无法推进（会得到空分片或死循环）。"""
+    """overlap 必须严格小于 size，否则分片无法推进（会得到空分片或死循环）。
+
+    父分片这条与模式无关（两种模式都会构造父分片器），因此仍在 ``Settings``
+    里判。子分片那条只在层级模式下有意义，判定已移到
+    ``RecursiveTextSplitter._validate_hierarchical_sizes()``。
+    """
     with pytest.raises(ValidationError, match="kb_chunk_overlap"):
         Settings(kb_chunk_size=100, kb_chunk_overlap=100)
-    with pytest.raises(ValidationError, match="kb_child_chunk_overlap"):
-        Settings(kb_child_chunk_size=50, kb_child_chunk_overlap=50)
 
 
 @pytest.mark.parametrize(
@@ -169,19 +205,21 @@ def test_int_and_float_settings_reject_bool(field_name):
         Settings(**{field_name: True})
 
 
-def test_child_chunk_size_cannot_exceed_parent_chunk_size():
-    """子分片不得大于父分片，否则层级结构静默退化为一层。
+def test_child_chunk_size_relation_is_not_checked_at_settings_time():
+    """子分片的尺寸关系**不再**在 ``Settings`` 里判——它只在层级模式下有意义。
 
-    实测 ``kb_chunk_size=300, kb_child_chunk_size=1500`` 被接受后，父块数从 2
-    涨到 10（每个父块只产出 1 个子块），「先粗后细」的父子检索意图失效。
+    模式是分片时的运行时参数（``build(splitter_structure_mode)``／CLI 的
+    ``--mode``），``Settings`` 看不到。原先无条件拒绝的后果是一组「standard 下
+    完全合法」的取值连配置都加载不了：用户只想用 standard，却必须先改掉用不到
+    的字段。判定移到 ``RecursiveTextSplitter._validate_hierarchical_sizes()``，
+    对应的回归在 ``tests/etl/test_pipeline.py``。
     """
-    with pytest.raises(ValidationError, match="kb_child_chunk_size"):
-        Settings(kb_chunk_size=300, kb_child_chunk_size=1500)
-    with pytest.raises(ValidationError, match="kb_child_chunk_size"):
-        Settings(kb_chunk_size=100, kb_child_chunk_size=100)
-    # 相等也应拒绝：与 overlap<size 同理，层级需要严格的大小关系。
-    with pytest.raises(ValidationError, match="kb_child_chunk_size"):
-        Settings(kb_chunk_size=500, kb_child_chunk_size=500)
+    # standard 下完全合法的一组取值：子分片大于父分片，但 standard 不构造子分片器
+    settings = Settings(
+        kb_chunk_size=100, kb_chunk_overlap=10, kb_child_chunk_size=300, kb_child_chunk_overlap=10
+    )
+
+    assert settings.kb_child_chunk_size == 300
 
 
 def test_hybrid_weights_cannot_both_be_zero():
@@ -323,6 +361,49 @@ def test_model_protocol_aliases_and_invalid_values():
         ModelDetail(provider="openai", model_name="gpt-test", protocol="unknown")
 
 
+# 校验器原先直接 ``str(value)``，于是 ``ModelDetail(protocol=10**4301)`` 撞上
+# CPython 的整数位数上限（``sys.get_int_max_str_digits()``，默认 4300），用户
+# 看到的是 ``Exceeds the limit (4300 digits)``——与「协议名写错了」毫无关系，
+# 而且是在**正要报告一个校验错误时**改抛另一个错误。
+#
+# 可达性说明：这条**不是**配置可达缺陷。``protocol`` 确实来自 ``config.toml``，
+# 但 ``tomllib`` 解析 4301 位的整数时自己就抛 ``ValueError``（``get_settings``
+# 已包成「配置解析失败」），位数在上限内的非字符串（``5``／``["responses"]``／
+# ``true``）原本就能得到正确消息——实测走真实 TOML 路径验证过。真正能触达的是
+# Python API 调用方。加这条守卫是为了与同文件其它 validator 的判据一致：
+# ``log_level`` 与路径字段都已显式判类型，只有这里漏了。
+@pytest.mark.parametrize(
+    "bad_value",
+    [10**4301, -(10**4301), ["responses"], {"p": "responses"}],
+    ids=["huge", "huge-negative", "list", "dict"],
+)
+def test_model_protocol_rejects_non_string_values_with_a_useful_message(bad_value):
+    """非字符串 ``protocol`` 必须报「不支持的模型协议」，不能泄漏解释器错误。"""
+    with pytest.raises(ValidationError) as excinfo:
+        ModelDetail(provider="openai", model_name="gpt-test", protocol=bad_value)
+
+    message = str(excinfo.value)
+    assert "不支持的模型协议" in message, message
+    assert "Exceeds the limit" not in message, message
+
+
+def test_model_protocol_accepts_valid_values_after_the_type_guard():
+    """收紧不能误伤：别名、规范名、``None`` 与空串照常通过。"""
+    cases = {
+        "chat": ModelProtocol.CHAT_COMPLETIONS,
+        "response": ModelProtocol.RESPONSES,
+        "responses": ModelProtocol.RESPONSES,
+        "anthropic": ModelProtocol.MESSAGES,
+        "gemini": ModelProtocol.GENERATE_CONTENT,
+    }
+    for raw, expected in cases.items():
+        detail = ModelDetail(provider="openai", model_name="m", protocol=raw)
+        assert detail.protocol is expected, raw
+
+    assert ModelDetail(provider="openai", model_name="m", protocol=None).protocol is None
+    assert ModelDetail(provider="openai", model_name="m", protocol="").protocol is None
+
+
 @pytest.mark.parametrize("field_name", ["embedding_configurations", "rerank_configurations"])
 def test_settings_rejects_protocol_on_non_llm_configuration(field_name):
     with pytest.raises(ValidationError, match="配置不支持 protocol"):
@@ -420,6 +501,79 @@ def test_settings_from_dotenv(tmp_path):
     assert settings.google_genai_use_vertexai is True
     assert settings.google_cloud_project == "dotenv-project"
     assert settings.google_cloud_location == "asia-east1"
+
+
+def test_dotenv_is_resolved_from_root_dir_not_cwd(tmp_path):
+    """``.env`` 必须按 ROOT_DIR 解析，与 config.toml 同源。
+
+    回归背景：``env_file`` 原先是相对路径 ``".env"``，由 pydantic-settings
+    按进程当前工作目录解析。冻结产物里可执行文件目录与调用者 CWD 通常不同，
+    用户放在安装目录旁的 ``.env`` 会被静默忽略。
+
+    必须用**子进程**验证，且不能在子进程里替 ``Settings`` 填好答案：
+    ``env_file`` 在类定义期求值，进程内任何对 ``ROOT_DIR`` / ``ENV_FILE_PATH``
+    的 patch 都不会让它重新求值。这里的做法是伪造 ``sys.frozen`` 与
+    ``sys.executable``，让 ``resolve_app_root()`` 在**导入前**就返回 app 目录，
+    从而走完整的生产求值路径。先前版本在测试里直接改写
+    ``Settings.model_config``，断言比较的是测试自己注入的值——把 ``env_file``
+    回退成相对路径后它依然通过，是测不到生产行为的假绿。
+    """
+    project_root = Path(__file__).resolve().parent.parent
+    cwd_dir = tmp_path / "cwd"
+    app_dir = tmp_path / "app"
+    cwd_dir.mkdir()
+    app_dir.mkdir()
+
+    (app_dir / ".env").write_text('OPENAI_API_KEY="from_app_dir"\n', encoding="utf-8")
+    (cwd_dir / ".env").write_text('OPENAI_API_KEY="from_cwd"\n', encoding="utf-8")
+
+    # 子进程：先伪造冻结环境，再导入，使 Settings 在类定义期按 app_dir 求值。
+    script = (
+        "import sys\n"
+        "sys.frozen = True\n"
+        "sys.executable = sys.argv[2]\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "from src.utils.config import Settings\n"
+        "print(Settings().openai_api_key)\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "OPENAI_API_KEY"}
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(project_root), str(app_dir / "PyRAG-Kit")],
+        cwd=cwd_dir,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert result.stdout.strip() == "from_app_dir"
+
+
+def test_env_file_path_constant_matches_model_config():
+    """``ENV_FILE_PATH`` 与 ``Settings.model_config["env_file"]`` 必须一致。
+
+    前者是模块常量、后者是类定义期求值的结果，两者若漂移，改哪个都会出现
+    「改了不生效」的困惑（这正是先前 fixture 里那行死代码的成因）。
+
+    必须在**子进程**里检查：本文件的 autouse fixture 会改写
+    ``Settings.model_config``，在进程内断言只会看到夹具注入的值。
+    """
+    project_root = Path(__file__).resolve().parent.parent
+    script = (
+        "import sys\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "from src.utils.config import ENV_FILE_PATH, Settings\n"
+        "assert Settings.model_config['env_file'] == str(ENV_FILE_PATH), (\n"
+        "    Settings.model_config['env_file'], str(ENV_FILE_PATH))\n"
+        "print('ok')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(project_root)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout.strip() == "ok"
 
 
 def test_settings_from_env_vars(monkeypatch):
@@ -655,6 +809,45 @@ def test_integer_settings_reject_overflow_magnitudes(field_name, bad_value):
         Settings(**{field_name: bad_value})
 
 
+# ── 回归：错误消息的格式化自己会抛异常（负数方向的位数超限） ──
+#
+# ``repr(10**4301)`` 抛 ``ValueError: Exceeds the limit (4300 digits)``
+# （``sys.get_int_max_str_digits()``，默认 4300）。校验消息里直接插值
+# ``{value}`` 的站点因此会在**正要报告一个错误时**改抛另一个错误：用户看到的
+# 是「整数转字符串超限」，与「倍率不合法」毫无关系。
+#
+# 只有**负数**能走到这一支：正数的超大整数在上界判断处就被拒了，那条消息用的
+# 是常量而不是插值。实测把 ``safe_repr(value)`` 换回 ``{value}`` 后本用例变红。
+def test_candidate_multiplier_lower_bound_message_survives_unprintable_integer():
+    """倍率下界分支的消息不得自己抛异常。"""
+    with pytest.raises(ValidationError, match="retrieval_candidate_multiplier") as excinfo:
+        Settings(retrieval_candidate_multiplier=-(10**4301))
+
+    assert "Exceeds the limit" not in str(excinfo.value)
+
+
+def test_settings_never_leak_the_integer_conversion_limit():
+    """扫过**全部**字段，确认没有一条校验消息会把解释器的位数上限泄漏出来。
+
+    与其逐个字段猜哪个分支会插值 ``{value}``，不如断言「消息里绝不出现
+    ``Exceeds the limit``」——那串文本只可能来自 CPython，不可能来自本项目的
+    任何一条校验消息。正负两个方向都要扫：正数在**上界**判断处被拒（消息里是
+    常量），负数才走到**下界**分支（那里插值），只扫正数会漏掉一半站点。
+
+    这条用例是对上面那条的推广，也是这次发现的缺陷的通用回归——``{value}``
+    这类站点散落在各 validator 里，逐个补断言挡不住下一个。
+    """
+    leaks = []
+    for field_name in Settings.model_fields:
+        for label, bad_value in (("正", 10**4301), ("负", -(10**4301))):
+            with pytest.raises(ValidationError) as excinfo:
+                Settings(**{field_name: bad_value})
+            if "Exceeds the limit" in str(excinfo.value):
+                leaks.append(f"{field_name}（{label}）")
+
+    assert not leaks, "以下字段的校验消息泄漏了解释器的整数位数上限: " + ", ".join(leaks)
+
+
 def test_score_threshold_overflow_is_a_validation_error_not_overflow_error():
     """``float(10**400)`` 抛的是裸 ``OverflowError``；它**不是** ``ValidationError``，
     会穿透 ``get_settings`` 的 ``except`` 变成未脱敏 traceback。因此范围判断必须在
@@ -716,3 +909,772 @@ def test_repository_code_paths_emit_no_swallowed_warnings():
         if issubclass(warning.category, (UserWarning, DeprecationWarning))
     ]
     assert not offenders, f"本仓库代码产生了警告，请修复而不是加过滤: {offenders}"
+
+
+# ── 回归：候选规模的上界必须落在 top_k × multiplier 的乘积上 ──
+
+
+def test_settings_rejects_oversized_candidate_pool():
+    """两个字段各自合法，乘积越界时必须拒绝。
+
+    ``effective_top_k = chat_top_k * retrieval_candidate_multiplier`` 直通
+    ``faiss_index.search()``，而 FAISS 对超过索引条数的 k 既不报错也不截断，
+    按 k 全量分配。实测 dim=1536、k=10**6 时峰值 RSS 涨约 35 GB。单字段上界
+    挡不住这个组合：10_000 × 100 = 10**6。
+    """
+    with pytest.raises(ValidationError, match="不能超过"):
+        Settings(_env_file=None, chat_top_k=2000, retrieval_candidate_multiplier=100)
+
+
+def test_settings_accepts_candidate_pool_at_the_bound():
+    """收紧不能误伤：恰好等于上界的组合必须接受。"""
+    settings = Settings(_env_file=None, chat_top_k=2000, retrieval_candidate_multiplier=1)
+
+    assert settings.chat_top_k * settings.retrieval_candidate_multiplier == 2000
+
+
+# ── 回归：config.toml 语法错也必须走脱敏边界 ──
+#
+# ``get_settings`` 的 try 只接 ``ValidationError`` 与 ``SettingsError``，两者都
+# 覆盖不到 ``tomllib.TOMLDecodeError``——它继承 ``ValueError``，但既不是
+# ``ValidationError`` 也不是 ``SettingsError``（pydantic-settings 在
+# ``load_toml_config`` 里直接把 tomllib 的异常放出来）。而 ``get_settings`` 在
+# import 期就会被调用（``log_manager.get_module_logger``），早于任何入口的
+# ``try``：实测 config.toml 语法错时 import 直接抛裸 traceback，35 帧全打在
+# 终端上；作为对照，同一份文件里字段**取值**非法时（``chat_top_k = "abc"``）
+# 得到的是 11 帧的脱敏消息 ``配置校验失败 - ...``。同属「配置写错」，收场方式
+# 不该有两种。
+
+
+def test_get_settings_wraps_unparseable_toml(isolated_config):
+    """config.toml 语法错时必须转成脱敏的 ``ValueError``，而不是裸 traceback。"""
+    (isolated_config / "config.toml").write_text("this is not valid toml =\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="配置解析失败"):
+        get_settings()
+
+
+def test_get_settings_reports_toml_error_location(isolated_config):
+    """错误消息要带上行号，否则用户无从定位是哪一行写坏了。"""
+    (isolated_config / "config.toml").write_text(
+        "chat_top_k = 5\nthis is not valid toml =\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        get_settings()
+
+    message = str(excinfo.value)
+    # 同时断言包装前缀：tomllib 的原始消息里本来就有 "line 2"，只查行号的话
+    # 未包装的裸异常也能通过——测试会因为错误的原因变绿。
+    assert "配置解析失败" in message, message
+    assert "line 2" in message, message
+
+
+# ── 回归：``int()`` 抛错的第二类情形——位数超过 ``sys.get_int_max_str_digits()`` ──
+#
+# 上一轮把 ``isdigit()`` 换成 ``isdecimal()``，只堵住了第一类（非十进制数字字符）。
+# ``"9" * 4301`` 是**合法**的十进制整数、``isdecimal()`` 也为真，但 ``int()``
+# 照样抛 ``ValueError: Exceeds the limit (4300 digits)``——CPython 默认上限
+# ``sys.get_int_max_str_digits()`` 是 4300 位。于是同样的崩溃只是换了个触发条件：
+# 配置编辑器里粘贴一长串数字、网关返回一个超长 status，收场与 ``²`` 完全一样。
+#
+# ``parse_decimal_int`` 用 ``try/except ValueError`` 一次覆盖两类，不硬编码位数
+# 上界——``int()`` 抛错本身就是判据。
+
+
+def _huge_digits():
+    import sys
+
+    return "9" * (sys.get_int_max_str_digits() + 1)
+
+
+def test_parse_decimal_int_rejects_digit_strings_beyond_the_conversion_limit():
+    """超过 ``int()`` 位数上限的数字串必须返回 ``None``，而不是抛 ``ValueError``。"""
+    assert parse_decimal_int(_huge_digits()) is None
+
+
+def test_parse_decimal_int_rejects_leading_zeros_beyond_the_limit():
+    """前导零同样计入位数：``"0" * 5000 + "1"`` 也超限。"""
+    assert parse_decimal_int("0" * 5000 + "1") is None
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("123", 123),
+        ("-7", -7),
+        ("0", 0),
+        ("  42  ", 42),
+        ("٣", 3),
+        ("１２", 12),
+        ("۷", 7),
+    ],
+)
+def test_parse_decimal_int_accepts_valid_literals(text, expected):
+    """收紧不能误伤：正常十进制字面量与可解析的 Unicode 数字照常解析。"""
+    assert parse_decimal_int(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "1_0",
+        "+7",
+        "0x10",
+        "²",
+        "①",
+        "፹",
+        "1.5",
+        "1e3",
+        "",
+        "-",
+        "abc",
+    ],
+)
+def test_parse_decimal_int_returns_none_for_non_literals(text):
+    """非十进制整数字面量一律返回 ``None``，绝不抛异常。
+
+    ``1_0``／``+7`` 是 ``int()`` 会**静默接受**的形态（``int("1_0") == 10``），
+    这类「安静的错值」必须显式拒绝。
+    """
+    assert parse_decimal_int(text) is None
+
+
+@pytest.mark.parametrize("value", [None, 42, 1.5, [], b"7"])
+def test_parse_decimal_int_returns_none_for_non_strings(value):
+    """非字符串输入返回 ``None``，不抛 ``AttributeError``。"""
+    assert parse_decimal_int(value) is None
+
+
+def test_parse_decimal_int_never_raises():
+    """穷举一批畸形输入：这个函数的契约是「解析不了返回 None」，永不抛异常。"""
+    probes = [
+        "",
+        "-",
+        "--1",
+        "-0",
+        " ",
+        "\t",
+        "\n",
+        "9" * 5000,
+        "0" * 5000,
+        "²" * 100,
+        "٣" * 5000,
+        "1" * 4299,
+        "1" * 4300,
+        "1" * 4301,
+    ]
+    for probe in probes:
+        result = parse_decimal_int(probe)
+        assert result is None or isinstance(result, int), f"{probe[:20]!r} 返回了非 int"
+
+
+# ── 回归：``tomllib`` 还有一类失败**不是** ``TOMLDecodeError`` ──
+#
+# 上面那个用例覆盖的是 ``TOMLDecodeError``（语法错）。但 ``tomllib`` 解析整数
+# 时走的是 ``int()``：位数超过 ``sys.get_int_max_str_digits()``（CPython 默认
+# 4300 位）时，``_parser`` 内部直接让 ``ValueError`` 穿出来——它**不是**
+# ``TOMLDecodeError``，三个 handler 全接不住。实测
+# ``chat_top_k = "9" * 4301`` 得到的是 36 帧裸 traceback，消息只有
+# "Exceeds the limit (4300 digits)..."，既没有「配置解析失败」前缀，也没说是
+# 哪个文件写坏了；而同样属于「配置写错」的语法错是 5 帧带前缀的消息。
+
+
+def test_get_settings_wraps_oversized_integer_literal(isolated_config):
+    """config.toml 里位数超限的整数必须走同一条脱敏路径，而不是裸 traceback。
+
+    ``"9" * 4301`` 是合法的 TOML 整数，tomllib 只是被 CPython 的整数位数上限
+    挡住——用户看到的消息必须与语法错同形。
+    """
+    import sys
+
+    digits = "9" * (sys.get_int_max_str_digits() + 1)
+    (isolated_config / "config.toml").write_text(f"chat_top_k = {digits}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError) as excinfo:
+        get_settings()
+
+    message = str(excinfo.value)
+    # 同时断言前缀与原因：只查前缀的话，一个把任意异常都包成同一句话的实现
+    # 也能通过；只查原因的话，未包装的裸 ValueError 也能通过。
+    assert "配置解析失败" in message, message
+    assert "Exceeds the limit" in message, message
+
+
+def test_get_settings_oversized_integer_is_not_a_toml_decode_error():
+    """确认这一支确实不是 ``TOMLDecodeError``——否则上面的用例是假绿。
+
+    ``tomllib`` 对语法错抛 ``TOMLDecodeError``，对超长整数抛的是**裸**
+    ``ValueError``。若哪天它改成抛 ``TOMLDecodeError``，这条用例会提醒我们
+    该分支已被 ``except tomllib.TOMLDecodeError`` 覆盖，可以简化。
+    """
+    import tomllib
+
+    digits = "9" * 5000
+    try:
+        tomllib.loads(f"chat_top_k = {digits}\n")
+    except ValueError as exc:
+        assert not isinstance(exc, tomllib.TOMLDecodeError), (
+            "tomllib 现在抛 TOMLDecodeError 了，ValueError 兜底分支可以移除"
+        )
+    else:
+        raise AssertionError("tomllib 竟然接受了超长整数")
+
+
+# ---------------------------------------------------------------------------
+# 非字符串取值必须收敛成脱敏的 ValueError
+# ---------------------------------------------------------------------------
+#
+# ``config.toml`` 的 TOML 值可以是任意类型，而这两个 validator 直接对传入值调用
+# 字符串方法，于是非字符串输入抛出的是**裸的** ``AttributeError``／``TypeError``
+# ——两者都**不是** ``ValueError`` 的子类，因此穿透 ``get_settings`` 的全部三个
+# handler，用户看到的是解释器默认 handler 打出的多帧 traceback：
+#
+# * ``log_level = 123``：``v.upper()`` 抛 ``AttributeError: 'int' object has no
+#   attribute 'upper'``（实测 14 帧裸 traceback）。这个字段更严重——它在
+#   **模块导入期**就被 ``log_manager.get_module_logger`` 读取，早于任何入口的
+#   ``try``，连脱敏边界都还没建立。
+# * ``knowledge_base_path = 123``：``Path(123)`` 抛 ``TypeError: expected str,
+#   bytes or os.PathLike object, not int``（实测 23 帧裸 traceback）。
+#
+# 参数 id 必须显式给出：``10**4301`` 超过 ``sys.get_int_max_str_digits()``，
+# pytest 自动生成 id 时调 ``str(val)`` 会自己抛 ``ValueError``。
+_NON_STRING_VALUES = [
+    pytest.param(123, id="int"),
+    pytest.param(10**400, id="400digits"),
+    pytest.param(10**4301, id="4301digits-over-int-max-str-digits"),
+    pytest.param(1.5, id="float"),
+    pytest.param(True, id="bool"),
+    pytest.param(["WARNING"], id="list"),
+    pytest.param({"level": "WARNING"}, id="dict"),
+]
+
+
+@pytest.mark.parametrize("bad_value", _NON_STRING_VALUES)
+def test_log_level_rejects_non_string_values(bad_value):
+    """``log_level`` 非字符串时必须报脱敏的 ``ValueError``，而不是 ``AttributeError``。"""
+    with pytest.raises(ValueError, match="log_level"):
+        Settings(log_level=bad_value, _env_file=None)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["knowledge_base_path", "pkl_path", "snapshot_root", "log_path", "cache_path"],
+)
+@pytest.mark.parametrize("bad_value", [pytest.param(123, id="int"), pytest.param(1.5, id="float")])
+def test_path_fields_reject_non_string_values(field, bad_value):
+    """路径字段非字符串时必须报 ``ValueError``，而不是裸 ``TypeError``。"""
+    with pytest.raises(ValueError, match=field):
+        Settings(**{field: bad_value}, _env_file=None)
+
+
+# ── 回归：报告配置校验失败这一步本身不得崩 ──
+#
+# ``_redacted_settings_error`` 里写的是 ``str(error.get("input"))``，而
+# ``input`` 是 pydantic 记下的原始输入值、可以是任意大的整数。实测
+# ``Settings(chat_top_k=10**4301)``（库调用方与测试都走这条构造路径）让
+# **报告校验失败**这一步自己抛 ``ValueError: Exceeds the limit``——用户看到的
+# 是位数上限错误，而真正的问题是 ``chat_top_k`` 越界。
+
+
+def test_settings_validation_error_survives_huge_integer_input():
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(chat_top_k=10**4301)
+
+    rendered = _redacted_settings_error(excinfo.value)
+
+    assert "chat_top_k" in rendered
+    assert "Exceeds the limit" not in rendered
+
+
+def test_settings_validation_error_still_redacts_secrets():
+    """替换 ``str`` 为 ``safe_repr`` 不得削弱脱敏。"""
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(chat_temperature="sk-live-abcdef123456")
+
+    rendered = _redacted_settings_error(excinfo.value)
+
+    assert "sk-live-abcdef123456" not in rendered
+
+
+# ── 回归：``retrieval_candidate_multiplier`` 的 inf 分支 ──
+#
+# ``int(inf)`` 抛 ``OverflowError``——``ArithmeticError`` 子类而**不是**
+# ``ValueError``，不在该 validator 的 ``except (ValueError, TypeError)`` 里，
+# 会穿透 ``get_settings`` 的全部三个 handler。而 ``get_settings`` 在**导入期**
+# 就被 ``cleanup.py`` 的 ``get_module_logger`` 调用，早于 ``run_cli`` 的任何
+# ``try``，于是 ``config.toml`` 写 ``retrieval_candidate_multiplier = inf``
+# （合法 TOML，``tomllib`` 原样解析成 ``inf``）让程序以裸 traceback 退出。
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        pytest.param(float("inf"), id="inf"),
+        pytest.param(float("-inf"), id="negative-inf"),
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(1e400, id="overflows-to-inf"),
+    ],
+)
+def test_retrieval_candidate_multiplier_rejects_non_finite(bad_value):
+    with pytest.raises((ValueError, ValidationError)):
+        Settings(retrieval_candidate_multiplier=bad_value)
+
+
+def test_retrieval_candidate_multiplier_rejects_decimal_infinity():
+    """非 ``float`` 的非有限数值（``Decimal``）必须收敛成脱敏的 ``ValueError``。
+
+    ``Decimal('Infinity')`` 绕过 ``isinstance(v, float) and not
+    math.isfinite(v)`` 前置守卫（``Decimal`` 不是 ``float``），由
+    ``_coerce_number`` 的类型兜底拒绝，给出「必须是数值，但得到 Decimal」。
+    （历史实现此处直接 ``int(v)``，才需要 ``except`` 里的 ``OverflowError``；
+    改用 ``_coerce_number`` 后该入口已前移。）这条钉住的是「不裸崩、且消息
+    可定位」，不绑定到某一条守卫。
+    """
+    import decimal
+
+    with pytest.raises((ValueError, ValidationError)):
+        Settings(retrieval_candidate_multiplier=decimal.Decimal("Infinity"))
+
+
+def test_retrieval_candidate_multiplier_inf_guard_message_names_the_field():
+    """``config.toml`` 写 ``inf`` 时必须报可定位到字段的「必须是整数」。
+
+    历史版本缺 ``isfinite`` 守卫时 ``inf`` 落到 ``int()`` 并报泛化的「转换
+    失败」。现版本前置守卫与 ``is_integer`` 收敛给出同一条消息（实测删掉
+    前置守卫本断言仍绿——两条路径已同文案），因此这里断言的是**消息内容**
+    这个对外契约，不绑定到某一条守卫的存在。
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(retrieval_candidate_multiplier=float("inf"))
+
+    assert "必须是整数" in str(excinfo.value)
+
+
+def test_tomllib_parses_inf_as_float_infinity():
+    """``inf`` 是合法 TOML，这条路径无需任何位数技巧即可到达。"""
+    import tomllib
+
+    assert tomllib.loads("x = inf")["x"] == float("inf")
+
+
+# ── 回归：路径字段必须拒绝 NUL 字节 ──
+#
+# ``os.makedirs``／``open`` 对含 NUL 的路径抛 ``ValueError: embedded null
+# byte``——**不是** ``OSError``，因此下游那些「目录不可写就降级」的
+# ``except OSError`` 全部接不住。实测 ``config.toml`` 写
+# ``log_path = "/tmp/a\u0000b"``（TOML 的 ``\u0000`` 转义）时，
+# ``cleanup.py`` 在**模块导入期**调用 ``get_module_logger``，程序连
+# ``run_cli`` 都到不了就崩。
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["log_path", "cache_path", "knowledge_base_path", "snapshot_root", "pkl_path"],
+)
+def test_path_fields_reject_nul_bytes(field_name):
+    with pytest.raises((ValueError, ValidationError), match="NUL"):
+        Settings(**{field_name: "/tmp/a\x00b"})
+
+
+# ── 回归：空的路径配置不得静默变成「当前工作目录」 ──
+#
+# ``resolve_path`` 的 docstring 承诺「将相对路径解析为绝对路径」，但它在解析
+# **之前**有一个 ``if not v: return v`` 提前返回，于是空串被原样返回，而
+# ``Path("")`` 在求值期等价于 ``Path(".")``——即**运行时的当前工作目录**。
+#
+# 两个后果，都不是「路径写错」应有的收场：
+#
+# 1. **信任根扩到 CWD**：``FaissStore.load_snapshot`` 用 ``snapshot_root`` 作为
+#    pickle 的来源信任根（``AGENTS.md`` 要求快照只从本项目生成的文件加载）。
+#    实测 ``SNAPSHOT_ROOT=""`` 时信任根解析为仓库根目录，在其中放一个带
+#    ``ACTIVE_SNAPSHOT`` 标记的目录即可让 ``load_snapshot`` 接受并反序列化它的
+#    ``chunks.pkl``——边界等于不存在。
+# 2. **行为随 CWD 漂移**：其余四个路径字段同样原样返回，同一份配置在仓库内运行
+#    与从仓库外运行会指向不同目录（实测 CWD=/tmp/xxx 时五者全部解析到 /tmp/xxx），
+#    而默认值（如 ``data/kb``）走的是 ``ROOT_DIR`` 分支、不随 CWD 变。
+#
+# 空值没有任何合法语义：路径字段的默认值都是非空的相对路径，用户「不想设」时
+# 应当删掉该键（回落默认值），而不是把它写成空串。因此这里显式拒绝，并给出
+# 可执行的指引。``cache_path`` 的清理侧另有 ``if not cache_dir: return "cache_path
+# 为空"`` 的守卫，那是删除前的最后一道防线，不该被当作「空值合法」的依据。
+@pytest.mark.parametrize(
+    "field_name",
+    ["knowledge_base_path", "pkl_path", "snapshot_root", "log_path", "cache_path"],
+)
+def test_path_settings_reject_empty_string(field_name):
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(**{field_name: ""})
+
+    message = str(excinfo.value)
+    assert field_name in message
+    # 只查字段名的话，一个把任意异常都包成同一句话的实现也能通过；指引必须
+    # 告诉用户「删掉该键回落默认值」这条可执行路径。
+    assert "默认值" in message
+
+
+def test_path_settings_reject_whitespace_only_string():
+    """纯空白同样不是合法路径：``Path("  ")`` 会解析成一个名为两个空格的真实目录。"""
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(snapshot_root="   ")
+
+    assert "snapshot_root" in str(excinfo.value)
+
+
+def test_empty_snapshot_root_does_not_widen_the_pickle_trust_root(tmp_path):
+    """端到端：空 ``snapshot_root`` 不得让 CWD 成为 pickle 的来源信任根。
+
+    走真实加载路径（``build_run_config`` → ``FaissStore.load_snapshot``），
+    而不是只看 ``Settings`` 的取值——只看取值的话，一个把空值换成 ``"."`` 的
+    实现仍然会让信任根落在 CWD 上。``Settings`` 层面空串被拒后，再把
+    ``snapshot_root`` 指到 CWD（``"."`` 的运行时形态）上验证 ``load_snapshot``
+    的信任根守卫确实拒绝加载仓库内目录——两层守卫各自钉住。
+    """
+    with pytest.raises(ValidationError):
+        Settings(snapshot_root="")
+
+    settings = Settings(
+        snapshot_root=str(tmp_path),
+        _env_file=None,
+    )
+    run_config = build_run_config(settings)
+    store = FaissStore(file_path=None)
+
+    # 仓库根下的目录不在受信快照根（tmp_path）之内：断言**归属判据**的专有消息——
+    # 宽到「知识快照」的话，成员判定被禁用后后一道 ACTIVE_SNAPSHOT 守卫的消息
+    # 同样匹配，这个断言就区分不出是哪道守卫在拦（实测注入禁用变异后仍绿）。
+    with pytest.raises(ValueError, match="必须位于受信根目录内"):
+        store.load_snapshot(Path(__file__).resolve().parent, snapshot_root=run_config.snapshot_root)
+
+
+# ── 回归：路径字段的符号链接环必须收敛成 ``ValueError`` ──
+#
+# ``resolve_path`` 里 ``(ROOT_DIR / v).resolve()`` 对**符号链接环**抛
+# ``RuntimeError: Symlink loop from ...``。它不是 ``ValueError`` 也不是
+# ``OSError``，``get_settings`` 已有的四个 handler（``ValidationError``／
+# ``SettingsError``／``TOMLDecodeError``／``RecursionError``）一个都接不住，
+# 而 ``get_settings`` 在 **import 期**就被调用（``log_manager
+# .get_module_logger``），早于任何入口的 ``try``。实测 ``data`` 是环
+# （``data -> data``）时 ``import main`` 以裸 traceback 终止。收敛判据与
+# ``utils.security.resolve_within`` 一致：``(OSError, RuntimeError)`` →
+# 带字段名的 ``ValueError``。
+
+
+def test_relative_path_symlink_loop_is_reported_as_value_error(tmp_path, monkeypatch):
+    """相对路径字段遇到符号链接环时，必须抛脱敏的 ``ValueError``。"""
+    monkeypatch.setattr("src.utils.config.ROOT_DIR", tmp_path)
+    loop = tmp_path / "data"
+    loop.symlink_to(loop)
+
+    with pytest.raises(ValueError, match="snapshot_root"):
+        Settings(snapshot_root="data/kb", _env_file=None)
+
+
+def test_absolute_path_field_is_not_resolved(tmp_path):
+    """绝对路径不做 ``resolve``，因此不受影响（收紧不能误伤）。"""
+    settings = Settings(snapshot_root=str(tmp_path / "kb"), _env_file=None)
+    assert settings.snapshot_root == str(tmp_path / "kb")
+
+
+# ── Settings 整数/数值守卫的**测试覆盖**补缺 ──
+#
+# 下面几条是**变异测试**翻出来的覆盖空洞：把对应守卫的 ``raise`` 删掉之后，
+# 全量套件仍然全绿——守卫本身正确，却没有任何一条测试会在它被删掉时变红。
+# 甄别方法是「删除守卫 + 真实 ``Settings(...)`` 入口」，只保留**行为确实改变**
+# 的那些（静默接受、静默截断，或把带字段名的 ``ValueError`` 换成别的异常）；
+# 纯等价变异（删除后落到下一个守卫、结论不变）不在此列。
+#
+# 每条都以「删除守卫即变红」的形态写：断言的是守卫存在时的收场。
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        pytest.param("chat_top_k", 1.5, id="chat_top_k"),
+        pytest.param("log_retention_days", 1.5, id="log_retention_days"),
+        pytest.param("kb_chunk_overlap", 1.5, id="kb_chunk_overlap"),
+        pytest.param("kb_child_chunk_overlap", 1.5, id="kb_child_chunk_overlap"),
+    ],
+)
+def test_integer_settings_reject_a_non_integral_float(field, value):
+    """非整数浮点必须被拒，而不是 ``int()`` 静默截断。
+
+    这四处各有一条 ``isinstance(number, float) and not number.is_integer()``
+    判据。删除后 ``int(1.5)`` 会把 ``1.5`` 悄悄变成 ``1``——用户写
+    ``chat_top_k = 1.5`` 得到的是「取 1 条」，没有任何报错，与「配置写错了」
+    的收场相去甚远。``1.5`` 是合法 TOML 浮点，无需任何技巧即可到达。
+    """
+    with pytest.raises(ValidationError, match="整数"):
+        Settings(**{field: value}, _env_file=None)
+
+
+def test_settings_reject_an_unknown_fusion_strategy():
+    """合法字符串但不在 ``{"rrf", "weighted"}`` 时必须报错。
+
+    ``validate_hybrid_fusion_strategy`` 的成员判据删除后，``"bogus"`` 会被
+    ``Settings`` 静默接受并原样存进 ``hybrid_fusion_strategy``，随后
+    ``HybridReranker`` 的派发（``if == "weighted" else _rrf_rerank``）按 RRF
+    出结果——用户配置里写着一个无效策略、程序却按 RRF 跑，是静默错误结果。
+    """
+    with pytest.raises(ValidationError, match="融合策略"):
+        Settings(hybrid_fusion_strategy="bogus", _env_file=None)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param([1], id="list"),
+        pytest.param({"a": 1}, id="dict"),
+        pytest.param(object(), id="object"),
+    ],
+)
+def test_numeric_settings_reject_a_non_numeric_container(value):
+    """``_coerce_number`` 对非数值容器必须给带字段名的 ``ValueError``。
+
+    最后那条 ``raise ValueError(f"{field_label} 必须是数值，但得到 ...")`` 删除
+    后，列表/字典/对象会一路落到 pydantic 的类型校验，抛的是没有字段语义的
+    ``TypeError``（实测 ``Settings(chat_top_k=[1])`` 报 ``TypeError``）——而本
+    项目其余数值字段一律以带字段名的 ``ValueError`` 收敛。
+    """
+    with pytest.raises((ValidationError, ValueError)):
+        Settings(chat_top_k=value, _env_file=None)
+
+
+def test_settings_reject_a_numeric_literal_that_overflows_to_infinity():
+    """``"1e400"`` 是合法十进制字面量，但 ``float()`` 后是 ``inf``。
+
+    ``_coerce_number`` 的 ``isfinite`` 判据删除后，``"1e400"`` 会被转成
+    ``inf`` 返回，随后落到整数上界判据，报「必须是整数，但得到 inf」——把
+    「字面量溢出」说成了「类型不对」，且不再是原始字符串。
+    """
+    with pytest.raises(ValidationError, match="有限数值"):
+        Settings(chat_top_k="1e400", _env_file=None)
+
+
+# ── 校验器守卫的覆盖缺口（变异扫描：删除后全量 3725 条仍全绿） ──
+#
+# 下列判据删除后行为确实改变（实测，经 ``Settings(**kwargs)`` 真实入口）：
+# * 966 「两个权重同时为零」组合校验 → **静默接受**，检索时每个文档得分都是
+#   0.0 并被分数阈值全部过滤——用户看到的是「搜不到」，配置本身却「合法」；
+# * 987 无效日志级别 → **静默接受** ``"BOGUS"``（只做了 ``.upper()``），
+#   日志系统拿到一个不认识的级别名，行为由 logging 内部兜底决定；
+# * 1035 无效融合策略 → **静默接受** ``"bogus"``，检索时按字符串比较落进
+#   else 分支（纯关键词检索），用户配置的混合检索静默失效；
+# * 1202 空路径 → **静默接受** 空串（解析成当前工作目录），路径随运行位置
+#   漂移；
+# * 867 负的分片重叠 → **静默接受** ``-1``；
+# * 984 非字符串日志级别 → 裸 ``AttributeError``（``5.upper()``）；
+# * 1030 非字符串融合策略 → 裸 ``AttributeError``；
+# * 1184 非字符串路径 → 裸 ``AttributeError``（``5.strip()``）；
+# * 831 非整数分片尺寸 → 消息退化成「kb_chunk_overlap 必须小于 kb_chunk_size」
+#   （把「1.5 不是整数」说成「重叠太大」）；
+# * 937 ``overlap == size`` → 消息退化成「不能超过一半」（把「必须小于」说成
+#   「超过一半」，指向错误的边界）。
+def test_settings_rejects_both_weights_zero():
+    """两个检索权重同时为零必须报错，不能静默接受。
+
+    后果是**静默空结果**：``weighted`` 融合下每个文档得分都是 0.0，随后被
+    ``chat_score_threshold`` 全部过滤——用户看到的是「搜不到」。
+    """
+    with pytest.raises(ValidationError, match="不能同时为 0"):
+        Settings(chat_vector_weight=0.0, chat_keyword_weight=0.0, _env_file=None)
+
+
+def test_settings_rejects_invalid_log_level():
+    """无效日志级别必须报错，不能静默接受 ``BOGUS``。"""
+    with pytest.raises(ValidationError, match="无效的日志级别"):
+        Settings(log_level="bogus", _env_file=None)
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        pytest.param(5, id="int"),
+        pytest.param(None, id="none"),
+    ],
+)
+def test_settings_rejects_non_string_log_level(bad_value):
+    """非字符串日志级别必须给带字段名的 ``ValidationError``，不是裸 ``AttributeError``。"""
+    with pytest.raises(ValidationError, match="log_level 必须是字符串"):
+        Settings(log_level=bad_value, _env_file=None)
+
+
+def test_settings_rejects_invalid_fusion_strategy():
+    """无效融合策略必须报错，不能静默接受 ``bogus``。"""
+    with pytest.raises(ValidationError, match="无效的混合检索融合策略"):
+        Settings(hybrid_fusion_strategy="bogus", _env_file=None)
+
+
+def test_settings_rejects_non_string_fusion_strategy():
+    """非字符串融合策略必须给 ``ValidationError``，不是裸 ``AttributeError``。"""
+    with pytest.raises(ValidationError, match="融合策略必须是字符串"):
+        Settings(hybrid_fusion_strategy=5, _env_file=None)
+
+
+def test_settings_rejects_empty_snapshot_root():
+    """空路径必须报错：``Path("")`` 会解析成当前工作目录，使路径随运行位置漂移。"""
+    with pytest.raises(ValidationError, match="不能为空"):
+        Settings(snapshot_root="", _env_file=None)
+
+
+def test_settings_rejects_non_string_snapshot_root():
+    """非字符串路径必须给 ``ValidationError``，不是裸 ``AttributeError``。"""
+    with pytest.raises(ValidationError, match="必须是字符串"):
+        Settings(snapshot_root=5, _env_file=None)
+
+
+def test_settings_rejects_negative_chunk_overlap():
+    """负的分片重叠必须报错，不能静默接受。"""
+    with pytest.raises(ValidationError, match="必须是非负整数"):
+        Settings(kb_chunk_overlap=-1, _env_file=None)
+
+
+def test_settings_reports_fractional_chunk_size_as_non_integer():
+    """``1.5`` 不是整数：消息必须点名「必须是整数」，不能退化成「重叠太大」。"""
+    with pytest.raises(ValidationError, match="必须是整数"):
+        Settings(kb_chunk_size=1.5, _env_file=None)
+
+
+def test_settings_reports_overlap_equal_to_size_with_its_own_message():
+    """``overlap == size`` 必须报「必须小于」，不能退化成「不能超过一半」。"""
+    with pytest.raises(ValidationError, match="必须小于 kb_chunk_size"):
+        Settings(kb_chunk_size=100, kb_chunk_overlap=100, _env_file=None)
+
+
+def test_retrieval_candidate_multiplier_rejects_numeric_subclass_with_failing_int():
+    """覆写 ``__int__`` 的数值子类必须收敛成脱敏 ``ValueError``，而不是裸崩。
+
+    ``_coerce_number`` 之后 ``number`` 已是 ``int``／整值 ``float``，``int()``
+    对它们不会失败；唯一能走到该 ``except`` 的是 ``int``／``float`` 的派生类
+    （只能从 Python 调用方传入），其 ``__int__`` 可能抛 ``OverflowError``——
+    ``ArithmeticError`` 子类而**不是** ``ValueError``，不显式列出就会穿透
+    ``get_settings`` 的三个 handler。删掉 ``OverflowError`` 会让这条变红。
+    """
+
+    class _EvilFloat(float):
+        def __int__(self):
+            raise OverflowError("模拟派生类")
+
+    with pytest.raises((ValueError, ValidationError)):
+        Settings(retrieval_candidate_multiplier=_EvilFloat(2.0))
+
+
+# --- face 12（== ↔ != 互换扫描）存活位点 -------------------------------------
+
+
+def test_non_llm_protocol_error_names_the_matching_role():
+    """错误消息的角色名必须与字段一致（``info.field_name == "embedding_..."``）。
+
+    ``==``→``!=`` 变异后两个角色的标签互换：embedding 配置报「Rerank 配置
+    不支持 protocol」，反之亦然——用户按消息去改错误的字段。
+    """
+    for field_name, role in (
+        ("embedding_configurations", "Embedding"),
+        ("rerank_configurations", "Rerank"),
+    ):
+        with pytest.raises(ValidationError) as excinfo:
+            Settings(
+                **{
+                    field_name: {
+                        "demo": {
+                            "provider": "openai",
+                            "model_name": "demo-model",
+                            "protocol": "responses",
+                        }
+                    }
+                }
+            )
+        assert f"{role} 配置不支持 protocol" in str(excinfo.value)
+
+
+# ── 回归：Settings 的每一个凭证字段都必须同时隐藏于 repr 与 dump ──
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    sorted(
+        {
+            "anthropic_api_key",
+            "google_api_key",
+            "siliconflow_api_key",
+            "gemini_api_key",
+            "google_application_credentials",
+            "openai_api_key",
+            "qwen_api_key",
+            "ark_api_key",
+            "volc_access_key",
+            "volc_secret_key",
+            "jina_api_key",
+            "deepseek_api_key",
+            "grok_api_key",
+            "lm_studio_api_key",
+        }
+    ),
+)
+def test_settings_hides_each_credential_in_repr_and_dump(field_name):
+    """``repr=False`` 与 ``_secret_fields`` 必须对**每个**凭证字段同时生效。"""
+    secret = f"sk-test-{field_name}"
+    settings = Settings(**{field_name: secret})
+
+    assert secret not in repr(settings), f"repr 回显了 {field_name}"
+    assert secret not in str(settings), f"str 回显了 {field_name}"
+    assert field_name not in settings.model_dump(), f"model_dump 泄漏 {field_name}"
+    assert field_name not in settings.model_dump_json(), f"model_dump_json 泄漏 {field_name}"
+    assert settings.model_dump(include_secrets=True)[field_name] == secret
+
+
+#
+# 14 个 ``*_api_key`` 字段声明时带 ``repr=False``（被 ``_secret_fields`` 纳入
+# dump 排除），但此前只有 openai/lm_studio/gemini 三个被断言过 ``model_dump``，
+# 没有一条断言过 ``repr``——boolc 变异扫描实测：任意单个字段的 ``repr=False``
+# 反向成 ``True`` 后全量 4269 条仍全绿，``repr(settings)``／``str(settings)``
+# 会回显该字段的明文（日志与 traceback 里最常见的一手凭证出口）。这里把 14 个
+# 字段逐一对过三条判据：repr 不出现、model_dump 不含键、include_secrets=True
+# 时才拿得到明文。
+
+
+# ── 回归：kb 清洗开关的**默认值**必须是关闭（config.toml.example 同款取值）──
+#
+# 四个 bool 字面量互换后全量 4269 条仍全绿（boolc 扫描）。不带显式配置的调用方
+# （未初始化 config.toml 的全新部署）拿到的是字段默认值：反向后清洗默认改写
+# 空白/空格/URL、启用 QA 分段——行为变化没有任何一处测试或文档提示，而
+# ``config.toml.example`` 里四个键全写的是 ``false``。
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "kb_replace_whitespace",
+        "kb_remove_spaces",
+        "kb_remove_urls",
+        "kb_use_qa_segmentation",
+    ],
+)
+def test_kb_cleaning_switch_defaults_are_off(field_name):
+    """四个清洗开关的 schema 默认值必须是 ``False``。"""
+    assert Settings.model_fields[field_name].default is False
+
+
+# ── 回归：resolve_app_root 的两条分支 ──
+
+
+def test_resolve_app_root_returns_repo_root_when_not_frozen():
+    """非冻结（源码运行）时根目录是仓库根，不受 ``sys.frozen`` 缺失影响。"""
+    from src.utils import config as config_module
+
+    assert (
+        config_module.resolve_app_root()
+        == Path(config_module.__file__).resolve().parent.parent.parent
+    )
+
+
+def test_resolve_app_root_uses_executable_dir_when_frozen(monkeypatch, tmp_path):
+    """冻结（PyInstaller）运行时根目录是可执行文件所在目录。"""
+    import sys as sys_module
+
+    from src.utils import config as config_module
+
+    monkeypatch.setattr(sys_module, "frozen", True, raising=False)
+    monkeypatch.setattr(sys_module, "executable", str(tmp_path / "app.bin"))
+
+    assert config_module.resolve_app_root() == tmp_path

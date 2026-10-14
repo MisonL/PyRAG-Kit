@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import json
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -10,11 +11,14 @@ from google.genai import types
 from src.providers.__base__.model_provider import (
     CompletionRequest,
     LargeLanguageModel,
+    StreamEvent,
     TextEmbeddingModel,
     _normalize_responses_native_item,
+    _responses_content_part,
     normalize_chat_messages,
     normalize_messages,
     normalize_responses_input,
+    raise_for_stream_error_event,
 )
 from src.providers.anthropic import AnthropicProvider
 from src.providers.factory import ModelProviderFactory
@@ -22,7 +26,12 @@ from src.providers.google import GoogleProvider
 from src.providers.openai import OpenAIProvider
 from src.providers.openai_compatible import OpenAICompatibleProvider
 from src.providers.resources import AsyncGoogleResources, GoogleResources
-from src.providers.volcengine import _ARK_BUILTIN_TOOL_ITEM_TYPES, VolcengineProvider
+from src.providers.volcengine import (
+    _ARK_BUILTIN_TOOL_ITEM_TYPES,
+    VolcengineProvider,
+    _require_ark_content,
+    _require_ark_list,
+)
 from src.utils.config import ModelDetail
 from src.utils.security import (
     find_sensitive_option_paths,
@@ -268,6 +277,61 @@ def test_completion_request_omits_implicit_temperature_for_model_defaults():
 
     explicit = CompletionRequest(prompt="hi", temperature=0.7)
     assert explicit.to_invoke_kwargs()["temperature"] == 0.7
+
+
+# `_build_chat_request` 用三条「与模型 options.extra_body 重复」判据挡住同一字段
+# 被两处配置：显式参数（`reasoning` 的 effort 分支与无 effort 分支各一条）与
+# 请求级 `extra_body`。三条在整套测试里从未执行（`sys.settrace` 行覆盖证实；
+# 把它们的 `raise` 换成 `pass` 后全量 3212 条仍然全绿）。删除后行为确实改变
+# （实测）：
+#   * 1167（`reasoning` 带 effort）与 1171（`reasoning` 无 effort）→ **静默接受**，
+#     显式 `reasoning` 覆盖模型 options 里的 `reasoning`，两处配置谁生效取决于
+#     调用顺序，没有任何提示；
+#   * 1185（请求级 `extra_body` 与模型 options 的键重复）→ **静默覆盖**，
+#     实测 `{"foo": 1}` 被 `{"foo": 2}` 顶掉。
+# 同批的 1145（`seed` 重复）经甄别是**等价变异**：删除后仍抛 `ValueError`，
+# 只是消息换成 `_validated_extra_body` 那条「不允许覆盖请求字段: seed」，结论不变，
+# 故不补测试。
+def _chat_request_provider(**options):
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "demo"
+    provider._protocol = "chat_completions"
+    provider._provider = "openai"
+    provider._options = options
+    return provider
+
+
+@pytest.mark.parametrize(
+    "reasoning",
+    [{"effort": "high"}, {"summary": "auto"}],
+    ids=["with-effort", "without-effort"],
+)
+def test_openai_chat_request_rejects_reasoning_duplicating_model_options(reasoning):
+    """显式 ``reasoning`` 与模型 options 里的 ``reasoning`` 重复时必须报错，不能静默覆盖。"""
+    provider = _chat_request_provider(extra_body={"reasoning": {"configured": True}})
+
+    with pytest.raises(ValueError, match="reasoning 与模型 options.extra_body 重复"):
+        provider._build_chat_request(prompt="hi", stream=False, reasoning=reasoning)
+
+
+def test_openai_chat_request_rejects_request_extra_body_overriding_model_options():
+    """请求级 ``extra_body`` 与模型 options 的同名键重复时必须报错，不能静默覆盖。"""
+    provider = _chat_request_provider(extra_body={"foo": 1})
+
+    with pytest.raises(ValueError, match="extra_body 与模型 options 重复: foo"):
+        provider._build_chat_request(prompt="hi", stream=False, extra_body={"foo": 2})
+
+
+def test_openai_chat_request_keeps_distinct_reasoning_and_extra_body():
+    """收紧不能误伤：不重复的 ``reasoning`` 与 ``extra_body`` 照常进请求。"""
+    provider = _chat_request_provider(extra_body={"foo": 1})
+
+    request = provider._build_chat_request(
+        prompt="hi", stream=False, reasoning={"effort": "high"}, extra_body={"bar": 2}
+    )
+
+    assert request["reasoning_effort"] == "high"
+    assert request["extra_body"] == {"foo": 1, "bar": 2}
 
 
 def test_completion_request_copy_preserves_implicit_temperature_marker():
@@ -762,6 +826,84 @@ def test_openai_chat_explicit_extra_body_extensions_cannot_be_silently_overridde
     kwargs = {field: {"effort": "high"} if field == "reasoning" else 2}
     with pytest.raises(ValueError, match=field):
         provider._build_chat_request(prompt="hi", stream=False, **kwargs)
+
+
+# `_build_responses_request` 与 `_build_chat_request` 同属一组「同一字段两处配置」
+# 判据，下面五条在整套测试里从未执行（`sys.settrace` 行覆盖证实；把它们的 `raise`
+# 换成 `pass` 后全量 3216 条仍然全绿）。删除后行为确实改变（实测）：
+#   * 1407 `options.text` 非对象 → 带字段名的 `ValueError` 变成裸
+#     `TypeError: 'int' object is not iterable`（`dict(configured_text)`）；
+#   * 1456 显式 `frequency_penalty`/`presence_penalty` 与模型 options 的
+#     `extra_body` 重复 → **静默接受**，两处配置谁生效取决于调用顺序；
+#   * 1596 `background` 非布尔 → **静默接受**，`"yes"` 原样进请求体；
+#   * 1598 `background=true` 配流式 → **静默接受**，把官方不支持的组合发出去；
+#   * 1610 请求级 `extra_body` 与模型 options 的同名键重复 → **静默覆盖**。
+# 同函数的 1415（`options.stop`/`seed` 与 extra_body 重复）与 1553
+# （`reasoning_effort` 与 extra_body 重复）经甄别是**等价变异**，不补测试：
+# 删除后仍抛 `ValueError`，只是消息换成 `_merge_extra_body`／`_validated_extra_body`
+# 那条，结论不变。
+def _responses_request_provider(**options):
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "demo"
+    provider._provider = "openai"
+    provider._protocol = "responses"
+    provider._base_url = "https://gateway.example.com/v1"
+    provider._options = options
+    return provider
+
+
+def test_openai_responses_rejects_non_object_options_text():
+    """`options.text` 非对象时必须给带字段名的 ``ValueError``，不是裸 ``TypeError``。"""
+    provider = _responses_request_provider(text=5)
+
+    with pytest.raises(ValueError, match="options.text 必须是对象"):
+        provider._build_responses_request(prompt="hi", stream=False)
+
+
+@pytest.mark.parametrize("field", ["frequency_penalty", "presence_penalty"])
+def test_openai_responses_rejects_sampling_field_duplicating_model_extra_body(field):
+    """显式采样字段与模型 options 的 ``extra_body`` 重复时必须报错，不能静默接受。"""
+    provider = _responses_request_provider(extra_body={field: 0.5})
+
+    with pytest.raises(ValueError, match=rf"{field} 与模型 options.extra_body 重复"):
+        provider._build_responses_request(prompt="hi", stream=False, **{field: 0.5})
+
+
+@pytest.mark.parametrize("background", ["yes", 1, [], {"a": 1}])
+def test_openai_responses_rejects_non_boolean_background(background):
+    """``background`` 必须是布尔值，不能把任意取值原样发给服务端。"""
+    provider = _responses_request_provider()
+
+    with pytest.raises(ValueError, match="background 必须是布尔值"):
+        provider._build_responses_request(prompt="hi", stream=False, background=background)
+
+
+def test_openai_responses_rejects_background_with_streaming():
+    """``background=true`` 与流式互斥，必须在构造阶段拦住。"""
+    provider = _responses_request_provider()
+
+    with pytest.raises(ValueError, match="background 请求不支持流式模式"):
+        provider._build_responses_request(prompt="hi", stream=True, background=True)
+
+
+def test_openai_responses_request_extra_body_cannot_override_model_options():
+    """请求级 ``extra_body`` 与模型 options 的同名键重复时必须报错，不能静默覆盖。"""
+    provider = _responses_request_provider(extra_body={"foo": 1})
+
+    with pytest.raises(ValueError, match="extra_body 与模型 options 重复: foo"):
+        provider._build_responses_request(prompt="hi", stream=False, extra_body={"foo": 2})
+
+
+def test_openai_responses_accepts_distinct_extra_body_and_background():
+    """收紧不能误伤：不重复的 ``extra_body`` 与非流式 ``background`` 照常进请求。"""
+    provider = _responses_request_provider(extra_body={"foo": 1})
+
+    request = provider._build_responses_request(
+        prompt="hi", stream=False, extra_body={"bar": 2}, background=True
+    )
+
+    assert request["extra_body"] == {"foo": 1, "bar": 2}
+    assert request["background"] is True
 
 
 def test_ark_responses_rejects_instructions_with_enabled_caching():
@@ -1944,6 +2086,68 @@ def test_google_tool_call_merge_rejects_ambiguous_unidentified_parallel_calls():
             accumulator,
             {"name": "lookup", "arguments": {"first": 2}},
         )
+
+
+# `_merge_tool_call` 有五条「分片指向多个调用／缺少稳定标识」的守卫在整套测试里
+# 从未执行（`sys.settrace` 行覆盖证实；把它们的 `raise` 换成 `pass` 后全量 3283 条
+# 仍然全绿）。既有用例 `test_google_tool_call_merge_rejects_ambiguous_unidentified_
+# parallel_calls` 命中的只是「先建一条、再补一条」这条路径，下面三条全绕开了。
+# 删除后行为确实改变（实测）：
+#   * 2303 同 index 已有两条 name 不同的记录 → **静默接受**，两个并行调用的参数
+#     被并进同一条记录；
+#   * 2341 同 id 已挂在两条不同 key 的记录上 → **静默接受**，同样合并；
+#   * 2326 index 分片匹配到多条「无 index 且同名」的记录 → **静默接受**。
+# 这三处的后果与源码注释写明的意图正相反：注释明确「绝不能从分片位置合成
+# index——该位置每个 chunk 都会重置，会把并行的独立调用合并在一起」，而合并后
+# 两次工具调用的参数会互相污染。
+# 同批的 2316 与 2376 经甄别是**等价变异**，不补测试：删除后落到相邻守卫，仍抛
+# `RuntimeError` 且消息仍指向同一类问题（实测分别是「index 指向多个调用」与
+# 「无法确认是否为同一调用」），结论不变。
+@pytest.mark.parametrize(
+    ("existing", "fragment"),
+    [
+        pytest.param(
+            [
+                (("index", 0), {"type": "function", "index": 0, "name": "lookup"}),
+                (("index", 0, "b"), {"type": "function", "index": 0, "name": "search"}),
+            ],
+            {"index": 0, "arguments": {"third": 3}},
+            id="same-index-different-names",
+        ),
+        pytest.param(
+            [
+                (("id", "call-1"), {"type": "function", "id": "call-1", "name": "lookup"}),
+                (("index", 7), {"type": "function", "index": 7, "id": "call-1", "name": "search"}),
+            ],
+            {"id": "call-1", "arguments": {"third": 3}},
+            id="same-id-two-keys",
+        ),
+    ],
+)
+def test_google_tool_call_merge_rejects_fragments_pointing_at_multiple_calls(existing, fragment):
+    """分片同时匹配多条已累积记录时必须 ``RuntimeError``，不能把两次调用合并成一条。"""
+    # 手工构造累积状态：走 ``_merge_tool_call`` 建这两条时它们会被同名规则合并，
+    # 构造不出「两条独立记录」这个前提。
+    accumulator = {key: {**value, "arguments": {}} for key, value in existing}
+
+    with pytest.raises(RuntimeError, match="指向多个调用"):
+        GoogleProvider._merge_tool_call(accumulator, fragment)
+
+    assert len(accumulator) == len(existing)
+
+
+def test_google_tool_call_merge_rejects_index_fragment_matching_multiple_unidentified_records():
+    """index 分片匹配到多条「无 index 且同名」的记录时必须报错，不能静默合并。"""
+    # 同上，手工构造两条同名且都无 index 的记录，模拟上游把它们当作两次独立调用
+    accumulator = {
+        ("position", 0): {"type": "function", "index": None, "name": "lookup", "arguments": {}},
+        ("position", 1): {"type": "function", "index": None, "name": "lookup", "arguments": {}},
+    }
+
+    with pytest.raises(RuntimeError, match="缺少稳定 id/index"):
+        GoogleProvider._merge_tool_call(accumulator, {"index": 3, "arguments": {"third": 3}})
+
+    assert len(accumulator) == 2
 
 
 def test_google_sync_stream_merges_tool_call_when_id_arrives_after_first_chunk():
@@ -3658,11 +3862,19 @@ def test_anthropic_extra_body_sampling_conflicts_are_explicit():
 
 
 def test_anthropic_beta_tool_runner_rejects_unsupported_compaction_control():
+    """不支持的 ``compaction_control`` 必须报「SDK 不支持」，不能误报成参数混用。
+
+    删除守卫后 ``compaction_control`` 被透传给 ``coerce_completion_request``，
+    消息变成「不能同时传 request 和关键字参数」（或「SDK 参数不匹配」）——把
+    「Beta tool_runner 不支持这个能力」说成「你调用的方式不对」，用户改调用形态
+    也解决不了。旧断言只匹配 ``compaction_control`` 子串，两条消息都含它，变异
+    后仍然变绿（变异扫描证实），必须钉住「当前 SDK 不支持」前缀。
+    """
     provider = object.__new__(AnthropicProvider)
     provider._model_name = "claude"
     provider._options = {}
 
-    with pytest.raises(ValueError, match="compaction_control"):
+    with pytest.raises(ValueError, match="当前 SDK 不支持 compaction_control"):
         provider.beta_tool_runner([], prompt="hi", compaction_control={"enabled": True})
 
 
@@ -3679,11 +3891,19 @@ def test_anthropic_output_format_follows_create_and_stream_sdk_shapes():
 
 
 def test_anthropic_beta_create_rejects_output_format():
+    """Beta 入口必须报 Beta 的消息，不能退化成下游普通 ``create`` 的指引。
+
+    删除 ``beta_create`` 的前置守卫后落到 ``_build_message_params`` 里的判据，
+    消息变成「Anthropic Messages.create 不支持 output_format；请使用 parse 或
+    stream。」——指引指向的 ``beta_parse``/``beta_stream`` 被换成普通入口，用户
+    按提示改会再次撞墙。变异扫描证实宽松的 ``match="create 不支持"`` 在变异后
+    仍然变绿（两条消息都含该子串）。
+    """
     provider = object.__new__(AnthropicProvider)
     provider._model_name = "claude"
     provider._options = {}
 
-    with pytest.raises(ValueError, match="create 不支持 output_format"):
+    with pytest.raises(ValueError, match=r"Beta Messages\.create 不支持 output_format"):
         provider.beta_create(CompletionRequest(prompt="hi", output_format={"type": "json_schema"}))
 
 
@@ -3700,7 +3920,9 @@ def test_anthropic_async_beta_create_rejects_output_format_before_sdk_call():
 
     provider._get_aclient = lambda: SimpleNamespace(beta=SimpleNamespace(messages=Messages()))
 
-    with pytest.raises(ValueError, match="create 不支持 output_format"):
+    # 异步侧是**另一处**守卫（async_beta_create 各自判一次），必须单独钉住 Beta
+    # 消息：同步用例打不到这里，删除后同样退化成下游普通 ``create`` 的指引。
+    with pytest.raises(ValueError, match=r"Beta Messages\.create 不支持 output_format"):
         asyncio.run(
             provider.async_beta_create(
                 CompletionRequest(prompt="hi", output_format={"type": "json_schema"})
@@ -3791,6 +4013,129 @@ def test_anthropic_modern_models_allow_explicit_legacy_sampling_for_proxies():
     assert provider.supports_sampling_option("temperature") is True
     assert provider.supports_sampling_option("top_p") is True
     assert provider.supports_sampling_option("top_k") is True
+
+
+# `_normalize_sampling_value` 的三条「必须是数字」判据在整套测试里从未执行
+# （`sys.settrace` 行覆盖证实；把它们的 `raise` 换成 `pass` 后全量 3251 条仍全绿）。
+# 既有用例 `test_anthropic_modern_models_omit_deprecated_sampling_defaults` 只喂
+# **合法数字**（`temperature=0.2`／`top_k=5`），所以三条都绕开了。删除后行为确实
+# 改变（实测）：
+#   * 299 `temperature="abc"` → 消息从「Anthropic temperature 必须是数字。」换成
+#     「当前 Claude 模型不支持该 temperature；请省略该字段或使用 1.0。」——把
+#     **类型错误**说成**值域错误**，照着提示改的人会把 `abc` 换成 `1.0`，而那与
+#     真正的问题无关；
+#   * 309 `top_p="abc"` → `to_finite_float` 返回 `None`，`None >= 0.99` 抛裸
+#     `TypeError: '>=' not supported between instances of 'NoneType' and 'float'`；
+#   * 312 `top_p=0.5`（合法数字但低于阈值）→ 落到函数末尾的 top_k 分支，消息变成
+#     「当前 Claude 模型不支持 top_k；请移除该字段。」——用户传的是 `top_p`，
+#     报错却说 `top_k`，改错字段。
+@pytest.mark.parametrize("value", ["abc", [1], {"a": 1}, object()])
+def test_anthropic_modern_models_reject_non_numeric_temperature(value):
+    """`temperature` 非数字时消息要直指「必须是数字」，不能说成「值不受支持」。"""
+    provider = object.__new__(AnthropicProvider)
+    provider._model_name = "claude-sonnet-4-6"
+    provider._options = {}
+
+    with pytest.raises(ValueError, match="temperature 必须是数字"):
+        provider._normalize_sampling_value("temperature", value)
+
+
+@pytest.mark.parametrize("value", ["abc", [1], {"a": 1}, object()])
+def test_anthropic_modern_models_reject_non_numeric_top_p(value):
+    """`top_p` 非数字时给带字段名的 ``ValueError``，不是裸 ``TypeError``。"""
+    provider = object.__new__(AnthropicProvider)
+    provider._model_name = "claude-sonnet-4-6"
+    provider._options = {}
+
+    with pytest.raises(ValueError, match="top_p 必须是数字"):
+        provider._normalize_sampling_value("top_p", value)
+
+
+def test_anthropic_modern_models_reject_low_top_p_with_the_right_field_name():
+    """`top_p` 低于阈值时消息要指向 `top_p`，不能误报成 `top_k`。"""
+    provider = object.__new__(AnthropicProvider)
+    provider._model_name = "claude-sonnet-4-6"
+    provider._options = {}
+
+    with pytest.raises(ValueError, match="该 top_p"):
+        provider._normalize_sampling_value("top_p", 0.5)
+
+
+# `_build_message_params` 的六条「配置与请求参数不冲突」判据在整套测试里从未执行
+# （`sys.settrace` 行覆盖证实；把它们的 `raise` 换成 `pass` 后全量 3260 条仍全绿）。
+# 删除后行为确实改变（实测，全在 `src/providers/anthropic.py`）：
+#   * 916 `allow_deprecated_sampling="yes"` → **静默接受**，非空字符串为真，等同于
+#     显式打开「转发已废弃采样字段」，与调用方写 `False` 的意图正好相反；
+#   * 920 `options.response_format` 非对象 → 带字段名的 `ValueError` 变成裸
+#     `TypeError: 'int' object is not iterable`；
+#   * 922／930 `response_format`／`output_format` 同时出现在 options 与请求参数 →
+#     **静默接受**，请求侧取值被丢弃，两处配置冲突无从察觉；
+#   * 962 请求级 `extra_body` 与模型 options 的 `extra_body` 有同名键 → **静默覆盖**；
+#   * 995 `extra_body` 的键与已建好的请求字段（如 `model`）重名 → **静默接受**，
+#     该字段会被 `extra_body` 覆盖掉再发给服务端。
+def _anthropic_options_provider(**options):
+    provider = object.__new__(AnthropicProvider)
+    provider._model_name = "claude-sonnet-4-6"
+    provider._options = options
+    return provider
+
+
+@pytest.mark.parametrize("value", ["yes", 1, 0, [], {}])
+def test_anthropic_rejects_non_boolean_allow_deprecated_sampling(value):
+    """`allow_deprecated_sampling` 必须是布尔值，不能靠真值语义静默生效。"""
+    provider = _anthropic_options_provider(allow_deprecated_sampling=value)
+
+    with pytest.raises(ValueError, match="allow_deprecated_sampling 必须是布尔值"):
+        provider._build_message_params(prompt="hi")
+
+
+@pytest.mark.parametrize("value", [5, "json_object", ["a"]])
+def test_anthropic_rejects_non_object_options_response_format(value):
+    """`options.response_format` 非对象时给带字段名的 ``ValueError``，不是裸 ``TypeError``。"""
+    provider = _anthropic_options_provider(response_format=value)
+
+    with pytest.raises(ValueError, match="response_format 必须是对象"):
+        provider._build_message_params(prompt="hi")
+
+
+@pytest.mark.parametrize("field", ["response_format", "output_format"])
+def test_anthropic_rejects_field_configured_in_both_options_and_request(field):
+    """同一字段同时配在 options 与请求参数时必须报错，不能静默丢掉一侧。"""
+    request_value = {"type": "json_object"} if field == "response_format" else str
+    provider = _anthropic_options_provider(**{field: request_value})
+
+    with pytest.raises(ValueError, match=rf"{field} 与配置项重复"):
+        provider._build_message_params(prompt="hi", stream=True, **{field: request_value})
+
+
+def test_anthropic_rejects_request_extra_body_overriding_configured_extra_body():
+    """请求级 `extra_body` 与模型 options 的 `extra_body` 同名键必须报错，不能静默覆盖。"""
+    provider = _anthropic_options_provider(extra_body={"temperature": 0.5})
+
+    with pytest.raises(ValueError, match="extra_body 不允许覆盖配置字段: temperature"):
+        provider._build_message_params(prompt="hi", extra_body={"temperature": 0.9})
+
+
+def test_anthropic_rejects_extra_body_overriding_a_request_field():
+    """`extra_body` 的键与已建好的请求字段重名时必须报错，不能静默顶掉该字段。"""
+    provider = _anthropic_options_provider(extra_body={"model": "other-model"})
+
+    with pytest.raises(ValueError, match="extra_body 不允许覆盖请求字段: model"):
+        provider._build_message_params(prompt="hi")
+
+
+def test_anthropic_accepts_distinct_configured_and_request_values():
+    """收紧不能误伤：不冲突的 options／请求参数组合照常构造请求。"""
+    provider = _anthropic_options_provider(extra_body={"metadata": {"team": "search"}})
+
+    params = provider._build_message_params(
+        prompt="hi", response_format={"type": "json_object"}, extra_body={"seed": 7}
+    )
+
+    assert params["output_config"] == {
+        "format": {"type": "json_schema", "schema": {"type": "object"}}
+    }
+    assert params["extra_body"] == {"metadata": {"team": "search"}, "seed": 7}
 
 
 def test_anthropic_default_max_tokens_scales_with_model_family():
@@ -4049,6 +4394,28 @@ def test_dynamic_native_resource_proxy_rejects_sensitive_positional_arguments():
             provider.resources.responses.connect(*args)
 
 
+def test_call_sdk_resource_contracts_signature_mismatch_to_valueerror():
+    """签名 ``bind`` 失败必须收敛成带渠道名的 ``ValueError``，不能透出裸 ``TypeError``。
+
+    删除守卫后未知关键字参数直接打到 ``method(...)``，抛的是裸
+    ``TypeError: ... unexpected keyword argument``——与本模块承诺的
+    「SDK 参数不匹配」错误分类不一致。变异扫描证实该守卫经
+    ``_call_sdk_resource`` 真实转发路径没有反向覆盖。
+    """
+
+    def method(a, b):
+        return a, b
+
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._provider = "openai"
+
+    with pytest.raises(ValueError, match=r"chat\.create SDK 参数不匹配: "):
+        provider._call_sdk_resource(method, (), {"zzz": 1}, "chat.create")
+
+    # 收紧不能误伤：签名匹配的调用照常转发
+    assert provider._call_sdk_resource(method, (), {"a": 1, "b": 2}, "chat.create") == (1, 2)
+
+
 def test_direct_openai_resource_call_rejects_sensitive_positional_arguments():
     provider = object.__new__(OpenAIProvider)
     provider._provider = "openai"
@@ -4092,6 +4459,109 @@ def test_provider_resource_guard_normalizes_duplicate_sdk_arguments():
     provider._get_client = lambda: SimpleNamespace(interactions=Interactions())
     with pytest.raises(ValueError, match="资源 SDK 参数重复"):
         provider.get_interaction("interaction-1", id="interaction-2")
+
+
+# ``_guard_provider_resource_method`` 把 SDK 抛出的 ``TypeError`` 收敛成带渠道名
+# 与原始消息的 ``ValueError``，分三个子类：unexpected keyword / multiple values /
+# missing required；同步与异步各有一份（2016/2020/2024 与 2046/2048/2050）。
+# 既有用例只钉住**同步**的「multiple values」那一条，其余五条在整套测试里从未
+# 执行（行覆盖证实；把它们换成 ``pass`` 后全量 3397 条仍全绿）。
+#
+# 删除后收场从 ``ValueError`` 退化成裸 ``TypeError``：调用方的错误分类按
+# ``ValueError`` 写，而 SDK 的 ``TypeError`` 文本只说「哪个参数不对」，没有
+# 渠道名——排查时无法定位到是哪个 provider 的资源方法。
+
+
+def _resource_guard_sync_provider(sdk_call):
+    class Interactions:
+        def get(self, *, id, **kwargs):
+            return sdk_call(id=id, **kwargs)
+
+    provider = object.__new__(GoogleProvider)
+    provider._model_name = "gemini"
+    provider._provider = "test"
+    provider._get_client = lambda: SimpleNamespace(interactions=Interactions())
+    return provider
+
+
+def _resource_guard_async_provider(sdk_call):
+    class Caches:
+        async def get(self, *, name, **kwargs):
+            return sdk_call(name=name, **kwargs)
+
+    class Aio:
+        caches = Caches()
+
+    provider = object.__new__(GoogleProvider)
+    provider._model_name = "gemini"
+    provider._provider = "test"
+    provider._get_client = lambda: SimpleNamespace(aio=Aio())
+    return provider
+
+
+def _unexpected_keyword(**_kwargs):
+    raise TypeError("get() got an unexpected keyword argument 'tenant'")
+
+
+def _duplicate_argument(id=None, **_kwargs):
+    raise TypeError("get() got multiple values for argument 'id'")
+
+
+def _missing_required_argument(**_kwargs):
+    raise TypeError("get() missing 1 required positional argument: 'name'")
+
+
+_RESOURCE_GUARD_CASES = [
+    pytest.param(_unexpected_keyword, "不匹配", id="unexpected-keyword"),
+    pytest.param(_duplicate_argument, "重复", id="duplicate-argument"),
+    pytest.param(_missing_required_argument, "不匹配", id="missing-required"),
+]
+
+
+@pytest.mark.parametrize(("sdk_call", "expected"), _RESOURCE_GUARD_CASES)
+def test_resource_guard_reports_sync_type_errors_readably(sdk_call, expected):
+    """同步资源入口的 ``TypeError`` 必须收敛成带渠道名的 ``ValueError``。"""
+    provider = _resource_guard_sync_provider(sdk_call)
+
+    with pytest.raises(ValueError, match=f"test 资源 SDK 参数{expected}"):
+        provider.get_interaction("interaction-1", extra_body={"tenant": "t"})
+
+
+@pytest.mark.parametrize(("sdk_call", "expected"), _RESOURCE_GUARD_CASES)
+def test_resource_guard_reports_async_type_errors_readably(sdk_call, expected):
+    """异步资源入口是**另一份包装器**，三条判据同样必须生效。
+
+    同步侧的用例打不到这里——``async_wrapper`` 与 ``wrapper`` 是两个独立的闭包。
+    """
+    provider = _resource_guard_async_provider(sdk_call)
+
+    async def run():
+        return await provider.async_get_cache("caches/1", extra_body={"tenant": "t"})
+
+    with pytest.raises(ValueError, match=f"test 资源 SDK 参数{expected}"):
+        asyncio.run(run())
+
+
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+def test_resource_guard_keeps_unrelated_type_errors_intact(async_mode):
+    """反向守卫：与参数无关的 ``TypeError`` 必须原样透出，不能被误分类。
+
+    守卫按消息内容分类；一条与 SDK 参数无关的 ``TypeError`` 若被收敛成
+    「资源 SDK 参数不匹配」，排查方向会被带偏。
+    """
+
+    def unrelated(**_kwargs):
+        raise TypeError("unsupported operand type(s) for +: 'int' and 'str'")
+
+    if async_mode:
+        provider = _resource_guard_async_provider(unrelated)
+        coroutine = provider.async_get_cache("caches/1", extra_body={"tenant": "t"})
+        with pytest.raises(TypeError, match="unsupported operand"):
+            asyncio.run(coroutine)
+    else:
+        provider = _resource_guard_sync_provider(unrelated)
+        with pytest.raises(TypeError, match="unsupported operand"):
+            provider.get_interaction("interaction-1", extra_body={"tenant": "t"})
 
 
 def test_resource_argument_validator_keeps_nested_business_values_isolated():
@@ -6177,6 +6647,139 @@ def test_responses_input_still_requires_tool_call_id():
         )
 
 
+@pytest.mark.parametrize("bad_tool_call", [5, "oops", ["x"]])
+def test_chat_tool_call_normalization_rejects_non_mapping_entries(bad_tool_call):
+    """``tool_calls`` 的元素必须是对象，非 Mapping 不能走到 ``dict()`` 或迭代。
+
+    删除该守卫后，整数元素抛裸 ``TypeError: 'int' object is not iterable``，
+    字符串元素抛 ``dictionary update sequence element #0 has length 1``——
+    两者都与「工具调用写错了」无关，且 ``TypeError`` 会穿透只捕获 ``ValueError``
+    的调用方。
+    """
+    with pytest.raises(ValueError, match=r"必须是对象"):
+        normalize_chat_messages(
+            [{"role": "assistant", "content": "", "tool_calls": [bad_tool_call]}]
+        )
+
+
+def test_chat_tool_call_normalization_rejects_non_mapping_function_field():
+    """嵌套 ``function`` 非对象时必须报错，不能静默改用顶层同名字段。
+
+    输入里顶层 ``name``/``arguments`` 都合法，只有 ``function`` 是字符串。
+    删除守卫后本函数会退回 ``normalized`` 取值并正常返回，把一个明显畸形的
+    工具调用当作有效请求发出。
+    """
+    with pytest.raises(ValueError, match=r"\.function 必须是对象"):
+        normalize_chat_messages(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "name": "n",
+                            "arguments": "{}",
+                            "function": "bad",
+                        }
+                    ],
+                }
+            ]
+        )
+
+
+def test_responses_function_call_item_rejects_non_mapping_function_field():
+    """Responses 原生 ``function_call`` 的嵌套 ``function`` 同样要校验。
+
+    这条守卫与 ``_chat_tool_call_item`` 里的是**两份独立代码**（969 与 384），
+    Chat 路径的测试杀不掉它。删除后原生 item 分支静默接受，把字符串 ``function``
+    丢弃、改用顶层字段拼出请求。
+    """
+    with pytest.raises(ValueError, match=r"\.function 必须是对象"):
+        normalize_responses_input(
+            None,
+            None,
+            [
+                {
+                    "role": "assistant",
+                    "type": "function_call",
+                    "call_id": "c1",
+                    "name": "n",
+                    "arguments": "{}",
+                    "function": "bad",
+                }
+            ],
+        )
+
+
+def test_responses_function_call_item_requires_function_name():
+    """原生 ``function_call`` 缺函数名必须在请求前报错。
+
+    删除守卫后返回 ``name=None`` 的 item，把无名调用发给 Responses。
+    """
+    with pytest.raises(ValueError, match="缺少函数名"):
+        normalize_responses_input(
+            None,
+            None,
+            [
+                {
+                    "role": "assistant",
+                    "type": "function_call",
+                    "call_id": "c1",
+                    "arguments": "{}",
+                }
+            ],
+        )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {
+            "role": "assistant",
+            "type": "function_call",
+            "call_id": "c1",
+            "name": "n",
+            "arguments": {"k": object()},
+        },
+        {"type": "function_call_output", "call_id": "c1", "output": {"k": object()}},
+    ],
+)
+def test_responses_json_text_rejects_unserializable_payload(message):
+    """工具参数与输出必须可 JSON 序列化，否则 ``json.dumps`` 会抛裸 ``TypeError``。
+
+    删除守卫后异常不再收敛为带 ``location`` 的 ``ValueError``；实测在
+    ``_responses_json_text`` 内部先撞 ``TypeError``，调用方只捕获 ``ValueError``
+    时无法给出「哪个字段写错了」的消息。
+    """
+    with pytest.raises(ValueError, match="必须可序列化为 JSON"):
+        normalize_responses_input(None, None, [message])
+
+
+def test_validate_complete_tool_call_requires_name_in_stream_events():
+    """流式工具调用在发出 completed 事件前必须带函数名。
+
+    ``validate_complete_tool_call`` 的 name 判据是流式两条路径（Chat Completions
+    与 Responses）共用的第一道闸。删除后无名调用被当作完整事件交付。
+    """
+    finish = StreamEvent(type="finish", finish_reason="tool_calls", usage={})
+    with pytest.raises(RuntimeError, match="缺少 name"):
+        OpenAICompatibleProvider._chat_completion_events(
+            finish,
+            {0: {"id": "t1", "type": "function", "arguments": "{}"}},
+            set(),
+        )
+    with pytest.raises(RuntimeError, match="缺少 name"):
+        OpenAICompatibleProvider._responses_completion_event(
+            StreamEvent(
+                type="tool_call_completed",
+                tool_call={"id": "t1", "type": "function", "arguments": "{}"},
+            ),
+            {},
+        )
+
+
 @pytest.mark.parametrize(
     "model_name",
     [
@@ -7534,3 +8137,2906 @@ def test_ark_responses_accepts_ark_only_fields():
     )
 
     assert converted[0]["image_pixel_limit"] == {"m": 1}
+
+
+# ---------------------------------------------------------------------------
+# 客户端级 max_retries
+# ---------------------------------------------------------------------------
+#
+# ``timeout`` 与 ``max_retries`` 是 openai SDK 的**客户端构造参数**，本项目把它们
+# 从 ``options`` 直接透传给 ``openai.OpenAI(...)``（见 ``_get_client``）。SDK 自己
+# 不做任何校验，于是 ``options`` 里的取值可以造成两类失败：
+#
+# 1. ``max_retries`` 为**负数**：SDK 的重试循环是 ``range(max_retries + 1)``，
+#    负数让循环体一次都不执行，请求根本没发出去，最后抛的是 SDK 内部的
+#    ``AssertionError: could not resolve response (should never happen)``——
+#    实测 ``max_retries=-1`` 时请求数为 **0**。
+# 2. ``max_retries`` 为**超大值**（``10**400`` 这类，``config.toml`` 的 TOML
+#    整数无上界）：等价于无上限重试，网络故障下会一直重试下去。
+#
+# 非整数（``"abc"``／``1.5``／``True``）则是第三种：SDK 把它们存进
+# ``self.max_retries``，直到真正重试时才在 ``max_retries - retries_taken`` 上
+# 抛 ``TypeError``，报错点离配置处很远。
+#
+# Ark 渠道的 ``_normalize_client_options`` 早就校验了 ``max_retries``（要求
+# ``>= 0`` 的整数），OpenAI 兼容渠道漏了同一道。这里补齐，并给上界——重试次数
+# 是配置项，不是可以取到天文数字的量。
+_CLIENT_OPTION_PROVIDER = "qwen"
+_CLIENT_OPTION_SETTINGS = SimpleNamespace(
+    qwen_api_key="key",
+    qwen_base_url="https://qwen.invalid/v1",
+)
+
+
+def _build_client_option_provider(**options):
+    return OpenAICompatibleProvider(
+        "demo", _CLIENT_OPTION_PROVIDER, settings=_CLIENT_OPTION_SETTINGS, options=options
+    )
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        pytest.param(-1, id="negative"),
+        pytest.param(-(10**400), id="negative-beyond-double-range"),
+        pytest.param(10**400, id="400digits-over-upper-bound"),
+        pytest.param(10**4301, id="4301digits-over-int-max-str-digits"),
+        pytest.param(True, id="bool"),
+        pytest.param(1.5, id="float"),
+        pytest.param("abc", id="non-numeric-string"),
+        pytest.param("", id="empty-string"),
+    ],
+)
+def test_openai_compatible_client_max_retries_must_be_bounded_non_negative_int(bad_value):
+    """``options.max_retries`` 必须在构造期收敛成有上界的非负整数。"""
+    with pytest.raises(ValueError, match="max_retries"):
+        _build_client_option_provider(max_retries=bad_value)
+
+
+@pytest.mark.parametrize(
+    ("good_value", "expected"),
+    [
+        (0, 0),
+        (1, 1),
+        (10, 10),
+        (100, 100),
+        # 数字字符串必须继续接受：``.env`` 与 TOML 来源本来就以字符串形态到达，
+        # 且 Ark 渠道的同一套判据也接受 ``"5"``。
+        ("5", 5),
+        (5.0, 5),
+    ],
+)
+def test_openai_compatible_client_max_retries_accepts_valid_values(good_value, expected):
+    provider = _build_client_option_provider(max_retries=good_value)
+    assert provider._client_options()["max_retries"] == expected
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        pytest.param(-1, id="negative"),
+        pytest.param(0, id="zero"),
+        pytest.param(10**400, id="400digits-beyond-double-range"),
+        pytest.param(10**4301, id="4301digits-over-int-max-str-digits"),
+        pytest.param(True, id="bool"),
+        pytest.param("abc", id="non-numeric-string"),
+    ],
+)
+def test_openai_compatible_client_timeout_must_be_finite_positive(bad_value):
+    """``options.timeout`` 是客户端构造参数，同样要在构造期拒绝非法取值。
+
+    原实现把 ``timeout`` 原样透传给 ``openai.OpenAI``，而 SDK 不校验：实测
+    ``timeout="abc"``、``timeout=-1``、``timeout=0`` 全部被接受并存进
+    ``client.timeout``，直到 httpx 层才以形态各异的错误暴露。
+    """
+    with pytest.raises(ValueError, match="timeout"):
+        _build_client_option_provider(timeout=bad_value)
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        pytest.param(101, id="just-over-upper-bound"),
+        pytest.param(10**400, id="400digits-over-upper-bound"),
+        pytest.param(10**4301, id="4301digits-over-int-max-str-digits"),
+        pytest.param(-1, id="negative"),
+        pytest.param(True, id="bool"),
+        pytest.param(1.5, id="float"),
+        pytest.param("abc", id="non-numeric-string"),
+    ],
+)
+def test_ark_client_max_retries_must_be_bounded_non_negative_int(bad_value):
+    """Ark 的 ``max_retries`` 与 OpenAI 兼容渠道走同一套判据。
+
+    此前的内联实现只要求「``>= 0`` 的整数」，**没有上界**：实测
+    ``max_retries = 10**400`` 被原样接受并传给 Ark SDK，而 SDK 的重试循环按该值
+    决定次数，等价于无限重试。
+    """
+    with pytest.raises(ValueError, match="max_retries"):
+        VolcengineProvider._normalize_client_options({"max_retries": bad_value})
+
+
+@pytest.mark.parametrize(
+    ("good_value", "expected"),
+    [(0, 0), (1, 1), (100, 100), ("5", 5), (5.0, 5)],
+)
+def test_ark_client_max_retries_accepts_valid_values(good_value, expected):
+    normalized = VolcengineProvider._normalize_client_options({"max_retries": good_value})
+    assert normalized["max_retries"] == expected
+
+
+# ---------------------------------------------------------------------------
+# Anthropic 的客户端级 timeout / max_retries
+# ---------------------------------------------------------------------------
+#
+# 与 OpenAI 兼容渠道同一类问题：``timeout``／``max_retries`` 被原样透传给
+# ``anthropic.Anthropic(...)``，SDK 不做任何校验。Anthropic SDK 的重试循环同样是
+# ``for retries_taken in range(max_retries + 1)``，因此 ``max_retries=-1`` 时循环体
+# 一次都不执行——实测 HTTP 请求数为 **0**，最终抛
+# ``RuntimeError: could not resolve response (should never happen)``。
+_ANTHROPIC_CLIENT_OPTION_SETTINGS = SimpleNamespace(anthropic_api_key="sk-ant-test")
+
+
+def _patch_anthropic_settings(monkeypatch) -> None:
+    """把 ``get_settings`` 打到 ``AnthropicProvider`` 真正读取的那个模块字典上。
+
+    不能用字符串形式 ``monkeypatch.setattr("src.providers.anthropic.get_settings", ...)``：
+    ``tests/providers/test_factory.py`` 会从 ``sys.modules`` 里删除
+    ``src.providers.anthropic`` 再重新导入，于是字符串形式解析到的是**新**模块对象，
+    而 ``AnthropicProvider.__init__`` 仍从**旧**模块字典取 ``get_settings``——patch
+    落空，构造器读到真实配置（无 key）后抛 ``ANTHROPIC_API_KEY is required``。
+    单独跑本文件时不会触发，只有全量运行才暴露。
+    """
+    module_globals = AnthropicProvider.__init__.__globals__
+    monkeypatch.setitem(module_globals, "get_settings", lambda: _ANTHROPIC_CLIENT_OPTION_SETTINGS)
+
+
+def _build_anthropic_provider(**options):
+    return AnthropicProvider("claude-sonnet-4-6", options=options or None)
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        pytest.param(101, id="just-over-upper-bound"),
+        pytest.param(10**400, id="400digits-over-upper-bound"),
+        pytest.param(10**4301, id="4301digits-over-int-max-str-digits"),
+        pytest.param(-1, id="negative"),
+        pytest.param(True, id="bool"),
+        pytest.param(1.5, id="float"),
+        pytest.param("abc", id="non-numeric-string"),
+    ],
+)
+def test_anthropic_client_max_retries_must_be_bounded_non_negative_int(monkeypatch, bad_value):
+    _patch_anthropic_settings(monkeypatch)
+    with pytest.raises(ValueError, match="max_retries"):
+        _build_anthropic_provider(max_retries=bad_value)
+
+
+@pytest.mark.parametrize(
+    ("good_value", "expected"),
+    [(0, 0), (1, 1), (100, 100), ("5", 5)],
+)
+def test_anthropic_client_max_retries_accepts_valid_values(monkeypatch, good_value, expected):
+    _patch_anthropic_settings(monkeypatch)
+    provider = _build_anthropic_provider(max_retries=good_value)
+    assert provider._normalized_client_options["max_retries"] == expected
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        pytest.param(-1, id="negative"),
+        pytest.param(0, id="zero"),
+        pytest.param(10**400, id="400digits-beyond-double-range"),
+        pytest.param(10**4301, id="4301digits-over-int-max-str-digits"),
+        pytest.param(True, id="bool"),
+        pytest.param("abc", id="non-numeric-string"),
+    ],
+)
+def test_anthropic_client_timeout_must_be_finite_positive(monkeypatch, bad_value):
+    _patch_anthropic_settings(monkeypatch)
+    with pytest.raises(ValueError, match="timeout"):
+        _build_anthropic_provider(timeout=bad_value)
+
+
+def test_anthropic_client_accepts_httpx_timeout_object(monkeypatch):
+    """``httpx.Timeout`` 形态必须保留——SDK 接受它，且无法用 TOML 表达。"""
+    import httpx2
+
+    _patch_anthropic_settings(monkeypatch)
+    provider = _build_anthropic_provider(timeout=httpx2.Timeout(5.0))
+    assert hasattr(provider._normalized_client_options["timeout"], "connect")
+
+
+# ── 回归：客户端 timeout 的**上界**与派生值 ──
+#
+# 四个渠道原本只判「有限正数」，没有上界。失效点不在超时值本身，而在派生值：
+# Google 是唯一把秒换算成毫秒再交给 SDK 的渠道（``_build_http_options`` 的
+# ``int(timeout * 1000)``），超过 ``DBL_MAX/1000`` 的秒数让该派生抛
+# ``OverflowError``——它是 ``ArithmeticError`` 的子类，**不是** ``ValueError``，
+# 穿透项目全部以 ``ValueError`` 为契约的 handler，以裸 traceback 终止会话。
+# 实测 ``config.toml`` 写 ``timeout = 1e306`` 即可复现：配置加载成功、provider
+# 构造成功，首次提问才炸。
+
+_BEYOND_MILLISECOND_RANGE = [
+    pytest.param(1e306, id="306exponent"),
+    pytest.param(1e308, id="308exponent"),
+    pytest.param(86_401.0, id="just-over-one-day"),
+]
+
+
+@pytest.mark.parametrize("bad_value", _BEYOND_MILLISECOND_RANGE)
+def test_google_request_timeout_has_upper_bound(bad_value):
+    """``options.timeout`` 必须在上界内，否则毫秒派生值会抛 OverflowError。"""
+    provider = object.__new__(GoogleProvider)
+    provider._model_name = "gemini-test"
+    provider._options = {}
+    with pytest.raises(ValueError, match="不能超过"):
+        provider._build_generation_config("system", None, 0.2, timeout=bad_value)
+
+
+@pytest.mark.parametrize("bad_value", _BEYOND_MILLISECOND_RANGE)
+def test_openai_compatible_client_timeout_has_upper_bound(bad_value):
+    with pytest.raises(ValueError, match="不能超过"):
+        _build_client_option_provider(timeout=bad_value)
+
+
+@pytest.mark.parametrize("bad_value", _BEYOND_MILLISECOND_RANGE)
+def test_anthropic_client_timeout_has_upper_bound(monkeypatch, bad_value):
+    _patch_anthropic_settings(monkeypatch)
+    with pytest.raises(ValueError, match="不能超过"):
+        _build_anthropic_provider(timeout=bad_value)
+
+
+def test_ark_client_timeout_has_upper_bound():
+    with pytest.raises(ValueError, match="不能超过"):
+        VolcengineProvider._normalize_client_options({"timeout": 1e306})
+
+
+def test_google_http_options_timeout_rejects_beyond_millisecond_range():
+    """``options.http_options.timeout`` 是毫秒，同样需要上界。
+
+    此前判据只要求「正整数毫秒」，实测 ``1e308`` 能通过，到真实
+    ``genai.Client(...)`` 构造时才抛 pydantic 的
+    ``Unable to parse input string as an integer``——错误消息与 Google 配置
+    毫无关联。
+    """
+    with pytest.raises(ValueError, match="正整数毫秒"):
+        GoogleProvider._validate_http_options({"timeout": 1e308})
+
+
+@pytest.mark.parametrize("good_value", [1, 30.0, "60"])
+def test_client_timeout_accepts_values_within_bound(good_value):
+    """上界之内的正常取值必须继续接受（Ark 渠道的字符串形态也在其中）。"""
+    assert VolcengineProvider._normalize_client_options({"timeout": good_value})["timeout"] > 0
+
+
+# ── 回归：Ark ``count_tokens`` 与其余七个 token 计数入口同契约 ──
+#
+# 八个 provider 的 token 计数入口都已改用 ``require_token_count``，只有 Ark 的
+# 同步/异步 ``count_tokens`` 漏了，写的是 ``int(field(item, "total_tokens", 0))``：
+# ``"abc"`` 抛裸 ``ValueError``、``None`` 抛裸 ``TypeError``、位数超限的数字串抛
+# 与 token 计数无关的位数错误，且消息里连字段名都没有；``0`` 默认值还把
+# 「响应不完整」静默算成「0 个 token」。
+
+
+def _ark_provider_with_tokenization_response(items):
+    """构造只带假 tokenization 资源的 Ark provider。"""
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "ark-model"
+    provider._options = {}
+    provider._get_client = lambda: SimpleNamespace(
+        tokenization=SimpleNamespace(
+            create=lambda **kwargs: SimpleNamespace(data=items),
+        )
+    )
+    return provider
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        pytest.param("abc", id="non-numeric-string"),
+        pytest.param(None, id="missing-field"),
+        pytest.param(1.5, id="fractional"),
+        pytest.param(-5, id="negative"),
+        pytest.param("9" * 4301, id="4301digits-over-int-max-str-digits"),
+    ],
+)
+def test_ark_count_tokens_reports_field_name_for_bad_values(bad_value):
+    provider = _ark_provider_with_tokenization_response([SimpleNamespace(total_tokens=bad_value)])
+    with pytest.raises(RuntimeError, match="total_tokens"):
+        provider.count_tokens("hello")
+
+
+def test_ark_count_tokens_sums_valid_values():
+    provider = _ark_provider_with_tokenization_response(
+        [SimpleNamespace(total_tokens=3), SimpleNamespace(total_tokens=4)]
+    )
+    assert provider.count_tokens("hello") == 7
+
+
+# ── 回归：不可哈希取值不得让集合成员守卫抛 TypeError ──
+#
+# ``field(x, "type") in {"a", "b"}`` 对 ``list``/``dict`` 抛
+# ``TypeError: unhashable type``，而调用方按 ``ValueError``/``RuntimeError``
+# 分类错误。这些值来自网关 JSON：openai SDK 对 SSE chunk 的未知顶层字段用
+# ``extra="allow"`` 原样保留，实测一个 ``{"type": ["error"]}`` 就能构造出来，
+# 于是「网关返回了形态异常的事件」变成裸 ``TypeError``。
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [pytest.param(["error"], id="list"), pytest.param({"a": 1}, id="dict")],
+)
+def test_responses_stream_event_type_must_not_raise_type_error(bad_value):
+    """非字符串 ``type`` 按「未知事件」处理，不得抛 TypeError。"""
+    assert raise_for_stream_error_event({"type": bad_value}, "openai") is None
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [pytest.param(["auto"], id="list"), pytest.param({"a": 1}, id="dict")],
+)
+@pytest.mark.parametrize("part_type", ["input_image", "input_file"])
+def test_responses_content_part_detail_must_not_raise_type_error(part_type, bad_value):
+    """``detail`` 非字符串时必须报 ``ValueError``，而不是 ``TypeError``。"""
+    part = {"type": part_type, "detail": bad_value}
+    if part_type == "input_image":
+        part["image_url"] = "https://x/y.png"
+    else:
+        part["file_data"] = "data:x"
+    with pytest.raises(ValueError, match="detail"):
+        _responses_content_part(part, "input[0]", provider="openai")
+
+
+# `_responses_content_part` 的二十六条形态判据在整套测试里从未执行（`sys.settrace`
+# 行覆盖证实；把它们的 `raise` 换成 `pass` 后全量 3286 条仍然全绿）。既有用例
+# `test_responses_content_part_detail_must_not_raise_type_error` 只钉住两个分支里
+# 的 `detail` 成员判据，其余形态判据全绕开了。删除后行为确实改变（实测，全在
+# `src/providers/__base__/model_provider.py`）：**二十五条静默接受**——畸形取值
+# 原样进 `converted` 字典再发给上游（如 `text: 5`、`file_id: 5`、`detail: "ultra"`、
+# 整块缺 URI 却产出 `{"type": "input_video"}`）；**两条变成裸 `TypeError`**——
+# `dict(...)` 对非映射取值抛 `TypeError: 'int' object is not iterable`。
+# 最值得记的是四条 `prompt_cache_breakpoint` 守卫（700／810／858／901）：它们
+# 拦住的是「把 OpenAI 专属字段发给 Ark SDK」——删掉后 Ark 侧静默丢弃该字段，
+# 而调用方以为缓存已生效。
+_DATA_PNG = "data:image/png;base64,AAA"
+
+
+@pytest.mark.parametrize(
+    ("part", "provider", "expected"),
+    [
+        pytest.param(5, "openai", r"必须是字符串或对象", id="part-not-str-or-object"),
+        pytest.param(
+            {"type": "text", "text": 5}, "openai", r"\.text 必须是字符串", id="text-not-string"
+        ),
+        pytest.param(
+            {"type": "text", "text": "a", "prompt_cache_breakpoint": 1},
+            "ark",
+            "prompt_cache_breakpoint 不受 Ark",
+            id="text-pcb-on-ark",
+        ),
+        pytest.param(
+            {"type": "input_audio", "audio_url": "https://x/a.wav", "file_id": 5},
+            "ark",
+            r"\.file_id 必须是字符串",
+            id="audio-file-id-not-string",
+        ),
+        pytest.param(
+            {"type": "input_audio", "audio_url": "https://x/a.wav", "chunking_strategy": 5},
+            "ark",
+            r"chunking_strategy 必须是对象",
+            id="audio-chunking-not-mapping",
+        ),
+        pytest.param(
+            {"type": "input_video", "video_url": {"url": 5}},
+            "ark",
+            r"video_url\.url 必须是字符串",
+            id="video-url-not-string",
+        ),
+        pytest.param(
+            {"type": "input_video", "video_url": {"url": "https://x/v.mp4"}, "file_id": 5},
+            "ark",
+            r"\.file_id 必须是字符串",
+            id="video-file-id-not-string",
+        ),
+        pytest.param(
+            {"type": "input_video", "video_url": {}},
+            "ark",
+            "缺少 video_url 或 file_id",
+            id="video-missing-url-and-file-id",
+        ),
+        pytest.param(
+            {"type": "image_url", "image_url": 5},
+            "openai",
+            r"\.image_url 必须是字符串或对象",
+            id="image-url-not-str-or-object",
+        ),
+        pytest.param(
+            {"type": "image_url", "image_url": {"url": 5}},
+            "openai",
+            r"image_url\.url 必须是字符串",
+            id="image-url-value-not-string",
+        ),
+        pytest.param(
+            {"type": "image_url", "file_id": 5},
+            "openai",
+            r"\.file_id 必须是字符串",
+            id="image-file-id-not-string",
+        ),
+        pytest.param(
+            {"type": "image_url", "image_url": _DATA_PNG, "detail": "ultra"},
+            "openai",
+            r"\.detail 必须是",
+            id="image-detail-not-allowed",
+        ),
+        pytest.param(
+            {"type": "image_url", "image_url": _DATA_PNG, "image_pixel_limit": {"min_pixels": 1}},
+            "openai",
+            "image_pixel_limit 不受 OpenAI",
+            id="image-pixel-limit-on-openai",
+        ),
+        pytest.param(
+            {"type": "image_url", "image_url": _DATA_PNG, "image_pixel_limit": 5},
+            "ark",
+            r"image_pixel_limit 必须是对象",
+            id="image-pixel-limit-not-mapping",
+        ),
+        pytest.param(
+            {"type": "image_url", "image_url": _DATA_PNG, "prompt_cache_breakpoint": 1},
+            "ark",
+            "prompt_cache_breakpoint 不受 Ark",
+            id="image-pcb-on-ark",
+        ),
+        pytest.param(
+            {"type": "input_image", "image_url": 5},
+            "openai",
+            r"\.image_url 必须是字符串",
+            id="input-image-url-not-string",
+        ),
+        pytest.param(
+            {"type": "input_image", "image_url": _DATA_PNG, "file_id": 5},
+            "openai",
+            r"\.file_id 必须是字符串",
+            id="input-image-file-id-not-string",
+        ),
+        pytest.param(
+            {"type": "input_image"},
+            "openai",
+            "缺少 image_url 或 file_id",
+            id="input-image-missing-url-and-file-id",
+        ),
+        pytest.param(
+            {"type": "input_image", "image_url": _DATA_PNG, "image_pixel_limit": 5},
+            "ark",
+            r"image_pixel_limit 必须是对象",
+            id="input-image-pixel-limit-not-mapping",
+        ),
+        pytest.param(
+            {"type": "input_image", "image_url": _DATA_PNG, "prompt_cache_breakpoint": 1},
+            "ark",
+            "prompt_cache_breakpoint 不受 Ark",
+            id="input-image-pcb-on-ark",
+        ),
+        pytest.param(
+            {"type": "file", "file": 5},
+            "openai",
+            r"\.file 必须是字符串或对象",
+            id="file-not-str-or-object",
+        ),
+        pytest.param(
+            {"type": "file"},
+            "openai",
+            "缺少 file_id、file_data 或 file_url",
+            id="file-missing-all-three",
+        ),
+        pytest.param(
+            {"type": "file", "file_id": 5},
+            "openai",
+            r"\.file_id 必须是字符串",
+            id="file-id-not-string",
+        ),
+        pytest.param(
+            {"type": "file", "file_id": "f", "detail": "auto"},
+            "ark",
+            r"\.detail 不受 Ark",
+            id="file-detail-on-ark",
+        ),
+        pytest.param(
+            {"type": "file", "file_id": "f", "prompt_cache_breakpoint": 1},
+            "ark",
+            "prompt_cache_breakpoint 不受 Ark",
+            id="file-pcb-on-ark",
+        ),
+        pytest.param(
+            {"type": "input_file", "file_id": 5},
+            "openai",
+            r"\.file_id 必须是字符串",
+            id="input-file-id-not-string",
+        ),
+        pytest.param(
+            {"type": "input_file", "file_id": "f", "prompt_cache_breakpoint": 1},
+            "ark",
+            "prompt_cache_breakpoint 不受 Ark",
+            id="input-file-pcb-on-ark",
+        ),
+    ],
+)
+def test_responses_content_part_rejects_malformed_blocks(part, provider, expected):
+    """内容块形态非法时必须给带字段名的 ``ValueError``，不能静默接受或抛裸 ``TypeError``。"""
+    with pytest.raises(ValueError, match=expected):
+        _responses_content_part(part, "input[0]", provider=provider)
+
+
+@pytest.mark.parametrize(
+    ("part", "provider"),
+    [
+        pytest.param({"type": "text", "text": "hi"}, "openai", id="text"),
+        pytest.param(
+            {"type": "text", "text": "hi", "prompt_cache_breakpoint": True},
+            "openai",
+            id="text-pcb-openai",
+        ),
+        pytest.param(
+            {
+                "type": "input_audio",
+                "audio_url": "https://x/a.wav",
+                "chunking_strategy": {"size": 1},
+            },
+            "ark",
+            id="audio-chunking",
+        ),
+        pytest.param({"type": "input_video", "video_url": "https://x/v.mp4"}, "ark", id="video"),
+        pytest.param(
+            {"type": "image_url", "image_url": _DATA_PNG, "detail": "original"},
+            "openai",
+            id="image",
+        ),
+        pytest.param(
+            {"type": "image_url", "image_url": _DATA_PNG, "image_pixel_limit": {"min_pixels": 1}},
+            "ark",
+            id="image-pixel-limit-ark",
+        ),
+        pytest.param({"type": "input_image", "image_url": _DATA_PNG}, "openai", id="input-image"),
+        pytest.param({"type": "file", "file_id": "file-1"}, "openai", id="file"),
+        pytest.param(
+            {"type": "file", "file_url": "https://x/f.pdf", "detail": "high"},
+            "openai",
+            id="file-detail",
+        ),
+        pytest.param({"type": "input_file", "file_id": "file-1"}, "openai", id="input-file"),
+    ],
+)
+def test_responses_content_part_accepts_well_formed_blocks(part, provider):
+    """收紧不能误伤：各分支的合法内容块照常转换。"""
+    converted = _responses_content_part(dict(part), "input[0]", provider=provider)
+
+    assert converted["type"].startswith("input_")
+
+
+def test_responses_stream_delta_survives_unhashable_event_type():
+    """网关 SSE chunk 的 ``type`` 是 list 时不得抛 TypeError。
+
+    openai SDK 对未知顶层字段用 ``extra="allow"`` 原样保留，因此
+    ``{"type": ["error"]}`` 会以 list 形态到达 ``_stream_delta``。
+    """
+    chunk = SimpleNamespace(type=["error"], delta="")
+    assert OpenAICompatibleProvider._stream_delta(chunk) == ""
+
+
+# ── 回归：错误消息插值不得因超大整数改抛位数错误 ──
+#
+# ``f"{10**4300}"`` 抛 ``ValueError: Exceeds the limit (4300 digits)``。
+# 这些字段（``status``／``code``／``message``）来自网关 JSON，而 openai SDK 能
+# 解析出 4300 位的整数——于是「网关返回了业务错误」变成「整数转字符串超限」。
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        pytest.param("status", id="status"),
+        pytest.param("code", id="code"),
+        pytest.param("error_code", id="error_code"),
+        pytest.param("message", id="message"),
+    ],
+)
+def test_chat_response_error_message_survives_huge_integer_field(field_name):
+    response = SimpleNamespace(choices=None, **{field_name: 10**4300})
+    with pytest.raises(RuntimeError, match="Chat Completions"):
+        OpenAICompatibleProvider._raise_for_chat_response_error(response)
+
+
+def test_chat_response_error_status_still_compares_numerically():
+    """``status`` 仍须参与 ``>= 400`` 的数值比较，不能被收敛成空串。"""
+    response = SimpleNamespace(choices=None, status=503)
+    with pytest.raises(RuntimeError, match="status=503"):
+        OpenAICompatibleProvider._raise_for_chat_response_error(response)
+
+
+# ── 回归：Embedding ``options.dimensions`` 必须校验 ──
+#
+# 这个值从 ``config.toml`` 直达请求体，此前**完全没有校验**：``-1``／``0``／
+# ``"abc"``／``1.5``／``True`` 全部原样发给远端；``10**4301`` 在 ``json.dumps``
+# 编码请求体时才抛位数错误。项目里 ``_MAX_EMBEDDING_DIMENSION`` 早就是这个量
+# 的上界（``local_hash`` 与 ``embedding_service`` 都在用）。
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        pytest.param(-1, id="negative"),
+        pytest.param(0, id="zero"),
+        pytest.param(10**400, id="400digits-over-upper-bound"),
+        pytest.param(10**4301, id="4301digits-over-int-max-str-digits"),
+        pytest.param("abc", id="non-numeric-string"),
+        pytest.param(1.5, id="float"),
+        pytest.param(True, id="bool"),
+    ],
+)
+def test_embedding_dimensions_option_is_validated(bad_value):
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._options = {"dimensions": bad_value}
+    provider._provider = "openai"
+    with pytest.raises(ValueError, match="dimensions"):
+        provider._embedding_options()
+
+
+def test_embedding_dimensions_option_accepts_valid_value():
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._options = {"dimensions": 1536}
+    provider._provider = "openai"
+    assert provider._embedding_options()["dimensions"] == 1536
+
+
+# ── 回归：Google 整数型生成参数必须校验 ──
+#
+# 此前只做键名白名单，取值原样透传给 ``types.GenerateContentConfig``：实测
+# ``options.max_output_tokens = 10**400`` 时构造与调用都成功，请求体里就带着
+# 那个 401 位整数发给服务端（MockTransport 抓包确认）；``candidate_count``
+# 的 ``-1``／``0`` 同样静默通过。
+
+
+@pytest.mark.parametrize("field_name", ["max_output_tokens", "candidate_count"])
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        pytest.param(-1, id="negative"),
+        pytest.param(0, id="zero"),
+        pytest.param(10**400, id="400digits-over-upper-bound"),
+        pytest.param(10**4301, id="4301digits-over-int-max-str-digits"),
+        pytest.param(1.5, id="float"),
+        pytest.param(True, id="bool"),
+    ],
+)
+def test_google_generation_options_are_validated(field_name, bad_value):
+    provider = object.__new__(GoogleProvider)
+    provider._options = {field_name: bad_value}
+    with pytest.raises(ValueError, match=field_name):
+        provider._generation_options()
+
+
+def test_google_generation_options_accept_valid_values():
+    provider = object.__new__(GoogleProvider)
+    provider._options = {"max_output_tokens": 4096, "candidate_count": 1}
+    values = provider._generation_options()
+    assert values == {"max_output_tokens": 4096, "candidate_count": 1}
+
+
+# ── 回归：Ark Classification 的动态资源路径必须与 Facade 同约束 ──
+#
+# AGENTS.md 要求 Ark Classification 资源「需通过显式 Facade/入口调用，不能把
+# 缺少资源挂载静默当成成功」。Facade 侧做对了（``_get_classification_resource``
+# 在 SDK 未挂载时抛带指引的 ``NotImplementedError``），但动态路径
+# ``resources.classification.create(...)`` 既不过 Facade、也不做参数白名单，
+# 实测 ``恶意字段=1`` 一路放行，最终拿到 SDK 内部的
+# ``AttributeError: 'Ark' object has no attribute 'classification'``。
+
+
+def _ark_provider_with_classification_resource():
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "ark-model"
+    provider._options = {}
+    provider._classification_resource = SimpleNamespace(create=lambda **kwargs: kwargs)
+    provider._get_client = lambda: SimpleNamespace()
+    return provider
+
+
+def test_ark_classification_dynamic_path_shares_facade_kwargs_whitelist():
+    provider = _ark_provider_with_classification_resource()
+    with pytest.raises(ValueError, match="Classification"):
+        provider._require_provider_resource(
+            "volcengine.classification.create",
+            {"unknown": 1},
+        )
+
+
+def test_ark_classification_dynamic_path_accepts_facade_supported_kwargs():
+    provider = _ark_provider_with_classification_resource()
+    # 不抛错即通过；具体资源可用性由 SDK 决定，本测试只固定「不受门禁误伤」。
+    provider._require_provider_resource(
+        "volcengine.classification.create",
+        {"user": "u1"},
+    )
+
+
+# ── 回归：诊断入口对形态异常的参数必须给可读消息，而不是裸的整数转换错误 ──
+#
+# ``protocol_status`` 与 ``capability_report`` 是公开的诊断 API（配置界面与
+# 排障工具会调），参数来自调用方而非 ``Settings``——``ModelDetail.protocol``
+# 有 validator，但这两个入口收的是**裸字符串**，没有任何校验。
+#
+# 两处都把取值直接喂给 ``str(...).strip().lower()`` 做协议名归一化：
+# ``10**4301`` 撞上 CPython 的整数位数上限，抛的是
+# ``ValueError: Exceeds the limit (4300 digits) for integer string conversion``
+# ——既没有「哪个参数错了」，也没有「可选值是什么」，用户拿到的是与协议诊断
+# 毫无关系的整数转换错误。同一文件的其它入口（``_normalize_verified_protocols``
+# 的非字符串分支）早已给出带指引的消息，这里补齐一致性。
+#
+# ``server_verified_protocols`` 里的取值同理：它是 ``options`` 里的任意值，
+# 而 ``validate_secret_free_options`` 只查敏感键名、不做类型校验。
+# 用显式 id：pytest 默认把参数值 ``str()`` 成用例 id，而 ``10**4301`` 在
+# 收集期就会抛 ``ValueError``，整个文件无法导入。
+@pytest.mark.parametrize(
+    "hostile_protocol",
+    [
+        pytest.param(10**4301, id="huge-int-4301"),
+        pytest.param(10**4000, id="huge-int-4000"),
+        pytest.param(None, id="none"),
+        pytest.param(["responses"], id="list"),
+    ],
+)
+def test_protocol_status_rejects_malformed_protocol_with_a_readable_message(hostile_protocol):
+    with pytest.raises(ValueError) as excinfo:
+        ModelProviderFactory.protocol_status("openai", hostile_protocol)
+
+    message = str(excinfo.value)
+    # 只断言「抛 ValueError」不够：未修复的实现抛的也是 ValueError（整数转换
+    # 错误），必须断言消息指向**参数名**。用参数名而不是「协议」二字，是因为
+    # 诊断入口的调用方要靠它定位自己传错了哪个实参。
+    assert "protocol" in message
+    assert "必须是字符串" in message
+
+
+@pytest.mark.parametrize(
+    "hostile_value",
+    [
+        pytest.param(10**4301, id="huge-int-4301"),
+        pytest.param(10**4000, id="huge-int-4000"),
+    ],
+)
+def test_protocol_status_rejects_malformed_verified_entry_with_a_readable_message(hostile_value):
+    with pytest.raises(ValueError) as excinfo:
+        ModelProviderFactory.protocol_status(
+            "openai",
+            "responses",
+            options={"server_verified_protocols": [hostile_value]},
+        )
+
+    message = str(excinfo.value)
+    assert "server_verified_protocols" in message
+    assert "必须是字符串" in message
+    # 关键区分：未修复的实现抛的是 CPython 的整数转换错误，用户拿不到任何
+    # 「哪个参数错了」的线索。断言消息里**不出现**那段原始文本。
+    assert "Exceeds the limit" not in message
+
+
+def test_protocol_status_still_accepts_valid_protocols_after_the_guard():
+    """反向守卫：收紧不得误伤正常取值与别名。"""
+    assert ModelProviderFactory.protocol_status("openai", "responses") == {
+        "adapter_supported": True,
+        "server_verified": False,
+    }
+    assert ModelProviderFactory.protocol_status("openai", "  RESPONSES  ") == (
+        ModelProviderFactory.protocol_status("openai", "responses")
+    )
+
+
+# ── 回归：协议名归一化的另外三处同样不能抛裸的整数转换错误 ──
+#
+# 与 ``factory`` 那两处同一根因：把取值直接喂给 ``str(...).strip().lower()``，
+# ``10**4301`` 撞上 CPython 的整数位数上限，抛的是与「协议名不支持」毫无关系的
+# ``ValueError: Exceeds the limit``。三处都可达（前两处经公开构造器，第三处经
+# ``_normalize_responses_native_item`` 的入口分流）。
+@pytest.mark.parametrize(
+    "hostile_protocol",
+    [
+        pytest.param(10**4301, id="huge-int-4301"),
+        pytest.param(None, id="none"),
+        pytest.param(["responses"], id="list"),
+    ],
+)
+def test_openai_compatible_normalize_protocol_rejects_non_string(hostile_protocol):
+    from src.providers.openai_compatible import OpenAICompatibleProvider
+
+    with pytest.raises(ValueError) as excinfo:
+        OpenAICompatibleProvider._normalize_protocol(hostile_protocol)
+
+    message = str(excinfo.value)
+    assert "必须是字符串" in message
+    assert "Exceeds the limit" not in message
+    # 诊断入口要给出可选值，否则用户只知道「传错了」。
+    assert "chat_completions" in message
+
+
+@pytest.mark.parametrize(
+    "hostile_protocol",
+    [
+        pytest.param(10**4301, id="huge-int-4301"),
+        pytest.param(None, id="none"),
+        pytest.param(["responses"], id="list"),
+    ],
+)
+def test_volcengine_rejects_non_string_protocol(hostile_protocol):
+    from src.providers.volcengine import VolcengineProvider
+
+    with pytest.raises(ValueError) as excinfo:
+        VolcengineProvider(model_name="demo", protocol=hostile_protocol)
+
+    message = str(excinfo.value)
+    assert "必须是字符串" in message
+    assert "Exceeds the limit" not in message
+
+
+def test_responses_provider_variant_falls_back_instead_of_raising():
+    """纯分流判断不该抛错：非字符串一律走 openai 变体。
+
+    它抛在 ``_normalize_responses_native_item`` 的入口，会把本该给出的
+    「字段类型不对」消息换成一条与协议无关的整数转换错误。
+    """
+    from src.providers.__base__.model_provider import _responses_provider_variant
+
+    for hostile in (10**4301, None, ["ark"], 42):
+        assert _responses_provider_variant(hostile) == "openai"
+    # 反向守卫：正常取值仍要正确分流。
+    assert _responses_provider_variant("ark") == "ark"
+    assert _responses_provider_variant("volcengine") == "ark"
+    assert _responses_provider_variant("  ARK  ") == "ark"
+    assert _responses_provider_variant("openai") == "openai"
+
+
+# ── 回归：``normalize_messages`` 的 prompt / system_prompt 形态 ──
+#
+# 本函数是四个 provider 公共 ``invoke`` 的**统一请求边界**（``google.py:1497``、
+# ``anthropic.py:834/1746/…``、``openai_compatible.py:1024``、``volcengine.py:1001``
+# 都调它）。``messages`` 那条分支有完整判据（非序列、非 Mapping 条目都给
+# ``ValueError``），而 ``prompt``／``system_prompt`` 这一半**完全没有**：
+#
+#   * ``prompt=5``／``["a"]`` 静默生成 ``{"role": "user", "content": 5}``，非字符串
+#     字面量被当成真实用户输入发给模型（与 ``ChatService._build_prompt`` 钉住的
+#     ``用户问题: None`` 是同一形态）；
+#   * ``prompt=10**4301`` 在 ``str(prompt).strip()`` 处抛 ``ValueError: Exceeds the
+#     limit``——消息与「请求内容写错了」无关，而 provider 的错误分类按
+#     ``ValueError``／``RuntimeError`` 写；
+#   * ``system_prompt`` 同理：非字符串直接进 ``content``，位数超限的整数在
+#     ``normalize_responses_input`` 的日志插值处炸。
+#
+# 可达路径：``invoke``／``ainvoke`` 是公开方法，参数一路透传到 ``normalize_messages``；
+# 本仓测试就有 ``ainvoke("hello", system_prompt=None, stream=False)`` 这类直调。
+
+
+@pytest.mark.parametrize(
+    "hostile_prompt",
+    [
+        pytest.param(10**4301, id="huge-int"),
+        pytest.param(5, id="int"),
+        pytest.param(["a"], id="list"),
+    ],
+)
+def test_normalize_messages_rejects_non_string_prompt_readably(hostile_prompt):
+    """非字符串 ``prompt`` 必须给带指引的 ``ValueError``，不是静默进 content 或裸整数转换错。"""
+    with pytest.raises(ValueError) as excinfo:
+        normalize_messages(hostile_prompt, None, None)
+
+    message = str(excinfo.value)
+    assert "Exceeds the limit" not in message, message
+    assert "prompt" in message
+
+
+@pytest.mark.parametrize(
+    "hostile_system",
+    [
+        pytest.param(10**4301, id="huge-int"),
+        pytest.param(5, id="int"),
+        pytest.param(["a"], id="list"),
+    ],
+)
+def test_normalize_messages_rejects_non_string_system_prompt_readably(hostile_system):
+    """非字符串 ``system_prompt`` 同样必须被拒绝，而不是进 ``content``。"""
+    with pytest.raises(ValueError) as excinfo:
+        normalize_messages("hi", hostile_system, None)
+
+    message = str(excinfo.value)
+    assert "Exceeds the limit" not in message, message
+    assert "system_prompt" in message
+
+
+def test_normalize_messages_still_accepts_string_prompt_and_system_prompt():
+    """收紧不能误伤：字符串 prompt／system_prompt 照常构造消息。"""
+    normalized = normalize_messages("北京天气", "你是助手", None)
+
+    assert normalized == [
+        {"role": "system", "content": "你是助手"},
+        {"role": "user", "content": "北京天气"},
+    ]
+
+
+# ── 回归：Responses background 轮询超时消息的 id 形态 ──
+#
+# ``_poll_background_response``／``_poll_background_response_async`` 在超时分支
+# 里用裸 f-string 插值 ``response_id``（``f"...响应 {response_id} 在 {timeout:g}s
+# 内未完成。"``）。``response_id`` 来自网关 JSON 的 ``id`` 字段，形态不受控：
+# ``10**4301`` 让 f-string 抛 ``ValueError: Exceeds the limit``——**正要报告超时**
+# 的那一步变成整数转换错误，而调用方按 ``TimeoutError``／``RuntimeError`` 分类。
+# 判据与同文件 ``_error_message``／``_extract_refusal`` 一致（字符串原样，其余走
+# ``safe_repr``）。
+
+
+def _background_poll_provider():
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._provider = "demo"
+    provider._options = {}
+    provider._background_poll_config = lambda: (0.0, 0.0)
+    provider._response_retrieve_kwargs = lambda params: {}
+    return provider
+
+
+@pytest.mark.parametrize(
+    "hostile_id",
+    [pytest.param(10**4301, id="huge-int"), pytest.param(["a"], id="list")],
+)
+def test_responses_background_timeout_reports_malformed_id_readably(hostile_id):
+    """超时消息不得因非字符串 ``id`` 抛裸异常。"""
+    provider = _background_poll_provider()
+    response = {"status": "queued", "id": hostile_id}
+
+    with pytest.raises(TimeoutError) as excinfo:
+        provider._poll_background_response(response, {})
+
+    assert "Exceeds the limit" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "hostile_id",
+    [pytest.param(10**4301, id="huge-int"), pytest.param(["a"], id="list")],
+)
+def test_responses_background_timeout_reports_malformed_id_readably_async(hostile_id):
+    """异步分支同判据。"""
+    provider = _background_poll_provider()
+    response = {"status": "queued", "id": hostile_id}
+
+    with pytest.raises(TimeoutError) as excinfo:
+        asyncio.run(provider._poll_background_response_async(response, {}))
+
+    assert "Exceeds the limit" not in str(excinfo.value)
+
+
+def test_responses_background_timeout_still_reports_string_id():
+    """收紧不能误伤：字符串 id 仍原样出现在消息里。"""
+    provider = _background_poll_provider()
+    response = {"status": "queued", "id": "resp_abc"}
+
+    with pytest.raises(TimeoutError) as excinfo:
+        provider._poll_background_response(response, {})
+
+    assert "resp_abc" in str(excinfo.value)
+
+
+# ── 流终止与拒答守卫 ──
+#
+# ``OpenAICompatibleProvider`` 与 ``VolcengineProvider`` 各自有四条「流在终结事件
+# 之前结束」与四条「返回拒答」守卫，分布在 ``invoke``／``ainvoke``（纯文本生成）
+# 与 ``stream_events``／``astream_events``（结构化事件）两套入口上，合计 30 条。
+# 这些判据在整套测试里从未执行（`sys.settrace` 行覆盖证实）；把它们的 ``raise``
+# 换成 ``pass`` 后全量 3361 条仍然全绿——既有用例只钉住 Responses 异步流的一条
+# 拒 delta 收敛（``test_openai_responses_async_streaming_refusal_delta_is_coerced``）。
+#
+# 删除后的后果分两类（实测，均经公开入口）：
+# * **流提前结束**：静默正常返回 ``["hi"]``（invoke 侧）或一串 ``StreamEvent``
+#   （stream_events 侧）。调用方无法区分「模型答完了」与「连接断了」，半截答案
+#   当成完整答案进入对话历史；
+# * **拒答**：非流式静默返回空列表，流式退化成相邻的「流提前结束」消息——把
+#   「模型明确拒绝回答」说成「流断了」，两者需要完全不同的处置。
+PROVIDER_STREAM_MATRIX = [
+    (OpenAICompatibleProvider, "responses", "responses"),
+    (OpenAICompatibleProvider, "chat_completions", "chat"),
+    (VolcengineProvider, "responses", "responses"),
+    (VolcengineProvider, "chat_completions", "chat"),
+]
+
+_RESPONSES_REFUSAL_BODY = {
+    "id": "r1",
+    "status": "completed",
+    "output": [{"type": "message", "role": "assistant", "refusal": "no", "content": []}],
+}
+# Ark 的 ``_extract_result`` 只认 ``output[].type == "refusal"``，与 OpenAI 侧的
+# ``output[].refusal`` 字段形态不同（见两处 ``_extract_result`` 的对比）。
+_ARK_REFUSAL_BODY = {
+    "id": "r1",
+    "status": "completed",
+    "output": [{"type": "refusal", "refusal": "no"}],
+}
+_RESPONSES_TEXT_BODY = {
+    "id": "r1",
+    "status": "completed",
+    "output": [
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "hi"}],
+        }
+    ],
+}
+_RESPONSES_REFUSAL_EVENT = {
+    "type": "response.refusal.delta",
+    "item_id": "i1",
+    "output_index": 0,
+    "delta": "no",
+}
+_RESPONSES_TEXT_EVENT = {
+    "type": "response.output_text.delta",
+    "item_id": "i1",
+    "output_index": 0,
+    "delta": "hi",
+}
+_RESPONSES_DONE_EVENT = {"type": "response.completed", "response": {"id": "r1"}}
+_CHAT_REFUSAL_BODY = {
+    "id": "c1",
+    "object": "chat.completion",
+    "choices": [
+        {
+            "index": 0,
+            "finish_reason": "content_filter",
+            "message": {"role": "assistant", "refusal": "no"},
+        }
+    ],
+}
+_CHAT_REFUSAL_CHUNK = {
+    "id": "c1",
+    "object": "chat.completion.chunk",
+    "choices": [{"index": 0, "delta": {"refusal": "no"}}],
+}
+_CHAT_TEXT_CHUNK = {
+    "id": "c1",
+    "object": "chat.completion.chunk",
+    "choices": [{"index": 0, "delta": {"content": "hi"}}],
+}
+_CHAT_FINISH_CHUNK = {
+    "id": "c1",
+    "object": "chat.completion.chunk",
+    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+}
+
+
+def _sync_iterator(items):
+    return iter(items)
+
+
+def _async_iterator(items):
+    async def gen():
+        for item in items:
+            yield item
+
+    return gen()
+
+
+def _stream_client(payload, kind, *, is_async):
+    """构造只区分 ``stream=`` 的假 SDK 客户端。
+
+    非流式调用返回响应对象本身、流式调用返回迭代器——两者不能混，否则
+    ``_raise_for_*`` 会拿到迭代器并把「响应缺字段」误报成非法响应。
+    """
+
+    def create(**kwargs):
+        if kwargs.get("stream"):
+            return _async_iterator(payload) if is_async else _sync_iterator(payload)
+        return payload[0]
+
+    if kind == "responses":
+        return SimpleNamespace(responses=SimpleNamespace(create=create))
+    return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+
+
+def _stream_provider(provider_type, protocol, kind, payload, *, is_async):
+    provider = object.__new__(provider_type)
+    provider._model_name = "demo"
+    provider._provider = "demo"
+    provider._protocol = protocol
+    provider._options = {"server_verified_protocols": ["responses", "chat_completions"]}
+    provider._server_verified_protocols = frozenset({"responses", "chat_completions"})
+    client = _stream_client(payload, kind, is_async=is_async)
+    if is_async:
+        provider._get_aclient = lambda: client
+    else:
+        provider._get_client = lambda: client
+    return provider
+
+
+def _refusal_body(provider_type, kind):
+    if kind != "responses":
+        return _CHAT_REFUSAL_BODY
+    if provider_type is VolcengineProvider:
+        return _ARK_REFUSAL_BODY
+    return _RESPONSES_REFUSAL_BODY
+
+
+def _unterminated_payload(kind):
+    if kind == "responses":
+        return [_RESPONSES_TEXT_EVENT]
+    return [_CHAT_TEXT_CHUNK]
+
+
+def _terminated_payload(kind):
+    if kind == "responses":
+        return [_RESPONSES_TEXT_EVENT, _RESPONSES_DONE_EVENT]
+    return [_CHAT_TEXT_CHUNK, _CHAT_FINISH_CHUNK]
+
+
+@pytest.mark.parametrize(
+    ("provider_type", "protocol", "kind"),
+    PROVIDER_STREAM_MATRIX,
+    ids=lambda value: value if isinstance(value, str) else value.__name__,
+)
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+def test_streaming_refusal_is_explicit(provider_type, protocol, kind, async_mode):
+    """拒答必须报成「返回拒答」，不能退化成「流提前结束」或静默返回空。
+
+    删除流式拒答守卫后，收场从「返回拒答: no」变成「流在 … 之前结束」——把
+    模型明确拒绝回答说成连接中断，两者需要完全不同的处置；删除非流式守卫后
+    则**静默返回空列表**，调用方把「拒答」当成「模型没话说」。
+    """
+    if kind == "responses":
+        payload = [_RESPONSES_REFUSAL_EVENT]
+    else:
+        payload = [_CHAT_REFUSAL_CHUNK]
+    provider = _stream_provider(provider_type, protocol, kind, payload, is_async=async_mode)
+
+    if async_mode:
+
+        async def run():
+            return [x async for x in provider.ainvoke(prompt="hi", stream=True)]
+
+        with pytest.raises(RuntimeError, match="返回拒答"):
+            asyncio.run(run())
+    else:
+        with pytest.raises(RuntimeError, match="返回拒答"):
+            list(provider.invoke(prompt="hi", stream=True))
+
+
+@pytest.mark.parametrize(
+    ("provider_type", "protocol", "kind"),
+    PROVIDER_STREAM_MATRIX,
+    ids=lambda value: value if isinstance(value, str) else value.__name__,
+)
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+def test_non_streaming_refusal_is_explicit(provider_type, protocol, kind, async_mode):
+    """非流式拒答同样必须显式报错。
+
+    删除后实测静默返回 ``[]``——一次明确的拒答变成「模型没有输出」。
+    """
+    payload = [_refusal_body(provider_type, kind)]
+    provider = _stream_provider(provider_type, protocol, kind, payload, is_async=async_mode)
+
+    if async_mode:
+
+        async def run():
+            return [x async for x in provider.ainvoke(prompt="hi", stream=False)]
+
+        with pytest.raises(RuntimeError, match="返回拒答"):
+            asyncio.run(run())
+    else:
+        with pytest.raises(RuntimeError, match="返回拒答"):
+            list(provider.invoke(prompt="hi", stream=False))
+
+
+@pytest.mark.parametrize(
+    ("provider_type", "protocol", "kind"),
+    PROVIDER_STREAM_MATRIX,
+    ids=lambda value: value if isinstance(value, str) else value.__name__,
+)
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+def test_streaming_without_terminal_event_is_explicit(provider_type, protocol, kind, async_mode):
+    """流在终结事件之前结束必须报错，不能静默交付半截答案。
+
+    删除后实测静默返回 ``["hi"]``：调用方无法区分「模型答完了」与「连接断了」。
+    """
+    provider = _stream_provider(
+        provider_type, protocol, kind, _unterminated_payload(kind), is_async=async_mode
+    )
+
+    if async_mode:
+
+        async def run():
+            return [x async for x in provider.ainvoke(prompt="hi", stream=True)]
+
+        with pytest.raises(RuntimeError, match="之前结束"):
+            asyncio.run(run())
+    else:
+        with pytest.raises(RuntimeError, match="之前结束"):
+            list(provider.invoke(prompt="hi", stream=True))
+
+
+@pytest.mark.parametrize(
+    ("provider_type", "protocol", "kind"),
+    PROVIDER_STREAM_MATRIX,
+    ids=lambda value: value if isinstance(value, str) else value.__name__,
+)
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+def test_stream_events_requires_terminal_event(provider_type, protocol, kind, async_mode):
+    """``stream_events``／``astream_events`` 是另一套实现，终止判据同样要生效。
+
+    删除后实测静默产出一串 ``StreamEvent``——结构化事件流的调用方连「流是否
+    完整」都无从判断，而它们正是靠这条区分「完整事件」与「半截事件」。
+    """
+    provider = _stream_provider(
+        provider_type, protocol, kind, _unterminated_payload(kind), is_async=async_mode
+    )
+
+    if async_mode:
+
+        async def run():
+            return [x async for x in provider.astream_events(prompt="hi")]
+
+        with pytest.raises(RuntimeError, match="之前结束"):
+            asyncio.run(run())
+    else:
+        with pytest.raises(RuntimeError, match="之前结束"):
+            list(provider.stream_events(prompt="hi"))
+
+
+@pytest.mark.parametrize(
+    ("provider_type", "protocol", "kind"),
+    PROVIDER_STREAM_MATRIX,
+    ids=lambda value: value if isinstance(value, str) else value.__name__,
+)
+def test_terminated_stream_still_yields_content(provider_type, protocol, kind):
+    """反向守卫：带终结事件的正常流照常产出内容与 finish 事件。"""
+    provider = _stream_provider(
+        provider_type, protocol, kind, _terminated_payload(kind), is_async=False
+    )
+
+    events = list(provider.stream_events(prompt="hi"))
+
+    assert any(event.type == "finish" for event in events)
+
+
+# ── 消息归一化的形态判据 ──
+#
+# ``normalize_chat_messages``／``normalize_messages``／``normalize_responses_input``
+# 是四个 provider 公共的**统一请求边界**，上面六条形态判据在整套测试里从未执行
+# （行覆盖证实；把它们的 ``raise`` 换成 ``pass`` 后全量 3405 条仍全绿）。既有用例
+# 覆盖的是元素**内部**字段（缺 id、缺 name、非法 arguments），这几条**形态**判据
+# 全绕开了。删除后行为确实改变（实测）：
+# * 消息元素非对象 → 整数抛裸 ``TypeError: 'int' object is not iterable``、字符串抛
+#   ``dictionary update sequence element #0 has length 1``；
+# * ``tool_calls`` 非序列 → 裸 ``TypeError``，或对字符串退化成元素级错误消息；
+# * ``messages`` 非序列 → 裸 ``TypeError``（字符串则退化成元素级消息）；
+# * ``prompt`` 为空／全空白 → **静默接受**，产出 ``{"role": "user", "content": None}``
+#   或全空白内容发给模型；
+# * Responses ``content`` 非序列 → 裸 ``TypeError``；
+# * ``role="function"`` → **静默接受**，产出一个没有 ``tool_call_id`` 的 function
+#   消息，Responses 无法把它关联回任何调用。
+
+
+@pytest.mark.parametrize("bad_message", [5, "oops", ["x"]], ids=["int", "str", "list"])
+def test_chat_messages_reject_non_mapping_entries(bad_message):
+    """``messages`` 的元素必须是对象。"""
+    with pytest.raises(ValueError, match=r"messages\[0\] 必须是对象"):
+        normalize_chat_messages([bad_message])
+
+
+@pytest.mark.parametrize("bad_tool_calls", [5, "abc", {"a": 1}], ids=["int", "str", "dict"])
+def test_chat_messages_reject_non_sequence_tool_calls(bad_tool_calls):
+    """``tool_calls`` 必须是序列；字符串虽可迭代但语义不同，须显式排除。"""
+    with pytest.raises(ValueError, match=r"tool_calls 必须是序列"):
+        normalize_chat_messages(
+            [{"role": "assistant", "content": "", "tool_calls": bad_tool_calls}]
+        )
+
+
+@pytest.mark.parametrize("bad_messages", [5, "abc", {"a": 1}], ids=["int", "str", "dict"])
+def test_normalize_messages_rejects_non_sequence_container(bad_messages):
+    """``messages`` 容器本身必须是序列，不能是字符串或映射。"""
+    with pytest.raises(ValueError, match="messages 必须是消息对象序列"):
+        normalize_messages(None, None, bad_messages)
+
+
+@pytest.mark.parametrize("prompt", [None, "", "   "], ids=["none", "empty", "blank"])
+def test_normalize_messages_requires_prompt_or_messages(prompt):
+    """既没有 ``messages`` 也没有非空 ``prompt`` 时必须报错。
+
+    删除守卫后实测产出 ``{"role": "user", "content": None}``（或全空白内容）并
+    发给模型——一次「请求内容为空」的配置错误变成真实提问。
+    """
+    with pytest.raises(ValueError, match="必须提供 prompt 或 messages"):
+        normalize_messages(prompt, None, None)
+
+
+@pytest.mark.parametrize("bad_content", [5, {"a": 1}, object()], ids=["int", "dict", "object"])
+def test_responses_input_rejects_non_sequence_content(bad_content):
+    """Responses 消息的 ``content`` 必须是字符串或内容块序列。"""
+    with pytest.raises(ValueError, match="content 必须是字符串或内容块序列"):
+        normalize_responses_input(None, None, [{"role": "user", "content": bad_content}])
+
+
+@pytest.mark.parametrize("bad_content", [5, {"a": 1}], ids=["int", "dict"])
+def test_responses_input_rejects_invalid_assistant_content_alongside_tool_calls(bad_content):
+    """带 ``tool_calls`` 的 assistant 消息，其「有值但非法」的 ``content`` 必须显式报错。
+
+    ``_responses_has_content`` 末行 ``return True`` 反向成 ``False`` 后实测：
+    int/dict 这类非 ``None``、非字符串、非序列的 content 被判为「无内容」而整段
+    丢弃，只剩 ``function_call`` 发给服务端——助手文本无声消失。既有
+    ``test_responses_input_rejects_non_sequence_content`` 只走 ``role="user"``
+    路径（另一处守卫），从未触发这里。
+    """
+    with pytest.raises(ValueError, match="content 必须是字符串或内容块序列"):
+        normalize_responses_input(
+            None,
+            None,
+            [
+                {
+                    "role": "assistant",
+                    "content": bad_content,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "f", "arguments": "{}"},
+                        }
+                    ],
+                }
+            ],
+        )
+
+
+def test_responses_input_rejects_function_role_without_tool_call_id():
+    """``role="function"`` 的消息必须带 ``tool_call_id``。
+
+    删除守卫后实测静默接受，产出没有 ``tool_call_id`` 的 function 消息——
+    Responses 侧无法把它关联回任何一次函数调用。
+    """
+    with pytest.raises(ValueError, match="function 消息缺少 tool_call_id"):
+        normalize_responses_input(None, None, [{"role": "function", "name": "f"}])
+
+
+def test_normalization_still_accepts_well_formed_messages():
+    """反向守卫：合法消息形态照常归一，不受上述收紧影响。"""
+    chat = normalize_chat_messages(
+        [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}]
+    )
+    assert [message["role"] for message in chat] == ["user", "assistant"]
+
+    responses = normalize_responses_input(
+        None, None, [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+    )
+    assert responses[0]["role"] == "user"
+
+    assert normalize_messages("hi", None, None) == [{"role": "user", "content": "hi"}]
+
+
+# ── Ark Chat／Embedding／Classification 的形态判据 ──
+#
+# 六条判据在整套测试里从未执行（行覆盖证实；把它们的 ``raise`` 换成 ``pass`` 后
+# 全量 3434 条仍全绿）。删除后行为确实改变（实测，均经公开入口）：
+# * 1027 ``max_tokens`` 与 ``max_completion_tokens`` 同时出现在模型 options →
+#   **静默接受**，只有 ``max_tokens`` 进请求，另一处配置被无声丢弃；
+# * 1404 原生 Responses 调用缺 ``input``／``input=None`` → **静默接受**，
+#   请求不带 ``input`` 直接发给服务端；
+# * 1420 ``session`` 非对象 → 带字段名的 ``ValueError`` 变成裸 ``TypeError:
+#   'int' object is not iterable``（``dict(session)``）；
+# * 2249／2296 Embedding 的 ``embed_documents``／``aembed_documents`` 请求参数
+#   覆盖 ``input``／``model`` → 消息从「不允许覆盖请求字段」退化成
+#   ``require_text_list`` 抛的「不支持请求参数」，把「参数冲突」说成「不支持的
+#   参数」；
+# * 2978 ``async_classify`` 的 ``labels`` 形态判据 → 非列表抛裸 ``TypeError``、
+#   元素非字符串抛裸 ``AttributeError``。
+
+
+def test_ark_chat_rejects_conflicting_max_tokens_options():
+    """两处输出长度配置同时出现必须报错，不能静默只取其一。"""
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "doubao-model"
+    provider._protocol = "chat_completions"
+    provider._options = {"max_tokens": 10, "max_completion_tokens": 20}
+
+    with pytest.raises(ValueError, match="不能同时设置 max_tokens 和 max_completion_tokens"):
+        provider._build_chat_request(prompt="hi", stream=False)
+
+
+@pytest.mark.parametrize(
+    "params",
+    [{"model": "m"}, {"model": "m", "input": None}],
+    ids=["missing-input", "none-input"],
+)
+def test_ark_native_responses_requires_input(params):
+    """原生 Responses 调用缺 ``input`` 必须在请求前报错。"""
+    with pytest.raises(ValueError, match="创建需要 input"):
+        VolcengineProvider._validate_native_response_kwargs(params)
+
+
+def test_ark_native_responses_rejects_non_object_session():
+    """``session`` 非对象必须给出可读消息，不能漏出裸 ``TypeError``。"""
+    with pytest.raises(ValueError, match="session 必须是对象"):
+        VolcengineProvider._validate_native_response_kwargs(
+            {"model": "m", "input": "hi", "session": 5}
+        )
+
+
+def test_ark_native_responses_still_accepts_valid_session():
+    """反向守卫：合法 ``session`` 照常归一为 dict。"""
+    params = VolcengineProvider._validate_native_response_kwargs(
+        {"model": "m", "input": "hi", "session": {"a": 1}}
+    )
+
+    assert params["session"] == {"a": 1}
+
+
+def _ark_embedding_provider():
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "doubao-embedding"
+    provider._protocol = "chat_completions"
+    provider._options = {}
+    return provider
+
+
+@pytest.mark.parametrize("field", ["input", "model"])
+def test_ark_embedding_rejects_request_field_overrides(field):
+    """请求参数覆盖 ``input``／``model`` 必须报「不允许覆盖请求字段」。
+
+    删除守卫后消息退化成 ``require_text_list`` 的「不支持请求参数」——把参数
+    冲突说成参数不受支持，排查方向被带偏。
+    """
+    provider = _ark_embedding_provider()
+
+    with pytest.raises(ValueError, match="不允许覆盖请求字段"):
+        provider.embed_documents(["a"], **{field: ["b"] if field == "input" else "other"})
+
+
+@pytest.mark.parametrize("field", ["input", "model"])
+def test_ark_async_embedding_rejects_request_field_overrides(field):
+    """异步入口同判据（另一份实现）。"""
+    provider = _ark_embedding_provider()
+
+    async def run():
+        return await provider.aembed_documents(
+            ["a"], **{field: ["b"] if field == "input" else "other"}
+        )
+
+    with pytest.raises(ValueError, match="不允许覆盖请求字段"):
+        asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "labels",
+    [5, [], [5], ["  "], ["ok", None]],
+    ids=["int", "empty", "non-string-entry", "blank-entry", "none-entry"],
+)
+def test_ark_async_classify_rejects_malformed_labels(labels):
+    """异步 Classification 的 ``labels`` 必须是非空字符串列表。
+
+    删除守卫后实测非列表抛裸 ``TypeError: 'int' object is not iterable``、元素
+    非字符串抛裸 ``AttributeError: 'int' object has no attribute 'strip'``。
+    """
+    provider = _ark_embedding_provider()
+
+    async def run():
+        return await provider.async_classify(query="q", labels=labels)
+
+    with pytest.raises(ValueError, match="labels 必须是非空字符串列表"):
+        asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "labels",
+    [5, [], [5], ["  "]],
+    ids=["int", "empty", "non-string-entry", "blank-entry"],
+)
+def test_ark_sync_classify_rejects_malformed_labels(labels):
+    """同步 Classification 是另一份实现，同样要有判据（既有用例已覆盖，这里作对照）。"""
+    provider = _ark_embedding_provider()
+
+    with pytest.raises(ValueError, match="labels 必须是非空字符串列表"):
+        provider.classify(query="q", labels=labels)
+
+
+# ── Anthropic 流终止与 parse 必填参数的八条守卫 ──
+#
+# 这八条在整套测试里从未执行（行覆盖证实；把它们的 ``raise`` 换成 ``pass`` 后
+# 全量 3479 条仍全绿）。既有用例只钉住 ``beta_tool_runner`` **同步**侧的
+# ``compaction_control`` 与 ``output_format`` 在 create/stream 两条路径上的判据。
+# 删除后行为确实改变（实测）：
+# * 1175／1210 ``invoke``／``ainvoke`` 的流在 ``message_stop`` 之前结束 → **静默
+#   返回已收到的片段**（实测 ``["hi"]``），调用方无法区分「答完了」与「断了」；
+# * 1541／1634 ``stream_events``／``astream_events`` 同判据 → 静默产出一串
+#   ``StreamEvent``，结构化事件流的调用方连「流是否完整」都无从判断；
+# * 1663／2146 ``parse``／``async_parse`` 与 1815／2032 ``beta_parse``／
+#   ``async_beta_parse`` 缺 ``output_format`` → 消息从「必须提供 output_format」
+#   退化成 ``normalize_messages`` 的「聊天请求必须提供 prompt 或 messages」，
+#   把「缺少结构化输出」说成「缺少提问」，排查方向被带偏；
+# * 944 ``output_format`` 传字典 schema（流式路径）→ **静默接受**，把整个字典
+#   当作 Python 类型原样放进请求的 ``output_format``；
+# * 2124 ``async_beta_tool_runner`` 的 ``compaction_control``（异步侧是**另一处**）
+#   → 消息退化成 ``CompletionRequest.__init__() got an unexpected keyword``，
+#   既不提 Anthropic 也不提 compaction_control。
+
+_ANTHROPIC_TEXT_EVENT = {
+    "type": "content_block_delta",
+    "index": 0,
+    "delta": {"type": "text_delta", "text": "hi"},
+}
+_ANTHROPIC_STOP_EVENT = {"type": "message_stop"}
+
+
+class _AnthropicSyncStream:
+    def __init__(self, events):
+        self._events = events
+
+    def __iter__(self):
+        return iter(self._events)
+
+
+class _AnthropicAsyncStream:
+    def __init__(self, events):
+        self._events = events
+
+    def __aiter__(self):
+        async def gen():
+            for event in self._events:
+                yield event
+
+        return gen()
+
+
+def _anthropic_stream_provider(events, *, is_async):
+    provider = object.__new__(AnthropicProvider)
+    provider._model_name = "claude-fable-5"
+    provider._options = {}
+    provider._provider = "anthropic"
+
+    class SyncContext:
+        def __enter__(self):
+            return _AnthropicSyncStream(events)
+
+        def __exit__(self, *exc):
+            return False
+
+    class AsyncContext:
+        async def __aenter__(self):
+            return _AnthropicAsyncStream(events)
+
+        async def __aexit__(self, *exc):
+            return False
+
+    if is_async:
+
+        class Messages:
+            @staticmethod
+            def stream(**_kwargs):
+                return AsyncContext()
+
+        client = SimpleNamespace(aio=SimpleNamespace(messages=Messages()), messages=Messages())
+    else:
+
+        class Messages:
+            @staticmethod
+            def stream(**_kwargs):
+                return SyncContext()
+
+        client = SimpleNamespace(messages=Messages())
+
+    provider._get_client = lambda: client
+    provider._get_aclient = lambda: client
+    return provider
+
+
+def _anthropic_invoke_text(events, *, is_async):
+    # ``_iter_invoke_stream_text``／``_aiter_invoke_stream_text`` 是 classmethod，
+    # 直接消费响应流，不经过 provider 实例。
+    response = _AnthropicAsyncStream(events) if is_async else _AnthropicSyncStream(events)
+    if is_async:
+
+        async def run():
+            return [item async for item in AnthropicProvider._aiter_invoke_stream_text(response)]
+
+        return asyncio.run(run())
+    return list(AnthropicProvider._iter_invoke_stream_text(response))
+
+
+def _anthropic_stream_events(events, *, is_async):
+    provider = _anthropic_stream_provider(events, is_async=is_async)
+    if is_async:
+
+        async def run():
+            return [item async for item in provider.astream_events(prompt="hi")]
+
+        return asyncio.run(run())
+    return list(provider.stream_events(prompt="hi"))
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_anthropic_invoke_stream_requires_message_stop(is_async):
+    """``invoke`` 的文本流必须在 ``message_stop`` 之后才算完整。
+
+    删除守卫后实测静默返回已收到的片段——半截答案当成完整答案交给调用方。
+    """
+    with pytest.raises(RuntimeError, match="message_stop 之前结束"):
+        _anthropic_invoke_text([_ANTHROPIC_TEXT_EVENT], is_async=is_async)
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_anthropic_stream_events_requires_message_stop(is_async):
+    """``stream_events`` 是另一套实现，终止判据同样要生效。"""
+    with pytest.raises(RuntimeError, match="message_stop 之前结束"):
+        _anthropic_stream_events([_ANTHROPIC_TEXT_EVENT], is_async=is_async)
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_anthropic_invoke_stream_still_yields_text_when_stopped(is_async):
+    """反向守卫：带 ``message_stop`` 的正常流照常产出全部文本。"""
+    assert _anthropic_invoke_text(
+        [_ANTHROPIC_TEXT_EVENT, _ANTHROPIC_STOP_EVENT], is_async=is_async
+    ) == ["hi"]
+
+
+def _anthropic_parse_provider():
+    provider = object.__new__(AnthropicProvider)
+    provider._model_name = "claude-fable-5"
+    provider._options = {}
+    provider._provider = "anthropic"
+    return provider
+
+
+@pytest.mark.parametrize(
+    ("method", "message"),
+    [
+        ("parse", "Anthropic parse 必须提供 output_format"),
+        ("beta_parse", "Anthropic Beta parse 必须提供 output_format"),
+    ],
+)
+def test_anthropic_parse_requires_output_format(method, message):
+    """同步两个 parse 入口缺 ``output_format`` 必须给专属消息。"""
+    provider = _anthropic_parse_provider()
+
+    with pytest.raises(ValueError, match=message):
+        getattr(provider, method)(None)
+
+
+@pytest.mark.parametrize(
+    ("method", "message"),
+    [
+        ("async_parse", "Anthropic parse 必须提供 output_format"),
+        ("async_beta_parse", "Anthropic Beta parse 必须提供 output_format"),
+    ],
+)
+def test_anthropic_async_parse_requires_output_format(method, message):
+    """异步两个 parse 入口是**另一份**实现，同样要有专属消息。"""
+    provider = _anthropic_parse_provider()
+
+    with pytest.raises(ValueError, match=message):
+        asyncio.run(getattr(provider, method)(None))
+
+
+def test_anthropic_stream_rejects_mapping_output_format():
+    """流式路径的 ``output_format`` 必须是 Python 类型，不能是字典 schema。
+
+    删除守卫后实测字典被原样放进请求的 ``output_format``——SDK 只接受类型对象，
+    这个请求到服务端才失败。
+    """
+    provider = _anthropic_parse_provider()
+
+    with pytest.raises(ValueError, match="必须是 Python 类型"):
+        provider._build_message_params(prompt="hi", output_format={"type": "object"}, stream=True)
+
+
+def test_anthropic_async_beta_tool_runner_rejects_compaction_control():
+    """异步 tool runner 的 ``compaction_control`` 判据是**另一处**守卫。
+
+    同步侧已有 ``test_anthropic_beta_tool_runner_rejects_unsupported_compaction_control``，
+    异步侧此前从未执行。
+    """
+    provider = _anthropic_parse_provider()
+
+    with pytest.raises(ValueError, match="当前 SDK 不支持 compaction_control"):
+        asyncio.run(
+            provider.async_beta_tool_runner([], prompt="hi", compaction_control={"enabled": True})
+        )
+
+
+# ── SDK 客户端属性的三条守卫 ──
+#
+# ``sdk_client``／``async_sdk_client`` 是 provider 基类上「供原生资源调用」的出口，
+# 三条判据在整套测试里从未执行（行覆盖证实；把它们的 ``raise`` 换成 ``pass``
+# 后全量 3540 条仍全绿）。删除后行为确实改变（实测）：
+# * 2140 同步侧没有 ``_get_client`` → 带 provider 类名的 ``AttributeError``
+#   变成裸 ``TypeError: 'NoneType' object is not callable``；
+# * 2150 ``_get_aclient()`` 返回 ``None`` → **静默返回 None**，调用方拿到
+#   ``None`` 当客户端用，在更远处才崩；
+# * 2158 客户端没有 ``aio`` 节点 → **静默返回 None**，同样把「没有异步客户端」
+#   说成「有，但它是 None」。
+#
+# 同批的 2155（``client_getter()`` 返回 ``None``）经甄别是**等价变异**，不补
+# 测试：删掉后 ``getattr(None, "aio", None)`` 得到 ``None``，随即被 2158 以
+# **同一条消息**拦住，结论不变。
+
+
+class _ClientlessProvider(LargeLanguageModel):
+    """没有 ``_get_client``／``_get_aclient`` 的 provider——两者都是纯基类实现。"""
+
+    def invoke(self, *_args, **_kwargs):
+        return iter(())
+
+    async def ainvoke(self, *_args, **_kwargs):
+        return
+        yield  # pragma: no cover - 让函数成为异步生成器
+
+    def stream_events(self, *_args, **_kwargs):
+        return iter(())
+
+    async def astream_events(self, *_args, **_kwargs):
+        return
+        yield  # pragma: no cover - 让函数成为异步生成器
+
+
+def test_sdk_client_reports_missing_getter_readably():
+    """没有 ``_get_client`` 时必须报出 provider 类名，而不是裸 ``TypeError``。"""
+    with pytest.raises(AttributeError, match="_ClientlessProvider 没有同步 SDK 客户端"):
+        _ = _ClientlessProvider().sdk_client
+
+
+def test_async_sdk_client_reports_none_client_readably():
+    """``_get_aclient()`` 返回 ``None`` 时必须报错，不能静默交出 ``None``。"""
+    provider = _ClientlessProvider()
+    provider._get_aclient = lambda: None
+
+    with pytest.raises(AttributeError, match="_ClientlessProvider 没有异步 SDK 客户端"):
+        _ = provider.async_sdk_client
+
+
+def test_async_sdk_client_reports_missing_aio_node_readably():
+    """客户端没有 ``aio`` 节点时必须报错，不能静默交出 ``None``。
+
+    这是「没有异步客户端」与「有但它是 None」的分界——两条守卫消息相同但位置
+    不同，少一条就会把一种说成另一种。
+    """
+    provider = _ClientlessProvider()
+    provider._get_client = lambda: SimpleNamespace()
+
+    with pytest.raises(AttributeError, match="_ClientlessProvider 没有异步 SDK 客户端"):
+        _ = provider.async_sdk_client
+
+
+def test_sdk_client_still_resolves_through_aio_node():
+    """反向守卫：同步客户端可用时，异步出口从 ``aio`` 节点解析。"""
+    provider = _ClientlessProvider()
+    aio = object()
+    provider._get_client = lambda: SimpleNamespace(aio=aio)
+
+    assert provider.async_sdk_client is aio
+
+
+# ── OpenAI 兼容渠道 openai_compatible.py 覆盖缺口守卫 ──
+#
+# 下列判据在整套测试里从未执行（行覆盖 + 变异扫描双证：把它们的 ``raise`` 换成
+# ``pass`` 后全量 3552 条仍全绿，唯一被抓住的 1208／1706 是覆盖器的假阳性、
+# 既有用例已覆盖）。删除后行为确实改变（实测，均经真实入口）：
+# * 289 构造期缺 ``api_key`` → **静默接受**，无凭证的 provider 被构造出来；
+# * 343 ``_normalize_protocol`` 未知协议 → **静默返回 None**，``_protocol`` 变
+#   ``None``，后续 ``== "responses"`` 判断全部落空；
+# * 478 ``_validate_sdk_resource_call`` 的 ``Signature.bind`` 抛 ``ValueError``
+#   （位置专用参数）→ **静默跳过**参数校验，未知参数一路发到 SDK；
+# * 568 ``_background_poll_config`` 的 ``timeout`` 非正／非数值 → 0 与负值被
+#   **静默接受**，``None`` 抛裸 ``TypeError``，超大整数抛裸 ``OverflowError``；
+# * 585／617 后台响应缺 ``id`` → 裸 ``AttributeError``（``_client``／``_aclient``）；
+# * 920 ``_require_responses_resource`` 非 responses 协议 → 不再拦，把本地 SDK
+#   资源当远端 Responses 能力；
+# * 936 ``_merge_options`` options 覆盖请求字段 → **静默覆盖** ``model``／``input``；
+# * 987 ``_merge_resource_kwargs`` 调用方覆盖 Facade 已绑定字段 → **静默覆盖**；
+# * 1145 Chat ``seed`` 与 options.extra_body 重复 → 消息退化成「extra_body 不允许
+#   覆盖请求字段」；
+# * 1264 ``_convert_responses_tool_choice`` 既非字符串也非 Mapping → 裸 ``TypeError``；
+# * 1273／1279 function tool_choice 缺 name → 1273 删掉后**静默产出**
+#   ``{"type": "function", "name": None}``，1279 删掉后**静默返回 None**；
+# * 1627 ``_convert_responses_format`` 的 json_schema 非对象 → 裸 ``AttributeError``；
+# * 1649 response_format 的 type 不支持且无 format → **静默返回 None**；
+# * 1885 Chat 错误体含 ``error`` 且状态码正常 → 消息退化成「响应缺少有效 choices」；
+# * 1906 ``allow_empty_choices`` 下 ``choices=None`` 且有 detail → **静默接受**；
+# * 2290 Responses 终止事件非 ``response.completed`` → **静默产出一个 finish 事件**；
+# * 2580／2617 ``parse``／``async_parse`` 缺 text_format → 消息退化成
+#   ``normalize_messages`` 的「聊天请求必须提供 prompt 或 messages」；
+# * 2598／2632 ``parse`` 同时用 request.response_format 与 text_format →
+#   **静默接受**，两者之一被无声丢弃；
+# * 3078／3137／3117 Embedding 请求参数与模型 options 重复／覆盖 ``model`` →
+#   **静默接受**或消息退化；
+# * 3195／4465 ``file_content`` 缺 ``files.content`` 资源 → 裸
+#   ``TypeError: 'NoneType' object is not callable``，同构的
+#   ``container_file_content`` 却有专属 ``NotImplementedError``（sibling 缺口）；
+# * 3355／4612 ``stream_responses``／``async_stream_responses`` 同时传 request 与
+#   原生关键字参数 → 裸 ``AttributeError``。
+#
+# 同批的 951（``_validated_extra_body`` 非对象）经甄别是**等价变异**，不补测试：
+# 删掉后落到下游 ``validate_secret_free_payload``，抛同一条消息的同一个
+# ``ValueError``，结论不变。
+
+
+def _openai_compatible_provider(**options):
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "demo"
+    provider._provider = "openai"
+    provider._protocol = "responses"
+    provider._base_url = None
+    provider._options = options
+    return provider
+
+
+def test_openai_compatible_constructor_requires_api_key():
+    """构造期缺 ``api_key`` 必须报错，不能静默构造出无凭证的 provider。"""
+    settings = SimpleNamespace(demo_api_key=None, demo_base_url="https://demo.invalid/v1")
+
+    with pytest.raises(ValueError, match="demo_api_key is required for demo"):
+        OpenAICompatibleProvider("m", "demo", settings=settings, options={})
+
+
+@pytest.mark.parametrize(
+    "protocol",
+    [
+        pytest.param("grpc", id="unknown"),
+        pytest.param("", id="empty"),
+        pytest.param("chat-completions-x", id="near-miss"),
+    ],
+)
+def test_openai_compatible_protocol_rejects_unsupported_names(protocol):
+    """未知协议名必须报错，不能静默返回 ``None`` 让后续分支全部落空。"""
+    with pytest.raises(ValueError, match="不支持 .* 协议"):
+        OpenAICompatibleProvider._normalize_protocol(protocol)
+
+
+def test_openai_compatible_sdk_parameter_validation_failure_is_not_skipped():
+    """``Signature.bind`` 抛 ``ValueError`` 时不得静默跳过校验。"""
+
+    class _ValueErrorSignature(inspect.Signature):
+        def bind(self, *args, **kwargs):
+            raise ValueError("positional-only argument passed as keyword")
+
+        def bind_partial(self, *args, **kwargs):
+            raise ValueError("positional-only argument passed as keyword")
+
+    def method(x):
+        return x
+
+    method.__signature__ = _ValueErrorSignature()
+
+    with pytest.raises(ValueError, match="SDK 参数无法验证"):
+        OpenAICompatibleProvider._validate_sdk_resource_call(method, (), {}, "OpenAI 资源")
+
+
+@pytest.mark.parametrize(
+    "timeout",
+    [
+        pytest.param(0, id="zero"),
+        pytest.param(-1, id="negative"),
+        pytest.param("0", id="string"),
+        pytest.param(True, id="bool"),
+        pytest.param(None, id="none"),
+        pytest.param(10**4301, id="huge-int"),
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="inf"),
+    ],
+)
+def test_openai_compatible_background_timeout_must_be_positive_number(timeout):
+    """``background_timeout`` 非正／非数值必须报错，不是静默接受或裸异常。
+
+    消息含上界：``background_timeout`` 超过 ``_MAX_CLIENT_TIMEOUT_SECONDS`` 时
+    会在 ``time.sleep`` 上抛裸 ``OverflowError: timestamp out of range``（实测
+    ``1e19`` 即触发），而不是本方法承诺的 ``ValueError``。
+    """
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._options = {"background_timeout": timeout}
+
+    with pytest.raises(ValueError, match="background_timeout 必须是大于 0 且不超过 86400 的正数"):
+        provider._background_poll_config()
+
+
+def test_openai_compatible_background_timeout_upper_bound():
+    """``background_timeout`` 的上界与客户端 timeout 同一个常量。
+
+    ``1e19`` 会让 ``time.sleep`` 抛裸 ``OverflowError``——不是 ``TimeoutError``
+    也不是 ``ValueError``，调用方按 ``TimeoutError`` 建立的分类接不住。
+    """
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._options = {"background_timeout": 1e19}
+
+    with pytest.raises(ValueError, match="background_timeout 必须是大于 0 且不超过 86400 的正数"):
+        provider._background_poll_config()
+
+
+@pytest.mark.parametrize(
+    "status",
+    [pytest.param("queued", id="queued"), pytest.param("in_progress", id="in-progress")],
+)
+def test_openai_compatible_background_poll_requires_response_id(status):
+    """后台响应缺 ``id`` 必须报 ``RuntimeError``，不是裸 ``AttributeError``。"""
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._provider = "demo"
+
+    with pytest.raises(RuntimeError, match="background 响应缺少 id"):
+        provider._poll_background_response({"status": status, "id": ""}, {})
+
+
+def test_openai_compatible_background_poll_requires_response_id_async():
+    """异步分支同判据。"""
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._provider = "demo"
+
+    with pytest.raises(RuntimeError, match="background 响应缺少 id"):
+        asyncio.run(provider._poll_background_response_async({"status": "queued", "id": ""}, {}))
+
+
+def test_openai_compatible_responses_resource_rejects_chat_protocol():
+    """非 responses 协议下不得把本地 SDK 资源当成远端 Responses 能力。"""
+    provider = _openai_compatible_provider()
+    provider._protocol = "chat_completions"
+    provider._get_client = lambda: pytest.fail("非 responses 协议不应初始化客户端")
+
+    with pytest.raises(ValueError, match="仅适用于 responses 协议"):
+        provider.retrieve_response("resp-1")
+
+
+@pytest.mark.parametrize("field", ["model", "input", "messages"])
+def test_openai_compatible_merge_options_rejects_reserved_field_override(field):
+    """``options`` 覆盖请求保留字段必须报错，不能静默覆盖。"""
+    with pytest.raises(ValueError, match="Provider options 不允许覆盖请求字段"):
+        OpenAICompatibleProvider._merge_options({"model": "a", "input": "b"}, {field: "x"})
+
+
+def test_openai_compatible_merge_resource_kwargs_rejects_caller_override():
+    """调用方覆盖 Facade 已绑定的资源字段必须报错，不能静默覆盖。"""
+    with pytest.raises(ValueError, match="资源 SDK 参数重复"):
+        OpenAICompatibleProvider._merge_resource_kwargs(
+            {"response_id": "r1"}, {"response_id": "r2"}, "拉取响应"
+        )
+
+
+def test_openai_compatible_chat_seed_duplicating_extra_body_reports_seed():
+    """Chat ``seed`` 与 options.extra_body 重复时消息必须点名 ``seed``。"""
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._model_name = "demo"
+    provider._provider = "openai"
+    provider._protocol = "chat_completions"
+    provider._options = {"extra_body": {"seed": 1}}
+    provider._get_client = lambda: SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kw: SimpleNamespace()))
+    )
+
+    with pytest.raises(ValueError, match="Chat Completions seed 与模型 options.extra_body 重复"):
+        provider._build_chat_request(prompt="hi", seed=2)
+
+
+@pytest.mark.parametrize(
+    "tool_choice",
+    [pytest.param(5, id="int"), pytest.param(1.5, id="float"), pytest.param([1], id="list")],
+)
+def test_openai_compatible_responses_tool_choice_rejects_non_string_non_mapping(tool_choice):
+    """``tool_choice`` 既非字符串也非 Mapping 必须给带字段名的 ``ValueError``。"""
+    with pytest.raises(ValueError, match="必须是字符串或对象"):
+        OpenAICompatibleProvider._convert_responses_tool_choice(tool_choice)
+
+
+@pytest.mark.parametrize(
+    "tool_choice",
+    [
+        pytest.param({"type": "function", "function": {}}, id="empty-function"),
+        pytest.param({"type": "function", "function": {"name": ""}}, id="blank-name"),
+    ],
+)
+def test_openai_compatible_responses_tool_choice_requires_function_name(tool_choice):
+    """``function`` 形态的 tool_choice 缺 name 必须报错，不能静默产出无名对象。"""
+    with pytest.raises(ValueError, match="function tool_choice 缺少 name"):
+        OpenAICompatibleProvider._convert_responses_tool_choice(tool_choice)
+
+
+def test_openai_compatible_responses_tool_choice_function_not_mapping_without_name():
+    """``function`` 非 Mapping 且顶层无 name 时，兜底判据必须拦住，不能静默返回 None。"""
+    with pytest.raises(ValueError, match="function tool_choice 缺少 name"):
+        OpenAICompatibleProvider._convert_responses_tool_choice({"type": "function", "function": 5})
+
+
+@pytest.mark.parametrize(
+    "response_format",
+    [
+        pytest.param({"type": "json_schema", "json_schema": 5}, id="int"),
+        pytest.param({"type": "json_schema", "json_schema": "s"}, id="str"),
+    ],
+)
+def test_openai_compatible_responses_format_rejects_non_object_json_schema(response_format):
+    """``json_schema`` 非对象必须报错，不是裸 ``AttributeError``。"""
+    with pytest.raises(ValueError, match="json_schema 必须是对象"):
+        OpenAICompatibleProvider._convert_responses_format(response_format)
+
+
+@pytest.mark.parametrize(
+    "response_format",
+    [pytest.param({"type": "xml"}, id="xml"), pytest.param({}, id="empty")],
+)
+def test_openai_compatible_responses_format_rejects_unsupported_type(response_format):
+    """不支持的 ``type`` 必须报错，不能静默返回 ``None`` 丢掉结构化输出约束。"""
+    with pytest.raises(ValueError, match="仅支持 json_schema 或 json_object"):
+        OpenAICompatibleProvider._convert_responses_format(response_format)
+
+
+def test_openai_compatible_chat_error_body_reports_detail():
+    """Chat 错误体含 ``error`` 且状态码正常时必须报 detail，不是「缺少 choices」。"""
+    with pytest.raises(RuntimeError, match="返回错误: boom"):
+        OpenAICompatibleProvider._raise_for_chat_response_error(
+            {"status": 200, "error": {"message": "boom"}}, provider="openai"
+        )
+
+
+def test_openai_compatible_chat_error_with_empty_choices_and_detail():
+    """``allow_empty_choices`` 下 ``choices=None`` 且有 detail 时必须报错。"""
+    with pytest.raises(RuntimeError, match="返回错误"):
+        OpenAICompatibleProvider._raise_for_chat_response_error(
+            {"choices": None, "msg": "boom"}, allow_empty_choices=True, provider="openai"
+        )
+
+
+def test_openai_compatible_terminal_event_without_error_status_is_rejected():
+    """终止事件非 ``response.completed`` 必须报错，不能静默产出 finish 事件。"""
+    with pytest.raises(RuntimeError, match="收到终止事件: response.incomplete"):
+        OpenAICompatibleProvider._responses_stream_event(
+            {"type": "response.incomplete", "response": {}}, error_provider="openai"
+        )
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_openai_compatible_parse_requires_text_format(async_mode):
+    """``parse``／``async_parse`` 缺 ``text_format`` 必须报专属消息。"""
+    provider = _openai_compatible_provider()
+
+    with pytest.raises(ValueError, match="必须提供 text_format"):
+        if async_mode:
+            asyncio.run(provider.async_parse(None))
+        else:
+            provider.parse(None)
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_openai_compatible_parse_rejects_dual_response_format(async_mode):
+    """``request.response_format`` 与 ``text_format`` 同时使用必须报错，不能静默接受。"""
+    provider = _openai_compatible_provider()
+    provider._get_client = lambda: SimpleNamespace(
+        responses=SimpleNamespace(parse=lambda **kw: "ok")
+    )
+
+    async def async_parse():
+        return await provider.async_parse(
+            dict, CompletionRequest(prompt="hi", response_format={"type": "json_object"})
+        )
+
+    with pytest.raises(ValueError, match="不能同时使用 request.response_format 和 text_format"):
+        if async_mode:
+            asyncio.run(async_parse())
+        else:
+            provider.parse(
+                dict, CompletionRequest(prompt="hi", response_format={"type": "json_object"})
+            )
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_openai_compatible_embedding_rejects_request_option_overlap(async_mode):
+    """Embedding 请求参数与模型 options 重复时必须报错，不能静默接受。"""
+    provider = _openai_compatible_provider(dimensions=128)
+    provider._get_client = lambda: SimpleNamespace(
+        embeddings=SimpleNamespace(create=lambda **kw: SimpleNamespace(data=[]))
+    )
+    provider._get_aclient = lambda: SimpleNamespace(
+        embeddings=SimpleNamespace(create=lambda **kw: SimpleNamespace(data=[]))
+    )
+
+    async def run():
+        return await provider.aembed_documents(["x"], dimensions=64)
+
+    with pytest.raises(ValueError, match="Embedding 请求参数与模型 options 重复"):
+        if async_mode:
+            asyncio.run(run())
+        else:
+            provider.embed_documents(["x"], dimensions=64)
+
+
+def test_openai_compatible_embedding_rejects_reserved_field_override():
+    """Embedding 请求参数覆盖 ``model`` 必须报「不允许覆盖请求字段」。"""
+    provider = _openai_compatible_provider()
+    provider._get_aclient = lambda: SimpleNamespace(
+        embeddings=SimpleNamespace(create=lambda **kw: SimpleNamespace(data=[]))
+    )
+
+    async def run():
+        return await provider.aembed_documents(["x"], model="other")
+
+    with pytest.raises(ValueError, match="Embedding 不允许覆盖请求字段"):
+        asyncio.run(run())
+
+
+def test_openai_compatible_file_content_reports_missing_sdk_resource():
+    """``file_content`` 缺 ``files.content`` 必须报 ``NotImplementedError``。"""
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._provider = "openai"
+    provider._get_client = lambda: SimpleNamespace(files=SimpleNamespace())
+
+    with pytest.raises(NotImplementedError, match=r"files\.content"):
+        provider.file_content("file-1")
+
+
+def test_openai_compatible_async_file_content_reports_missing_sdk_resource():
+    """异步分支同判据。"""
+    provider = object.__new__(OpenAICompatibleProvider)
+    provider._provider = "openai"
+    provider._get_aclient = lambda: SimpleNamespace(files=SimpleNamespace())
+
+    async def run():
+        return await provider.async_file_content("file-1")
+
+    with pytest.raises(NotImplementedError, match=r"files\.content"):
+        asyncio.run(run())
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_openai_compatible_stream_responses_rejects_request_and_kwargs(async_mode):
+    """``stream_responses`` 同时传 request 与原生关键字参数必须报错。"""
+    provider = _openai_compatible_provider()
+    provider._get_client = lambda: pytest.fail("双来源必须在构造请求前拦住")
+
+    with pytest.raises(ValueError, match="不能同时传 request 和原生关键字参数"):
+        if async_mode:
+            provider.async_stream_responses(CompletionRequest(prompt="hi"), model="x")
+        else:
+            provider.stream_responses(CompletionRequest(prompt="hi"), model="x")
+
+
+# ── Ark／Volcengine 渠道 volcengine.py 覆盖缺口守卫 ──
+#
+# 下列判据在整套测试里从未执行（行覆盖 + 变异扫描双证；把它们的 ``raise`` 换成
+# ``pass`` 后全量 3598 条仍全绿）。删除后行为确实改变（实测，均经真实入口）：
+# * 106／125 ``_require_ark_list``／``_require_ark_content`` 非列表 → 裸
+#   ``TypeError: 'int' object is not iterable``（str 还会被**逐字符**当成元素）；
+# * 558 ``__init__`` 未知协议 → 不再拦，``_protocol`` 落空；
+# * 582 ``__init__`` 缺全部凭证 → **静默构造**出无凭证的 provider；
+# * 605 ``_client_options`` 认证不完整 → **静默返回空字典**，SDK 拿到无认证客户端；
+# * 648 ``_normalize_client_options`` region 非字符串 → 裸 ``AttributeError``，
+#   空白 → **静默接受**、region 变成空串；
+# * 660／671 ``_normalize_verified_protocols`` 非序列 → 裸 ``TypeError``，元素
+#   非法 → 裸 ``AttributeError``；
+# * 675 登记未知协议 → **静默接受**，``frozenset({'grpc'})`` 通过；
+# * 801 ``_require_classification_resource`` 资源未挂载 → **静默返回 None**；
+# * 857／889 ``_convert_responses_format``／``_convert_responses_tools`` 形态 →
+#   裸 ``AttributeError``／``TypeError``；
+# * 1035／1040／1084／1088 Ark Chat 的 top_k／seed 在模型 options 与 extra_body
+#   两处配置 → **静默接受**，其中一个被无声丢弃；
+# * 1108 extra_body 与模型 options 重复 → **静默覆盖**；
+# * 1507 ``_prepare_batch_kwargs`` 缺必填参数 → 消息退化成「不支持请求参数」，
+#   把「缺字段」说成「字段不受支持」；
+# * 1510 资源 model 非字符串／空白 → **静默接受**，非法 model 一路发给 SDK；
+# * 1663 Responses 状态 ``incomplete`` → **静默返回 None**，不完整响应当成成功；
+# * 2396／2718 ``create_response``／``async_create_response`` 同时传 request 与
+#   原生关键字参数 → 裸 ``AttributeError``；
+# * 2525／2881 ``count_tokens``／``async_count_tokens`` 响应缺 ``data`` →
+#   **静默返回 0**，把「响应不完整」报成「没有 token」；
+# * 2608／2957 Classification 资源导入失败 → 裸 ``UnboundLocalError``；
+# * 3028／3051 ``close``／``aclose`` 首个关闭异常 → **静默吞掉**，不向上报告。
+#
+# 同批的 578（部分 AK/SK）与 631（timeout 非数值）经甄别是**等价变异**，不补测试：
+# 578 删掉后落到 582 的同一条消息，631 删掉后落到下游 ``normalize_client_timeout``
+# 的同一条消息，结论都不变。
+
+
+def _volcengine_provider(**options):
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "demo"
+    provider._provider = "volcengine"
+    provider._protocol = "chat_completions"
+    provider._options = options
+    provider._base_url = None
+    provider._api_key = "ak"
+    provider._secret_key = "sk"
+    provider._ark_api_key = "ark-key"
+    return provider
+
+
+def _volcengine_init(settings):
+    """用给定 settings 跑一遍真实构造路径（构造期凭证判据在 ``get_settings`` 之后）。
+
+    补丁打在 ``VolcengineProvider`` 所属类的 ``__globals__`` 上，而**不是**
+    重新 ``import src.providers.volcengine``：``tests/providers/test_factory.py``
+    的 autouse 夹具会把该模块从 ``sys.modules`` 删除并重新导入，此时
+    ``import ... as m`` 拿到的是**新模块对象**，而类仍从**旧模块字典**取全局名
+    ——补丁会静默落空，走真实 ``get_settings``（全量套件下才复现）。
+    """
+    module_globals = VolcengineProvider.__init__.__globals__
+
+    original = module_globals["get_settings"]
+    module_globals["get_settings"] = lambda: settings
+    try:
+        return VolcengineProvider("m", protocol="ark", options={})
+    finally:
+        module_globals["get_settings"] = original
+
+
+async def _async_value(value):
+    return value
+
+
+class _ClassificationImportBlocker:
+    """拦截 ``volcenginesdkarkruntime.resources.classification`` 的导入。"""
+
+    _TARGET = "volcenginesdkarkruntime.resources.classification"
+
+    def find_spec(self, name, path=None, target=None):
+        if name == self._TARGET:
+            raise ImportError(f"No module named {name!r}")
+
+
+def _with_blocked_classification_import(call):
+    # 必须先逐出 ``sys.modules`` 里的缓存：全套运行时更早的用例可能已经导入过该
+    # 模块，此后 ``from ... import`` 直接命中缓存、根本不会走 ``find_spec``，拦截器
+    # 形同虚设（单跑时缓存为空才通过）。逐出后再装拦截器，才能稳定复现「SDK 未
+    # 提供该资源」这条分支。
+    target = _ClassificationImportBlocker._TARGET
+    cached = sys.modules.pop(target, None)
+    blocker = _ClassificationImportBlocker()
+    sys.meta_path.insert(0, blocker)
+    try:
+        return call()
+    finally:
+        sys.meta_path.remove(blocker)
+        if cached is not None:
+            sys.modules[target] = cached
+
+
+@pytest.mark.parametrize(
+    "value",
+    [pytest.param(5, id="int"), pytest.param(1.5, id="float"), pytest.param({"a": 1}, id="dict")],
+)
+def test_ark_require_list_rejects_non_sequence(value):
+    """Ark 容器字段非列表必须报 ``RuntimeError``，不是裸 ``TypeError``。"""
+    with pytest.raises(RuntimeError, match="必须是列表"):
+        _require_ark_list(value, label="output")
+
+
+def test_ark_require_list_treats_string_as_sequence_of_characters():
+    """字符串会被**逐字符**当成元素——必须显式拒绝，不能静默拆成字符列表。"""
+    with pytest.raises(RuntimeError, match="必须是列表"):
+        _require_ark_list("ab", label="output")
+
+
+def test_ark_require_content_rejects_non_sequence():
+    """嵌套 ``content`` 非列表必须报 ``RuntimeError``。"""
+    with pytest.raises(RuntimeError, match="必须是列表"):
+        _require_ark_content({"content": 5}, label="content")
+
+
+@pytest.mark.parametrize(
+    "protocol",
+    [pytest.param("grpc", id="unknown"), pytest.param("", id="empty")],
+)
+def test_volcengine_init_rejects_unsupported_protocol(protocol):
+    """未知协议必须报错，不能静默留下落空的 ``_protocol``。"""
+    with pytest.raises(ValueError, match="仅支持 ark/chat_completions 或 responses"):
+        VolcengineProvider("m", protocol=protocol)
+
+
+def test_volcengine_init_requires_credentials():
+    """缺全部凭证必须报错，不能静默构造出无凭证的 provider。"""
+    settings = SimpleNamespace(
+        volc_access_key=None, volc_secret_key=None, ark_api_key=None, volc_base_url=None
+    )
+
+    with pytest.raises(ValueError, match="需要配置 ARK_API_KEY"):
+        _volcengine_init(settings)
+
+
+def test_volcengine_client_options_require_complete_credentials():
+    """``_client_options`` 认证不完整必须报错，不能静默返回空字典。"""
+    provider = object.__new__(VolcengineProvider)
+    provider._options = {}
+    provider._base_url = None
+    provider._api_key = None
+    provider._secret_key = None
+    provider._ark_api_key = None
+
+    with pytest.raises(ValueError, match="认证配置不完整"):
+        provider._client_options()
+
+
+def test_volcengine_client_options_reject_non_string_region():
+    """region 非字符串必须报错，不是裸 ``AttributeError``。"""
+    with pytest.raises(ValueError, match="region 必须是非空字符串"):
+        VolcengineProvider._normalize_client_options({"region": 5})
+
+
+def test_volcengine_client_options_reject_blank_region():
+    """region 纯空白必须报错，不能静默收敛成空串。"""
+    with pytest.raises(ValueError, match="region 必须是非空字符串"):
+        VolcengineProvider._normalize_client_options({"region": "   "})
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [pytest.param(5, id="int"), pytest.param(1.5, id="float")],
+)
+def test_volcengine_verified_protocols_reject_non_sequence(configured):
+    """``server_verified_protocols`` 非序列必须报错，不是裸 ``TypeError``。"""
+    with pytest.raises(ValueError, match="必须是字符串或协议序列"):
+        VolcengineProvider._normalize_verified_protocols(configured)
+
+
+def test_volcengine_verified_protocols_reject_non_string_element():
+    """登记项非字符串必须报错，不是裸 ``AttributeError``。"""
+    with pytest.raises(ValueError, match="中的协议必须是非空字符串"):
+        VolcengineProvider._normalize_verified_protocols([5])
+
+
+def test_volcengine_verified_protocols_reject_unknown_name():
+    """登记未知协议必须报错，不能静默接受 ``frozenset({'grpc'})``。"""
+    with pytest.raises(ValueError, match="不支持登记服务端协议: grpc"):
+        VolcengineProvider._normalize_verified_protocols(["grpc"])
+
+
+def test_ark_classification_guard_reports_missing_resource():
+    """分类资源未挂载时必须报错，不能静默返回 ``None``。"""
+    provider = _volcengine_provider()
+    provider._protocol = "responses"
+    provider._client = object()
+    provider._get_classification_resource = lambda: (_ for _ in ()).throw(
+        NotImplementedError("no classification")
+    )
+
+    with pytest.raises(NotImplementedError, match="Ark classify"):
+        provider._require_classification_resource("classify")
+
+
+@pytest.mark.parametrize(
+    "response_format",
+    [pytest.param(5, id="int"), pytest.param("s", id="str")],
+)
+def test_ark_responses_format_rejects_non_object(response_format):
+    """``response_format`` 非对象必须报错，不是裸 ``AttributeError``。"""
+    with pytest.raises(ValueError, match="response_format 必须是对象"):
+        VolcengineProvider._convert_responses_format(response_format)
+
+
+@pytest.mark.parametrize("tools", [pytest.param(5, id="int"), pytest.param(1.5, id="float")])
+def test_ark_responses_tools_reject_non_sequence(tools):
+    """``tools`` 非列表必须报错，不是裸 ``TypeError``。"""
+    with pytest.raises(ValueError, match="工具定义必须是列表"):
+        VolcengineProvider._convert_responses_tools(tools)
+
+
+@pytest.mark.parametrize("field", ["top_k", "seed"])
+def test_ark_chat_model_options_reject_duplicate_with_extra_body(field):
+    """模型 options 的 top_k／seed 与 extra_body 重复时必须报错，不能静默丢弃。"""
+    provider = _volcengine_provider(extra_body={field: 1}, **{field: 2})
+
+    with pytest.raises(ValueError, match=rf"模型 options 的 {field} 与 extra_body 重复"):
+        provider._build_chat_request("hi")
+
+
+@pytest.mark.parametrize("field", ["top_k", "seed"])
+def test_ark_chat_request_rejects_duplicate_with_model_extra_body(field):
+    """请求级 top_k／seed 与模型 options.extra_body 重复时必须报错。"""
+    provider = _volcengine_provider(extra_body={field: 1})
+
+    with pytest.raises(ValueError, match=rf"{field} 与模型 options.extra_body 重复"):
+        provider._build_chat_request("hi", **{field: 2})
+
+
+def test_ark_chat_extra_body_duplicate_with_model_options():
+    """请求级 extra_body 与模型 options 重复时必须报错，不能静默覆盖。"""
+    provider = _volcengine_provider(extra_body={"a": 1})
+
+    with pytest.raises(ValueError, match="extra_body 与模型 options 重复"):
+        provider._build_chat_request("hi", extra_body={"a": 2})
+
+
+def test_ark_batch_kwargs_reports_missing_required_parameter():
+    """缺必填参数必须点名，不能退化成「不支持请求参数」。"""
+    with pytest.raises(ValueError, match="缺少必填参数: name"):
+        VolcengineProvider._prepare_batch_kwargs(
+            {}, "demo", "知识库", frozenset({"name"}), ("name",)
+        )
+
+
+@pytest.mark.parametrize("model", [pytest.param(5, id="int"), pytest.param("   ", id="blank")])
+def test_ark_batch_kwargs_rejects_invalid_model(model):
+    """资源 model 非字符串／空白必须报错，不能静默发给 SDK。"""
+    with pytest.raises(ValueError, match="model 必须是非空字符串"):
+        VolcengineProvider._prepare_batch_kwargs(
+            {"model": model, "name": "k"},
+            "demo",
+            "知识库",
+            frozenset({"model", "name"}),
+            ("name",),
+        )
+
+
+def test_ark_responses_incomplete_status_is_rejected():
+    """状态 ``incomplete`` 必须报错，不能静默当成成功。"""
+    with pytest.raises(RuntimeError, match="响应不完整"):
+        VolcengineProvider._raise_for_response_error(
+            {"status": "incomplete", "incomplete_details": {"reason": "max_tokens"}}
+        )
+
+
+def test_ark_responses_cancelled_status_is_rejected():
+    """状态 ``cancelled`` 必须报错，不能静默返回 None。
+
+    删除守卫后 ``status == "cancelled"`` 的响应不再抛错，调用方把「请求已取消」
+    当成成功响应继续用（``_raise_for_response_error`` 静默返回 ``None``）。
+    变异扫描证实该守卫在整套测试里没有反向覆盖（既有 ``cancelled`` 用例打的是
+    流式事件路径 ``_responses_stream_event``，不是本函数）。
+    """
+    with pytest.raises(RuntimeError, match="已取消"):
+        VolcengineProvider._raise_for_response_error({"status": "cancelled"})
+
+
+def test_ark_responses_incomplete_reason_with_huge_int_reports_readably():
+    """``incomplete`` 原因是大整数时消息不得抛位数超限的 ``ValueError``。"""
+    with pytest.raises(RuntimeError) as excinfo:
+        VolcengineProvider._raise_for_response_error(
+            {"status": "incomplete", "incomplete_details": {"reason": 10**4300}}
+        )
+
+    assert "Exceeds the limit" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_ark_create_response_rejects_request_and_kwargs(async_mode):
+    """``create_response`` 同时传 request 与原生关键字参数必须报错。"""
+    provider = _volcengine_provider()
+    provider._protocol = "responses"
+    provider._server_verified_protocols = frozenset({"responses"})
+    provider._get_client = lambda: pytest.fail("双来源必须在构造请求前拦住")
+    provider._get_aclient = lambda: pytest.fail("双来源必须在构造请求前拦住")
+
+    with pytest.raises(ValueError, match="不能同时传 request 和原生关键字参数"):
+        if async_mode:
+            asyncio.run(provider.async_create_response(CompletionRequest(prompt="hi"), model="x"))
+        else:
+            provider.create_response(CompletionRequest(prompt="hi"), model="x")
+
+
+@pytest.mark.parametrize(
+    "items",
+    [pytest.param([], id="empty"), pytest.param(None, id="missing-field")],
+)
+def test_ark_count_tokens_requires_data(items):
+    """tokenization 响应缺 ``data`` 必须报错，不能静默返回 0。"""
+    provider = _ark_provider_with_tokenization_response(items)
+
+    with pytest.raises(RuntimeError, match="tokenization 响应缺少 data"):
+        provider.count_tokens("hi")
+
+
+@pytest.mark.parametrize(
+    "items",
+    [pytest.param([], id="empty"), pytest.param(None, id="missing-field")],
+)
+def test_ark_async_count_tokens_requires_data(items):
+    """异步分支同判据。"""
+    provider = _ark_provider_with_tokenization_response(items)
+    provider._get_aclient = lambda: SimpleNamespace(
+        tokenization=SimpleNamespace(
+            create=lambda **kwargs: _async_value(SimpleNamespace(data=items))
+        )
+    )
+
+    async def run():
+        return await provider.async_count_tokens("hi")
+
+    with pytest.raises(RuntimeError, match="tokenization 响应缺少 data"):
+        asyncio.run(run())
+
+
+def test_ark_classification_import_failure_reports_readably():
+    """Classification 模块导入失败时必须报 ``NotImplementedError``，不是裸 ``UnboundLocalError``。"""
+    provider = _volcengine_provider()
+    provider._protocol = "responses"
+    provider._classification_resource = None
+    provider._get_client = lambda: SimpleNamespace()
+
+    with pytest.raises(NotImplementedError, match="Ark Classification 资源"):
+        _with_blocked_classification_import(provider._get_classification_resource)
+
+
+def test_ark_async_classification_import_failure_reports_readably():
+    """异步分支同判据。"""
+    provider = _volcengine_provider()
+    provider._protocol = "responses"
+    provider._async_classification_resource = None
+    provider._get_aclient = lambda: SimpleNamespace()
+
+    async def run():
+        return await provider._get_async_classification_resource()
+
+    with pytest.raises(NotImplementedError, match="Ark Async Classification 资源"):
+        _with_blocked_classification_import(lambda: asyncio.run(run()))
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_volcengine_close_reports_first_error(async_mode):
+    """``close``／``aclose`` 首个关闭异常必须向上报告，不能静默吞掉。"""
+
+    class _BadClose:
+        def close(self):
+            raise RuntimeError("close 失败")
+
+    provider = object.__new__(VolcengineProvider)
+    provider._client = _BadClose()
+    provider._aclient = None
+    provider._classification_resource = None
+    provider._async_classification_resource = None
+
+    with pytest.raises(RuntimeError, match="close 失败"):
+        if async_mode:
+            asyncio.run(provider.aclose())
+        else:
+            provider.close()
+
+
+# ── OpenAICompatibleProvider Responses 扩展字段重复 / close 的覆盖缺口 ──
+#
+# 下列判据在整套测试里从未执行（行覆盖 + 变异扫描双证；把它们的 ``raise`` 换成
+# ``pass`` 后全量 3698 条仍全绿）。删除后行为确实改变（实测，经
+# ``_build_responses_request`` 真实入口）：
+# * 1415 ``options.stop``／``options.seed`` 与 ``extra_body`` 重复 → 消息从
+#   「Responses options.X 与 extra_body 重复」退化成下游
+#   ``_merge_extra_body`` 的「模型 options 的扩展字段重复」：同一个重复被报两次，
+#   但**点名的是合并器而不是字段来源**，调用方按消息定位要改的地方会改错；
+# * 1553 ``options.reasoning_effort`` 与 ``extra_body.reasoning`` 重复 → 消息
+#   退化成「extra_body 不允许覆盖请求字段: reasoning」，把「两个来源配了同一个
+#   意图」说成「extra_body 越权覆盖请求字段」；
+# * 5678／5699 ``close``／``aclose`` 首个关闭异常 → **静默吞掉**（Google 与
+#   Volcengine 的两个入口都有覆盖，OpenAI 兼容渠道没有——sibling 缺口）。
+def _responses_provider(**options):
+    provider = _openai_compatible_provider(**options)
+    provider._server_verified_protocols = frozenset({"responses"})
+    return provider
+
+
+@pytest.mark.parametrize("field,value", [("stop", ["x"]), ("seed", 7)])
+def test_openai_compatible_responses_rejects_option_duplicated_in_extra_body(field, value):
+    """``options`` 的 stop／seed 与 ``extra_body`` 重复时必须点名是哪个字段重复。
+
+    只覆盖 ``configured_options`` 那一半：``_compat_extra_options()`` 里的
+    ``top_k``／``repetition_penalty`` 走的是下游 ``_merge_extra_body``，报的是
+    「模型 options 的扩展字段重复」，与本条不是同一判据。
+    """
+    provider = _responses_provider(**{field: value, "extra_body": {field: "other"}})
+
+    with pytest.raises(ValueError, match=rf"Responses options\.{field} 与 extra_body 重复"):
+        provider._build_responses_request(prompt="hi")
+
+
+def test_openai_compatible_responses_rejects_reasoning_effort_duplicated_in_extra_body():
+    """``reasoning_effort`` 与 ``extra_body.reasoning`` 重复时必须点名来源。"""
+    provider = _responses_provider(
+        reasoning_effort="high", extra_body={"reasoning": {"effort": "low"}}
+    )
+
+    with pytest.raises(
+        ValueError, match="Responses reasoning_effort 与模型 options.extra_body 重复"
+    ):
+        provider._build_responses_request(prompt="hi")
+
+
+def test_openai_responses_rejects_reasoning_duplicating_model_extra_body():
+    """显式 ``reasoning`` 与 ``extra_body.reasoning`` 重复时必须点名来源。
+
+    ``_build_chat_request`` 的同名判据早有覆盖，但 Responses 路径（1549）是
+    **另一处**独立判据，变异扫描证实它在整套测试里存活：删除后消息退化成
+    ``_validated_extra_body`` 的「不允许覆盖请求字段: reasoning」——只说
+    「冲突」，不再指出冲突的是「模型 options 里的 extra_body」，用户不知道该
+    去改配置文件还是改调用参数。同函数 1553 的 ``reasoning_effort`` 分支已有
+    用例钉住（变异后变红），本条补对称的 ``reasoning`` 分支。
+    """
+    provider = _responses_provider(extra_body={"reasoning": {"effort": "low"}})
+
+    with pytest.raises(ValueError, match="Responses reasoning 与模型 options.extra_body 重复"):
+        provider._build_responses_request(prompt="hi", reasoning={"effort": "high"})
+
+
+class _BadOpenAIClose:
+    def close(self):
+        raise RuntimeError("close 失败")
+
+
+@pytest.mark.parametrize("method_name", ["close", "aclose"])
+def test_openai_compatible_close_reports_first_error(method_name):
+    """``close``／``aclose`` 首个关闭异常必须向上报告，不能静默吞掉。"""
+    provider = _openai_compatible_provider()
+    provider._client = _BadOpenAIClose() if method_name == "close" else None
+    provider._aclient = _BadOpenAIClose() if method_name == "aclose" else None
+
+    with pytest.raises(RuntimeError, match="close 失败"):
+        result = getattr(provider, method_name)()
+        if method_name == "aclose":
+            asyncio.run(result)
+
+
+# ── VolcengineProvider Ark SDK 缺失时的报错形态 ──
+#
+# ``_load_ark_clients`` 在导入失败时抛带指引的 ``RuntimeError``。这条判据在整套
+# 测试里从未执行（行覆盖 + 变异扫描双证；把 ``raise`` 换成 ``pass`` 后全量 3698
+# 条仍全绿）——SDK 在开发机与 CI 上都已安装，这条分支只在缺依赖的部署里走到。
+# 删除后行为确实改变（实测）：``Ark`` 未绑定，收场从
+# ``RuntimeError: 未安装 volcengine-python-sdk[ark]...`` 变成裸
+# ``UnboundLocalError: cannot access local variable 'Ark'``——调用方按
+# ``RuntimeError`` 分类，接不住。
+class _ArkSdkImportBlocker:
+    """拦截 ``volcenginesdkarkruntime`` 顶层包的导入。"""
+
+    _TARGET = "volcenginesdkarkruntime"
+
+    def find_spec(self, name, path=None, target=None):
+        if name == self._TARGET:
+            raise ImportError(f"No module named {name!r}")
+
+
+def _with_blocked_ark_sdk_import(call):
+    # 同 ``_with_blocked_classification_import``：先逐出缓存再装拦截器，否则
+    # ``from volcenginesdkarkruntime import ...`` 直接命中 ``sys.modules``、
+    # 拦截器形同虚设。顶层包与全部子模块都要逐出——``from X import Y`` 命中
+    # 缓存时走的是 ``X`` 本身。
+    target = _ArkSdkImportBlocker._TARGET
+    cached = {
+        name: sys.modules.pop(name)
+        for name in list(sys.modules)
+        if name == target or name.startswith(target + ".")
+    }
+    blocker = _ArkSdkImportBlocker()
+    sys.meta_path.insert(0, blocker)
+    try:
+        return call()
+    finally:
+        sys.meta_path.remove(blocker)
+        sys.modules.update(cached)
+
+
+def test_volcengine_ark_sdk_missing_reports_readably():
+    """缺 Ark SDK 时必须报带安装指引的 ``RuntimeError``，不是裸 ``UnboundLocalError``。"""
+    import src.providers.volcengine as volcengine_module
+
+    with pytest.raises(RuntimeError, match=r"未安装 volcengine-python-sdk\[ark\]"):
+        _with_blocked_ark_sdk_import(volcengine_module._load_ark_clients)
+
+
+def _ark_provider_for_logging_tests():
+    """构造一个最小可用的 Ark provider（不发真实请求）。"""
+    provider = object.__new__(VolcengineProvider)
+    provider._model_name = "doubao"
+    provider._options = {}
+    provider._protocol = "chat_completions"
+    return provider
+
+
+@pytest.mark.parametrize(
+    "method_name, is_async",
+    [
+        pytest.param("invoke", False, id="invoke"),
+        pytest.param("ainvoke", True, id="ainvoke"),
+        pytest.param("embed_documents", False, id="embed_documents"),
+        pytest.param("aembed_documents", True, id="aembed_documents"),
+    ],
+)
+def test_ark_call_paths_log_failures_before_reraising(caplog, method_name, is_async):
+    """Ark 的四条调用路径失败时必须留下日志。
+
+    另外三家（anthropic/google/openai_compatible）的 ``invoke``/``ainvoke``／
+    ``embed_documents``/``aembed_documents`` 都有同一层包装：
+    ``except Exception: logger.exception(...); raise``——记日志后**重新抛出**，
+    不吞掉异常。Ark 是同一批适配器里的第四个渠道，四处全部缺失：失败时零日志，
+    用户只看到异常，排查无从下手（``safe_exception_text`` 的脱敏与截断也一并失效）。
+    """
+    import logging
+
+    provider = _ark_provider_for_logging_tests()
+
+    class _Boom:
+        def __getattr__(self, name):
+            raise RuntimeError("Ark 调用失败")
+
+    provider._get_client = lambda: _Boom()
+    provider._get_aclient = lambda: _Boom()
+
+    with (
+        caplog.at_level(logging.ERROR, logger="src.providers.volcengine"),
+        pytest.raises(RuntimeError, match="Ark 调用失败"),
+    ):
+        if is_async:
+            if method_name == "ainvoke":
+                asyncio.run(_consume_async(provider.ainvoke(prompt="hi")))
+            else:
+                asyncio.run(provider.aembed_documents(["文本"]))
+        else:
+            if method_name == "invoke":
+                list(provider.invoke(prompt="hi"))
+            else:
+                provider.embed_documents(["文本"])
+    assert caplog.records, f"{method_name} 失败时没有留下任何日志"
+
+
+async def _consume_async(agen):
+    async for _ in agen:
+        pass
+
+
+def test_volcengine_init_partial_credentials_names_both_keys():
+    """只配一半 VOLC 凭证时必须点名缺的另一半，而不是泛化消息。
+
+    ``except`` 前的分支区分「完全没有凭证」与「只配了一半」：前者提示
+    ``ARK_API_KEY``，后者提示「需要同时配置 VOLC_ACCESS_KEY 和
+    VOLC_SECRET_KEY」。删除部分凭证分支后两者共用泛化消息，用户按提示
+    再配一个 ARK key 仍然报同样的错。
+    """
+    settings = SimpleNamespace(
+        volc_access_key="ak", volc_secret_key=None, ark_api_key=None, volc_base_url=None
+    )
+
+    with pytest.raises(ValueError, match="需要同时配置 VOLC_ACCESS_KEY 和 VOLC_SECRET_KEY"):
+        _volcengine_init(settings)
+
+
+class _ClassificationAttributeErrorBlocker:
+    """让 ``classification`` 模块**导入成功但模块体抛 AttributeError**。
+
+    与 ``_ClassificationImportBlocker`` 的区别：那个在 ``find_spec`` 抛
+    ``ImportError``，覆盖的是「模块不存在」；这个在 ``exec_module`` 抛
+    ``AttributeError``，覆盖的是「模块存在但初始化引用了缺失属性」——
+    真实的 SDK 版本错配常是后者。
+    """
+
+    _TARGET = "volcenginesdkarkruntime.resources.classification"
+
+    class _Loader:
+        def create_module(self, spec):
+            return None
+
+        def exec_module(self, module):
+            raise AttributeError("模块体引用了缺失属性")
+
+    def find_spec(self, name, path=None, target=None):
+        if name == self._TARGET:
+            import importlib.util
+
+            return importlib.util.spec_from_loader(name, self._Loader())
+        return None
+
+
+def _with_classification_attribute_error(call):
+    import sys
+
+    target = _ClassificationAttributeErrorBlocker._TARGET
+    cached = sys.modules.pop(target, None)
+    blocker = _ClassificationAttributeErrorBlocker()
+    sys.meta_path.insert(0, blocker)
+    try:
+        return call()
+    finally:
+        sys.meta_path.remove(blocker)
+        if cached is not None:
+            sys.modules[target] = cached
+
+
+def test_ark_classification_attribute_error_reports_readably():
+    """模块体抛 ``AttributeError`` 时同样收敛成 ``NotImplementedError``。
+
+    ``except (ImportError, AttributeError)`` 的 ``AttributeError`` 此前无测试
+    触发——收窄成 ``except ImportError`` 后，模块体 AttributeError 冒泡，
+    用户拿到的是 SDK 内部错误而不是能力缺失提示。
+    """
+    provider = _volcengine_provider()
+    provider._protocol = "responses"
+    provider._classification_resource = None
+    provider._get_client = lambda: SimpleNamespace()
+
+    with pytest.raises(NotImplementedError, match="Ark Classification 资源"):
+        _with_classification_attribute_error(provider._get_classification_resource)
+
+
+def test_ark_async_classification_attribute_error_reports_readably():
+    """异步分支同判据。"""
+    provider = _volcengine_provider()
+    provider._protocol = "responses"
+    provider._async_classification_resource = None
+    provider._get_aclient = lambda: SimpleNamespace()
+
+    async def run():
+        return await provider._get_async_classification_resource()
+
+    with pytest.raises(NotImplementedError, match="Ark Async Classification 资源"):
+        _with_classification_attribute_error(lambda: asyncio.run(run()))
+
+
+def test_google_http_options_timeout_rejects_zero_and_accepts_positive():
+    """``timeout <= 0`` 拒绝：0 与负数都必须拦下（``<`` 不是 ``<=``）。"""
+    from src.providers.google import GoogleProvider
+
+    for bad in (0, -1, 0.0):
+        with pytest.raises(ValueError, match="正整数毫秒"):
+            GoogleProvider._validate_http_options({"timeout": bad})
+    GoogleProvider._validate_http_options({"timeout": 1})
+
+
+# ── 回归：chat 请求构造必须把 ``require_tool_call_ids=True`` 传给规范化层 ──
+#
+# openai 1048 与 volcengine 1020 的布尔字面量互换后全量测试仍全绿：两者调用
+# ``normalize_messages(..., require_tool_call_ids=True)`` 的**调用点标志**无人
+# 看守——既有的 ``test_chat_completions_still_requires_tool_call_id`` 直接调
+# ``normalize_messages`` 本身，不经过构造器。反向成 ``False`` 后缺 id 的
+# assistant 历史被静默放进请求，网关按自己那一套处理（或直接 400），而 Chat
+# Completions 协议要求 assistant 历史的每个 ``tool_call`` 都带 id（构造器上方
+# 的注释写明了这一点）。
+
+
+@pytest.mark.parametrize(
+    "provider_cls,protocol",
+    [
+        pytest.param(OpenAICompatibleProvider, "chat_completions", id="openai"),
+        pytest.param(VolcengineProvider, "chat_completions", id="volcengine"),
+    ],
+)
+def test_build_chat_request_rejects_tool_calls_without_id(provider_cls, protocol):
+    provider = object.__new__(provider_cls)
+    provider._model_name = "m"
+    provider._provider = "openai"
+    provider._protocol = protocol
+    provider._options = {}
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"type": "function", "function": {"name": "f", "arguments": "{}"}}],
+        }
+    ]
+
+    with pytest.raises(ValueError, match="缺少 id/call_id"):
+        provider._build_chat_request(prompt="hi", messages=messages)
+
+
+# ── 回归：动态资源 Facade 的 ``_delegate_native`` 必须逐类声明 ──
+#
+# 四个类的 ``_delegate_native = True`` 互换后全量测试仍全绿（boolc 扫描）：
+# 既有用例只通过 ``dir(resources_module)`` 取**第一个** OpenAI 命名的 Facade
+# 来验证动态资源代理，其余类从不实例化。反向成 ``False`` 后 ``__getattr__``
+# 与 ``beta``／``async_beta`` 直接抛 ``AttributeError``——官方 SDK 在模块发布
+# 之后新增的资源（Realtime／Webhooks／Interactions 等）对这几个渠道整棵树消失，
+# 而这是 Facade 存在的唯一理由。
+
+
+@pytest.mark.parametrize(
+    "facade_name,client_attr",
+    [
+        pytest.param("GoogleResources", "sdk_client", id="google"),
+        pytest.param("AsyncGoogleResources", "async_sdk_client", id="async-google"),
+        pytest.param("AsyncArkResources", "async_sdk_client", id="async-ark"),
+    ],
+)
+def test_facade_delegates_native_resources_for_every_declaring_class(facade_name, client_attr):
+    """每个声明 ``_delegate_native = True`` 的 Facade 都要能转发动态资源。"""
+    import src.providers.resources as resources_module
+
+    facade_cls = getattr(resources_module, facade_name)
+    assert facade_cls._delegate_native is True
+
+    provider = SimpleNamespace(
+        _provider="demo",
+        sdk_client=SimpleNamespace(brand_new="SYNC", beta="SYNC-BETA"),
+        async_sdk_client=SimpleNamespace(brand_new="ASYNC", beta="ASYNC-BETA"),
+    )
+    facade = facade_cls(provider)
+
+    # ``__getattr__`` 走 ``_delegate_client_name``，而 ``beta``／``async_beta``
+    # 两个属性方法固定读同步／异步客户端——三者的客户端来源不同，分开断言。
+    expected = "ASYNC" if client_attr == "async_sdk_client" else "SYNC"
+    assert facade.brand_new == expected
+    assert facade.beta == "SYNC-BETA"
+    assert facade.async_beta == "ASYNC-BETA"

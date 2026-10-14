@@ -5,6 +5,7 @@ import inspect
 import json
 import math
 import struct
+import sys
 from abc import ABC, abstractmethod
 from collections.abc import (
     AsyncGenerator,
@@ -31,6 +32,9 @@ from tenacity import (
     wait_exponential,
 )
 
+from src.utils.config import is_double_convertible, parse_decimal_int, safe_repr
+from src.utils.log_manager import get_module_logger
+from src.utils.security import safe_exception_text
 from src.utils.security import (
     validate_secret_free_options as _validate_secret_free_options,
 )
@@ -280,6 +284,30 @@ class StreamEvent:
     raw: Any = None
 
 
+def hashable_key_part(value: Any) -> Any:
+    """把要参与累加器键的值收敛成可哈希形态。
+
+    为什么需要它：``accumulator.setdefault(("index", value), ...)`` 对不可哈希的
+    ``value`` 抛 ``TypeError: unhashable type``。这些值来自不可信的兼容网关 SSE
+    JSON——``openai`` SDK 的流式解析走 ``construct_type``，**跳过已声明字段的
+    Literal/int 校验**，实测 ``{"tool_calls": [{"index": [1, 2]}]}`` 会原样产出
+    ``ChoiceDeltaToolCall(index=[1, 2])``（声明类型是 ``int``）。调用方按
+    ``ValueError`` / ``RuntimeError`` 分类错误，于是「网关片段形态异常」变成裸
+    ``TypeError``，日志脱敏与用户提示都接不住。
+
+    收敛而不是抛错，是因为键只用于**归并同一调用的分片**：不可哈希的形态本来就
+    无法充当稳定标识，退回 ``("position", ...)`` 与「没有 id/index」走同一条
+    分支，语义一致。可哈希的取值原样返回，行为不变。
+    """
+    if value is None:
+        return None
+    try:
+        hash(value)
+    except TypeError:
+        return None
+    return value
+
+
 def merge_tool_call_fragment(
     accumulator: dict[Any, dict[str, Any]],
     tool_call: Mapping[str, Any],
@@ -290,8 +318,8 @@ def merge_tool_call_fragment(
     供应商通常只在第一个片段发送 id/name，后续片段只发送 index 和
     partial arguments。统一在适配层保留这些字段，避免调用方自行拼接。
     """
-    index = tool_call.get("index", fallback_index)
-    call_id = tool_call.get("id") or tool_call.get("call_id")
+    index = hashable_key_part(tool_call.get("index", fallback_index))
+    call_id = hashable_key_part(tool_call.get("id") or tool_call.get("call_id"))
     if index is not None:
         key: Any = ("index", index)
     elif call_id:
@@ -464,7 +492,27 @@ def normalize_messages(
 
     ``require_tool_call_ids`` 只应由确实要求 assistant 历史工具调用带 ``id``
     的协议（Chat Completions）开启；其它协议继续接受 Gemini 这类无 id 的历史。
+
+    ``prompt`` 与 ``system_prompt`` 的形态必须在这里收敛，且必须与 ``messages``
+    分支同判据：本函数是四个 provider 公共 ``invoke`` 的**统一请求边界**
+    （``google.py``／``anthropic.py``／``openai_compatible.py``／``volcengine.py``
+    都调它），而 ``messages`` 那条分支对非序列、非 ``Mapping`` 条目都给
+    ``ValueError``，``prompt``／``system_prompt`` 这一半此前**完全没有**判据：
+
+    * ``prompt=5``／``["a"]`` 静默生成 ``{"role": "user", "content": 5}``——非字符串
+      字面量被当成真实用户输入发给模型（与 ``ChatService._build_prompt`` 钉住的
+      ``用户问题: None`` 是同一形态）；
+    * ``prompt=10**4301`` 在 ``str(prompt).strip()`` 处抛 ``ValueError: Exceeds
+      the limit``，消息与「请求内容写错了」无关；
+    * ``system_prompt`` 同理：真值非字符串直接进 ``content``。
+
+    ``None`` 是合法取值（``prompt=None`` 走「必须提供 prompt 或 messages」分支，
+    ``system_prompt=None`` 表示不带系统提示），只拒绝非字符串的**真值**形态。
     """
+    if prompt is not None and not isinstance(prompt, str):
+        raise ValueError(f"prompt 必须是字符串，但得到 {safe_repr(prompt)}。")
+    if system_prompt is not None and not isinstance(system_prompt, str):
+        raise ValueError(f"system_prompt 必须是字符串，但得到 {safe_repr(system_prompt)}。")
     if messages is not None:
         if isinstance(messages, (str, bytes, bytearray)) or not isinstance(messages, Sequence):
             raise ValueError("messages 必须是消息对象序列。")
@@ -517,8 +565,18 @@ def _responses_has_content(value: Any) -> bool:
 
 
 def _responses_provider_variant(provider: str) -> str:
-    """规范化 Responses 目标 SDK 变体。"""
-    normalized = str(provider).strip().lower().replace("-", "_")
+    """规范化 Responses 目标 SDK 变体。
+
+    非字符串收敛成 ``"openai"`` 而不是抛错：本函数只做**分流**（Ark 还是
+    OpenAI 变体），调用方在两条路径上都会继续做各自的取值校验。此前写
+    ``str(provider)``，``10**4301`` 撞上 CPython 的整数位数上限抛
+    ``ValueError: Exceeds the limit``——一个纯粹的分流判断不该产生与协议无关的
+    整数转换错误，而且它抛在 ``_normalize_responses_native_item`` 的入口，会让
+    本该给出的「字段类型不对」消息变成这条。
+    """
+    if not isinstance(provider, str):
+        return "openai"
+    normalized = provider.strip().lower().replace("-", "_")
     return "ark" if normalized in {"ark", "volcengine", "volc_engine"} else "openai"
 
 
@@ -690,10 +748,12 @@ def _responses_content_part(
             raise ValueError(f"{location}.file_id 必须是字符串。")
         if not video_url and not video_file_id:
             raise ValueError(f"{location} 缺少 video_url 或 file_id。")
+        # 先判可转换性：``math.isfinite(float(x))`` 对超出双精度范围的整数
+        # 自己就抛 ``OverflowError``（**不是** ``ValueError``）。
         if fps is not None and (
             isinstance(fps, bool)
             or not isinstance(fps, (int, float))
-            or not math.isfinite(float(fps))
+            or not is_double_convertible(fps)
         ):
             raise ValueError(f"{location}.fps 必须是有限数字。")
         converted_video: dict[str, Any] = {"type": "input_video"}
@@ -782,7 +842,7 @@ def _responses_content_part(
         allowed_details = {"auto", "low", "high"}
         if variant == "openai":
             allowed_details.add("original")
-        if source["detail"] not in allowed_details:
+        if not isinstance(source["detail"], str) or source["detail"] not in allowed_details:
             allowed = "、".join(sorted(allowed_details))
             raise ValueError(f"{location}.detail 必须是 {allowed}。")
         converted_input_image: dict[str, Any] = {"type": "input_image", "detail": source["detail"]}
@@ -827,7 +887,12 @@ def _responses_content_part(
                 raise ValueError(f"{location}.{key} 必须是字符串。")
         converted = {"type": "input_file"}
         if source.get("detail") is not None:
-            if variant != "openai" or source["detail"] not in {"auto", "low", "high"}:
+            detail_value = source["detail"]
+            if (
+                variant != "openai"
+                or not isinstance(detail_value, str)
+                or detail_value not in {"auto", "low", "high"}
+            ):
                 raise ValueError(f"{location}.detail 不受 {variant.title()} Responses SDK 支持。")
             converted["detail"] = source["detail"]
         for key in ("file_id", "file_data", "file_url", "filename"):
@@ -847,7 +912,12 @@ def _responses_content_part(
             raise ValueError(f"{location} 缺少 file_id、file_data 或 file_url。")
         converted = {"type": "input_file"}
         if source.get("detail") is not None:
-            if variant != "openai" or source["detail"] not in {"auto", "low", "high"}:
+            detail_value = source["detail"]
+            if (
+                variant != "openai"
+                or not isinstance(detail_value, str)
+                or detail_value not in {"auto", "low", "high"}
+            ):
                 raise ValueError(f"{location}.detail 不受 {variant.title()} Responses SDK 支持。")
             converted["detail"] = source["detail"]
         for key in ("file_id", "file_data", "file_url", "filename"):
@@ -1187,14 +1257,31 @@ def normalize_usage(usage: Any) -> dict[str, Any]:
 
 
 def extract_system_prompt(messages: Sequence[Mapping[str, Any]] | None) -> str | None:
-    """提取消息列表中的 system 内容，供无 system role 的 SDK 使用。"""
-    if not messages:
+    """提取消息列表中的 system 内容，供无 system role 的 SDK 使用。
+
+    容器与条目形态都要先收敛：本函数在多数 provider 里**先于**
+    ``normalize_messages`` 被调用（后者有完整的 ``ValueError`` 判据），因此
+    非法取值在这里就炸，收场由本函数决定。实测 ``messages=5`` 抛裸
+    ``TypeError: 'int' object is not iterable``（列表推导的迭代）、
+    ``messages="s"`` 抛裸 ``AttributeError: 'str' object has no attribute 'get'``
+    （``"s".get`` 不存在，且字符串是合法的 ``Sequence``，只判可迭代拦不住）。
+    两者都不落调用方按 ``ValueError`` 建立的分类。
+
+    判据与 ``normalize_messages`` 逐字对齐（含 ``bytes``／``bytearray`` 的
+    显式排除——它们也是 ``Sequence``，迭代得到的是整数，``.get`` 不存在）。
+    条目非 Mapping 时同样给 ``ValueError`` 而不是跳过：静默跳过会让一条写错的
+    消息**悄悄消失**，system 提示随之丢失，比报错更难查。
+    """
+    if messages is None:
         return None
-    values = [
-        content_to_text(message.get("content", ""))
-        for message in messages
-        if message.get("role") == "system"
-    ]
+    if isinstance(messages, (str, bytes, bytearray)) or not isinstance(messages, Sequence):
+        raise ValueError("messages 必须是消息对象序列。")
+    values = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, Mapping):
+            raise ValueError(f"messages[{index}] 必须是消息对象，但得到 {safe_repr(message)}。")
+        if message.get("role") == "system":
+            values.append(content_to_text(message.get("content", "")))
     value = "\n\n".join(item for item in values if item)
     return value or None
 
@@ -1224,21 +1311,55 @@ def normalize_tool_arguments(value: Any) -> str:
 
 
 def validate_complete_tool_call(tool_call: Mapping[str, Any], provider: str) -> dict[str, Any]:
-    """校验流式工具调用在发送 completed 事件前已经完整。"""
+    """校验流式工具调用在发送 completed 事件前已经完整。
+
+    判据是**黑名单**：只有 ``custom_tool_call`` 接受任意文本（Responses 的
+    custom tool 契约里 ``input`` 就是 ``str``，无 JSON 约束），其余任何 ``type``
+    都按函数调用要求完整 JSON。
+
+    这一点必须说清楚，因为两条判据很容易被写成相反的方向——「必须有非空
+    arguments」用 ``type != "custom_tool_call"``（黑名单），「必须校验 JSON」却
+    写成 ``type in {"function", "function_call"}``（白名单）。这样任何不在白名单
+    里的取值（网关改写过的 ``type``、大写形式、空串）同时满足「必须有参数」与
+    「不必校验参数」，半截 JSON 就被当作完整调用交付。而 ``type`` 是不可信输入：
+    SDK 流式解析走 ``construct_type``（``_process_response_data`` 在非严格校验下
+    不校验已声明字段），``tool_calls[].type`` 写成 ``["function"]`` 也能到达这里。
+
+    因此这里只做一次类型收敛（非字符串无法与 ``custom_tool_call`` 相等，按函数
+    调用处理），不再做集合成员测试——成员测试对 ``list``/``dict`` 会抛
+    ``TypeError: unhashable type``，那是崩溃而不是校验。
+    """
     name = tool_call.get("name")
     if not isinstance(name, str) or not name.strip():
         raise RuntimeError(f"{provider} 工具调用缺少 name，流提前结束。")
-    tool_type = tool_call.get("type", "function_call")
+    raw_type = tool_call.get("type")
+    is_custom_tool = isinstance(raw_type, str) and raw_type == "custom_tool_call"
     arguments = tool_call.get("arguments")
     # Responses custom tools intentionally accept arbitrary text, including an
-    # empty input. Function calls still require a complete JSON arguments value.
-    if tool_type != "custom_tool_call" and (arguments is None or arguments == ""):
+    # empty input. Every other call requires a complete JSON arguments value.
+    if not is_custom_tool and (arguments is None or arguments == ""):
         raise RuntimeError(f"{provider} 工具调用 {name} 缺少完整 arguments，流提前结束。")
-    if tool_type == "function_call" and isinstance(arguments, str):
+    if not is_custom_tool and isinstance(arguments, str):
         try:
             json.loads(arguments)
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"{provider} 工具调用 {name} 的 arguments 不是完整 JSON。") from exc
+        except RecursionError as exc:
+            # 嵌套深度超过解释器栈：JSON 可能结构完整，但本进程无法校验它。
+            # ``RecursionError`` 是 ``RuntimeError`` 的子类，类型上虽落在调用方
+            # 的分类内，消息却只有解释器文案，没有工具调用名。
+            raise RuntimeError(
+                f"{provider} 工具调用 {name} 的 arguments 嵌套过深，无法校验完整性。"
+            ) from exc
+        except ValueError as exc:
+            # 除 ``JSONDecodeError``（``ValueError`` 子类，上面已捕获）外，
+            # ``json.loads`` 还会因整数位数超过 ``sys.get_int_max_str_digits()``
+            # 抛 ``ValueError``。它不是 ``RuntimeError``，会穿透调用方按
+            # ``RuntimeError`` 做的错误分类，消息更是与「哪个工具调用」无关。
+            # 与全项目同一判据：整数转换问题不冒名成协议错误。
+            raise RuntimeError(
+                f"{provider} 工具调用 {name} 的 arguments 含超长整数，无法校验完整性。"
+            ) from exc
     return dict(tool_call)
 
 
@@ -1247,7 +1368,29 @@ def normalize_embedding_vector(value: Any) -> list[float]:
     if hasattr(value, "tolist"):
         value = value.tolist()
     if isinstance(value, (list, tuple)):
-        return [float(item) for item in value]
+        # ``float(item)`` 对超出双精度范围的整数抛 ``OverflowError``——它不是
+        # ``ValueError``，会穿透 ``EmbeddingService`` 的 ``except ValueError``
+        # 与 provider 的错误分类逻辑。SDK 返回的 JSON 里出现一个 401 位整数
+        # 就足以走到这里，因此逐项先判可转换性。
+        #
+        # 只收敛 ``OverflowError``，不改变既有契约：``inf``/``nan`` 在此仍照旧
+        # 转成 ``inf``/``nan`` 交给下游——``EmbeddingService`` 会显式拒绝非有限
+        # 向量（``np.isfinite`` 检查），而 base64 分支（``struct.unpack``）本来
+        # 就可能产出 ``inf``。在这里另加一道有限性拒绝会让两个分支的契约不一致。
+        converted: list[float] = []
+        for index, item in enumerate(value):
+            # 只拦「超出双精度范围的 int」——它是 ``OverflowError`` 的唯一来源。
+            # ``inf``/``nan`` 照旧放行：base64 分支（``struct.unpack``）本来就
+            # 可能产出它们，有限性由下游 ``EmbeddingService`` 统一拒绝，在这里
+            # 另加一道会让两个分支的契约不一致。
+            if (
+                isinstance(item, int)
+                and not isinstance(item, bool)
+                and not is_double_convertible(item)
+            ):
+                raise ValueError(f"Embedding 向量第 {index} 项超出双精度范围: {safe_repr(item)}。")
+            converted.append(float(item))
+        return converted
     if isinstance(value, (bytes, bytearray, memoryview)):
         encoded = bytes(value)
     elif isinstance(value, str):
@@ -1271,6 +1414,167 @@ def field(value: Any, name: str, default: Any = None) -> Any:
     return getattr(value, name, default)
 
 
+def enum_field(value: Any, name: str) -> str:
+    """读取**用于集合成员判断**的枚举字段，非字符串一律收敛成 ``""``。
+
+    为什么需要它：``field(x, "type") in {"a", "b"}`` 对 ``list``/``dict`` 抛
+    ``TypeError: unhashable type``。这些值来自网关 JSON（openai SDK 对 SSE
+    chunk 的未知顶层字段用 ``extra="allow"`` 原样保留，实测一个
+    ``{"type": ["error"]}`` 就能构造出来），而调用方按 ``ValueError`` /
+    ``RuntimeError`` 分类错误——于是「网关返回了形态异常的事件」变成裸
+    ``TypeError``，日志脱敏与错误分类都接不住。
+
+    收敛成 ``""`` 而不是抛错，是因为这些站点的语义是「**不是**我认识的事件就
+    跳过」：未知类型本来就走 else 分支，空串落在同一个分支上，行为不变。
+    """
+    candidate = field(value, name, "")
+    return candidate if isinstance(candidate, str) else ""
+
+
+def require_token_count(value: Any, provider: str, field_name: str) -> int:
+    """把 SDK 返回的 token 计数收敛成非负整数。
+
+    八个 provider 方法（Anthropic 同步/异步 × 普通/Beta、Google 同步/异步、
+    OpenAI Responses 同步/异步）此前都写成「判 ``None`` 后直接 ``int(value)``」。
+    那只挡住了缺字段：SDK 或兼容网关返回 ``"abc"``、``1.5``、``[1]`` 或位数超限
+    的数字串时，``int()`` 抛的是裸 ``ValueError``／``TypeError``／位数超限错误，
+    与「token 计数」这件事无关，调用方也拿不到是哪个字段出的问题。
+
+    非负整数是这份数据的真实契约：token 计数不可能为负，也不可能带小数。
+    """
+    if value is None:
+        raise RuntimeError(f"{provider} token count 响应缺少 {field_name}。")
+    if isinstance(value, bool):
+        raise RuntimeError(
+            f"{provider} token count 响应的 {field_name} 不是整数: {safe_repr(value)}。"
+        )
+    if isinstance(value, str):
+        parsed = parse_decimal_int(value)
+        if parsed is None:
+            raise RuntimeError(
+                f"{provider} token count 响应的 {field_name} 不是整数: {safe_repr(value)}。"
+            )
+        numeric = parsed
+    elif isinstance(value, (int, float)):
+        if isinstance(value, float) and (not math.isfinite(value) or not value.is_integer()):
+            raise RuntimeError(
+                f"{provider} token count 响应的 {field_name} 不是整数: {safe_repr(value)}。"
+            )
+        numeric = int(value)
+    else:
+        raise RuntimeError(
+            f"{provider} token count 响应的 {field_name} 不是整数（{type(value).__name__}）。"
+        )
+    if numeric < 0:
+        raise RuntimeError(
+            f"{provider} token count 响应的 {field_name} 不能为负: {safe_repr(numeric)}。"
+        )
+    return numeric
+
+
+# 客户端级重试次数的上界。
+#
+# SDK 的重试循环是 ``range(max_retries + 1)``（openai SDK 的
+# ``_request``；Ark SDK 是等价的递归 ``_retry_request``），因此这个值直接决定
+# 一次请求在故障时最多发出多少次。给它上界有两个理由：``config.toml`` 的 TOML
+# 整数**无上界**，不设界时 ``max_retries = 10**400`` 会被原样接受并存进 SDK
+# 客户端（实测 ``client.max_retries`` 确实是那个 401 位整数），网络故障下等价于
+# 无限重试；而一个合理的重试上限本来就是配置项该有的约束，不是可以取到天文
+# 数字的量。
+_MAX_CLIENT_RETRIES = 100
+
+# 客户端级请求超时（秒）的上界。
+#
+# 与 ``max_retries`` 同属「透传给 SDK、SDK 自己不校验」的一类，但失效方式不同：
+# 超时值本身再大也只是「等到天荒地老」，真正的崩点在**派生值**上。Google 的
+# ``_build_http_options`` 把秒换算成毫秒（``int(timeout * 1000)``）交给
+# ``types.HttpOptions``，而 ``int()`` 对超过 ``DBL_MAX`` 的浮点抛
+# ``OverflowError``——它是 ``ArithmeticError`` 的子类，穿透项目全部以
+# ``ValueError`` 为契约的 handler（``get_settings``、chat 主循环、questionary
+# validator），以裸 traceback 终止会话。实测 ``config.toml`` 写
+# ``timeout = 1e306`` 即可：配置加载成功、provider 构造成功，首次提问才炸。
+#
+# 这个上界取一天：超时是「多久算失败」的判定，没有任何真实场景需要等更久，
+# 而它同时把换算后的毫秒值（86400000）约束在安全整数区间内。
+_MAX_CLIENT_TIMEOUT_SECONDS = 86_400.0
+
+
+def normalize_client_timeout(value: Any, provider: str, field_name: str) -> float:
+    """把客户端级 ``timeout`` 收敛成 ``0`` 到 ``_MAX_CLIENT_TIMEOUT_SECONDS`` 的秒数。
+
+    必须在构造期校验，而不是交给 SDK：SDK 对 ``timeout`` 不做任何检查，非法
+    取值要到发请求时才以形态各异的错误暴露。
+
+    * **非正数**（``0``／``-1``）：httpx 会立刻超时，请求形同未发。
+    * **超大值**：不只是「等得久」。凡是在该值上再做算术的下游都会炸——
+      Google SDK 的毫秒换算抛 ``OverflowError``，而 ``OverflowError`` 不是
+      ``ValueError``，穿透项目所有错误边界。实测 ``1e306`` 即触发。
+    * **非数字**（``"abc"``／``True``）：SDK 原样存进客户端，直到比较超时时
+      才抛 ``TypeError``，报错点离配置处很远。
+
+    只接受 ``int``／``float``，不接受字符串字面量：超时是数值型配置，三个渠道
+    （Google、Anthropic、OpenAI 兼容）原本就拒绝 ``"30"``，这条契约由
+    ``test_google_request_timeout_must_be_finite_and_positive`` 固定。
+    """
+    # ``is_double_convertible`` 是这里唯一正确的守卫：它先判类型，再对 ``int``
+    # 判绝对值上界、对 ``float`` 判有限性。直接写 ``float(value)`` 会引入同一个
+    # 失效模式——``float(10**400)`` 抛 ``OverflowError``（**不是**
+    # ``ValueError``），本函数就成了「正要拒绝非法值时改抛别的异常」。它同时
+    # 挡住 ``bool``（``int`` 子类，``True`` 会静默变成 1.0）与 ``str``。
+    if not is_double_convertible(value):
+        raise ValueError(f"{provider} {field_name} 必须是正数。")
+    numeric = float(value)
+    if numeric <= 0:
+        raise ValueError(f"{provider} {field_name} 必须是正数。")
+    if numeric > _MAX_CLIENT_TIMEOUT_SECONDS:
+        raise ValueError(
+            f"{provider} {field_name} 不能超过 {_MAX_CLIENT_TIMEOUT_SECONDS:.0f} 秒，"
+            f"但得到 {safe_repr(value)}。"
+        )
+    return numeric
+
+
+def normalize_client_retries(value: Any, provider: str) -> int:
+    """把客户端级 ``max_retries`` 收敛成 ``0`` 到 ``_MAX_CLIENT_RETRIES`` 的整数。
+
+    为什么必须在构造期校验，而不是交给 SDK：SDK 对 ``max_retries`` 不做任何
+    检查，取值直接决定重试循环的次数，于是每一类非法取值都表现为远处的怪错误。
+
+    * **负数**：``range(max_retries + 1)`` 一次都不执行，请求根本没发出去，
+      最终抛的是 SDK 内部的 ``AssertionError: could not resolve response
+      (should never happen)``——实测 ``max_retries=-1`` 时 HTTP 请求数为 **0**，
+      用户看到的是「断言失败」，与「重试次数配错了」毫无关联。
+    * **超大值**：等价于无上限重试。
+    * **非整数**（``"abc"``／``1.5``／``True``）：SDK 把它们原样存进
+      ``self.max_retries``，直到真正重试时才在 ``max_retries - retries_taken``
+      上抛 ``TypeError``，报错点离配置处很远。
+
+    字符串按十进制字面量接受（``"3"``），因为 ``.env``／TOML 来源本来就以字符串
+    到达；``bool`` 必须显式拒绝——它是 ``int`` 的子类，``True`` 会静默变成 ``1``。
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{provider} options.max_retries 必须是整数，不能是布尔值。")
+    if isinstance(value, str):
+        parsed = parse_decimal_int(value)
+        if parsed is None:
+            raise ValueError(f"{provider} options.max_retries 必须是整数。")
+        numeric = parsed
+    elif isinstance(value, int):
+        numeric = value
+    elif isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError(f"{provider} options.max_retries 必须是整数。")
+        numeric = int(value)
+    else:
+        raise ValueError(f"{provider} options.max_retries 必须是整数。")
+    if not 0 <= numeric <= _MAX_CLIENT_RETRIES:
+        raise ValueError(
+            f"{provider} options.max_retries 必须在 0 到 {_MAX_CLIENT_RETRIES} 之间，"
+            f"但得到 {safe_repr(value)}。"
+        )
+    return numeric
+
+
 def is_retryable_error(error: BaseException) -> bool:
     """只对连接、限流和服务端错误重试，避免参数/认证错误重复发送请求。"""
     if isinstance(error, (TimeoutError, ConnectionError)):
@@ -1285,9 +1589,14 @@ def is_retryable_error(error: BaseException) -> bool:
             continue
         if isinstance(status, int):
             return status == 429 or status >= 500
-        if isinstance(status, str) and status.isdigit():
-            numeric_status = int(status)
-            return numeric_status == 429 or numeric_status >= 500
+        # 解析走 ``parse_decimal_int``：``int()`` 会抛错的情形有两类——非十进制
+        # 数字字符（``isdigit()`` 为真但 ``int()`` 抛错的 ``²`` ``①`` ``፩`` …）
+        # 与位数超过 ``sys.get_int_max_str_digits()``。任一类漏掉都会让「这个错误
+        # 要不要重试」的判断本身崩掉，把可重试的 5xx 变成一条解析异常。
+        if isinstance(status, str):
+            numeric_status = parse_decimal_int(status)
+            if numeric_status is not None:
+                return numeric_status == 429 or numeric_status >= 500
     name = error.__class__.__name__.lower()
     return any(
         token in name
@@ -1358,17 +1667,33 @@ async def iterate_async(value: Any) -> AsyncGenerator[Any, None]:
             return
         raise TypeError("SDK 流式响应既不是异步迭代器也不是同步迭代器。")
     finally:
-        close = getattr(value, "aclose", None)
-        if close is not None:
-            result = close()
-            if inspect.isawaitable(result):
-                await result
-        else:
-            close = getattr(value, "close", None)
+        # 关闭异常**不能**顶替 ``try`` 里正在上抛的那个：``finally`` 的异常
+        # 会替换掉它，而调用方按异常类型分类——``retry_async_stream`` 用
+        # ``is_retryable_error`` 的类名判据决定是否重试。实测「流中途断开」
+        # （``ConnectionError``，可重试）被「关闭也失败」（``RuntimeError``，
+        # 不可重试）顶替后，一次可重试的连接错误只尝试了 1 次就放弃。
+        #
+        # ``sys.exc_info()`` 必须在**进入 except 之前**取：一旦进到内层
+        # ``except``，它返回的就是关闭异常本身，判据失效。
+        in_flight = sys.exc_info()[0] is not None
+        try:
+            close = getattr(value, "aclose", None)
             if close is not None:
                 result = close()
                 if inspect.isawaitable(result):
                     await result
+            else:
+                close = getattr(value, "close", None)
+                if close is not None:
+                    result = close()
+                    if inspect.isawaitable(result):
+                        await result
+        except Exception:  # 清理失败不得顶替主流程异常
+            if not in_flight:
+                raise
+
+
+logger = get_module_logger(__name__)
 
 
 T = TypeVar("T")
@@ -1387,6 +1712,13 @@ def raise_for_stream_error_event(event: Any, provider: str) -> None:
     """将协议层 error 事件转换为带状态码的异常。"""
     event_type = field(event, "type", "")
     embedded_error = field(event, "error")
+    # ``event_type`` 来自网关 JSON，形态不受控：``type`` 写成 list/dict 时
+    # ``not in {...}`` 抛 ``TypeError: unhashable type``，而本函数的调用方
+    # 按 ``ValueError``/``RuntimeError`` 分类错误。先判类型，与
+    # ``_normalize_responses_native_item`` 的 ``isinstance(item_type, str)``
+    # 同一写法。
+    if not isinstance(event_type, str):
+        event_type = ""
     if event_type not in {"error", "response.error"} and embedded_error is None:
         return
     error = embedded_error or event
@@ -1414,7 +1746,15 @@ def raise_for_stream_error_event(event: Any, provider: str) -> None:
         if not message:
             pending.extend(value for value in values if value is not None)
     if not message:
-        message = field(error, "code") or f"{provider} 流返回错误"
+        # ``code`` 来自网关 JSON，形态不受控：位数超限的整数让 f-string 抛
+        # ``ValueError: Exceeds the limit``，正要报出流错误的那一步变成整数转换
+        # 错误，而调用方按 ``StreamEventError`` 分类。判据与上面提取 ``message``
+        # 的路径一致（字符串原样，其余走 ``safe_repr``）。
+        code = field(error, "code")
+        if code:
+            message = code if isinstance(code, str) else safe_repr(code)
+        else:
+            message = f"{provider} 流返回错误"
     status: int | None = None
     for value in (
         field(error, "status_code"),
@@ -1427,9 +1767,13 @@ def raise_for_stream_error_event(event: Any, provider: str) -> None:
         if isinstance(value, int):
             status = value
             break
-        if isinstance(value, str) and value.isdigit():
-            status = int(value)
-            break
+        # 同 ``is_retryable_error``：``int()`` 解析不了的值必须跳过，而不是让
+        # 流错误的提取本身崩掉。
+        if isinstance(value, str):
+            parsed_status = parse_decimal_int(value)
+            if parsed_status is not None:
+                status = parsed_status
+                break
     raise StreamEventError(f"{provider} 流返回错误: {message}", status)
 
 
@@ -1466,30 +1810,87 @@ def retry_sync_stream(
 ) -> Generator[Any, None, None]:
     """只重试同步流在首个事件前的建立阶段，避免重复已输出内容。"""
 
-    def open_and_peek() -> tuple[Any, Any]:
-        iterator = iter(factory())
+    def open_and_peek() -> tuple[Any, Any, Any]:
+        response = factory()
+        iterator = iter(response)
         try:
             first = next(iterator)
             if first is not _STREAM_END and first_event_validator is not None:
                 first_event_validator(first)
-            return iterator, first
+            return response, iterator, first
         except StopIteration:
-            return iterator, _STREAM_END
+            return response, iterator, _STREAM_END
         except BaseException:
+            # 关闭异常**不能**顶替这里正在上抛的原始异常：``retry_sync_call``
+            # 按 ``is_retryable_error`` 的类名判据决定要不要重试，替身/自定义
+            # 迭代器的 ``close`` 抛错会让可重试的 429 被不可重试的关闭异常
+            # 顶替（实测只尝试 1 次），或反向让不可重试错误被重发 3 次。
+            #
+            # 底层 response 也要在这里补关（与消费阶段 ``finally`` 同判据）：
+            # openai/anthropic 的 ``Stream.__iter__`` 是生成器函数，包装形态下
+            # ``iterator.close()`` 只终止包装层——validator 拒绝（正是 429 重试
+            # 路径）时每次重试泄漏一条连接（实测 3 次 = 3 个未关闭 response）。
             close = getattr(iterator, "close", None)
             if close is not None:
-                close()
+                try:
+                    close()
+                except Exception as close_exc:  # noqa: BLE001
+                    # 清理失败不得顶替原始异常——吞掉但留一条调试日志。
+                    logger.debug("建立阶段清理流失败: %s", safe_exception_text(close_exc))
+            if response is not iterator:
+                response_close = getattr(response, "close", None)
+                if response_close is not None:
+                    try:
+                        response_close()
+                    except Exception as close_exc:  # noqa: BLE001
+                        logger.debug("建立阶段清理响应失败: %s", safe_exception_text(close_exc))
             raise
 
-    iterator, first = retry_sync_call(open_and_peek)
+    response, iterator, first = retry_sync_call(open_and_peek)
     try:
         if first is not _STREAM_END:
             yield first
         yield from iterator
     finally:
-        close = getattr(iterator, "close", None)
-        if close is not None:
-            close()
+        # 关闭异常**不能**顶替消费阶段正在上抛的那个：``finally`` 的异常会替换
+        # 掉它，而调用方按异常类型分类（``is_retryable_error`` 的类名判据决定
+        # 要不要重试）。实测同步流「中途断开」（``ConnectionError``，可重试）
+        # 被「关闭也失败」（``RuntimeError``，不可重试）顶替后只尝试 1 次。
+        #
+        # ``sys.exc_info()`` 必须在 ``finally`` 的**第一条语句**取、且早于
+        # 内层 ``except``：放到 ``try`` 之前取会恒为 ``None``（那时还没有异常），
+        # 进到内层 ``except`` 之后取则返回关闭异常本身。两种都会让判据失效。
+        in_flight = sys.exc_info()[0] is not None
+        # ``iter()`` 拿到的常常只是**包装生成器**：openai/anthropic 的
+        # ``Stream.__iter__`` 是生成器函数（``for item in self._iterator:
+        # yield item``），close 它只终止包装层，``Stream.close()``（即
+        # ``response.close()``）从不被调——消费方提前退出或首帧校验失败时
+        # 连接释放退化为 GC 时机（实测复现，async 侧经 ``iterate_async``
+        # 包装则确定性关闭）。这里对底层响应补一刀；``__iter__`` 返回
+        # self 的形态两者同一对象，跳过重复关闭。
+        #
+        # 补刀必须放在**外层 finally**（嵌套 try/finally）：iterator.close
+        # 抛错且无在途异常时按契约 re-raise——裸的顺序结构在 re-raise 时
+        # 会跳过补刀（实测 log 只有 ``iclose``），response 泄漏。嵌套
+        # finally 保证补刀无条件执行，iterator 的清理异常仍按原语义上抛。
+        try:
+            try:
+                close = getattr(iterator, "close", None)
+                if close is not None:
+                    close()
+            except Exception as close_exc:
+                logger.debug("消费阶段清理流失败: %s", safe_exception_text(close_exc))
+                if not in_flight:
+                    raise
+        finally:
+            if response is not iterator:
+                response_close = getattr(response, "close", None)
+                if response_close is not None:
+                    try:
+                        response_close()
+                    except Exception:  # 清理失败不得顶替主流程异常
+                        if not in_flight:
+                            raise
 
 
 async def retry_async_stream(
@@ -1518,17 +1919,25 @@ async def retry_async_stream(
             raise
 
     iterator, first = await retry_async_call(open_and_peek)
+    # 与 ``retry_sync_stream`` 同一契约：关闭异常不得顶替消费阶段的异常。
     try:
         if first is not _STREAM_END:
             yield first
         async for item in iterator:
             yield item
     finally:
-        close = getattr(iterator, "aclose", None)
-        if close is not None:
-            result = close()
-            if inspect.isawaitable(result):
-                await result
+        # ``sys.exc_info()`` 取在 ``finally`` 第一条语句，理由见
+        # ``retry_sync_stream`` 的同名位置。
+        in_flight = sys.exc_info()[0] is not None
+        try:
+            close = getattr(iterator, "aclose", None)
+            if close is not None:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+        except Exception:  # 清理失败不得顶替主流程异常
+            if not in_flight:
+                raise
 
 
 @contextmanager
@@ -1540,9 +1949,15 @@ def retry_sync_stream_context(factory: Callable[[], Any]) -> Any:
         try:
             return manager, manager.__enter__()
         except BaseException:
+            # 清理异常不得顶替 ``__enter__`` 的原始异常——与 ``open_and_peek``
+            # 同一契约（实测：可重试 429 被 close 的 ``Boom`` 顶替后重试链
+            # 被斩断，只尝试 1 次）。
             close = getattr(manager, "close", None)
             if close is not None:
-                close()
+                try:
+                    close()
+                except Exception as close_exc:  # noqa: BLE001
+                    logger.debug("建立阶段清理 manager 失败: %s", safe_exception_text(close_exc))
             raise
 
     manager, response = retry_sync_call(enter)
@@ -1564,11 +1979,17 @@ async def retry_async_stream_context(factory: Callable[[], Any]) -> Any:
         try:
             return manager, await manager.__aenter__()
         except BaseException:
+            # 与 sync 侧同一契约：清理异常不得顶替原始异常（``iterate_async``
+            # 包装的 in-flight 守卫在替身形态下不生效，显式吞错对齐——实测
+            # aclose 抛错顶替可重试 429 后只尝试 1 次）。
             close = getattr(manager, "aclose", None)
             if close is not None:
-                result = close()
-                if inspect.isawaitable(result):
-                    await result
+                try:
+                    result = close()
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception as close_exc:  # noqa: BLE001
+                    logger.debug("建立阶段清理 manager 失败: %s", safe_exception_text(close_exc))
             raise
 
     manager, response = await retry_async_call(enter)
@@ -1924,6 +2345,37 @@ class LargeLanguageModel(ABC):
     async def aclose(self) -> None:
         """释放 Provider 持有的异步 SDK 客户端。"""
         return
+
+
+def require_text_list(texts: Any, provider: str) -> list[str]:
+    """校验向量化入参是**字符串列表**，返回原对象。
+
+    ``texts`` 是 ``TextEmbeddingModel`` 全部公开入口的入参，此前六个实现
+    （``local_hash``／``openai_compatible``／``google``／``volcengine`` 各两个
+    方向）没有一处判它的形态。三种收场都不在调用方的错误分类内：
+
+    * ``texts=5`` —— 六个实现里有四处抛裸
+      ``TypeError: object of type 'int' has no len()``（日志里的
+      ``len(texts)`` 或 ``asyncio.to_thread`` 之前的迭代），``local_hash`` 抛
+      ``TypeError: 'int' object is not iterable``；
+    * ``texts="abc"`` —— 字符串是合法的 ``Sequence``，被**静默**当成三条单字符
+      文本向量化（``local_hash`` 实测返回 3 条），而不是报错；
+    * ``texts=[b"x"]`` —— 元素非字符串时由各家 SDK 分别报错，形态各异。
+
+    判据与 ``normalize_messages`` 对齐：显式排除 ``str``／``bytes``／
+    ``bytearray``（它们是 ``Sequence``，迭代得到的是字符或整数）。空列表**合法**
+    ——``embed_documents([])`` 的语义是「没有文档要向量化」，各家返回空列表。
+    """
+    if isinstance(texts, (str, bytes, bytearray)) or not isinstance(texts, Sequence):
+        raise ValueError(
+            f"{provider} Embedding texts 必须是字符串列表，但得到 {safe_repr(texts)}。"
+        )
+    for index, text in enumerate(texts):
+        if not isinstance(text, str):
+            raise ValueError(
+                f"{provider} Embedding texts[{index}] 必须是字符串，但得到 {safe_repr(text)}。"
+            )
+    return list(texts)
 
 
 class TextEmbeddingModel(ABC):

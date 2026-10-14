@@ -295,13 +295,6 @@ class AsyncOpenAICompatibleResources(_NativeFacade):
     """Async native-client access for OpenAI-compatible channels."""
 
 
-class _AsyncOnlyResourceFacade(_NativeFacade):
-    """Expose async-only SDK resources while retaining native delegation."""
-
-    _delegate_native = True
-    _delegate_client_name = "async_sdk_client"
-
-
 class OpenAIResources(OpenAICompatibleResources):
     """OpenAI 官方资源 Facade；兼容渠道不会继承此类能力声明。"""
 

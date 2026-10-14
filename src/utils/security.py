@@ -96,6 +96,13 @@ _SAFE_RESOURCE_PARAMETER_CONTAINERS = frozenset({"query", "params"})
 # ``密钥sk-...`` 两侧都不成立，而国产网关（SiliconFlow、Ark、DashScope）的
 # 错误消息正是中文，密钥会整串落进日志。
 _BEARER_TEXT_RE = re.compile(r"(?i)(?<![A-Za-z0-9])bearer\s+[A-Za-z0-9._~+/=-]+")
+# Basic 认证同理：``Authorization: Basic <base64>`` 是 SDK 异常回显的常见形态。
+# 要求前置 ``authorization`` 键名（大小写不敏感、可选 ``proxy-`` 前缀），
+# 否则 ``basic understanding`` 这类普通文本会被误伤。
+_BASIC_AUTH_TEXT_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(?:(?:proxy[_-]?)?authorization)\s*[:=]\s*"
+    r"basic\s+[A-Za-z0-9._~+/=:-]{8,}"
+)
 # A punctuation separator is unambiguous.  Whitespace-only forms are useful
 # for redacting messages such as ``token sk-...``, but treating every following
 # word as a credential causes ordinary text (``token usage``) to be rejected by
@@ -298,7 +305,7 @@ def _redact_masked_credential(match: re.Match[str]) -> str:
 
     没有分隔符时，游程可能是凭证的可见片段（``sk-abc***xyz``），不能整段
     留下；但敏感键名（``token``/``myApiKey``）要保留，让
-    ``_KEY_VALUE_TEXT_RE`` 接续处理 ``sk-abc***token: <secret>`` 这类写法。
+    ``_CREDENTIAL_KEY_VALUE_RE`` 接续处理 ``sk-abc***token: <secret>`` 这类写法。
     """
     # 键名游程由正则的 ``([A-Za-z0-9_.*-]*)`` 捕获（``*``/``.``/``…`` 等掩码
     # 占位符不在其中），整段判断是否为敏感键：``token``/``myApiKey`` 命中并保留，
@@ -307,7 +314,7 @@ def _redact_masked_credential(match: re.Match[str]) -> str:
     # 把 ``sk-abc***`` 切碎。
     run = match.group(1)
     # 键值尾部：游程是键名，后面的值同样属于凭证的可见尾部，一并脱敏。
-    # 这里不能只保留键名交给 ``_KEY_VALUE_TEXT_RE``——键名可能不是敏感键
+    # 这里不能只保留键名交给 ``_CREDENTIAL_KEY_VALUE_RE``——键名可能不是敏感键
     # （``xxxtoken``/``oauth``），那条规则不会接手，值就明文落进日志。
     if match.group(2) is not None:
         return "[REDACTED]" + run + "=[REDACTED]"
@@ -320,22 +327,139 @@ def _redact_masked_credential(match: re.Match[str]) -> str:
 
 
 _GOOGLE_API_KEY_RE = re.compile(r"(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{20,}(?![A-Za-z0-9])")
+# 有固定前缀、可自证的凭证。与 ``_GOOGLE_API_KEY_RE`` 同一类：**不带键名**也能
+# 认出是凭证，因此不依赖 ``key=value`` 上下文。
+#
+# 为什么需要：SDK 的异常消息常回显请求头或 URL（``safe_exception_text`` 的
+# docstring 写明了这一点），此时凭证是**裸串**，没有键名可锚定。本项目的
+# ``_TEXT_CREDENTIAL_KEYS`` 覆盖的是键名，``volc_access_key=...`` 这类会被
+# 脱敏，但 ``invalid access key 'AKLT...'`` 这种回显形态不会——实测
+# ``RedactingFormatter`` 对它原样输出。火山引擎（Ark）与阿里云都使用这种
+# 固定前缀的长串凭证。
+#
+# 前缀足够长（4 字符）且有长度下限，因此误伤风险很低：对真实知识库 4489 行、
+# 全部源码与文档扫描，零命中。
+_AK_SK_PREFIXED_KEY_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:AKLT|LTAI)[0-9A-Za-z_-]{12,}(?![A-Za-z0-9])"
+)
+# 同一类「固定前缀、无键名也能自证」的业界通用凭证：GitHub PAT（``ghp_``／
+# ``github_pat_``）、Slack token（``xox[abper]-`` 与 ``xapp-``，支持家族见
+# ``_SELF_ATTESTING_PREFIX_RE`` 处注释）、AWS Access Key（``AKIA``/
+# ``ASIA``）与 Jina（``jina_``，本项目 rerank 渠道实际在用的形态）。触发面与
+# sk-/AIza 相同——SDK 异常回显、知识库正文、嵌入方回传的服务端消息都是不可控
+# 文本，不能依赖键名锚定。长度下限挡住普通文本里的词（``the ghp variable``、
+# ``xoxb is a prefix`` 这类不带体的前缀词不命中）。
+_SELF_ATTESTING_PREFIX_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:"
+    # GitHub token 家族共享 ``gh[x]_`` 形态：PAT 之外还有 OAuth（``gho_``）、
+    # server-to-server（``ghs_``）、user-to-server（``ghu_``）与 refresh
+    # （``ghr_``），体同为 36+ 字符——异常回显里哪一种都可能。体要求**含数字**
+    # 且有上界：真实 token 是随机混合（必含数字、体长约 36-80），知识库正文里
+    # ``ghp_xxx`` 开头的纯字母长标识符不再被误脱敏。
+    r"gh[pousr]_(?=[0-9A-Za-z]{30,90}[0-9])[0-9A-Za-z]{30,90}"
+    # ``github_pat_`` 体含 ``_``：前瞻 + 上界同时挡两类问题——体不含数字的
+    # 正文标识符，以及**体类含 ``_`` 导致相邻前缀串被整个吞并的平方级回溯**
+    # （实测 ``"github_pat_"*8000`` 17.8 秒；上界截断回溯空间后线性）。真实
+    # token 总长 80+，体上界 120 不漏。
+    r"|github_pat_(?=[0-9A-Za-z_]{20,120}[0-9])[0-9A-Za-z_]{20,120}"
+    # Slack：``xoxe-``（refresh）与 ``xapp-``（app-level）同样自证前缀。
+    # 字符类与支持家族必须显式登记——不在类中的家族（``xoxd-`` 密钥、
+    # ``xoxo-``／``xoxs-``）是**显式不支持**，非遗漏。
+    r"|xox[abper]-[0-9A-Za-z-]{10,}"
+    r"|xapp-[0-9A-Za-z-]{10,}"
+    r"|(?:AKIA|ASIA)[0-9A-Z]{16,}"
+    r"|jina_(?=[0-9A-Za-z]{30,90}[0-9])[0-9A-Za-z]{30,90}"
+    r")(?![A-Za-z0-9])"
+)
+
+
+# PEM 私钥块。这是本项目**自己点名要防**的一类凭证——``SENSITIVE_OPTION_KEYS``
+# 里同时列了 ``privatekey``／``sshkey``／``sshprivatekey``，Google Vertex AI 的
+# ADC 服务账号 JSON 里就带 ``private_key``。但键名规则只挡得住「键名 + 值」的
+# 形态：私钥**正文**作为一段独立文本出现时（异常消息回显文件内容、URL 参数、
+# 单行 base64 正文）没有任何锚点，会原样落进终端与日志。实测
+# ``validate_secret_free_options`` 把私钥当键名拒绝时，回显的消息里就带着完整
+# 正文；裸 PEM 文本走 ``redact_sensitive_text`` 同样原样返回。
+#
+# 覆盖 BEGIN/END 成对与裸 ``BEGIN`` 两种：前者吃掉整块（含正文），后者兜住被
+# 截断的片段（``safe_exception_text`` 会把消息截到 240 字符，END 可能已被切掉）。
+_PEM_PRIVATE_KEY_RE = re.compile(
+    r"(?i)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"
+    r".*?"
+    r"(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)",
+    re.DOTALL,
+)
+
+
+def _display_repr(value: Any) -> str:
+    """把任意取值渲染成字符串，位数超限时退回量级描述。
+
+    本模块**不能**导入 ``config.safe_repr``：``config`` 反过来从本模块导入
+    ``redact_sensitive_text`` 与 ``validate_secret_free_options``，跨模块引用会
+    形成循环导入。判据与 ``safe_repr`` 一致（位数超限时用 ``bit_length()`` 给
+    出量级），改一处时两处都要看。
+    """
+    if isinstance(value, str):
+        return value
+    try:
+        return str(value)
+    except (ValueError, RuntimeError, RecursionError):
+        if isinstance(value, int):
+            digits = value.bit_length() * 30103 // 100000 + 1  # log10(2) ≈ 0.30103
+            return f"<整数，约 {digits} 位十进制>"
+        return f"<{type(value).__name__}>"
+
+
+def _require_string_keys(mapping: Mapping[Any, Any], label: str) -> None:
+    """校验映射的**顶层**键都是字符串。
+
+    非字符串键本身不是凭证，但它会让下游的 ``str(key)`` 与 ``sorted(...)`` 崩在
+    与字段无关的地方：``str(10**4301)`` 抛
+    ``ValueError: Exceeds the limit``（类型对、内容错），``", ".join(sorted(...))``
+    对普通整数键抛裸 ``TypeError: sequence item 0: expected str instance``。
+    ``ModelDetail.options`` 声明为 ``dict[str, Any]``，pydantic 会强制这一形态，
+    因此**配置来源**到不了这里；但 provider 是**公开类**——嵌入方可以直接
+    ``JinaProvider("m", {1: "x"})``（本仓测试就这么构造）。各校验器的其余判据都
+    按 ``ValueError`` 收敛，这里必须对齐。
+
+    嵌套层级的同类判据在 ``find_sensitive_option_paths`` 的递归里，两处共用
+    ``_display_repr`` 渲染越界整数。
+    """
+    for key in mapping:
+        if not isinstance(key, str):
+            raise ValueError(
+                f"{label} 的键必须是字符串，但得到 {_display_repr(key)}。"
+                " 请检查配置里的 options 表（TOML 表的键本就是字符串，"
+                "非字符串键通常来自直接构造 Provider 的库调用方）。"
+            )
 
 
 def redact_sensitive_text(value: Any) -> str:
     """脱敏异常、日志和请求错误中的常见凭证表示。"""
     if not isinstance(value, str):
-        value = str(value)
+        # 非字符串（调用方有传异常、URL、映射的），而 pickle 是二进制格式、
+        # 不受十进制位数限制，畸形快照能带进超限整数这类值。
+        # 循环导入限制（不能导入 ``config.safe_repr``）由 ``_display_repr`` 统一
+        # 承担，这里不再内联同一份判据。
+        value = _display_repr(value)
     # 掩码形态必须最先处理：``_BEARER_TEXT_RE`` 会先吃掉 ``Bearer sk-abc``
     # 的可见前缀，使后续的 ``sk-`` 锚点失效，尾部掩码片段就会残留。
     redacted = _MASKED_CREDENTIAL_RE.sub(_redact_masked_credential, value)
     redacted = _BEARER_TEXT_RE.sub("Bearer [REDACTED]", redacted)
+    redacted = _BASIC_AUTH_TEXT_RE.sub("Basic [REDACTED]", redacted)
     redacted = _CREDENTIAL_KEY_VALUE_RE.sub(_redact_credential_pair, redacted)
     redacted = _SHORT_CREDENTIAL_KEY_RE.sub(r"\1=[REDACTED]", redacted)
     redacted = _URL_USERINFO_RE.sub(r"\1[REDACTED]:[REDACTED]@", redacted)
     redacted = _URL_QUERY_SECRET_RE.sub(r"\1[REDACTED]", redacted)
     redacted = _OPENAI_KEY_RE.sub("[REDACTED]", redacted)
-    return _GOOGLE_API_KEY_RE.sub("[REDACTED]", redacted)
+    redacted = _GOOGLE_API_KEY_RE.sub("[REDACTED]", redacted)
+    redacted = _AK_SK_PREFIXED_KEY_RE.sub("[REDACTED]", redacted)
+    redacted = _SELF_ATTESTING_PREFIX_RE.sub("[REDACTED]", redacted)
+    # PEM 块放最后：它的正文是多行 base64，前面几条规则可能已经改写了其中的
+    # 片段（例如正文里恰好出现 ``sk-`` 形态），但 BEGIN/END 标记不受影响，
+    # 整块仍能被吃掉。放前面则会把已被部分脱敏的块再匹配一次，结果相同但多
+    # 一次全串扫描。
+    return _PEM_PRIVATE_KEY_RE.sub("[REDACTED PRIVATE KEY]", redacted)
 
 
 def safe_exception_text(exc: BaseException) -> str:
@@ -344,8 +468,43 @@ def safe_exception_text(exc: BaseException) -> str:
     终端与日志是凭证最容易泄漏的出口——SDK 的异常消息常回显请求头或
     URL。所有面向用户的异常输出都应经过这里，而不是直接 ``str(exc)``
     或把异常对象交给 ``console.print`` / ``logger.error``。
+
+    ``str(exc)`` 自己会抛，必须兜住：``str(10**4301)`` 撞上 CPython 的整数
+    位数上限（``sys.get_int_max_str_digits()``，默认 4300）抛 ``ValueError``。
+    本函数是**最后一道展示边界**，它在 22 处 ``except`` 里被调用——它再抛，
+    用户看到的就是解释器默认 handler 打出的裸 traceback，连脱敏都没有，
+    比「消息不好看」严重得多。
+
+    这类值确实可达：``pickle`` 是二进制格式，不受十进制位数限制，实测
+    ``pickle.loads(pickle.dumps(10**4301))`` 正常往返，而本项目加载 pickle
+    知识快照。JSON 与 TOML 两条路径送不进来（解析器自己就抛），所以此前没被
+    发现；快照里的畸形值可以。
+
+    兜底不用 ``repr``（同样会抛），用 ``safe_repr``：它对位数超限的整数退回
+    ``bit_length()`` 给出量级，既保住了「是哪个字段」的信息，也不再抛。
     """
-    message = str(exc).strip()
+    try:
+        message = str(exc).strip()
+    except Exception:  # noqa: BLE001 - 展示边界不得再抛
+        # 只有异常自身的 args 含位数超限的整数会走到这里。
+        #
+        # 逐个渲染 args 而不是把整个元组交给 ``safe_repr``：``repr(tuple)`` 会
+        # 递归到元素上，对含超大整数的元组抛错，``safe_repr`` 兜住后只能退回
+        # ``<tuple>``，把「是哪个值出的问题」也丢掉了。逐元素渲染既保住信息，
+        # 又因为每个元素单独兜底而不会抛。
+        #
+        # 局部导入 ``safe_repr``：``config`` 在模块层导入本模块
+        # （``from src.utils.security import redact_sensitive_text, ...``），
+        # 模块层反向导入会成环。这里只在异常兜底分支执行，代价可忽略。
+        from src.utils.config import safe_repr
+
+        rendered = ", ".join(safe_repr(item) for item in exc.args) if exc.args else ""
+        if not rendered:
+            return type(exc).__name__
+        # 兜底分支**同样**是展示边界，必须脱敏：异常 args 里的凭证（如
+        # ``Authorization: Basic <base64>``）若不过 ``redact_sensitive_text``
+        # 就会明文落进日志——与主分支的收场不一致。
+        return f"{type(exc).__name__}: {redact_sensitive_text(rendered)[:240]}"
     if not message:
         return type(exc).__name__
     return f"{type(exc).__name__}: {redact_sensitive_text(message)[:240]}"
@@ -383,6 +542,19 @@ def _model_dump_mapping(value: Any) -> Mapping[str, Any] | None:
     Pydantic 型 SDK 配置对象（例如 ``google.genai.types.HttpOptions``）不是
     ``Mapping``，只遍历普通字典会让其中的 headers/base URL 绕过配置边界。
     仅使用 SDK 明确提供的 ``model_dump``，无法读取时保持原有兼容行为。
+
+    返回 ``None`` 的语义是「**这个值检视不了**」，不是「这个值是安全的」——
+    调用方 ``find_sensitive_option_paths`` 会就此跳过它。这是**有意的
+    fail-open**，与边界对其它不可检视值的处理一致：没有 ``model_dump`` 的对象、
+    任意 ``object()``、``bytes`` 同样被跳过（实测四者都返回 ``[]``）。收紧成
+    fail-closed 会让所有非 pydantic 的第三方配置对象（``httpx.Client``、
+    ``openai.OpenAI`` 都属此类）连同其中的普通配置一起被拒，那是行为破坏而非
+    加固。
+
+    此处原先的注释写「third-party model_dump must fail closed」，与代码相反；
+    那句话描述的是**意图**（不要因为读不到就当成已检查），而实现选择的是
+    「读不到就不检查、也不拒绝」。注释已按实际行为改写，避免下一个人照着
+    「fail closed」去推断边界强度。
     """
     model_dump = getattr(value, "model_dump", None)
     if not callable(model_dump):
@@ -392,9 +564,9 @@ def _model_dump_mapping(value: Any) -> Mapping[str, Any] | None:
     except TypeError:
         try:
             dumped = model_dump()
-        except Exception:  # noqa: BLE001 - third-party model_dump must fail closed
+        except Exception:  # noqa: BLE001 - 读不到就不检查，见 docstring 的 fail-open 说明
             return None
-    except Exception:  # noqa: BLE001 - third-party model_dump must fail closed
+    except Exception:  # noqa: BLE001 - 读不到就不检查，见 docstring 的 fail-open 说明
         return None
     if dumped is value or not isinstance(dumped, Mapping):
         return None
@@ -402,8 +574,16 @@ def _model_dump_mapping(value: Any) -> Mapping[str, Any] | None:
 
 
 def normalize_option_key(key: Any) -> str:
-    """将配置键规范化为大小写无关、分隔符无关的形式。"""
-    return "".join(char for char in str(key).lower() if char.isalnum())
+    """将配置键规范化为大小写无关、分隔符无关的形式。
+
+    非字符串键走 ``_display_repr``：``str(10**4301)`` 撞上 CPython 的整数位数
+    上限抛 ``ValueError: Exceeds the limit``。本函数在配置边界的**每一层**键上
+    调用（``find_sensitive_option_paths`` 的递归、``_is_credential_key``），
+    也在文本脱敏的正则回调里调用，因此对不可 ``str()`` 的键必须降级而不是崩。
+    归一化结果对非字符串键没有语义（调用方另有 ``_require_string_keys`` 判据），
+    只要不抛即可。
+    """
+    return "".join(char for char in _display_repr(key).lower() if char.isalnum())
 
 
 def _is_credential_key(key: Any) -> bool:
@@ -423,7 +603,7 @@ def _is_credential_key(key: Any) -> bool:
         part.lower()
         for part in re.split(
             r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])",
-            str(key),
+            _display_repr(key),
         )
         if part
     ]
@@ -510,17 +690,26 @@ def find_sensitive_option_paths(
     options: Mapping[str, Any],
     *,
     allowed_containers: Collection[str] = (),
+    label: str = "Provider options",
 ) -> list[str]:
     """递归查找凭证、连接覆盖和 URL 中的凭证路径。
 
     ``allowed_containers`` 只用于供应商明确支持的安全容器（例如 Google
     ``http_options.headers``）；容器内的键和值仍会继续递归检查。
+
+    每一层的键都必须是字符串：本函数是**唯一的**递归点，四个兄弟校验器都经由
+    它扫描，因此判据放在这里才能覆盖嵌套层级。此前判据只在
+    ``validate_secret_free_options`` 的顶层循环里，嵌套的 ``{10**4301: "x"}``
+    会在这里的 ``str(key)`` 上抛 ``ValueError: Exceeds the limit``（类型对、内容
+    与字段无关），而普通的 ``{1: "x"}`` 则静默通过、随后在调用方的
+    ``", ".join(sorted(...))`` 处抛裸 ``TypeError``。
     """
     found: list[str] = []
     allowed = {normalize_option_key(value) for value in allowed_containers}
 
     def visit(value: Any, path: str = "") -> None:
         if isinstance(value, Mapping):
+            _require_string_keys(value, label if not path else f"{label} 的 {path}")
             for key, nested in value.items():
                 current = f"{path}.{key}" if path else str(key)
                 if is_sensitive_option_key(key) and normalize_option_key(key) not in allowed:
@@ -556,7 +745,13 @@ def validate_secret_free_options(
         return {}
     if not isinstance(options, Mapping):
         raise ValueError(f"{provider} options 必须是对象。")
-    found = find_sensitive_option_paths(options, allowed_containers=allowed_containers)
+    # 键形态判据（顶层与嵌套）统一由 ``find_sensitive_option_paths`` 承担：
+    # 它是四个校验器共用的递归点，判据放在那里才覆盖每一层。
+    found = find_sensitive_option_paths(
+        options,
+        allowed_containers=allowed_containers,
+        label=f"{provider} options",
+    )
     if found:
         raise ValueError(
             f"{provider} options 不允许包含凭证或请求头/query 配置: " + ", ".join(found)
@@ -589,7 +784,7 @@ def validate_secret_free_request_overrides(
             continue
         if not isinstance(value, Mapping):
             raise ValueError(f"{provider} {field_name} 必须是对象。")
-        found = find_sensitive_option_paths(value)
+        found = find_sensitive_option_paths(value, label=f"{provider} {field_name}")
         if found:
             raise ValueError(
                 f"{provider} 请求头/query 不允许包含凭证: {field_name}." + ", ".join(found)
@@ -609,7 +804,7 @@ def validate_secret_free_payload(
         return {}
     if not isinstance(value, Mapping):
         raise ValueError(f"{provider} {field_name} 必须是对象。")
-    found = find_sensitive_option_paths(value)
+    found = find_sensitive_option_paths(value, label=f"{provider} {field_name}")
     if found:
         raise ValueError(f"{provider} {field_name} 不允许包含凭证或连接字段: " + ", ".join(found))
     return _copy_nested(dict(value))
@@ -629,6 +824,9 @@ def validate_secret_free_resource_kwargs(
         return {}
     if not isinstance(kwargs, Mapping):
         raise ValueError(f"{provider} 资源参数必须是对象。")
+    # 顶层键单独判：下面的扫描器只收到 ``generic_kwargs``（已按扩展键名过滤），
+    # 非字符串键若恰好归一化成扩展键名就会绕过那一层的判据。
+    _require_string_keys(kwargs, f"{provider} 资源参数")
     sanitized = _copy_nested(dict(kwargs))
 
     # SDK client/resource methods also expose client-level overrides such as
@@ -643,6 +841,7 @@ def validate_secret_free_resource_kwargs(
     found = find_sensitive_option_paths(
         generic_kwargs,
         allowed_containers=_SAFE_RESOURCE_PARAMETER_CONTAINERS,
+        label=f"{provider} 资源参数",
     )
     if found:
         raise ValueError(
@@ -709,6 +908,7 @@ def validate_secret_free_resource_args(
             find_sensitive_option_paths(
                 {f"args[{index}]": value},
                 allowed_containers=_SAFE_RESOURCE_PARAMETER_CONTAINERS,
+                label=f"{provider} 资源位置参数",
             )
         )
     if found:
@@ -735,8 +935,31 @@ def resolve_within(
     （``root/link -> /etc`` 这类逃逸）。``resolve()`` 用默认的
     ``strict=False``：目标可以尚不存在，此处只判断归属，存在性由调用方另行校验。
     """
-    resolved_root = Path(root).resolve()
-    resolved_candidate = Path(candidate).resolve()
+    # ``Path.resolve()`` 对符号链接环抛 ``RuntimeError: Symlink loop from ...``，
+    # 它**不是** ``ValueError``，会穿透本函数的契约与调用方的 ``except ValueError``
+    # ——``ensure_trusted_source`` 只接 ``ValueError``，于是一条「拒绝加载」的消息
+    # 变成 pathlib 的内部错误。``strict=False`` 不覆盖这种情况：环是**解析期**的
+    # 失败，与目标是否存在无关。这里统一收敛成 ``ValueError``。
+    #
+    # ``Path(...)`` 对非路径取值抛的 ``TypeError``（``None``／``int``／``list``：
+    # ``expected str, bytes or os.PathLike object, not ...``）同样要收敛：它不是
+    # ``ValueError``，且消息里没有字段名，而本函数的两个调用方
+    # （``ensure_trusted_source`` 与 ``FaissStore.load_snapshot``）都按
+    # ``ValueError`` 分类。形态判据放在构造之前，让消息带上是哪一个参数错了。
+    for role, value in (("路径", candidate), ("受信根", root)):
+        if not isinstance(value, (str, os.PathLike)):
+            raise ValueError(
+                f"{label} 的{role}必须是字符串或路径，但得到 {type(value).__name__}。"
+                " 请检查该路径来源（通常来自 RunConfig 的路径字段）。"
+            )
+    try:
+        resolved_root = Path(root).resolve()
+        resolved_candidate = Path(candidate).resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(
+            f"{label} 无法解析（{type(exc).__name__}: {exc}）。"
+            " 路径可能包含符号链接环或过长的间接层，请检查配置。"
+        ) from exc
     if resolved_candidate != resolved_root and not resolved_candidate.is_relative_to(resolved_root):
         raise ValueError(
             f"{label} 必须位于受信根目录内。"
@@ -756,20 +979,74 @@ def ensure_trusted_source(
 
     ``trusted_roots`` 为 ``None`` 或空集合时一律拒绝——调用方没有声明任何
     信任来源时，不能退化成「任意路径都可加载」，否则这个边界等于不存在。
+
+    ``trusted_roots`` 是**可迭代**，而 ``str``／``bytes``／``bytearray`` 也是
+    合法的可迭代：直接 ``for root in trusted_roots`` 会把一个字符串信任根拆成
+    单字符根。实测 ``trusted_roots="/etc"`` 拆出 ``"/"``（解析为文件系统根），
+    于是**任意绝对路径都被接受**——``/anywhere/evil.pkl`` 也返回成功，正好绕开
+    「不导入不可信来源的 .pkl」这条边界。这与同模块对 ``Sequence`` 参数的既有
+    判据一致（``normalize_messages``／``_require_documents`` 都显式排除
+    ``str``／``bytes``／``bytearray``），必须同样拦下。
+
+    每个根还要能构成 ``Path``：``Path(None)``／``Path(5)``／``Path([...])`` 抛
+    裸 ``TypeError: expected str, bytes or os.PathLike object, not ...``——它
+    不是 ``ValueError``，会穿透 ``load`` 调用方按 ``ValueError`` 建立的错误
+    分类，消息里也没有字段名。收敛成带 label 的 ``ValueError``，与
+    ``resolve_within`` 对候选路径的同类形态同判据。
     """
-    roots = [Path(root) for root in trusted_roots] if trusted_roots else []
+    if isinstance(trusted_roots, (str, bytes, bytearray)):
+        raise ValueError(
+            f"{label} 的受信来源必须是路径序列，但得到 {type(trusted_roots).__name__}。"
+            " 字符串会被逐字符拆成信任根（其中 ``/`` 会放行任意绝对路径），"
+            "请传入路径列表，例如 [snapshot_root]。"
+        )
+    # 非可迭代的形态也要在这里拦下：下面直接 ``for root in trusted_roots``，对
+    # ``5``／``True``／``object()`` 抛裸 ``TypeError: 'int' object is not
+    # iterable``——不是本函数承诺的带 label 的 ``ValueError``，而调用方
+    # ``FaissStore.load`` 按 ``ValueError`` 分类。``str``／``bytes`` 已在上一条
+    # 显式拦下（它们**是**可迭代，但会被逐字符拆开，是另一种失败），这里补的是
+    # 「根本不是序列」这一类。可达路径：``load`` 是 ``VectorStoreBase`` 的契约
+    # 方法，嵌入方直接调用时把 ``trusted_paths`` 写错形态即命中。
+    if trusted_roots is not None and not isinstance(trusted_roots, Iterable):
+        raise ValueError(
+            f"{label} 的受信来源必须是路径序列，但得到 {type(trusted_roots).__name__}。"
+            " 请传入路径列表，例如 [snapshot_root]。"
+        )
+    roots: list[Path] = []
+    if trusted_roots is not None:
+        for root in trusted_roots:
+            try:
+                roots.append(Path(root))
+            except TypeError as exc:
+                raise ValueError(
+                    f"{label} 的受信来源必须是路径，但得到 {type(root).__name__}。"
+                    " 请传入路径列表（通常来自 RunConfig 的 snapshot_root 或"
+                    " legacy_pkl_path）。"
+                ) from exc
     if not roots:
         raise ValueError(
             f"缺少 {label} 的受信来源声明，已拒绝加载。"
             " 请在调用处显式传入 trusted_paths/trusted_roots（通常来自 RunConfig 的"
             " snapshot_root 或 legacy_pkl_path）。"
         )
-    errors: list[str] = []
     for root in roots:
         try:
             return resolve_within(candidate, root, label=label)
-        except ValueError as exc:
-            errors.append(str(exc))
+        except ValueError:
+            # 逐个根试探，全部落空后由下面的消息统一报告：单条 ``resolve_within``
+            # 的消息只提一个根，而这里的结论是「一个都没命中」，把根列表完整
+            # 列出来更有用。收集各条子消息再拼进去会让消息变长却不增加信息量。
+            continue
+    # ``candidate`` 的形态先在这里判一次，不能只依赖 ``resolve_within``：后者对
+    # 非路径取值抛的 ``ValueError`` 会被上面的 ``except ValueError: continue``
+    # 吞掉，于是全部根都「没命中」，最后落到下面那条消息里的 ``Path(candidate)``
+    # ——那里对 ``None``／``int``／``list`` 抛的是裸 ``TypeError``。本函数的契约
+    # 是带 label 的 ``ValueError``（调用方 ``FaissStore.load`` 按它分类）。
+    if not isinstance(candidate, (str, os.PathLike)):
+        raise ValueError(
+            f"{label} 的路径必须是字符串或路径，但得到 {type(candidate).__name__}。"
+            " 请检查该路径来源（通常来自 RunConfig 的 legacy_pkl_path）。"
+        )
     raise ValueError(
         f"{label} 不在任何受信路径内。路径={Path(candidate)}。"
         f" 受信路径={[str(root) for root in roots]}。"

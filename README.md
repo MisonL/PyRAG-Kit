@@ -55,7 +55,7 @@
 │   ├── services/       # 应用服务层：知识库构建、检索、聊天
 │   ├── ui/             # 交互界面：动态配置菜单与 Rich 渲染
 │   └── utils/          # 基础设施：强类型配置 (Pydantic) 与日志系统
-├── scripts/            # 工具脚本：知识库构建、发布打包与说明提取
+├── scripts/            # 工具脚本：知识库构建、发布打包、说明提取与变异审计（scripts/audit/）
 ├── tests/              # 验证矩阵：覆盖核心组件的单元测试
 └── data/               # 持久化层：向量索引文件与审计日志
 ```
@@ -145,7 +145,31 @@ uv run python scripts/build_binary_release.py --target macos-x64 --validate
 打包脚本不执行跨平台交叉编译，`--target` 必须与当前主机或 CI runner 的系统和 CPU 架构一致；例如 Intel macOS 使用 `macos-x64`，Apple Silicon macOS 使用 `macos-arm64`。不匹配时脚本会在清理产物前显式失败，避免生成错误架构的发布包。
 
 发布工作流定义在 [`.github/workflows/release.yml`](./.github/workflows/release.yml)，发布说明会从 [CHANGELOG.md](./CHANGELOG.md) 的对应版本节自动提取。
-二进制包内默认只包含空的 `knowledge_base/` 占位目录，使用时请自行放入 Markdown 源文档后再构建知识快照。
+二进制包解压后的目录结构如下，`PyRAG-Kit/` 子目录是程序自己的根目录（可执行文件所在位置），
+所有相对路径（`knowledge_base/`、`data/`、`config.toml`、`.env`）都以它为准：
+
+```
+PyRAG-Kit-<版本>-<目标>/
+├── README.md               # 本文件
+├── LICENSE / DIFY_LICENSE / licenses/
+└── PyRAG-Kit/              # 程序根目录
+    ├── PyRAG-Kit           # 可执行文件
+    ├── _internal/          # 运行时依赖
+    ├── config.toml.example # 配置模板（复制为同目录下的 config.toml）
+    ├── .env.example        # 密钥模板（复制为同目录下的 .env）
+    ├── knowledge_base/     # 放置 Markdown 源文档
+    ├── tiktoken_cache/     # 预置的分词编码，供离线首次运行使用
+    └── data/               # 运行产物（快照、日志）
+```
+
+因此在二进制包中，`knowledge_base/` 指的是 `PyRAG-Kit/knowledge_base/`，
+配置模板也在 `PyRAG-Kit/` 目录内，复制时请一并进入该目录：
+
+```bash
+cd PyRAG-Kit
+cp config.toml.example config.toml
+cp .env.example .env
+```
 
 ---
 

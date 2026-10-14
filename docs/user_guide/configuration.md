@@ -73,6 +73,10 @@ OPENAI_API_BASE="https://api.openai.com/v1"
 DEFAULT_LLM_PROVIDER="openai"
 ```
 
+注意：`.env` 的 `DEFAULT_LLM_PROVIDER` 会覆盖 `config.toml` 的零凭证默认值，
+未配置好对应渠道前照抄会让全部模型配置因密钥为空串在运行期失败——
+请先在 `config.toml` 中完成渠道定义再启用。
+
 `.env` 中的 `OPENAI_API_BASE` 会覆盖 `config.toml` 的 `openai_api_base`，适合把流量指向代理、中转或自建网关。
 注意 `provider = "openai"` 的条目都会走这个 Base URL，因此指向网关时，`model_name` 必须是该网关实际提供的模型 ID。
 

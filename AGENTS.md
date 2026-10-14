@@ -5,7 +5,7 @@
 ## Project Structure & Module Organization
 
 - `main.py` 是交互式入口；`src/` 按职责划分为 `chat/`、`etl/`、`models/`、`providers/`、`retrieval/`、`retrieval_test/`、`runtime/`、`services/`、`ui/` 和 `utils/`。
-- `scripts/` 放置知识库快照构建、发布打包和发布说明提取脚本；`tests/` 按源码模块组织 pytest 测试。
+- `scripts/` 放置知识库快照构建、发布打包、发布说明提取脚本与变异审计验证工具（`scripts/audit/`）；`tests/` 按源码模块组织 pytest 测试。
 - `knowledge_base/` 保存本地 Markdown 原文；`data/kb/` 和 `data/logs/` 保存运行产物，均不应提交。仓库不再包含 Dify 上游子模块，Dify 相关逻辑以 `src/` 中的移植代码维护。
 - 核心流程为 ETL -> embedding -> FAISS 快照 -> 混合检索 -> provider-backed chat。
 
@@ -20,6 +20,7 @@ uv run python -m scripts.embed_knowledge_base --mode standard
 uv run pytest
 uv run pytest tests/providers/test_factory.py
 uv run python scripts/build_binary_release.py --target macos-arm64 --validate
+uv run python scripts/audit/verify_sites.py --selftest
 ```
 
 `standard` 也可替换为 `hierarchical`。发布目标支持 `windows-x64`、`macos-x64`、`macos-arm64`、`linux-x64` 和 `linux-arm64`；标签 `v*` 会触发 GitHub Release 工作流。

@@ -1,0 +1,65 @@
+# 否定变异扫描的 38 个存活位点（坐标已重新基线化到当前 HEAD）。
+#
+# 历史教训：夹具最初记录在扫描当轮的源码位置上，随后源码持续演化（行号漂移、
+# 守卫随修复移动、死代码删除整段移位），到 HEAD 时 10 个位点已无法定位、
+# 10 个需要漂移才能命中——夹具静默失效却仍被按「字段可解析」放行。本版把
+# 每个坐标在 HEAD 上用 mutate.find_site 精确校验过（exact=38，无漂移）。
+#
+# 源码再演化时本文件会再次失效：跑一次下面的命令，凡报 MUTFAIL 的行就是
+# 坐标漂移/守卫被移除，需按当轮源码重新定位或删除该行。
+#
+# 用法（需要 1 个以上已注册且干净的 git worktree）：
+#   uv run python scripts/audit/verify_sites.py --worktrees /path/wt scripts/audit/regressions/green38.txt
+#
+# 期望判定来自逐点人工复核（含本轮重新分诊，重跑时剔除自指元测试）：
+# 35 处 KILLED（红验证过的测试，含 google.py:571 与 openai_compatible.py:1391
+# 两处后补的 killer 选择器）、4 处 SURVIVED（确证的等价变异）。
+#
+# 本轮分诊的两个教训（假判定点都出在这里）：
+# 1. 元测试 test_green38_fixture_sites_resolve_at_head 读工作区源码 AST——变异
+#    点落在它引用的节点上时它必红，导致 4 个 SURVIVED 全部假报 KILLED。它已随
+#    其余读源码的测试一起被 run_pytest 从判定中 --deselect（只在未变异源码上
+#    跑）；因此 SURVIVED 现在是「剔除自指元测试后的全量套件存活」。
+# 2. 定点选择器与全量套件的结论可能相反（此前 openai_compatible.py:1153 记了
+#    一个能杀死它的全量 killer 却在定点下存活——实测换
+#    test_chat_request_forwards_extra_headers 即稳定杀死）。换 killer 必须在
+#    **定点模式**下重验，不能只看全量扫描的红。
+# SURVIVED 行验证无 selector 时的全量套件判定（同样剔除自指元测试）。
+src/providers/anthropic.py|1615|31|notin|tests/providers/test_guard_coverage_regressions.py::test_anthropic_async_stream_emits_completed_tool_call|KILLED
+src/providers/anthropic.py|281|12|drop|tests/providers/test_guard_coverage_regressions.py::test_anthropic_supports_sampling_option_tracks_model_generation|KILLED
+src/providers/anthropic.py|684|19|drop|tests/providers/test_guard_coverage_regressions.py::test_anthropic_tool_content_list_is_preserved|KILLED
+src/providers/anthropic.py|841|71|isnot|tests/providers/test_guard_coverage_regressions.py::test_anthropic_beta_only_fields_rejected_without_beta|KILLED
+src/providers/anthropic.py|972|19|isnot||SURVIVED
+src/providers/anthropic.py|981|19|isnot|tests/providers/test_guard_coverage_regressions.py::test_anthropic_duplicate_sampling_field_with_extra_body|KILLED
+src/ui/config_menu.py|249|15|isnot|tests/ui/test_config_menu.py::test_edit_retrieval_params_writes_rerank_toggle|KILLED
+src/ui/config_menu.py|473|15|isnot|tests/ui/test_config_menu.py::test_edit_model_params_writes_selected_rerank_configuration|KILLED
+src/retrieval_test/excel_logger.py|346|84|isnot|tests/retrieval_test/test_retrieval_cli.py::test_excel_log_drops_none_scores_from_all_scores_column|KILLED
+src/providers/factory.py|356|16|isnot||SURVIVED
+src/providers/google.py|1798|27|drop|tests/providers/test_guard_coverage_regressions.py::test_google_tool_result_part_resolves_name_from_call_id|KILLED
+src/providers/google.py|1800|61|drop|tests/providers/test_guard_coverage_regressions.py::test_google_tool_result_accepts_valid_name|KILLED
+src/providers/google.py|2576|19|drop|tests/providers/test_guard_coverage_regressions.py::test_google_stream_refusal_part_uses_text_fallback|KILLED
+src/providers/google.py|2612|37|drop|tests/providers/test_guard_coverage_regressions.py::test_google_stream_candidate_refusal_emitted_once|KILLED
+src/providers/google.py|306|19|notin|tests/providers/test_google_genai.py::test_google_provider_loads_credentials_file_and_forwards_it|KILLED
+src/providers/google.py|3687|11|isnot|tests/providers/test_guard_coverage_regressions.py::test_google_async_validate_tuning_reward_forwards_composite_config|KILLED
+src/providers/google.py|577|15|drop|tests/providers/test_guard_coverage_regressions.py::test_google_validate_http_options_keeps_blank_query_values|KILLED
+src/providers/__base__/model_provider.py|1204|11|notin||SURVIVED
+src/providers/__base__/model_provider.py|338|7|isnot||SURVIVED
+src/providers/openai_compatible.py|1153|11|isnot|tests/providers/test_guard_coverage_regressions.py::test_chat_request_forwards_extra_headers|KILLED
+src/providers/openai_compatible.py|1391|15|isnot|tests/providers/test_guard_coverage_regressions.py::test_openai_responses_none_max_output_tokens_not_forwarded|KILLED
+src/providers/openai_compatible.py|1505|15|isnot|tests/providers/test_guard_coverage_regressions.py::test_openai_responses_official_endpoint_rejects_configured_extra_body_stop|KILLED
+src/providers/openai_compatible.py|1587|28|isnot|tests/providers/test_guard_coverage_regressions.py::test_openai_responses_configured_top_logprobs_used_as_fallback|KILLED
+src/providers/openai_compatible.py|2460|27|notin|tests/providers/test_guard_coverage_regressions.py::test_openai_responses_sync_emits_completed_before_later_events|KILLED
+src/providers/openai_compatible.py|2516|31|notin|tests/providers/test_protocol_adapters.py::test_openai_responses_async_stream_deduplicates_tool_completion_events|KILLED
+src/providers/openai_compatible.py|2550|27|notin|tests/providers/test_guard_coverage_regressions.py::test_openai_responses_async_emits_completed_before_later_events|KILLED
+src/providers/openai_compatible.py|4828|19|isnot|tests/providers/test_guard_coverage_regressions.py::test_openai_async_update_vector_store_file_drops_none_extras|KILLED
+src/providers/openai_compatible.py|5292|15|isnot|tests/providers/test_guard_coverage_regressions.py::test_openai_async_compact_responses_forwards_only_given_fields|KILLED
+src/providers/openai_compatible.py|590|33|isnot|tests/providers/test_guard_coverage_regressions.py::test_openai_response_retrieve_kwargs_drops_none_values|KILLED
+src/providers/openai_compatible.py|996|58|drop|tests/providers/test_guard_coverage_regressions.py::test_openai_compatible_merge_resource_kwargs_keeps_none_by_default|KILLED
+src/providers/openai_compatible.py|996|75|isnot|tests/providers/test_guard_coverage_regressions.py::test_openai_compatible_merge_resource_kwargs_omits_none_when_requested|KILLED
+src/utils/security.py|531|11|isnot|tests/providers/test_security_boundaries.py::test_secret_free_options_keeps_self_copied_sdk_model|KILLED
+src/utils/security.py|712|49|drop|tests/providers/test_security_boundaries.py::test_secret_free_options_nested_non_string_key_reports_path|KILLED
+src/providers/volcengine.py|1428|38|isnot|tests/providers/test_guard_coverage_regressions.py::test_ark_responses_native_kwargs_validate_extra_body_secrets|KILLED
+src/providers/volcengine.py|1841|31|notin|tests/providers/test_guard_coverage_regressions.py::test_ark_responses_sync_deduplicates_tool_call_delivered_by_finish|KILLED
+src/providers/volcengine.py|1876|27|notin|tests/providers/test_guard_coverage_regressions.py::test_ark_responses_sync_emits_completed_before_later_events|KILLED
+src/providers/volcengine.py|1941|31|notin|tests/providers/test_guard_coverage_regressions.py::test_ark_responses_async_deduplicates_tool_call_delivered_by_finish|KILLED
+src/providers/volcengine.py|1975|27|notin|tests/providers/test_guard_coverage_regressions.py::test_ark_responses_async_emits_completed_before_later_events|KILLED

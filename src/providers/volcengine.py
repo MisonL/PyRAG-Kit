@@ -1,5 +1,5 @@
 import inspect
-import math
+import time
 from collections.abc import AsyncGenerator, Collection, Generator, Mapping
 from typing import Any
 
@@ -15,9 +15,12 @@ from src.providers.__base__.model_provider import (
     close_resource_sync,
     coerce_completion_request,
     content_to_text,
+    enum_field,
     field,
     is_retryable_error,
     merge_tool_call_fragment,
+    normalize_client_retries,
+    normalize_client_timeout,
     normalize_embedding_vector,
     normalize_messages,
     normalize_responses_input,
@@ -25,6 +28,8 @@ from src.providers.__base__.model_provider import (
     normalize_usage,
     raise_for_stream_error_event,
     reject_unsupported_kwargs,
+    require_text_list,
+    require_token_count,
     retry_async_call,
     retry_async_stream,
     retry_sync_call,
@@ -35,9 +40,9 @@ from src.providers.__base__.model_provider import (
 )
 from src.providers.openai_compatible import OpenAICompatibleProvider
 from src.providers.resources import ArkResources, AsyncArkResources
-from src.utils.config import get_settings
+from src.utils.config import get_settings, is_double_convertible, require_model_name, safe_repr
 from src.utils.log_manager import get_module_logger
-from src.utils.security import validate_secret_free_payload
+from src.utils.security import safe_exception_text, validate_secret_free_payload
 
 logger = get_module_logger(__name__)
 
@@ -82,10 +87,50 @@ _ARK_BUILTIN_TOOL_ITEM_TYPES = frozenset(
 )
 
 
+def _require_ark_list(value: Any, *, label: str) -> list[Any]:
+    """把 Ark 响应里的容器字段收敛成列表，非法形态给出可读的 ``RuntimeError``。
+
+    两个容器此前只有 ``field(x, ..., []) or []``——那挡住 ``None`` 与空值，挡不住
+    其它形态。实测走**真实入口**（``VolcengineProvider.complete``）：
+
+    * Responses 路径 ``output=5`` -> 裸 ``TypeError: 'int' object is not iterable``；
+    * Chat 路径 ``message.tool_calls=5`` -> 同一个裸 ``TypeError``。
+
+    两者都不是 ``RuntimeError``——而本 provider 的错误分类（以及调用方的
+    ``except``）按 ``RuntimeError`` 写。同一个形态在
+    ``openai_compatible._raise_for_chat_response_error`` 对 ``choices`` 早已有
+    显式守卫，两个 provider 的收场必须一致。
+
+    返回列表而不是原值：调用方全都只做迭代，收敛后不必再各自 ``or []``。
+    """
+    if not isinstance(value, (list, tuple)):
+        raise RuntimeError(f"Ark {label} 必须是列表，但得到 {safe_repr(value)}。")
+    return list(value)
+
+
+def _require_ark_content(item: Any, *, label: str) -> list[Any]:
+    """把 Responses 输出项里的嵌套 ``content`` 收敛成列表。
+
+    ``output[].content`` 是 ``output`` 之下的一层容器，本文件有 **3 处**直接迭代
+    它，此前都写 ``field(item, "content", []) or []``——与顶层 ``output`` 修复前的
+    写法完全相同。实测 ``item.content = 5`` 抛裸
+    ``TypeError: 'int' object is not iterable``，而本 provider 的错误分类按
+    ``RuntimeError`` 写（顶层 ``output``／``tool_calls``／``choices`` 都已按同一
+    判据修过）。
+
+    与 google 不同，**本条线上可达**：Ark SDK 的 ``_base_client`` 走
+    ``construct_type``，不执行 pydantic 校验（对照表见 ``_require_ark_list``）。
+    """
+    content = field(item, "content", []) or []
+    if not isinstance(content, (list, tuple)):
+        raise RuntimeError(f"Ark {label} 必须是列表，但得到 {safe_repr(content)}。")
+    return list(content)
+
+
 def _ark_responses_has_builtin_tool_items(response: Any) -> bool:
     """判断响应里是否含 Ark 内置工具的调用项。"""
-    for item in field(response, "output", []) or []:
-        if field(item, "type") in _ARK_BUILTIN_TOOL_ITEM_TYPES:
+    for item in _require_ark_list(field(response, "output", []) or [], label="响应的 output"):
+        if enum_field(item, "type") in _ARK_BUILTIN_TOOL_ITEM_TYPES:
             return True
     return False
 
@@ -99,9 +144,9 @@ def _ark_responses_output_text(response: Any) -> str:
     混进正文。
     """
     chunks: list[str] = []
-    for item in field(response, "output", []) or []:
-        for content in field(item, "content", []) or []:
-            if field(content, "type") not in {"output_text", "text"}:
+    for item in _require_ark_list(field(response, "output", []) or [], label="响应的 output"):
+        for content in _require_ark_content(item, label="响应的 output[].content"):
+            if enum_field(content, "type") not in {"output_text", "text"}:
                 continue
             piece = field(content, "text")
             if isinstance(piece, str):
@@ -463,6 +508,16 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         }
     )
 
+    # Classification 资源支持的请求参数。业务参数（``query``/``model``/``labels``）
+    # 必须显式列进来：动态路径 ``resources.classification.create(...)`` 把它们放进
+    # ``kwargs``，若不在白名单里会被「不支持请求参数」拒掉——而静态 ``classify()``
+    # 是把这三个当**命名参数**传给 SDK、不经 kwargs 校验，于是两条路径对同一组
+    # 输入给出相反结论。此前白名单只含扩展字段，恒拒唯一的合法动态用法。
+    _ARK_CLASSIFICATION_KEYS = frozenset(
+        {"user", "extra_headers", "extra_query", "extra_body", "timeout"}
+        | {"query", "model", "labels"}
+    )
+
     capabilities = frozenset(
         {
             "chat",
@@ -490,14 +545,26 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
     def __init__(
         self, model_name: str, protocol: str = "ark", options: dict[str, Any] | None = None
     ):
-        normalized = str(protocol).strip().lower().replace("-", "_")
+        # 非字符串显式拒绝：``str(10**4301)`` 撞上 CPython 的整数位数上限，抛的是
+        # ``ValueError: Exceeds the limit``，与「协议名不支持」完全无关。协议名只
+        # 能是字符串。
+        if not isinstance(protocol, str):
+            raise ValueError(
+                f"Volcengine 的协议必须是字符串，但得到 {safe_repr(protocol)}。"
+                " 可选值: ark/chat_completions、responses"
+            )
+        normalized = protocol.strip().lower().replace("-", "_")
         if normalized in {"ark", "chat", "chat_completion", "chat_completions"}:
             self._protocol = "chat_completions"
         elif normalized in {"response", "responses"}:
             self._protocol = "responses"
         else:
             raise ValueError("Volcengine 仅支持 ark/chat_completions 或 responses 协议。")
-        self._model_name = model_name
+        # ``VolcengineProvider`` 是公开类，嵌入方可以绕过工厂直接构造。工厂路径
+        # 已用 ``require_model_name`` 收敛，这里同样要判：非字符串取值此前**全程
+        # 静默接受**（没有日志插值兜底），原样进 ``"model": self._model_name``
+        # 发给服务端。
+        self._model_name = require_model_name(model_name)
         self._options = validate_secret_free_options(options, "Volcengine")
         self._options = self._normalize_client_options(self._options)
         self._server_verified_protocols = self._normalize_verified_protocols(
@@ -554,43 +621,30 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         normalized = dict(options)
         if "timeout" in normalized:
             value = normalized["timeout"]
-            if isinstance(value, bool):
-                raise ValueError("Volcengine options.timeout 必须是正数。")
-            if isinstance(value, str):
-                try:
-                    value = float(value.strip())
-                except ValueError as exc:
-                    raise ValueError("Volcengine options.timeout 必须是正数。") from exc
-            if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
-                # httpx.Timeout is accepted by the Ark SDK but cannot be
-                # represented in TOML. Preserve such explicit SDK objects.
-                if not hasattr(value, "connect"):
-                    raise ValueError("Volcengine options.timeout 必须是正数或 httpx.Timeout。")
-            elif float(value) <= 0:
-                raise ValueError("Volcengine options.timeout 必须是正数。")
+            # httpx.Timeout 被 Ark SDK 接受，但无法用 TOML 表达，原样保留。
+            if hasattr(value, "connect"):
+                normalized["timeout"] = value
             else:
-                normalized["timeout"] = float(value)
+                # Ark 渠道一直接受数字字符串（``.env`` 来源本来就以字符串到达），
+                # 这里保留该行为，再交给共享 helper 做上界与有限性判断。其余三个
+                # 渠道的既有契约是拒绝字符串，故不做统一。
+                if isinstance(value, str):
+                    try:
+                        value = float(value.strip())
+                    except ValueError as exc:
+                        raise ValueError("Volcengine options.timeout 必须是正数。") from exc
+                normalized["timeout"] = normalize_client_timeout(
+                    value, "Volcengine", "options.timeout"
+                )
 
         if "max_retries" in normalized:
-            value = normalized["max_retries"]
-            if isinstance(value, bool):
-                raise ValueError("Volcengine options.max_retries 必须是大于等于 0 的整数。")
-            if isinstance(value, str):
-                text = value.strip()
-                try:
-                    parsed = int(text)
-                except ValueError as exc:
-                    raise ValueError(
-                        "Volcengine options.max_retries 必须是大于等于 0 的整数。"
-                    ) from exc
-                if text not in {str(parsed), f"+{parsed}"}:
-                    raise ValueError("Volcengine options.max_retries 必须是大于等于 0 的整数。")
-                value = parsed
-            elif isinstance(value, float) and math.isfinite(value) and value.is_integer():
-                value = int(value)
-            if not isinstance(value, int) or value < 0:
-                raise ValueError("Volcengine options.max_retries 必须是大于等于 0 的整数。")
-            normalized["max_retries"] = value
+            # 走与 OpenAI 兼容渠道同一个 helper：两边都是 SDK 的客户端构造参数，
+            # 判据必须一致。此前的内联实现**没有上界**，实测 ``max_retries`` 写成
+            # ``10**400`` 会被原样接受并传给 Ark SDK（``client.max_retries`` 就是
+            # 那个 401 位整数），而 SDK 的重试循环按该值决定次数，等价于无限重试。
+            normalized["max_retries"] = normalize_client_retries(
+                normalized["max_retries"], "Volcengine"
+            )
 
         if "region" in normalized:
             value = normalized["region"]
@@ -670,6 +724,23 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         带着 ``instructions`` 与 ``caching={"type": "enabled"}`` 直接发出。
         """
         segments = method_name.split(".")
+        if "classification" in segments:
+            # AGENTS.md 要求 Ark Classification 资源「需通过显式 Facade/入口
+            # 调用，不能把缺少资源挂载静默当成成功」。Facade 侧已用
+            # ``_get_classification_resource()`` 做到（SDK 未挂载时抛带指引的
+            # ``NotImplementedError``），但动态路径此前既不过该 Facade、也不做
+            # 参数白名单，实测 ``resources.classification.create(恶意字段=1)``
+            # 一路放行，最终拿到的是 SDK 内部的
+            # ``AttributeError: 'Ark' object has no attribute 'classification'``。
+            # 这里让动态路径与 Facade 受同一约束。
+            self._require_classification_resource(method_name)
+            if kwargs:
+                self._validate_resource_kwargs(
+                    "Classification",
+                    dict(kwargs),
+                    self._ARK_CLASSIFICATION_KEYS,
+                )
+            return
         if (
             "responses" in segments
             or method_name.endswith("_response")
@@ -681,8 +752,24 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             # ``async_create`` 这类 SDK 演进后新增的写法）。凡是参数里出现
             # 受校验字段就执行同一套校验——这正是「动态路径与 Facade 受同一
             # 约束」的判据。
-            if kwargs and self._ARK_RESPONSES_VALIDATED_KWARGS.intersection(kwargs):
-                self._validate_native_response_kwargs(kwargs)
+            #
+            # 但「一个触发字段都没出现」不等于「不是创建调用」：此前那种情况下
+            # 整套校验被跳过，请求直达 SDK，撞上 ``_utils/_utils.py`` 的
+            # ``assert "model" in kwargs``，抛出 **``AssertionError``**——它既不
+            # 落 ``except ValueError`` 也不落 ``except RuntimeError``。实测
+            # ``resources.responses.create()``／``create(store=True)``／
+            # ``create(text={...})`` 三条都得到 ``AssertionError: you need to
+            # support model``，而同样参数走 Facade 得到的是带指引的
+            # ``ValueError: Ark Responses 原生调用必须显式提供 model。``。
+            #
+            # ``create`` 是 ``responses`` 段下的动态方法（路径形如
+            # ``responses.create``／``responses.async_create``），其 ``model``
+            # 与 ``input`` 都是必填——无参调用本就该被本地拒绝。因此对创建方法
+            # 无条件执行校验，其余（retrieve／delete／list／子资源）仍按触发字段
+            # 判断，以免 ``retrieve("r1")`` 被误要求提供 model。
+            is_create = any(segment in {"create", "async_create"} for segment in segments)
+            if is_create or (kwargs and self._ARK_RESPONSES_VALIDATED_KWARGS.intersection(kwargs)):
+                self._validate_native_response_kwargs(kwargs or {})
 
     def _require_responses_resource(self, operation: str) -> None:
         """阻止未验证的 Ark Responses 请求到达远端。"""
@@ -700,6 +787,22 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
                 "请在 provider options 中显式配置 "
                 "server_verified_protocols=['responses']。"
             )
+
+    def _require_classification_resource(self, operation: str) -> None:
+        """阻止未挂载的 Ark Classification 请求以 SDK 内部错误收场。
+
+        与 ``_require_responses_resource`` 同一目的：动态路径
+        （``resources.classification.create(...)``）不经过 Facade，若不在这里
+        显式检查，资源缺失会退化成
+        ``AttributeError: 'Ark' object has no attribute 'classification'``——
+        用户拿不到「该资源未挂载」这个可定位的结论。这里主动构造一次资源，
+        让 ``_get_classification_resource`` 的 ``NotImplementedError`` 成为
+        唯一出口。
+        """
+        try:
+            self._get_classification_resource()
+        except NotImplementedError as exc:
+            raise NotImplementedError(f"Ark {operation}: {exc}") from exc
 
     def _get_client(self) -> Any:
         if self._client is None:
@@ -744,17 +847,40 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
     _merge_extra_body = staticmethod(OpenAICompatibleProvider._merge_extra_body)
 
     @staticmethod
-    def _convert_responses_format(response_format: dict[str, Any]) -> dict[str, Any]:
+    def _convert_responses_format(response_format: Any) -> dict[str, Any]:
+        """把统一的 ``response_format`` 转成 Ark Responses 的 ``format``。
+
+        容器形态判在这里：本函数的两个来源（``options.response_format`` 与请求参数）
+        都会走到它，而非 Mapping 时 ``.get()`` 抛裸 ``AttributeError``——不是
+        ``ValueError``，穿透调用方的错误分类。判据与 ``google.py`` 的
+        ``_response_format_values`` 一致。
+        """
+        if response_format is None:
+            return {}
+        if not isinstance(response_format, Mapping):
+            raise ValueError(
+                f"Ark Responses 的 response_format 必须是对象，但得到 {safe_repr(response_format)}。"
+            )
         if response_format.get("type") == "json_schema":
             schema = response_format.get("json_schema", response_format)
-            if not isinstance(schema, dict):
+            if not isinstance(schema, Mapping):
                 raise ValueError("Ark Responses 的 json_schema 必须是对象。")
+            # 无 schema 时不能回退成 ``{}``：那会伪造出一个空 JSON Schema 发给
+            # 服务端，客户端以为拿到了结构化输出约束，实际没有。与
+            # ``openai_compatible._convert_responses_format`` 同一判据——那份
+            # 副本已在 453d096 修过，本副本是同一转换逻辑的 Ark 分支，同批漏修。
+            json_schema = schema.get("schema")
+            if not isinstance(json_schema, Mapping) or not json_schema:
+                raise ValueError(
+                    "Ark Responses 的 json_schema 缺少 schema 字段；"
+                    "请提供 {'type': 'json_schema', 'json_schema': {'name': ..., 'schema': {...}}}。"
+                )
             return {
                 "format": {
                     "type": "json_schema",
                     "json_schema": {
                         "name": schema.get("name", "response"),
-                        "schema": schema.get("schema", response_format.get("schema", {})),
+                        "schema": json_schema,
                         "strict": schema.get("strict", True),
                     },
                 }
@@ -762,7 +888,7 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         if response_format.get("type") == "json_object":
             return {"format": {"type": "json_object"}}
         if "format" in response_format:
-            return response_format
+            return dict(response_format)
         raise ValueError("Ark Responses 的 response_format 仅支持 json_schema 或 json_object。")
 
     @staticmethod
@@ -770,6 +896,11 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         """将统一的 Chat 工具 schema 转换为 Ark Responses 工具 schema。"""
         if not tools:
             return None
+        # 容器形态先判：``enumerate(tools)`` 对不可迭代的取值抛裸
+        # ``TypeError``，而同函数对可迭代但元素非法的形态给的是带序号的
+        # ``ValueError``。同一判据的两半必须都在。
+        if not isinstance(tools, (list, tuple)):
+            raise ValueError(f"Ark Responses 工具定义必须是列表，但得到 {safe_repr(tools)}。")
         converted: list[dict[str, Any]] = []
         for index, tool in enumerate(tools):
             if not isinstance(tool, Mapping):
@@ -824,7 +955,12 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
                 return aliases[normalized]
             raise ValueError(f"Ark Responses 不支持 tool_choice: {tool_choice}")
         if isinstance(tool_choice, dict):
-            if tool_choice.get("type") == "function":
+            choice_type = tool_choice.get("type")
+            # 来自调用方的 dict，形态不受控：``in {...}`` 对 list/dict 抛
+            # ``TypeError``，而本函数的契约是 ``ValueError``。
+            if not isinstance(choice_type, str):
+                choice_type = None
+            if choice_type == "function":
                 function = tool_choice.get("function", tool_choice)
                 if not isinstance(function, Mapping):
                     raise ValueError("Ark Responses 的 function tool_choice 必须是对象。")
@@ -832,7 +968,7 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
                 if not name:
                     raise ValueError("Ark Responses 的 function tool_choice 缺少 name。")
                 return {"type": "function", "name": name}
-            if tool_choice.get("type") in {"mcp", "web_search", "knowledge_search"}:
+            if choice_type in {"mcp", "web_search", "knowledge_search"}:
                 return dict(tool_choice)
         raise ValueError("Ark Responses 的 tool_choice 必须是 auto、none、required 或工具对象。")
 
@@ -1344,10 +1480,12 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         def positive_finite(value: float | None, name: str) -> float | None:
             if value is None:
                 return None
+            # 先判可转换性：``math.isfinite(float(x))`` 对超出双精度范围的整数
+            # 自己就抛 ``OverflowError``（**不是** ``ValueError``）。
             if (
                 isinstance(value, bool)
                 or not isinstance(value, (int, float))
-                or not math.isfinite(float(value))
+                or not is_double_convertible(value)
                 or float(value) <= 0
             ):
                 raise ValueError(f"Ark 文件等待的 {name} 必须是有限正数。")
@@ -1389,13 +1527,23 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
 
     @staticmethod
     def _extract_result(response: Any) -> CompletionResult:
-        choices = field(response, "choices", []) or []
+        # ``choices`` 的形态守卫不能只靠 Chat 路径：``complete``／``acomplete`` 在
+        # Responses 分支走的是 ``_raise_for_response_error``，它只查 ``error`` 与
+        # ``status``，**不碰 choices**（对照 ``openai_compatible`` 的同名方法：
+        # 那边三个提取器也是这个形状）。此前这里直接 ``field(response, "choices",
+        # []) or []``，Responses 响应带 ``choices=5`` 时下面 ``choices[0]`` 抛裸
+        # ``TypeError: 'int' object is not subscriptable``——本 provider 的错误分类
+        # 按 ``RuntimeError`` 写。与 ``output``／``tool_calls`` 同判据走
+        # ``_require_ark_list``。
+        choices = _require_ark_list(field(response, "choices", []) or [], label="响应的 choices")
         text = ""
         calls: list[dict[str, Any]] = []
         if choices:
             message = field(choices[0], "message")
             text = content_to_text(field(message, "content", ""))
-            for call in field(message, "tool_calls", []) or []:
+            for call in _require_ark_list(
+                field(message, "tool_calls", []) or [], label="响应的 tool_calls"
+            ):
                 fn = field(call, "function")
                 calls.append(
                     {
@@ -1419,8 +1567,8 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             # 入口都会返回空文本而不报错。仅在没有 choices 文本时启用，避免
             # 覆盖 Chat Completions 分支已经取到的内容。
             text = _ark_responses_output_text(response)
-        for item in field(response, "output", []) or []:
-            item_type = field(item, "type")
+        for item in _require_ark_list(field(response, "output", []) or [], label="响应的 output"):
+            item_type = enum_field(item, "type")
             if item_type in {"function_call", "custom_tool_call"}:
                 calls.append(
                     {
@@ -1444,8 +1592,8 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             candidate_refusal = field(message, "refusal")
             if isinstance(candidate_refusal, str) and candidate_refusal:
                 refusal = candidate_refusal
-        for item in field(response, "output", []) or []:
-            if field(item, "type") in {"reasoning", "reasoning_item"}:
+        for item in _require_ark_list(field(response, "output", []) or [], label="响应的 output"):
+            if enum_field(item, "type") in {"reasoning", "reasoning_item"}:
                 summary = field(item, "summary")
                 if isinstance(summary, str):
                     reasoning += summary
@@ -1454,7 +1602,7 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
                         reasoning_text = field(entry, "text")
                         if isinstance(reasoning_text, str):
                             reasoning += reasoning_text
-                for content in field(item, "content", []) or []:
+                for content in _require_ark_content(item, label="响应的 output[].content"):
                     reasoning_text = field(content, "text")
                     if isinstance(reasoning_text, str):
                         reasoning += reasoning_text
@@ -1465,7 +1613,7 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
                 candidate_refusal = field(item, "refusal") or field(item, "text")
                 if isinstance(candidate_refusal, str) and candidate_refusal:
                     refusal = candidate_refusal
-            for content in field(item, "content", []) or []:
+            for content in _require_ark_content(item, label="响应的 output[].content"):
                 if field(content, "type") != "refusal":
                     continue
                 candidate_refusal = field(content, "refusal") or field(content, "text")
@@ -1516,11 +1664,17 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
                 if isinstance(error, str)
                 else field(error, "message", "Ark Responses 请求失败")
             )
-            raise RuntimeError(str(message))
+            # ``message`` 来自网关 JSON，形态不受控：位数超限的整数让裸 ``str()``
+            # 抛 ``ValueError: Exceeds the limit``，正要报告网关错误的那一步变成
+            # 整数转换错误，而调用方按 ``RuntimeError`` 分类。
+            raise RuntimeError(message if isinstance(message, str) else safe_repr(message))
         if status == "incomplete":
             details = field(response, "incomplete_details")
             reason = field(details, "reason", "unknown")
-            raise RuntimeError(f"Ark Responses 响应不完整: {reason}")
+            # ``reason`` 来自网关 JSON，形态不受控：``f"{10**4300}"`` 抛
+            # ``ValueError: Exceeds the limit``，于是「响应不完整」这条错误
+            # 被替换成与原因无关的位数错误。
+            raise RuntimeError(f"Ark Responses 响应不完整: {safe_repr(reason)}")
         if status == "cancelled":
             raise RuntimeError("Ark Responses 请求已取消")
 
@@ -1541,7 +1695,7 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         text = content_to_text(field(delta, "content", ""))
         reasoning = field(delta, "reasoning_content") or field(delta, "reasoning") or ""
         refusal = field(delta, "refusal")
-        calls = field(delta, "tool_calls", []) or []
+        calls = _require_ark_list(field(delta, "tool_calls", []) or [], label="流块的 tool_calls")
         finish_reason = field(choice, "finish_reason")
         events: list[StreamEvent] = []
         if isinstance(refusal, str) and refusal:
@@ -1568,7 +1722,16 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
                             "index": field(call, "index", position),
                             "type": field(call, "type", "function"),
                             "name": field(function, "name"),
-                            "arguments": field(function, "arguments", ""),
+                            # 与另两条路径同判据（非流式 ``_extract_result`` 与
+                            # OpenAI 兼容的 ``_chat_stream_events`` 都走
+                            # ``normalize_tool_arguments``）。网关可以把
+                            # ``arguments`` 写成对象／数组／整数（``construct_type``
+                            # 不做校验），原样透传会让**同一个输入在 Ark 的两条
+                            # 路径上给出不同类型**——调用方按字符串 ``json.loads``
+                            # 时拿到 dict 并抛裸 ``TypeError``；位数超限的整数则让
+                            # 拼接／``json.dumps`` 抛 ``ValueError: Exceeds the
+                            # limit``。字符串片段原样透传，拼接语义不变。
+                            "arguments": normalize_tool_arguments(field(function, "arguments", "")),
                         },
                         response_id=response_id,
                         raw=chunk,
@@ -1669,7 +1832,7 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             ):
                 if terminal_seen:
                     continue
-                event_type = field(event, "type", "")
+                event_type = enum_field(event, "type")
                 converted = self._responses_stream_event(event, response_tool_metadata)
                 if converted:
                     if converted.type == "finish":
@@ -1769,7 +1932,7 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
             ):
                 if terminal_seen:
                     continue
-                event_type = field(event, "type", "")
+                event_type = enum_field(event, "type")
                 converted = self._responses_stream_event(event, response_tool_metadata)
                 if converted:
                     if converted.type == "finish":
@@ -1912,92 +2075,110 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         extra_body: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> Generator[str, None, None]:
-        request = CompletionRequest(
-            prompt=prompt,
-            system_prompt=system_prompt,
-            messages=messages,
-            tools=tools,
-            stream=stream,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            top_p=top_p,
-            stop=stop,
-            response_format=response_format,
-            tool_choice=tool_choice,
-            extra_body=extra_body,
-            **kwargs,
+        logger.info(
+            f"调用 {getattr(self, '_provider', 'volcengine')} LLM ({self._model_name})，流式: {stream}"
         )
-        if self._protocol == "responses":
-            self._require_responses_resource("invoke")
-            if tools:
-                raise ValueError(
-                    "Ark Responses invoke 仅返回文本，不支持 tools；"
-                    "请使用 complete 或 stream_events 获取工具调用。"
-                )
+        start_time = time.perf_counter()
+        try:
+            request = CompletionRequest(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                messages=messages,
+                tools=tools,
+                stream=stream,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                top_p=top_p,
+                stop=stop,
+                response_format=response_format,
+                tool_choice=tool_choice,
+                extra_body=extra_body,
+                **kwargs,
+            )
+            if self._protocol == "responses":
+                self._require_responses_resource("invoke")
+                if tools:
+                    raise ValueError(
+                        "Ark Responses invoke 仅返回文本，不支持 tools；"
+                        "请使用 complete 或 stream_events 获取工具调用。"
+                    )
+                if stream:
+                    terminal_seen = False
+                    for event in retry_sync_stream(
+                        lambda: self._get_client().responses.create(
+                            **self._build_responses_request(request)
+                        ),
+                        lambda event: raise_for_stream_error_event(event, "Ark Responses"),
+                    ):
+                        raise_for_stream_error_event(event, "Ark Responses")
+                        converted = self._responses_stream_event(event)
+                        if field(event, "type") == "response.completed":
+                            terminal_seen = True
+                        if converted and converted.type == "refusal_delta" and converted.refusal:
+                            raise RuntimeError(f"Ark Responses 返回拒答: {converted.refusal}")
+                        if converted and converted.text:
+                            yield converted.text
+                    if not terminal_seen:
+                        raise RuntimeError("Ark Responses 流在 response.completed 之前结束。")
+                else:
+                    response = retry_sync_call(
+                        lambda: self._get_client().responses.create(
+                            **self._build_responses_request(request)
+                        )
+                    )
+                    self._raise_for_response_error(response)
+                    result = self._extract_result(response)
+                    if result.refusal:
+                        raise RuntimeError(f"Ark Responses 返回拒答: {result.refusal}")
+                    if result.text:
+                        yield result.text
+                return
             if stream:
                 terminal_seen = False
-                for event in retry_sync_stream(
-                    lambda: self._get_client().responses.create(
-                        **self._build_responses_request(request)
+                for chunk in retry_sync_stream(
+                    lambda: self._get_client().chat.completions.create(
+                        **self._build_chat_request(**request.to_invoke_kwargs())
                     ),
-                    lambda event: raise_for_stream_error_event(event, "Ark Responses"),
+                    lambda chunk: raise_for_stream_error_event(chunk, "Ark Chat Completions"),
                 ):
-                    raise_for_stream_error_event(event, "Ark Responses")
-                    converted = self._responses_stream_event(event)
-                    if field(event, "type") == "response.completed":
-                        terminal_seen = True
-                    if converted and converted.type == "refusal_delta" and converted.refusal:
-                        raise RuntimeError(f"Ark Responses 返回拒答: {converted.refusal}")
-                    if converted and converted.text:
-                        yield converted.text
+                    raise_for_stream_error_event(chunk, "Ark Chat Completions")
+                    for event in self._chat_stream_events(chunk):
+                        if event.type == "finish":
+                            terminal_seen = True
+                        if event.type == "refusal_delta" and event.refusal:
+                            raise RuntimeError(f"Ark Chat Completions 返回拒答: {event.refusal}")
+                        if event.type == "text_delta" and event.text:
+                            yield event.text
                 if not terminal_seen:
-                    raise RuntimeError("Ark Responses 流在 response.completed 之前结束。")
+                    raise RuntimeError("Ark Chat Completions 流在 finish 事件之前结束。")
             else:
                 response = retry_sync_call(
-                    lambda: self._get_client().responses.create(
-                        **self._build_responses_request(request)
+                    lambda: self._get_client().chat.completions.create(
+                        **self._build_chat_request(**request.to_invoke_kwargs())
                     )
                 )
-                self._raise_for_response_error(response)
+                OpenAICompatibleProvider._raise_for_chat_response_error(
+                    response,
+                    provider="Ark Chat Completions",
+                )
                 result = self._extract_result(response)
                 if result.refusal:
-                    raise RuntimeError(f"Ark Responses 返回拒答: {result.refusal}")
+                    raise RuntimeError(f"Ark Chat Completions 返回拒答: {result.refusal}")
                 if result.text:
                     yield result.text
-            return
-        if stream:
-            terminal_seen = False
-            for chunk in retry_sync_stream(
-                lambda: self._get_client().chat.completions.create(
-                    **self._build_chat_request(**request.to_invoke_kwargs())
-                ),
-                lambda chunk: raise_for_stream_error_event(chunk, "Ark Chat Completions"),
-            ):
-                raise_for_stream_error_event(chunk, "Ark Chat Completions")
-                for event in self._chat_stream_events(chunk):
-                    if event.type == "finish":
-                        terminal_seen = True
-                    if event.type == "refusal_delta" and event.refusal:
-                        raise RuntimeError(f"Ark Chat Completions 返回拒答: {event.refusal}")
-                    if event.type == "text_delta" and event.text:
-                        yield event.text
-            if not terminal_seen:
-                raise RuntimeError("Ark Chat Completions 流在 finish 事件之前结束。")
-        else:
-            response = retry_sync_call(
-                lambda: self._get_client().chat.completions.create(
-                    **self._build_chat_request(**request.to_invoke_kwargs())
-                )
+            duration = time.perf_counter() - start_time
+            logger.info(
+                f"{getattr(self, '_provider', 'volcengine')} LLM ({self._model_name}) 调用完成，耗时: {duration:.2f}s"
             )
-            OpenAICompatibleProvider._raise_for_chat_response_error(
-                response,
-                provider="Ark Chat Completions",
+        except Exception as e:
+            error_text = safe_exception_text(e)
+            logger.exception(
+                "%s LLM (%s) 出错: %s",
+                getattr(self, "_provider", "volcengine"),
+                self._model_name,
+                error_text,
             )
-            result = self._extract_result(response)
-            if result.refusal:
-                raise RuntimeError(f"Ark Chat Completions 返回拒答: {result.refusal}")
-            if result.text:
-                yield result.text
+            raise
 
     async def ainvoke(
         self,
@@ -2008,85 +2189,103 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         temperature: float | None = _UNSET_TEMPERATURE,  # type: ignore[assignment]
         **kwargs: Any,
     ) -> AsyncGenerator[str, None]:
-        if prompt is not None:
-            kwargs["prompt"] = prompt
-        kwargs["system_prompt"] = system_prompt
-        if tools is not None:
-            kwargs["tools"] = tools
-        kwargs["stream"] = stream
-        kwargs["temperature"] = temperature
-        request = CompletionRequest(**kwargs)
-        if self._protocol == "responses":
-            self._require_responses_resource("ainvoke")
-            if request.tools:
-                raise ValueError(
-                    "Ark Responses ainvoke 仅返回文本，不支持 tools；"
-                    "请使用 acomplete 或 astream_events 获取工具调用。"
-                )
+        logger.info(
+            f"调用 {getattr(self, '_provider', 'volcengine')} LLM ({self._model_name})，流式: {stream}"
+        )
+        start_time = time.perf_counter()
+        try:
+            if prompt is not None:
+                kwargs["prompt"] = prompt
+            kwargs["system_prompt"] = system_prompt
+            if tools is not None:
+                kwargs["tools"] = tools
+            kwargs["stream"] = stream
+            kwargs["temperature"] = temperature
+            request = CompletionRequest(**kwargs)
+            if self._protocol == "responses":
+                self._require_responses_resource("ainvoke")
+                if request.tools:
+                    raise ValueError(
+                        "Ark Responses ainvoke 仅返回文本，不支持 tools；"
+                        "请使用 acomplete 或 astream_events 获取工具调用。"
+                    )
+                if request.stream:
+                    terminal_seen = False
+                    async for event in retry_async_stream(
+                        lambda: self._get_aclient().responses.create(
+                            **self._build_responses_request(request)
+                        ),
+                        lambda event: raise_for_stream_error_event(event, "Ark Responses"),
+                    ):
+                        raise_for_stream_error_event(event, "Ark Responses")
+                        converted = self._responses_stream_event(event)
+                        if field(event, "type") == "response.completed":
+                            terminal_seen = True
+                        if converted and converted.type == "refusal_delta" and converted.refusal:
+                            raise RuntimeError(f"Ark Responses 返回拒答: {converted.refusal}")
+                        if converted and converted.text:
+                            yield converted.text
+                    if not terminal_seen:
+                        raise RuntimeError("Ark Responses 异步流在 response.completed 之前结束。")
+                else:
+                    response = await retry_async_call(
+                        lambda: self._get_aclient().responses.create(
+                            **self._build_responses_request(request)
+                        )
+                    )
+                    self._raise_for_response_error(response)
+                    result = self._extract_result(response)
+                    if result.refusal:
+                        raise RuntimeError(f"Ark Responses 返回拒答: {result.refusal}")
+                    if result.text:
+                        yield result.text
+                return
             if request.stream:
                 terminal_seen = False
-                async for event in retry_async_stream(
-                    lambda: self._get_aclient().responses.create(
-                        **self._build_responses_request(request)
+                async for chunk in retry_async_stream(
+                    lambda: self._get_aclient().chat.completions.create(
+                        **self._build_chat_request(**request.to_invoke_kwargs())
                     ),
-                    lambda event: raise_for_stream_error_event(event, "Ark Responses"),
+                    lambda chunk: raise_for_stream_error_event(chunk, "Ark Chat Completions"),
                 ):
-                    raise_for_stream_error_event(event, "Ark Responses")
-                    converted = self._responses_stream_event(event)
-                    if field(event, "type") == "response.completed":
-                        terminal_seen = True
-                    if converted and converted.type == "refusal_delta" and converted.refusal:
-                        raise RuntimeError(f"Ark Responses 返回拒答: {converted.refusal}")
-                    if converted and converted.text:
-                        yield converted.text
+                    raise_for_stream_error_event(chunk, "Ark Chat Completions")
+                    for event in self._chat_stream_events(chunk):
+                        if event.type == "finish":
+                            terminal_seen = True
+                        if event.type == "refusal_delta" and event.refusal:
+                            raise RuntimeError(f"Ark Chat Completions 返回拒答: {event.refusal}")
+                        if event.type == "text_delta" and event.text:
+                            yield event.text
                 if not terminal_seen:
-                    raise RuntimeError("Ark Responses 异步流在 response.completed 之前结束。")
+                    raise RuntimeError("Ark Chat Completions 异步流在 finish 事件之前结束。")
             else:
                 response = await retry_async_call(
-                    lambda: self._get_aclient().responses.create(
-                        **self._build_responses_request(request)
+                    lambda: self._get_aclient().chat.completions.create(
+                        **self._build_chat_request(**request.to_invoke_kwargs())
                     )
                 )
-                self._raise_for_response_error(response)
+                OpenAICompatibleProvider._raise_for_chat_response_error(
+                    response,
+                    provider="Ark Chat Completions",
+                )
                 result = self._extract_result(response)
                 if result.refusal:
-                    raise RuntimeError(f"Ark Responses 返回拒答: {result.refusal}")
+                    raise RuntimeError(f"Ark Chat Completions 返回拒答: {result.refusal}")
                 if result.text:
                     yield result.text
-            return
-        if request.stream:
-            terminal_seen = False
-            async for chunk in retry_async_stream(
-                lambda: self._get_aclient().chat.completions.create(
-                    **self._build_chat_request(**request.to_invoke_kwargs())
-                ),
-                lambda chunk: raise_for_stream_error_event(chunk, "Ark Chat Completions"),
-            ):
-                raise_for_stream_error_event(chunk, "Ark Chat Completions")
-                for event in self._chat_stream_events(chunk):
-                    if event.type == "finish":
-                        terminal_seen = True
-                    if event.type == "refusal_delta" and event.refusal:
-                        raise RuntimeError(f"Ark Chat Completions 返回拒答: {event.refusal}")
-                    if event.type == "text_delta" and event.text:
-                        yield event.text
-            if not terminal_seen:
-                raise RuntimeError("Ark Chat Completions 异步流在 finish 事件之前结束。")
-        else:
-            response = await retry_async_call(
-                lambda: self._get_aclient().chat.completions.create(
-                    **self._build_chat_request(**request.to_invoke_kwargs())
-                )
+            duration = time.perf_counter() - start_time
+            logger.info(
+                f"{getattr(self, '_provider', 'volcengine')} LLM ({self._model_name}) 异步调用完成，耗时: {duration:.2f}s"
             )
-            OpenAICompatibleProvider._raise_for_chat_response_error(
-                response,
-                provider="Ark Chat Completions",
+        except Exception as e:
+            error_text = safe_exception_text(e)
+            logger.exception(
+                "%s LLM (%s) 异步出错: %s",
+                getattr(self, "_provider", "volcengine"),
+                self._model_name,
+                error_text,
             )
-            result = self._extract_result(response)
-            if result.refusal:
-                raise RuntimeError(f"Ark Chat Completions 返回拒答: {result.refusal}")
-            if result.text:
-                yield result.text
+            raise
 
     @retry(
         stop=stop_after_attempt(3),
@@ -2098,41 +2297,61 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         overlap = sorted({"input", "model"}.intersection(kwargs))
         if overlap:
             raise ValueError(f"Ark Embedding 不允许覆盖请求字段: {', '.join(overlap)}")
-        request: dict[str, Any] = {"input": texts, "model": self._model_name}
-        configured_options = self._embedding_options()
-        configured_extra_body = self._validated_extra_body(
-            configured_options.pop("extra_body", None),
-            "Ark Embedding",
-            set(request).union(configured_options),
+        texts = require_text_list(texts, "Ark")
+        logger.info(
+            f"调用 {getattr(self, '_provider', 'volcengine')} 嵌入 ({self._model_name})，数量: {len(texts)}"
         )
-        request_options = dict(kwargs)
-        self._validate_resource_kwargs(
-            "Embedding",
-            request_options,
-            {
-                "encoding_format",
-                "dimensions",
-                "user",
-                "extra_body",
-                "extra_headers",
-                "extra_query",
-                "timeout",
-            },
-        )
-        request_extra_body = self._validated_extra_body(
-            request_options.pop("extra_body", None),
-            "Ark Embedding",
-            set(request).union(configured_options).union(request_options),
-        )
-        request.update(configured_options)
-        request.update(request_options)
-        merged_extra_body = self._merge_extra_body(
-            configured_extra_body, request_extra_body, "Ark Embedding"
-        )
-        if merged_extra_body:
-            request["extra_body"] = merged_extra_body
-        response = self._get_client().embeddings.create(**request)
-        return [normalize_embedding_vector(item.embedding) for item in response.data]
+        start_time = time.perf_counter()
+        try:
+            request: dict[str, Any] = {"input": texts, "model": self._model_name}
+            configured_options = self._embedding_options()
+            configured_extra_body = self._validated_extra_body(
+                configured_options.pop("extra_body", None),
+                "Ark Embedding",
+                set(request).union(configured_options),
+            )
+            request_options = dict(kwargs)
+            self._validate_resource_kwargs(
+                "Embedding",
+                request_options,
+                {
+                    "encoding_format",
+                    "dimensions",
+                    "user",
+                    "extra_body",
+                    "extra_headers",
+                    "extra_query",
+                    "timeout",
+                },
+            )
+            request_extra_body = self._validated_extra_body(
+                request_options.pop("extra_body", None),
+                "Ark Embedding",
+                set(request).union(configured_options).union(request_options),
+            )
+            request.update(configured_options)
+            request.update(request_options)
+            merged_extra_body = self._merge_extra_body(
+                configured_extra_body, request_extra_body, "Ark Embedding"
+            )
+            if merged_extra_body:
+                request["extra_body"] = merged_extra_body
+            response = self._get_client().embeddings.create(**request)
+            embeddings = [normalize_embedding_vector(item.embedding) for item in response.data]
+            duration = time.perf_counter() - start_time
+            logger.info(
+                f"{getattr(self, '_provider', 'volcengine')} 嵌入 ({self._model_name}) 完成，耗时: {duration:.2f}s"
+            )
+            return embeddings
+        except Exception as e:
+            error_text = safe_exception_text(e)
+            logger.exception(
+                "%s 嵌入 (%s) 出错: %s",
+                getattr(self, "_provider", "volcengine"),
+                self._model_name,
+                error_text,
+            )
+            raise
 
     @retry(
         stop=stop_after_attempt(3),
@@ -2144,43 +2363,63 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         overlap = sorted({"input", "model"}.intersection(kwargs))
         if overlap:
             raise ValueError(f"Ark Embedding 不允许覆盖请求字段: {', '.join(overlap)}")
-        request: dict[str, Any] = {"input": texts, "model": self._model_name}
-        configured_options = self._embedding_options()
-        configured_extra_body = self._validated_extra_body(
-            configured_options.pop("extra_body", None),
-            "Ark Embedding",
-            set(request).union(configured_options),
+        texts = require_text_list(texts, "Ark")
+        logger.info(
+            f"调用 {getattr(self, '_provider', 'volcengine')} 嵌入 ({self._model_name})，数量: {len(texts)}"
         )
-        request_options = dict(kwargs)
-        self._validate_resource_kwargs(
-            "Embedding",
-            request_options,
-            {
-                "encoding_format",
-                "dimensions",
-                "user",
-                "extra_body",
-                "extra_headers",
-                "extra_query",
-                "timeout",
-            },
-        )
-        request_extra_body = self._validated_extra_body(
-            request_options.pop("extra_body", None),
-            "Ark Embedding",
-            set(request).union(configured_options).union(request_options),
-        )
-        request.update(configured_options)
-        request.update(request_options)
-        merged_extra_body = self._merge_extra_body(
-            configured_extra_body, request_extra_body, "Ark Embedding"
-        )
-        if merged_extra_body:
-            request["extra_body"] = merged_extra_body
-        response = await self._resolve_async_result(
-            self._get_aclient().embeddings.create(**request)
-        )
-        return [normalize_embedding_vector(item.embedding) for item in response.data]
+        start_time = time.perf_counter()
+        try:
+            request: dict[str, Any] = {"input": texts, "model": self._model_name}
+            configured_options = self._embedding_options()
+            configured_extra_body = self._validated_extra_body(
+                configured_options.pop("extra_body", None),
+                "Ark Embedding",
+                set(request).union(configured_options),
+            )
+            request_options = dict(kwargs)
+            self._validate_resource_kwargs(
+                "Embedding",
+                request_options,
+                {
+                    "encoding_format",
+                    "dimensions",
+                    "user",
+                    "extra_body",
+                    "extra_headers",
+                    "extra_query",
+                    "timeout",
+                },
+            )
+            request_extra_body = self._validated_extra_body(
+                request_options.pop("extra_body", None),
+                "Ark Embedding",
+                set(request).union(configured_options).union(request_options),
+            )
+            request.update(configured_options)
+            request.update(request_options)
+            merged_extra_body = self._merge_extra_body(
+                configured_extra_body, request_extra_body, "Ark Embedding"
+            )
+            if merged_extra_body:
+                request["extra_body"] = merged_extra_body
+            response = await self._resolve_async_result(
+                self._get_aclient().embeddings.create(**request)
+            )
+            embeddings = [normalize_embedding_vector(item.embedding) for item in response.data]
+            duration = time.perf_counter() - start_time
+            logger.info(
+                f"{getattr(self, '_provider', 'volcengine')} 嵌入 ({self._model_name}) 异步完成，耗时: {duration:.2f}s"
+            )
+            return embeddings
+        except Exception as e:
+            error_text = safe_exception_text(e)
+            logger.exception(
+                "%s 嵌入 (%s) 异步出错: %s",
+                getattr(self, "_provider", "volcengine"),
+                self._model_name,
+                error_text,
+            )
+            raise
 
     def upload_file(self, file: Any, purpose: str, **kwargs: Any) -> Any:
         purpose = self._require_non_empty_string(purpose, "Ark 文件 purpose")
@@ -2363,10 +2602,24 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         response = self._get_client().tokenization.create(
             text=text, model=self._model_name, **kwargs
         )
-        values = field(response, "data", []) or []
+        # ``data`` 的形态同样要收敛：``or []`` 只挡 ``None`` 与空值，实测
+        # ``data=5`` 时下面的生成器迭代抛裸
+        # ``TypeError: 'int' object is not iterable``——而紧邻的「缺少 data」
+        # 是 ``RuntimeError``，同一份响应的两种形态不该得到两种异常分类。
+        values = _require_ark_list(
+            field(response, "data", []) or [], label="tokenization 响应的 data"
+        )
         if not values:
             raise RuntimeError("Ark tokenization 响应缺少 data。")
-        return sum(int(field(item, "total_tokens", 0)) for item in values)
+        # 与其余七个 token 计数入口（``require_token_count``）保持同一契约：
+        # 此前写成 ``int(field(item, "total_tokens", 0))``，于是 ``"abc"`` 抛裸
+        # ``ValueError``、``None`` 抛裸 ``TypeError``、位数超限的数字串抛与 token
+        # 计数无关的位数错误，且消息里连字段名都没有。``0`` 默认值也不合适——
+        # 缺字段时静默算成 0 个 token，把「响应不完整」报成「没有 token」。
+        return sum(
+            require_token_count(field(item, "total_tokens"), "Ark", "total_tokens")
+            for item in values
+        )
 
     def multimodal_embed(self, inputs: Any, **kwargs: Any) -> Any:
         self._validate_resource_kwargs(
@@ -2705,10 +2958,24 @@ class VolcengineProvider(LargeLanguageModel, TextEmbeddingModel):
         response = await self._resolve_async_result(
             self._get_aclient().tokenization.create(text=text, model=self._model_name, **kwargs)
         )
-        values = field(response, "data", []) or []
+        # ``data`` 的形态同样要收敛：``or []`` 只挡 ``None`` 与空值，实测
+        # ``data=5`` 时下面的生成器迭代抛裸
+        # ``TypeError: 'int' object is not iterable``——而紧邻的「缺少 data」
+        # 是 ``RuntimeError``，同一份响应的两种形态不该得到两种异常分类。
+        values = _require_ark_list(
+            field(response, "data", []) or [], label="tokenization 响应的 data"
+        )
         if not values:
             raise RuntimeError("Ark tokenization 响应缺少 data。")
-        return sum(int(field(item, "total_tokens", 0)) for item in values)
+        # 与其余七个 token 计数入口（``require_token_count``）保持同一契约：
+        # 此前写成 ``int(field(item, "total_tokens", 0))``，于是 ``"abc"`` 抛裸
+        # ``ValueError``、``None`` 抛裸 ``TypeError``、位数超限的数字串抛与 token
+        # 计数无关的位数错误，且消息里连字段名都没有。``0`` 默认值也不合适——
+        # 缺字段时静默算成 0 个 token，把「响应不完整」报成「没有 token」。
+        return sum(
+            require_token_count(field(item, "total_tokens"), "Ark", "total_tokens")
+            for item in values
+        )
 
     async def async_multimodal_embed(self, inputs: Any, **kwargs: Any) -> Any:
         self._validate_resource_kwargs(

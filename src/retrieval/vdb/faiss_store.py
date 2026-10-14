@@ -8,7 +8,8 @@ import os
 # Pickle is retained only for trusted local legacy snapshots.
 import pickle  # nosec B403
 import time
-from collections.abc import Iterable
+import warnings
+from collections.abc import Iterable, Mapping
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -24,12 +25,118 @@ except ImportError as exc:
         "FAISS is not installed. Please install it with `pip install faiss-cpu`."
     ) from exc
 
+from ...ui.display_utils import document_source
+from ...utils.config import _MAX_RETRIEVAL_TOP_K, safe_repr
 from ...utils.log_manager import get_module_logger
-from ...utils.security import ensure_trusted_source, resolve_within
+from ...utils.security import ensure_trusted_source, resolve_within, safe_exception_text
 from .base import VectorStoreBase
 
 logger = get_module_logger(__name__)
 jieba.setLogLevel(jieba.logging.ERROR)
+
+
+def _parent_key(parent_id: Any) -> str:
+    """把 ``parent_id`` 收敛成父文档字典的键。
+
+    四处都用裸 ``str()``，而 ``parent_id`` 来自知识快照的元数据——本项目加载
+    pickle 格式的快照，pickle 是二进制格式、不受 CPython 十进制位数限制
+    （实测 ``pickle.loads(pickle.dumps(10**4301))`` 正常往返）。位数超限时
+    ``str()`` 抛 ``ValueError: Exceeds the limit``：在 ``load_snapshot`` 里它让
+    **加载宣布成功之后**的每一次检索都崩，在 ``resolve_parent_content`` 里它让
+    父块召回整体不可用。
+
+    不能用 ``safe_repr``：它对位数超限的值只给量级描述（``<整数，约 4302 位
+    十进制>``），对 81~4300 位的整数给 ``text[:77] + "..."`` 截断——两者都让
+    **不同**取值塌成**同一**键（``10**4301`` 与 ``10**4301+1`` 得到同一键），
+    于是 ``_normalize_documents`` 的父块字典推导让后一条静默覆盖前一条，
+    ``resolve_parent_content`` 对两个不同 id 返回同一父块正文——父块内容张冠
+    李戴。按二进制补码取 sha256 摘要才能既稳定又唯一——**摘要算法**（signed
+    big-endian ``to_bytes`` + sha256）与 ``retrieval_service._key_text`` 一致，
+    但**触发阈值有意不同**：这里只对 ``str()`` 无法表达的超限整数（>4300 位）
+    启用摘要，``_key_text`` 对 repr 超过 80 字符的整数就启用。键是写盘后长期
+    存在的格式，main 时代构建的快照里整数 id 的键是 ``str(parent_id)``（``1`` →
+    ``"1"``），无差别换键会让旧快照在载入后召回不到任何整数 id 的父块（实测
+    复现）。``str`` 对可表达的整数是**精确**转换，本身不塌键；塌键风险只
+    来自 ``safe_repr`` 的截断。因此先试 ``str()``，抛 ``ValueError`` 才落
+    摘要——旧快照零破坏，超限整数仍唯一稳定。
+    """
+    if isinstance(parent_id, str):
+        return parent_id
+    if isinstance(parent_id, int):
+        try:
+            return str(parent_id)
+        except ValueError:  # 十进制位数超 CPython str() 上限（4300 位）
+            import hashlib
+
+            raw = parent_id.to_bytes((parent_id.bit_length() + 8) // 8, "big", signed=True)
+            digest = hashlib.sha256(raw, usedforsecurity=False).hexdigest()
+            return f"<整数，{digest}>"
+    # numpy 标量（``np.int64``／``np.float64``／``np.bool_``）在 numpy 2.x 下
+    # **不是** ``int``／``float`` 的子类，落不进上面的分支。main 用 ``str()``
+    # 得到 ``"3"``，``safe_repr`` 得到 ``"np.int64(3)"``——同一份旧快照在两版
+    # 代码间键形态不同，载入后召回静默 miss（实测复现）。numpy 标量提供
+    # ``.item()``，归一成原生 Python 值后与 main 的 ``str()`` 逐字一致。
+    item_method = getattr(parent_id, "item", None)
+    if callable(item_method):
+        try:
+            return _parent_key(item_method())
+        except Exception as item_exc:  # noqa: BLE001 - item() 不可用即退回通用兜底
+            logger.debug("parent_id 的 item() 归一失败: %s", safe_exception_text(item_exc))
+    # 其余非 str/int 取值不能退回 ``safe_repr``：repr 超 80 字符的取值被截成
+    # ``text[:77] + "..."``，两个不同的长 bytes/tuple 塌成同一个键（实测复现），
+    # 字典推导静默并条。repr 未超限的原样保留，超限的对 repr 字节取摘要。
+    # 判据同样落在真实 repr 上：``safe_repr`` 截断输出恰好 80 字符，拿
+    # ``len(rendered) > 80`` 判断永远不触发（实测复现）。repr 不可用时退回
+    # ``safe_repr``。
+    rendered = safe_repr(parent_id)
+    try:
+        raw_repr = repr(parent_id)
+    except Exception:  # noqa: BLE001 - repr 不可用时只能量级描述
+        return rendered
+    if len(raw_repr) > 80:
+        import hashlib
+
+        raw = raw_repr.encode("utf-8", errors="replace")
+        digest = hashlib.sha256(raw, usedforsecurity=False).hexdigest()
+        return f"<{type(parent_id).__name__}，{digest}>"
+    return rendered
+
+
+def _require_top_k(top_k: Any) -> int:
+    """校验检索方法的 ``top_k``，返回原值。
+
+    ``semantic_search`` 与 ``keyword_search`` 同名参数、同一份上界来源，判据必须
+    一致——此前两处完全不同，同一取值给出三种收场：
+
+    * ``0``／负数：``semantic_search`` 抛 FAISS 内建 ``assert k > 0`` 产生的
+      **无消息** ``AssertionError``（``str(e)`` 是空串，栈里只有 C 层）；
+      ``keyword_search`` 则因为循环体先 ``append`` 再判 ``len(results) >= top_k``，
+      **返回 1 条**——调用方要求「不要结果」却拿到一条，且无任何提示。
+    * 非整数：FAISS 报 ``TypeError: an integer is required``，
+      ``keyword_search`` 在 ``int >= str`` 处报 ``TypeError: '>=' not supported``
+      ——两者都是裸 ``TypeError``，不是本项目的 ``ValueError``，调用方按
+      ``except ValueError`` 写的处理接不住。
+    * 过大：FAISS 不报错也不截断，直接按 k 分配结果数组——实测 ``top_k=10**9``
+      挂起（>30s），``10**8`` 耗时 15.3s。配置层的 ``_MAX_RETRIEVAL_TOP_K`` 拦不住
+      这里：它只作用在 ``Settings.chat_top_k`` 与 ``SessionConfig.top_k`` 上，而
+      这两个方法是 ``VectorStoreBase`` 的公开方法，参数一路透传到 FAISS。
+
+    ``bool`` 显式排除：它是 ``int`` 子类，``True`` 会被当成 1 放行，而那几乎必然
+    是上游把标志位写进了规模字段。
+    """
+    if isinstance(top_k, bool) or not isinstance(top_k, int):
+        raise ValueError(f"top_k 必须是整数，但得到 {safe_repr(top_k)}。")
+    if not 1 <= top_k <= _MAX_RETRIEVAL_TOP_K:
+        # 这条消息里也必须用 ``safe_repr``，与上面那条一致。裸 ``{top_k}`` 对位数
+        # 超过 ``sys.get_int_max_str_digits()``（默认 4300）的整数会抛
+        # ``ValueError: Exceeds the limit``——正要报「top_k 越界」的那一步自己
+        # 抛错，用户拿到的是整数转换错误，与 top_k 毫无关系。实测
+        # ``top_k=10**4301`` 时两个方法都复现；``10**4000`` 则正常（位数在上限
+        # 内，只是消息被 ``safe_repr`` 的 80 字符截断规则处理得更可读）。
+        raise ValueError(
+            f"top_k 必须是 1 到 {_MAX_RETRIEVAL_TOP_K} 之间的整数，但得到 {safe_repr(top_k)}。"
+        )
+    return top_k
 
 
 class FaissStore(VectorStoreBase):
@@ -56,6 +163,29 @@ class FaissStore(VectorStoreBase):
 
         if not file_path:
             return
+        # 形态判据与 ``save``／``load``／``save_snapshot``／``load_snapshot`` 一致：
+        # 构造器是同一个 ``file_path`` 的另一条公开入口，而它第一件事就是
+        # ``os.path.exists``——那里早于 ``load`` 里的形态守卫，非路径取值的收场
+        # 不在本类的 ``ValueError`` 契约内。实测：
+        #   * ``["a"]``／``{"a": 1}``／``object()`` -> 裸
+        #     ``TypeError: stat: path should be string, bytes, os.PathLike or
+        #     integer, not ...``；
+        #   * 位数超限的整数（``10**4301``）-> 裸 ``OverflowError: fd is greater
+        #     than maximum``——``ArithmeticError`` 子类，**不是** ``ValueError``，
+        #     穿透调用方全部 ``except ValueError`` 分类；
+        #   * 普通整数（``5``）更隐蔽：``os.path.exists`` 把它当成**文件描述符**
+        #     探测，fd 未打开时静默返回 ``False``，构造"成功"并把整数留在
+        #     ``self.file_path`` 上——与 ``save(5)`` 把字节写进 fd 5 是同一类
+        #     「整数被当成 fd」的问题，只是后果从写错文件变成静默空 store。
+        # 可达路径：``FaissStore`` 是公开类，且
+        # ``VectorStoreFactory.get_vector_store(store_type, file_path)`` 把
+        # ``file_path`` 原样透传到这里。
+        if not isinstance(file_path, (str, os.PathLike)):
+            raise ValueError(
+                "FaissStore 的 file_path 必须是字符串或路径，"
+                f"但得到 {type(file_path).__name__}。"
+                " 请检查该路径来源（通常来自 RunConfig 的 legacy_pkl_path）。"
+            )
         if not os.path.exists(file_path):
             return
         self.load(file_path, trusted_paths=trusted_paths)
@@ -70,6 +200,33 @@ class FaissStore(VectorStoreBase):
         if isinstance(parent_document, str):
             return {"content": parent_document, "metadata": {}}
         return {"content": "", "metadata": {}}
+
+    @staticmethod
+    def _index_text_of(document: Any) -> str:
+        """从任意形态的条目里取出建索引用文本，非映射条目返回空串。
+
+        ``_build_index_text`` 的契约是「拿到一个映射」，而 ``self.documents``
+        的**历史**内容不受写入侧校验的约束：``load_snapshot`` 会从 pickle 读回
+        任意形态（虽有 ``_validate_document_shape``，但那是后来才加的边界），而
+        重建索引是**由 documents 派生的缓存**，不该在派生期抛异常——一抛就卡死
+        整个 store（见 ``_rebuild_indices`` 的说明）。这里把非法形态降级成空串：
+        该条目缺席检索，但其余条目照常可用，store 也不再卡死。
+        """
+        if not isinstance(document, Mapping):
+            return ""
+        # ``_build_index_text`` 的两处取值同样要求形态正确：``metadata`` 非映射时
+        # ``.get`` 抛 ``AttributeError``，``page_content`` 非字符串时要么在
+        # ``in`` 上抛 ``TypeError``，要么把列表交给 ``jieba.cut`` 抛
+        # ``AttributeError: 'list' object has no attribute 'decode'``。这里先归一化
+        # 成契约形态再交给它——非字符串内容没有可检索的文本表示，降级为空串。
+        metadata = document.get("metadata")
+        content = document.get("page_content", "")
+        return FaissStore._build_index_text(
+            {
+                "page_content": content if isinstance(content, str) else "",
+                "metadata": metadata if isinstance(metadata, Mapping) else {},
+            }
+        )
 
     @staticmethod
     def _build_index_text(document: dict[str, Any]) -> str:
@@ -93,16 +250,36 @@ class FaissStore(VectorStoreBase):
         ``lexical.index`` 读回 ``[]``（空快照或手工构造的目录），旧实现
         在此崩溃且不报「快照为空」这个真实原因。
         """
-        if not tokenized_docs:
+        # 两个条件缺一不可：``not tokenized_docs`` 只挡住**外层为空**，而
+        # ``rank_bm25`` 的 ``_calc_idf`` 在**所有 token 都为空**时也会除零
+        # （``idf_sum / len(self.idf)``，分母为 0）。实测 ``[[]]`` 与 ``[[], []]``
+        # 都抛 ``ZeroDivisionError: division by zero``——``jieba.cut("")`` 返回
+        # ``[]``，因此一条 ``page_content=""`` 的文档就足以构造出这个形态，而空
+        # ``page_content`` 在快照里是合法的（``_validate_document_shape`` 只要求
+        # 它是 ``str``）。两种形态的语义相同：没有可检索的语料，返回 ``None``。
+        if not tokenized_docs or not any(tokenized_docs):
             return None
         return BM25Okapi(tokenized_docs)
 
     def _rebuild_indices(self) -> None:
         if self.documents:
-            self._tokenized_docs_cache = [
-                list(jieba.cut(self._build_index_text(doc))) for doc in self.documents
-            ]
-            self.bm25_index = self._build_bm25_index(self._tokenized_docs_cache)
+            # 先整体算完再赋值。原先直接给 ``self._tokenized_docs_cache`` 赋一个
+            # 列表推导式的结果——推导式在赋值**前**整体求值，中途抛异常时该属性
+            # 保持旧值，而 ``self.documents`` 已经多出条目，于是
+            # ``_tokenized_docs_cache[i]`` 与 ``self.documents[i]`` 不再一一对应。
+            # 两个消费点都按下标取值：``keyword_search`` 拿
+            # ``self._tokenized_docs_cache[idx]`` 打分却取 ``self.documents[idx]``
+            # 作结果，``_promote_parent_context`` 同样按下标取文档。错配即张冠李戴。
+            #
+            # 更要紧的是它让 store **卡死**：``_build_index_text`` 对非映射条目抛
+            # ``AttributeError``，因此只要 documents 里混进一条孤儿，此后**每一次**
+            # ``upsert_embeddings`` 都会在重建索引时重复抛出——连喂完全合法的文档
+            # 也失败。实测连续 3 次合法 upsert 全部报同一个错，documents 停在 5 条
+            # 不再增长，向量库事实上报废。索引重建是「由 documents 派生的缓存」，
+            # 必须容忍 documents 里的任何形态，把校验交给写入侧的入口。
+            tokenized_docs = [list(jieba.cut(self._index_text_of(doc))) for doc in self.documents]
+            self._tokenized_docs_cache = tokenized_docs
+            self.bm25_index = self._build_bm25_index(tokenized_docs)
         else:
             self._tokenized_docs_cache = []
             self.bm25_index = None
@@ -114,14 +291,221 @@ class FaissStore(VectorStoreBase):
         else:
             self.faiss_index = None
 
-    def _normalize_loaded_documents(self) -> None:
-        normalized_parent_documents = dict(self.parent_documents)
-        for document in self.documents:
-            metadata = document.get("metadata") or {}
+    @staticmethod
+    def _validate_embeddings_shape(embeddings: Any, *, source: str) -> None:
+        """确认向量矩阵是二维的，非法形态给出可读的 ``ValueError``。
+
+        两个载入入口（``load``／``load_snapshot``）原先把取值直接赋给
+        ``self.embeddings``，由 ``_rebuild_indices`` 事后读 ``len()`` 与
+        ``shape[1]``——于是形状错误抛的是 ``TypeError: len() of unsized object``
+        （0 维）、``IndexError: tuple index out of range``（1 维）或
+        ``AttributeError: 'list' object has no attribute 'shape'``（legacy pkl 里
+        是普通列表）。三者都不是 ``ValueError``，穿透调用方的错误分类；更要紧的
+        是校验发生在赋值**之后**，因此失败会留下半更新的 store——而两个入口的
+        契约都是「失败必须让 store 保持原状」。
+
+        写入侧 ``upsert_embeddings`` 早已有同一断言（``ndim != 2``），这里补齐
+        读取侧，判据与措辞对齐。
+
+        ``None`` 是合法取值：表示「这份 legacy／快照没有向量」，后续
+        ``_rebuild_indices`` 会把 ``faiss_index`` 置为 ``None``。
+        """
+        if embeddings is None:
+            return
+        ndim = getattr(embeddings, "ndim", None)
+        if ndim != 2:
+            raise ValueError(
+                f"{source}的 embeddings 必须是二维数组"
+                f"（得到 {type(embeddings).__name__}，ndim={ndim!r}）。"
+                " 请重建知识快照或修正数据来源。"
+            )
+        # 有限性同样要判，且必须判在 ``astype(np.float32)`` **之后**：写入侧
+        # ``EmbeddingService._as_float32_matrix`` 早就拦了非有限向量，理由写在
+        # 那里——FAISS 把 NaN 向量照单收下（``ntotal`` 正常增加），既不报错也不
+        # 跳过，直到查询时那个下标干脆不出现在结果里，用户看到的是「搜到了」而
+        # 不是「这份快照坏了」。载入侧此前只判 ``ndim``，于是同一份内容写入侧
+        # 拒绝、载入侧放行。
+        #
+        # 判 cast 之后的矩阵而不是原数组：``1e300`` 在 float64 里是**有限**的，
+        # cast 成 float32 才溢出成 ``inf``（写入侧正是靠这个顺序把这一类也拦住）。
+        # 只对原数组调 ``isfinite`` 会让载入侧在这一点上再次与写入侧分叉。
+        # ``astype`` 只是校验用的副本，不改写 ``embeddings`` 本身，因此失败时
+        # store 仍保持原状。
+        #
+        # 溢出警告在这里是预期行为（正是它说明 cast 确实产生了 inf），不能让它
+        # 冒充成新的警告泄漏出去。
+        if isinstance(embeddings, np.ndarray):
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    cast = embeddings.astype(np.float32)
+            except (TypeError, ValueError, OverflowError) as exc:
+                # ``dtype=object`` 的 ndarray 在 ``astype`` 时抛裸
+                # ``OverflowError: int too large to convert to float``——它不是
+                # ``ValueError``，而载入侧对「来源不自洽」的承诺是带指引的
+                # ``ValueError``（与写入侧 ``_as_float32_matrix`` 一致）。pickle 是
+                # 二进制格式、不受十进制位数限制，``10**400`` 这种元素能正常往返。
+                raise ValueError(
+                    f"{source}的 embeddings 无法转为 float32（{type(exc).__name__}: {exc}）。"
+                    " 请重建知识快照或修正数据来源。"
+                ) from exc
+            if not np.isfinite(cast).all():
+                raise ValueError(
+                    f"{source}的 embeddings 包含非有限值（NaN 或无穷大）。"
+                    " 请重建知识快照或修正数据来源。"
+                )
+
+    @staticmethod
+    def _validate_row_alignment(
+        documents: Any,
+        embeddings: Any,
+        faiss_index: Any,
+        *,
+        source: str,
+    ) -> None:
+        """确认三条行数必须对齐：文档数、embeddings 行数、语义索引条数。
+
+        三者由 ``save_snapshot``／``upsert_embeddings`` 从同一份内存状态写出，
+        行数一致才保证 ``semantic_search`` 的 ``indices`` 下标对应
+        ``documents``。实测 embeddings 两行、文档 2 条但 ``semantic.index`` 只有
+        1 个向量时：载入成功、无任何提示，``semantic_search`` 拿 ``indices``
+        索引 ``documents``——第 2 条文档永远不出现在结果里，用户看到的是
+        「搜不到」而不是「这份快照坏了」。反向（索引或矩阵比文档多）同样危险：
+        ``self.documents[doc_index]`` 抛 ``IndexError``，与「快照不自洽」无关的
+        类型。``embeddings=None`` 表示这份快照没有向量，不参与对齐。
+        """
+        doc_rows = len(documents)
+        if embeddings is not None:
+            matrix_rows = int(embeddings.shape[0])
+            if matrix_rows != doc_rows:
+                raise ValueError(
+                    f"{source}不自洽：向量矩阵行数与分块数不一致。"
+                    f" embeddings={matrix_rows}，chunks.pkl={doc_rows}。"
+                    " 快照可能在写入或复制过程中被截断，请重建。"
+                )
+        if faiss_index is not None:
+            index_rows = int(faiss_index.ntotal)
+            if index_rows != doc_rows:
+                raise ValueError(
+                    f"{source}不自洽：语义索引条数与分块数不一致。"
+                    f" semantic.index={index_rows}，chunks.pkl={doc_rows}。"
+                    " 快照可能在写入或复制过程中被截断，请重建。"
+                )
+
+    @staticmethod
+    def _validate_document_shape(document: Any, position: int, *, source: str) -> None:
+        """确认条目符合 ``Document`` 的契约，``source`` 用于说明它来自哪里。
+
+        ``Document`` 的字段是 ``content: str`` + ``metadata: dict``
+        （见 ``src/models/document.py``），而载入路径原先把条目直接当成 ``Document``
+        用，只做 ``metadata or {}`` 的兜底。实测 ``page_content=None`` 的快照能通过
+        ``validate_snapshot_dir``、加载成功，直到 ``display_results`` 里
+        ``.replace()`` 才抛 ``AttributeError: 'NoneType' object has no attribute
+        'replace'``——报错现场离真正的原因（快照里这一条不是字符串）很远。
+        ``metadata`` 非 dict 与条目本身不是 dict 同理。
+
+        两个调用点的契约相同、处置不同，因此消息里的处置指引必须分开：
+        ``load_snapshot`` 遇到的是**盘上已有的**坏数据，用户能做的是重建快照；
+        ``upsert_embeddings`` 遇到的是**正在写入**的坏数据，用户能做的是修正来源
+        并重试，让他「重建快照」会指向一个还没写坏的旧快照。原先写死「请重建
+        快照」的措辞只在载入侧成立。
+        """
+        if not isinstance(document, dict):
+            raise ValueError(
+                f"{source}：第 {position} 条文档不是映射"
+                f"（{type(document).__name__}），无法作为文档使用。"
+            )
+        # ``page_content`` 在 ``Document`` 里是必填的 ``str``（没有默认值），
+        # 因此 ``None`` 与其它非字符串同样是违规——消费者里
+        # ``display_results`` 调 ``.replace()``、``_display_retrieved_docs`` 切片，
+        # 都会在 None 上崩。键**缺失**则不同：各消费者都写了默认值
+        # （``.get("page_content", "")``），因此缺失照旧放行。
+        content = document.get("page_content", "")
+        if not isinstance(content, str):
+            raise ValueError(
+                f"{source}：第 {position} 条文档的 page_content 不是字符串"
+                f"（{type(content).__name__}）。"
+            )
+        metadata = document.get("metadata")
+        if metadata is not None and not isinstance(metadata, dict):
+            raise ValueError(
+                f"{source}：第 {position} 条文档的 metadata 不是映射（{type(metadata).__name__}）。"
+            )
+
+    @staticmethod
+    def _normalize_documents(
+        documents: Any, parent_documents: Any
+    ) -> tuple[list[Any], dict[str, dict[str, Any]]]:
+        """校验并归一化载入的条目，返回新值，**不改动 ``self``**。
+
+        盘上的父条目也要过一遍 ``_normalize_parent_document``，与
+        ``register_parent_documents`` 同一条契约。
+
+        快照校验器**显式放行** ``str`` 形态的父条目（它的注释写着「要么是 dict
+        （取 ``content``），要么是 str（整体即内容）——``FaissStore._normalize_parent_document``
+        的取值契约」），但载入路径原样赋值、只补不归一化，于是那个契约在载入
+        侧从未被履行：``resolve_parent_content`` 拿 str 去 ``.get("content")``。
+
+        实测后果：``parents.pkl`` 为 ``{"p1": "父块正文"}`` 时，
+        ``validate_snapshot_dir``、``load_manifest``、``load_snapshot`` **全部**
+        通过（快照被激活并宣布加载成功），而聊天与召回测试的每一次检索都在
+        ``_promote_parent_context`` 抛
+        ``AttributeError: 'str' object has no attribute 'get'``。这条形态不是
+        假想输入：legacy 导入分支 ``store.load()`` → ``save_snapshot()`` 会把
+        第三方 pkl 里的 str 值原样写进新快照。
+
+        **不改动 ``self`` 是刻意的**：调用方在全部校验通过后才一次性赋值，失败
+        时 store 保持原状。原先本方法是就地改 ``self.documents``／
+        ``self.parent_documents`` 的，而两个调用方又已经先把新值赋了进去——中途
+        失败就留下半更新的 store（见 ``load`` 的说明）。
+        """
+        # 顶层形态同样要有守卫。``SnapshotRepository.validate_snapshot_dir`` 已经
+        # 覆盖这些形态，但 ``load``／``load_snapshot`` 是 ``VectorStoreBase`` 的
+        # 契约方法，直接调它们的嵌入方不经过那道校验（与
+        # ``_validate_document_shape`` 同一取舍）。实测后果都是与「快照不自洽」
+        # 无关的裸异常：
+        #   分块列表是 int／None -> ``TypeError: 'int' object is not iterable``
+        #   分块列表是 dict／str -> 逐字符/逐键当成文档，报「第 0 条文档不是映射」
+        #     （误导：真正的问题是顶层形态）
+        #   父块索引是 int／None／list -> ``AttributeError: 'int' object has no
+        #     attribute 'items'``
+        # 判定与 ``validate_snapshot_dir`` 的同名守卫一致：拒绝 str／bytes／映射，
+        # 并要求有 ``__len__``。``len("ab") == 2`` 这类会静默通过的形态正是靠
+        # 类型判断拦下的。
+        if isinstance(documents, (str, bytes, Mapping)) or not hasattr(documents, "__len__"):
+            raise ValueError(
+                "知识快照不自洽：分块列表的顶层不是序列"
+                f"（{type(documents).__name__}），无法作为文档列表使用。请重建快照。"
+            )
+        if not isinstance(parent_documents, Mapping):
+            raise ValueError(
+                "知识快照不自洽：父块索引的顶层不是映射"
+                f"（{type(parent_documents).__name__}），无法作为父块索引使用。请重建快照。"
+            )
+
+        normalized_parent_documents = {
+            _parent_key(parent_id): FaissStore._normalize_parent_document(parent_document)
+            for parent_id, parent_document in parent_documents.items()
+        }
+        normalized_documents: list[Any] = []
+        for position, document in enumerate(documents):
+            FaissStore._validate_document_shape(
+                document,
+                position,
+                source="知识快照不自洽，请重建快照",
+            )
+            # 浅拷贝而不是原地改：``metadata.pop("parent_content", ...)`` 会写进
+            # 调用方持有的那个字典，而「任何一条校验失败都不留痕」要求连输入也
+            # 不被改写。归一化后的内容完全一致，只是换了对象。
+            metadata = dict(document.get("metadata") or {})
             parent_id = metadata.get("parent_id")
             parent_content = metadata.pop("parent_content", None)
-            if parent_id and parent_content and str(parent_id) not in normalized_parent_documents:
-                normalized_parent_documents[str(parent_id)] = {
+            if (
+                parent_id
+                and parent_content
+                and _parent_key(parent_id) not in normalized_parent_documents
+            ):
+                normalized_parent_documents[_parent_key(parent_id)] = {
                     "content": parent_content,
                     "metadata": {
                         key: value
@@ -129,40 +513,139 @@ class FaissStore(VectorStoreBase):
                         if key not in {"chunk_id", "doc_id", "parent_id", "parent_chunk_index"}
                     },
                 }
-            document["metadata"] = metadata
-        self.parent_documents = normalized_parent_documents
+            normalized_documents.append({**document, "metadata": metadata})
+        return normalized_documents, normalized_parent_documents
 
     def register_parent_documents(self, parent_documents: dict[str, dict[str, Any]]):
+        # 顶层形态的判据与载入侧 ``_normalize_documents`` 的同名守卫一致（同一条
+        # 注释：「``load``／``load_snapshot`` 是 ``VectorStoreBase`` 的契约方法，
+        # 直接调它们的嵌入方不经过那道校验」——本方法同样是契约方法，取舍同样
+        # 适用）。此前只有载入侧有这条守卫：非映射传进来时，这里在 ``.items()``
+        # 上抛裸 ``AttributeError: 'int' object has no attribute 'items'``，而
+        # 载入侧对同一形态给的是带指引的 ``ValueError``。同一件事两种收场。
+        #
+        # 本仓自带流程到不了这里（``knowledge_build_service`` 传的是
+        # ``dict``，且前面已用 ``isinstance(..., dict)`` 过滤），因此在生产上
+        # 不可达——修的是契约一致性：嵌入方直接调这个公开方法时，拿到的错误
+        # 应当和其它入口一样指向「配置项形态错了」。
+        if not isinstance(parent_documents, Mapping):
+            raise ValueError(
+                "父块索引的顶层不是映射"
+                f"（{type(parent_documents).__name__}），无法作为父块索引使用。"
+            )
         for parent_id, parent_document in parent_documents.items():
             normalized = self._normalize_parent_document(parent_document)
             if normalized["content"]:
-                self.parent_documents[str(parent_id)] = normalized
+                self.parent_documents[_parent_key(parent_id)] = normalized
 
     def resolve_parent_content(self, parent_id: str | None) -> str | None:
         if not parent_id:
             return None
-        parent_document = self.parent_documents.get(str(parent_id))
+        parent_document = self.parent_documents.get(_parent_key(parent_id))
         if not parent_document:
             return None
         content = parent_document.get("content")
         return content if isinstance(content, str) and content else None
 
     def upsert_embeddings(self, documents: list[dict[str, Any]], embeddings: Any):
+        # 顶层容器形态先判：下一行 ``if not documents`` 之后就是 ``len(documents)``。
+        # 实测 ``documents=5`` 抛裸 ``TypeError: object of type 'int' has no len()``
+        # ——不是本方法其余拒绝路径承诺的 ``ValueError``；``documents=None`` 更糟，
+        # 它被 ``if not documents`` 当成「无写入」**静默返回**，调用方以为写入成功
+        # 而 store 一个字都没变。判据与载入侧 ``_normalize_documents`` 的同名守卫
+        # 一致（拒绝 ``str``／``bytes``／映射，要求有 ``__len__``）。
+        if isinstance(documents, (str, bytes, Mapping)) or not hasattr(documents, "__len__"):
+            raise ValueError(
+                "待写入的 documents 必须是文档列表，但得到 "
+                f"{type(documents).__name__}，无法作为文档列表使用。"
+            )
         if not documents:
             return
 
-        new_embeddings = np.array(embeddings, dtype=np.float32)
+        # cast 溢出（``1e300`` → ``inf``）在这里是**被校验的对象**，不是要给
+        # 调用方的警告：下面的有限性判据正是靠它把这一类拦住。不抑制的话它会以
+        # ``RuntimeWarning`` 的形式泄漏出去，且出现在报错之前。
+        #
+        # 转换失败同样要收敛成 ``ValueError``，判据与同文件 ``semantic_search``
+        # 的查询向量转换逐字相同——那里早已按同一分类修过，这一半此前漏了。
+        # ``np.array`` 的失败分三类，只有一类是本项目契约里的类型：
+        #   ``OverflowError``——``np.array(10**4301, dtype=np.float32)``，超出
+        #     双精度范围的整数。它是 ``ArithmeticError`` 子类而**不是**
+        #     ``ValueError``，穿透调用方全部 ``except ValueError`` 分类。
+        #   ``TypeError``——``object()``／``{"a": 1}``，消息是 ``float()
+        #     argument must be a string or a real number``。
+        #   ``ValueError``——``"abc"``，消息是 numpy 的 ``could not convert
+        #     string to float``，与本项目的措辞不同。
+        # 三者的消息都不指向「这批向量形态不对」，而 ``documents`` 那一半已经
+        # 给出了带指引的 ``ValueError``（见上）——同一方法的两个入参，收场不该
+        # 一个可读一个裸抛。
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                new_embeddings = np.array(embeddings, dtype=np.float32)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "待写入的 embeddings 必须是二维数值数组，但得到 "
+                f"{type(embeddings).__name__}（{type(exc).__name__}: {exc}）。"
+                " 请检查向量来源（通常来自 EmbeddingService）。"
+            ) from exc
         if new_embeddings.ndim != 2:
             raise ValueError("embeddings 必须是二维数组。")
         if len(documents) != len(new_embeddings):
             raise ValueError("documents 与 embeddings 的数量不一致。")
 
+        # 维度检查必须在改动 ``self.documents`` **之前**：原先先 extend 再判维度，
+        # 维度不一致时抛异常但 documents 已经多出一批没有对应向量的条目。实测
+        # 拒绝之后 documents=2 而 embeddings=(1,4)，store 已不自洽，而
+        # ``save_snapshot`` 会照常把这份不自洽落盘（之后的语义检索会拿
+        # ``indices`` 去索引 ``documents``，越界或错配）。失败必须不留痕。
+        if self.embeddings is not None and self.embeddings.shape[1] != new_embeddings.shape[1]:
+            raise ValueError("新增向量维度与现有索引不一致。")
+
+        # 有限性：与载入侧 ``_validate_embeddings_shape`` 同一判据。此前只有载入
+        # 侧校验，写入侧放行——同一份内容「写得进、读不出」：FAISS 把 NaN/inf
+        # 向量照单收下（``ntotal`` 正常增加），既不报错也不跳过，直到查询时那个
+        # 下标干脆不出现在结果里，用户看到的是「搜到了」而不是「这份数据坏了」。
+        # 更糟的是 ``save_snapshot`` 会把它落盘，此后**载入侧**才拒绝——快照
+        # 已经写坏，而报错现场离写入处很远。
+        #
+        # 判 ``new_embeddings``（已经 cast 成 float32）而不是原数组：``1e300``
+        # 在 float64 里有限、cast 成 float32 才溢出成 ``inf``，载入侧正是靠这个
+        # 顺序把这一类也拦住。``np.array(..., dtype=np.float32)`` 在溢出时会发
+        # ``RuntimeWarning``，那是预期行为，在下面统一抑制，避免冒充成新的警告
+        # 泄漏给调用方。
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            cast = np.asarray(embeddings, dtype=np.float32)
+        if not np.isfinite(cast).all():
+            raise ValueError(
+                "待写入的 embeddings 包含非有限值（NaN 或无穷大），已拒绝写入。"
+                " 请修正向量来源后重试。"
+            )
+
+        # 条目形态同样必须在改动 ``self.documents`` **之前**确认，理由与上面那条
+        # 维度检查一致：写入侧原先只校验 embeddings，文档形态则放任 ``extend``
+        # 之后由 ``_rebuild_indices`` 在派生索引时撞出来。实测一条非映射条目
+        # （第三方 store 的返回值、手工构造的 pkl）会让
+        # ``_build_index_text`` 抛 ``AttributeError: 'str' object has no attribute
+        # 'get'``——异常看似「拒绝写入」，实际上 documents 已经多出这条孤儿，
+        # ``save_snapshot`` 会把它写进快照，而 store 在此之后**再也无法接受任何
+        # 写入**。错误类型也从「快照不自洽」退化成裸 ``AttributeError``。
+        #
+        # 判据与载入边界 ``_validate_document_shape`` 完全一致（同一份
+        # ``Document`` 契约），因此复用同一份实现；只是这里的下标从 0 起算，
+        # 而载入路径的 position 用于描述「第几条」，两者语义相同。
+        for position, document in enumerate(documents):
+            self._validate_document_shape(
+                document,
+                position,
+                source="待写入的文档不符合 Document 契约，已拒绝写入",
+            )
+
         self.documents.extend(documents)
         if self.embeddings is None:
             self.embeddings = new_embeddings
         else:
-            if self.embeddings.shape[1] != new_embeddings.shape[1]:
-                raise ValueError("新增向量维度与现有索引不一致。")
             self.embeddings = np.vstack((self.embeddings, new_embeddings))
         self._rebuild_indices()
 
@@ -178,7 +661,35 @@ class FaissStore(VectorStoreBase):
         if self.faiss_index is None or self.embeddings is None:
             return []
 
-        query_vector = np.asarray(query_embedding, dtype=np.float32)
+        # 校验放在调 ``faiss_index.search()`` **之前**：FAISS 对非法 k 的收场
+        # 不可用（详见 ``_require_top_k``）。
+        _require_top_k(top_k)
+
+        # 转换失败要收敛成 ``ValueError``。``np.asarray`` 的失败分三类，只有一类
+        # 是本项目契约里的类型：
+        #   ``OverflowError``——``np.asarray(10**4301, dtype=np.float32)``，超双精度
+        #     范围的整数（容器里混入这类元素同样）。它是 ``ArithmeticError`` 子类
+        #     而**不是** ``ValueError``，穿透调用方全部 ``except ValueError`` 分类。
+        #   ``TypeError``——``object()``／集合／生成器，消息是 ``float() argument
+        #     must be a string or a real number``。
+        #   ``ValueError``——``"abc"`` 这类字符串，消息是 numpy 的
+        #     ``could not convert string to float``，与本项目的措辞不同。
+        # 本函数已按同一判据修过 ``_require_top_k``（那里拦住的是 FAISS 的裸
+        # ``TypeError``／``AssertionError``），查询向量这条漏了：同一个「参数形态
+        # 非法」的处置，两处收场不同。
+        #
+        # 不逐元素预检：``np.zeros(4, dtype=np.float32)`` 是 ``embed_query`` 的
+        # 真实输出，逐元素判有限性会把合法的 numpy 标量一并拒掉（实测
+        # ``to_finite_float(np.float32(0.1))`` 返回 ``None``——它只认 Python
+        # 的 int／float）。非有限值不在这里拦：``ndim`` 守卫之后 FAISS 自己处理。
+        try:
+            query_vector = np.asarray(query_embedding, dtype=np.float32)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "查询向量必须是一维数值序列，但得到 "
+                f"{type(query_embedding).__name__}（{type(exc).__name__}: {exc}）。"
+                " 请检查嵌入模型的输出。"
+            ) from exc
         if query_vector.ndim != 1 or query_vector.size == 0:
             raise ValueError("查询向量必须是一维且非空。")
         expected_dimension = int(self.embeddings.shape[1])
@@ -204,6 +715,16 @@ class FaissStore(VectorStoreBase):
         if self.bm25_index is None:
             return []
 
+        # 与 ``semantic_search`` 同一判据（详见 ``_require_top_k``）。这里尤其
+        # 重要：下面的收集循环是「先 append 再判长度」，``top_k=0`` 会返回 1 条。
+        _require_top_k(top_k)
+
+        # ``jieba.cut`` 对非字符串抛 ``AttributeError: 'int' object has no
+        # attribute 'decode'``（它按字节处理输入）——不是本项目的 ``ValueError``，
+        # 消息也指向 jieba 内部。查询文本只能来自用户输入或调用方，形态必须显式
+        # 校验，与 ``_require_top_k``／查询向量同一判据。
+        if not isinstance(query_text, str):
+            raise ValueError(f"关键词检索的查询文本必须是字符串，但得到 {safe_repr(query_text)}。")
         tokenized_query = list(jieba.cut(query_text))
         doc_scores = self.bm25_index.get_scores(tokenized_query)
         top_indices = np.argsort(doc_scores)[::-1]
@@ -255,6 +776,17 @@ class FaissStore(VectorStoreBase):
         )
 
     def save(self, path: str):
+        # 形态守卫与读取侧 ``load``／``load_snapshot`` 同判据：``open()`` 对**整数**
+        # 入参不报错，而是把它当成**文件描述符**——``save(5)`` 会把 pickle 字节写进
+        # fd 5（实测复现），既没落到预期路径，也可能覆盖进程里恰好占着该 fd 的
+        # 文件；对 ``list`` 抛裸 ``TypeError: expected str, bytes or os.PathLike
+        # object, not ...``，位数超限的整数抛 ``ValueError: Exceeds the limit``。
+        # 三条都不是本类其余拒绝路径承诺的带指引 ``ValueError``。
+        if not isinstance(path, (str, os.PathLike)):
+            raise ValueError(
+                f"向量存储文件路径必须是字符串或路径，但得到 {type(path).__name__}。"
+                " 请检查该路径来源（通常来自 RunConfig 或 SnapshotRepository）。"
+            )
         with open(path, "wb") as file:
             pickle.dump(
                 {
@@ -277,20 +809,82 @@ class FaissStore(VectorStoreBase):
         ``RunConfig.legacy_pkl_path`` 的所在目录）。为 ``None`` 或空时拒绝加载：
         pickle 会执行任意代码，而「路径看起来像本项目的文件」不构成来源证明。
         """
+        # ``os.path.exists`` 对非路径取值抛裸 ``TypeError``（``expected str,
+        # bytes or os.PathLike object, not ...``），早于下面的来源校验——而本
+        # 方法（及其调用方 ``VectorStoreFactory``）按 ``ValueError`` 分类。判据与
+        # ``resolve_within`` 的同类守卫一致，形态判在第一次使用之前。
+        if not isinstance(path, (str, os.PathLike)):
+            raise ValueError(
+                f"legacy 向量存储文件路径必须是字符串或路径，但得到 {type(path).__name__}。"
+                " 请检查该路径来源（通常来自 RunConfig 的 legacy_pkl_path）。"
+            )
         if not os.path.exists(path):
             raise FileNotFoundError(f"向量存储文件未找到: {path}")
         ensure_trusted_source(path, trusted_paths, label="legacy 向量存储文件")
-        with open(path, "rb") as file:
-            data = pickle.load(file)  # nosec B301 - 上方已校验来源
-        self.documents = data.get("documents", [])
-        self.embeddings = data.get("embeddings")
-        self.parent_documents = data.get("parent_documents", {})
-        self._normalize_loaded_documents()
+        # 空/截断文件让 ``pickle.load`` 抛 ``EOFError``／``UnpicklingError``，
+        # 目录/无读权限抛 ``IsADirectoryError``／``PermissionError``——裸异常
+        # 穿透 ``Chatbot.__init__`` 后被 ``main.py`` 的
+        # ``except (KeyboardInterrupt, EOFError)`` **误判为用户中断**，程序以
+        # 「检测到中断信号」正常退出（实测复现），真因（文件损坏）无任何提示。
+        # 本方法其余拒绝路径承诺带指引的 ``ValueError``，这里一并收敛。
+        try:
+            with open(path, "rb") as file:
+                data = pickle.load(file)  # nosec B301 - 上方已校验来源
+        except (OSError, EOFError, pickle.UnpicklingError) as exc:
+            raise ValueError(
+                f"legacy 向量存储文件无法读取（{type(exc).__name__}: {exc}）："
+                f"{path}。文件可能为空、被截断或是目录；请检查该文件，"
+                "或重新构建知识快照。"
+            ) from exc
+        # 全部解析、校验到**局部变量**，最后一次性赋给 ``self``。原先先把三个
+        # 字段赋进 ``self`` 再调 ``_normalize_loaded_documents``，中途失败就留下
+        # 半更新的 store——实测一次被拒的载入之后：``documents`` 换成了新值、
+        # ``embeddings`` 是新值，而 ``faiss_index`` 与 ``_tokenized_docs_cache``
+        # 还是**旧**的（索引条数 2 对应 1 条文档），随后 ``semantic_search`` 抛
+        # ``TypeError: 'str' object does not support item assignment``——报错现场
+        # 与真正的原因（载入被拒）毫无关联。失败必须让 store 保持原状。
+        if not isinstance(data, Mapping):
+            raise ValueError(
+                "legacy 向量存储文件不自洽：顶层不是映射"
+                f"（{type(data).__name__}），无法取出 documents／embeddings。"
+            )
+        documents, parent_documents = self._normalize_documents(
+            data.get("documents", []), data.get("parent_documents", {})
+        )
+        embeddings = data.get("embeddings")
+        # 形状必须在赋值**之前**判：下面的 ``self.documents = documents`` 之后
+        # ``_rebuild_indices`` 才读形状，那时失败已经留下半更新的 store。
+        self._validate_embeddings_shape(embeddings, source="legacy 向量存储文件")
+        # legacy pkl 没有独立的 semantic.index（``_rebuild_indices`` 会重建），
+        # 但 **embeddings 行数**仍必须与 documents 对齐：``_rebuild_indices`` 按
+        # ``len(embeddings)`` 建索引，行数错配的 legacy 文件载入后文档与向量
+        # 一一错位，``semantic_search`` 返回的张冠李戴结果。``load_snapshot`` 的
+        # 同一守卫还包含 ``semantic.index`` 条数分支，这里索引恒为 ``None``。
+        self._validate_row_alignment(documents, embeddings, None, source="legacy 向量存储文件")
+
+        self.documents = documents
+        self.parent_documents = parent_documents
+        self.embeddings = embeddings
         self._rebuild_indices()
 
     def save_snapshot(self, snapshot_dir: str):
         if self.faiss_index is None or self.embeddings is None:
-            raise RuntimeError("当前语义索引为空，无法保存快照。")
+            # 消息带上「来源是空数据」的可能：legacy 导入分支传入空 legacy
+            # 文件（合法 pickle、``documents: []``）时也会走到这里，裸
+            # 「语义索引为空」让用户无从知道真实原因是**来源文件没有内容**。
+            raise RuntimeError(
+                "当前语义索引为空，无法保存快照。"
+                "若来源是 legacy 向量存储文件，请确认其包含 documents 与"
+                " embeddings 数据（空文件无法构建快照）。"
+            )
+        # 与 ``save`` 同一处、同一判据（详见那里的说明）：``Path(5)`` 抛裸
+        # ``TypeError``、位数超限的整数抛 ``ValueError: Exceeds the limit``，都绕开
+        # 本类的 ``ValueError`` 契约。写入侧入口的形态判据与读取侧对齐。
+        if not isinstance(snapshot_dir, (str, os.PathLike)):
+            raise ValueError(
+                f"快照目录必须是字符串或路径，但得到 {type(snapshot_dir).__name__}。"
+                " 请检查该路径来源（通常来自 RunConfig 或 SnapshotRepository）。"
+            )
         snapshot_path = Path(snapshot_dir)
         snapshot_path.mkdir(parents=True, exist_ok=True)
         with (snapshot_path / "chunks.pkl").open("wb") as file:
@@ -301,10 +895,21 @@ class FaissStore(VectorStoreBase):
             pickle.dump(self._tokenized_docs_cache, file)
         np.save(snapshot_path / "embeddings.npy", self.embeddings)
         faiss.write_index(self.faiss_index, str(snapshot_path / "semantic.index"))
+        # ``.get("metadata", {})`` 的默认值只在**键缺失**时生效；键存在而值为
+        # ``None`` 时它返回 ``None``，随后的 ``.get`` 抛
+        # ``AttributeError: 'NoneType' object has no attribute 'get'``。同文件另外
+        # 三处（``_build_index_text``、``_normalize_loaded_documents``、
+        # ``_normalize_parent_document``）用的都是 ``or {}``，这里与它们对齐。
+        # 实测 ``upsert_embeddings`` 接受 ``metadata=None`` 的条目并正常建好索引
+        # （``_rebuild_indices`` 里走的是 ``or {}``），到 ``save_snapshot`` 才崩——
+        # 同一份数据两条路径的判据不一致。
         stats = {
-            "document_count": len(
-                {doc.get("metadata", {}).get("source") for doc in self.documents}
-            ),
+            # 集合推导会对取值取哈希，而 ``source`` 来自磁盘上的快照／legacy
+            # pkl，形态不受控：``source=["a"]`` 或 ``{"a": 1}`` 抛
+            # ``TypeError: unhashable type``，而这条路径正是把文档写进快照的那
+            # 一步——异常类型与「快照写入失败」毫无关联。``document_source``
+            # 对非字符串安全返回 ``"N/A"``，与 ``factory.py`` 用的是同一个。
+            "document_count": len({document_source(doc) for doc in self.documents}),
             "chunk_count": len(self.documents),
             "parent_count": len(self.parent_documents),
             "embedding_dimension": int(self.embeddings.shape[1])
@@ -340,39 +945,214 @@ class FaissStore(VectorStoreBase):
                 " 快照目录内的文件是 pickle，必须由调用方声明信任根（"
                 "RunConfig.snapshot_root 或 SnapshotRepository.root）。"
             )
-        snapshot_path = resolve_within(
-            Path(snapshot_dir), Path(snapshot_root), label="知识快照目录"
-        )
+        # 直接把**原始取值**交给 ``resolve_within``，不要先包一层 ``Path``：
+        # ``Path(5)``／``Path(["a"])`` 抛裸 ``TypeError: expected str, bytes or
+        # os.PathLike object, not ...``，位数超限的整数抛 ``ValueError: Exceeds
+        # the limit``——两条都发生在 ``resolve_within`` 的形态判据**之前**，于是
+        # 本方法其余拒绝路径承诺的带指引 ``ValueError`` 收场被绕过。``load``
+        # （legacy 入口）早已按同一判据修过，这一半此前漏了。
+        snapshot_path = resolve_within(snapshot_dir, snapshot_root, label="知识快照目录")
         if not snapshot_path.is_dir():
             raise FileNotFoundError(f"知识快照目录不存在: {snapshot_path}")
         marker = snapshot_path.parent / "ACTIVE_SNAPSHOT"
         if not marker.exists():
             raise ValueError(f"知识快照目录未被激活，缺少标记文件: {marker}")
-        active_id = marker.read_text(encoding="utf-8").strip()
-        active_dir = (marker.parent / active_id).resolve()
+        # 读取本身要收敛：``exists()`` 对**目录**也为真，``read_text`` 于是抛
+        # ``IsADirectoryError``；标记文件不是 UTF-8 时抛 ``UnicodeDecodeError``。
+        # 两者都不是本方法的 ``ValueError`` 契约，而调用方
+        # （``VectorStoreFactory._load_existing_state``）按它分类——启动会以裸
+        # ``OSError`` 收场。判据与下面 ``resolve()`` 的 ``(OSError, RuntimeError)``
+        # 收敛一致。
+        try:
+            active_id = marker.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ValueError(
+                f"知识快照的 ACTIVE_SNAPSHOT 标记无法读取: {marker}"
+                f"（{type(exc).__name__}: {exc}）。"
+                " 该路径可能是一个目录，或文件内容不是 UTF-8；"
+                "请检查该文件，或重建知识快照。"
+            ) from exc
+        # ``resolve()`` 对符号链接环抛 ``RuntimeError: Symlink loop from ...``，
+        # 不是 ``ValueError``——本方法的其余拒绝路径一律抛 ``ValueError``，且
+        # 调用方（``VectorStoreFactory._load_existing_state``）按 ``ValueError``
+        # 分类。标记文件是磁盘上的任意文本，用户手工摆一个环即触发，于是「标记
+        # 坏了，请重建快照」变成 pathlib 的内部错误。判据与
+        # ``SnapshotRepository._require_snapshot_id_within_root``、
+        # ``utils.security.resolve_within`` 一致：``(OSError, RuntimeError)``
+        # 统一收敛成 ``ValueError``。
+        try:
+            active_dir = (marker.parent / active_id).resolve()
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(
+                f"知识快照的 ACTIVE_SNAPSHOT 标记无法解析: {marker}"
+                f"（{type(exc).__name__}: {exc}）。"
+                " 标记内容或其路径可能包含符号链接环，请检查该文件，或重建知识快照。"
+            ) from exc
         if active_dir != snapshot_path:
             raise ValueError(
                 "知识快照目录不是当前活动快照。"
                 f" 传入={snapshot_path}，ACTIVE_SNAPSHOT 指向={active_dir}。"
             )
+        # 与 ``load()`` 同一取舍：全部解析、校验到**局部变量**，最后一次性赋给
+        # ``self``。原先每读一个文件就直接写 ``self``，中途任何一步失败都留下
+        # 半更新的 store——实测一次被拒的 ``load_snapshot`` 之后 ``documents``
+        # 是新值而 ``faiss_index`` 还是旧的，后续检索在错配的下标上崩出与
+        # 「快照坏了」无关的异常。失败必须让 store 保持原状。
         with (snapshot_path / "chunks.pkl").open("rb") as file:
-            self.documents = pickle.load(file)  # nosec B301
+            raw_documents = pickle.load(file)  # nosec B301
         with (snapshot_path / "parents.pkl").open("rb") as file:
-            self.parent_documents = pickle.load(file)  # nosec B301
+            raw_parent_documents = pickle.load(file)  # nosec B301
         embeddings_path = snapshot_path / "embeddings.npy"
-        self.embeddings = np.load(embeddings_path) if embeddings_path.exists() else None
+        embeddings = np.load(embeddings_path) if embeddings_path.exists() else None
+        self._validate_embeddings_shape(embeddings, source="知识快照")
         faiss_index_path = snapshot_path / "semantic.index"
-        self.faiss_index = (
-            faiss.read_index(str(faiss_index_path)) if faiss_index_path.exists() else None
-        )
+        faiss_index = faiss.read_index(str(faiss_index_path)) if faiss_index_path.exists() else None
+        # 顺序与 ``load()`` 一致：先归一化文档，再建索引。此前这里是反的，
+        # 于是「``lexical.index`` 是否存在」决定了用户看到哪条错误——实测同一
+        # 份畸形 chunks（``page_content`` 是 ``int``）：
+        #   有 lexical.index → ``ValueError: 知识快照不自洽：第 0 条文档的
+        #     page_content 不是字符串（int）。请重建快照。``
+        #   缺 lexical.index → ``AttributeError: 'int' object has no attribute
+        #     'decode'``（``_rebuild_indices`` 先跑，在 ``_build_index_text`` 里崩）
+        # 而 ``validate_snapshot_dir`` 的必需文件清单里没有 ``lexical.index``，
+        # 缺它是合法状态（下面的 ``else`` 分支就是为它准备的）。``load()`` 早已
+        # 是正确的顺序，两处对齐。
+        documents, parent_documents = self._normalize_documents(raw_documents, raw_parent_documents)
+        # 维度不变量：矩阵与索引都在时维度必须一致。行数全对齐但维度错配的
+        # 快照能载入成功，查询时 FAISS 抛**空消息** ``AssertionError``（实测）
+        # ——用户看到的不是「这份快照坏了」。生产路径由
+        # ``validate_snapshot_dir`` 挡住，这里是库级契约方法的同类守卫。
+        if embeddings is not None and faiss_index is not None:
+            index_dim = getattr(faiss_index, "d", None)
+            if index_dim is not None and int(index_dim) != int(embeddings.shape[1]):
+                raise ValueError(
+                    "知识快照不自洽：语义索引维度与向量矩阵不一致。"
+                    f" semantic.index.d={int(index_dim)}，"
+                    f"embeddings.shape[1]={int(embeddings.shape[1])}。"
+                    " 请重建知识快照。"
+                )
+        # ``embeddings`` 缺失而索引存在是自相矛盾形态（重建也无从着手），
+        # 同样拦下——但**索引缺失而矩阵存在**是合法形态：下方无
+        # ``lexical.index`` 的分支会从矩阵重建索引。它的缺陷形态（有
+        # lexical 就不重建 → 静默空语义检索）在该分支内拦，见下。
+        if embeddings is None and faiss_index is not None:
+            raise ValueError(
+                "知识快照不自洽：向量矩阵缺失而语义索引存在。"
+                " 快照可能在写入或复制过程中被截断，请重建。"
+            )
+        # 三条行数必须对齐：embeddings 行数、``semantic.index`` 条数与
+        # ``documents`` 数。此前只校验了索引这一条，embeddings 行数错配仍能
+        # 载入成功——``semantic_search`` 的分数来自矩阵行、文档来自下标，错配
+        # 即张冠李戴或 ``IndexError``。``load()`` 的 legacy 路径调用同一守卫。
+        self._validate_row_alignment(documents, embeddings, faiss_index, source="知识快照")
+        # ``semantic.index`` 的行数是**第三条**必须与 ``documents`` 对齐的量，
+        # 而此前只校验了 ``lexical.index`` 的条数。实测 documents=2、embeddings
+        # 两行、但索引里只有 1 个向量时：加载成功、无任何提示，而
+        # ``semantic_search`` 拿 ``indices`` 去索引 ``documents``——第 2 条文档
+        # 永远不出现在结果里，用户看到的是「搜不到」而不是「这份快照坏了」。
+        # 反向（索引比文档多）同样危险：``self.documents[doc_index]`` 抛
+        # ``IndexError``，与「快照不自洽」无关的类型。
+        #
+        # 只断言这一条最小不变量，不比对向量内容：``embeddings`` 与索引由
+        # ``save_snapshot`` 从同一份内存状态写出，条数一致即可保证下标对应关系。
+        # （断言本体在上方 ``_validate_row_alignment``——索引条数分支已由它覆盖，
+        # 此处不再重复。）
         lexical_path = snapshot_path / "lexical.index"
         if lexical_path.exists():
             with lexical_path.open("rb") as file:
-                self._tokenized_docs_cache = pickle.load(file)  # nosec B301
-            self.bm25_index = self._build_bm25_index(self._tokenized_docs_cache)
+                tokenized_docs = pickle.load(file)  # nosec B301
+            # 盘上的 ``lexical.index`` 与 ``self.documents`` 必须等长，否则
+            # ``keyword_search`` 拿 ``argsort`` 的下标去索引 ``self.documents``
+            # 会越界或错配（实测语料 3 条、文档 2 条 -> ``IndexError: list index
+            # out of range``；语料 1 条、文档 2 条 -> 静默丢结果）。
+            #
+            # 生产路径**已经**由 ``SnapshotRepository.validate_snapshot_dir`` 挡住
+            # 这些形态，本方法是库级公开 API（``VectorStoreBase`` 的契约方法），
+            # 直接调它的嵌入方不会经过那道校验——``_validate_document_shape`` 的
+            # 注释已说明同一取舍。这里只断言「顶层是序列且长度对齐」这条最小
+            # 不变量，不逐条校验语料内容：条目本身是什么形态不影响下标对应关系。
+            #
+            # 判定必须在 ``_build_bm25_index`` **之前**，否则非序列形态会先在
+            # ``any()`` 上抛裸 ``TypeError: 'int' object is not iterable``——与
+            # 「快照不自洽」无关的类型，也没有重建指引。``None`` 同样要拦：
+            # ``_build_bm25_index(None)`` 返回 ``None``，``keyword_search`` 于是
+            # 对一份有 2 条文档的快照静默返回空结果，用户看到的是「搜不到」而不是
+            # 「快照坏了」。
+            # ``set``/``frozenset`` 必须单列拒绝：它们有 ``__len__``、不是
+            # str/bytes/dict，能穿过下面的全部守卫（实测），但**没有稳定下标
+            # 语义**——``_build_bm25_index`` 按迭代序把语料喂给 BM25，而
+            # ``keyword_search`` 按下标读 ``self.documents``，两条顺序一旦
+            # 不同，分数就静默绑定到错误文档。这不是理论边界：set 迭代序
+            # 随 ``PYTHONHASHSEED`` 跨进程翻转（实测同一对象 seed=0/1 与
+            # seed=2 顺序相反），同一份坏快照每次启动可能给出不同的错误召回。
+            if isinstance(tokenized_docs, (str, bytes, dict, set, frozenset)) or (
+                tokenized_docs is not None and not hasattr(tokenized_docs, "__len__")
+            ):
+                raise ValueError(
+                    "知识快照不自洽：lexical.index 的顶层不是列表"
+                    f"（{type(tokenized_docs).__name__}），无法作为关键词索引语料使用。请重建快照。"
+                )
+            # ``len()`` 必须排在上面的形态守卫**之后**：``int`` 这类没有
+            # ``__len__`` 的形态会先在这里抛裸 ``TypeError: object of type 'int'
+            # has no len()``，用户拿到的又是与快照无关的错误类型。
+            tokenized_rows = 0 if tokenized_docs is None else len(tokenized_docs)
+            if tokenized_rows != len(documents):
+                raise ValueError(
+                    "知识快照不自洽：关键词索引语料条数与分块数不一致。"
+                    f" lexical.index={tokenized_rows}，"
+                    f" chunks.pkl={len(documents)}。"
+                    " 快照可能在写入或复制过程中被截断，请重建。"
+                )
+            # **条目**形态也要拦：上面两道守卫只覆盖顶层（是不是列表）与条数，
+            # 而 ``BM25Okapi._initialize`` 会对每条语料调 ``len(document)``——
+            # 实测语料 ``[7]``、``[10**4301]``、``[1.5]``、``[None]`` 全部穿过
+            # 顶层守卫与条数校验，在 ``_build_bm25_index`` 里抛裸
+            # ``TypeError: object of type 'int' has no len()``。这条路径在生产上
+            # 可达：``SnapshotRepository.validate_snapshot_dir`` 同样只看顶层与
+            # 条数，于是坏快照能被 finalize 成**活动快照**，此后每次启动都在
+            # 载入期以与「快照坏了」无关的异常类型失败。
+            #
+            # 只判「有没有 ``__len__``」而不判「是不是 ``list[str]``」：语料是
+            # 本应用写出的分词结果，形态确定；这里要挡的是「根本不是序列」，
+            # 过严会把将来可能的迭代器形态一并拒掉。
+            for position, entry in enumerate(tokenized_docs if tokenized_docs is not None else []):
+                if isinstance(entry, (str, bytes)) or not hasattr(entry, "__len__"):
+                    raise ValueError(
+                        "知识快照不自洽：lexical.index 的第 "
+                        f"{position} 条语料不是序列（{type(entry).__name__}），"
+                        "无法作为关键词索引语料使用。请重建快照。"
+                    )
+            # ``_build_bm25_index`` 的入参已经过上面三道守卫（顶层形态、条数、
+            # 条目形态），是「最后一个可以失败的步骤」——失败也只发生在局部
+            # 变量上，``self`` 仍是旧快照的完整状态（「拒绝的载入不改 store」
+            # 契约覆盖到最后一步）。缓存赋值整体推迟到本块末尾、与新快照字段
+            # 同批进行，避免「缓存已是新值、documents 还是旧值」的中间态。
+            lexical_cache = tokenized_docs if tokenized_docs is not None else []
+            lexical_bm25 = self._build_bm25_index(lexical_cache)
+        # 有 lexical 就不重建索引：矩阵存在而索引缺失的快照会让
+        # ``semantic_search`` 对有文档有向量的数据静默返回 ``[]``（实测）。
+        # 合法快照（本项目写出）二者同在，此形态即「快照残缺」。判定必须在
+        # **批量赋值之前**：守卫只读局部变量（``embeddings``／``faiss_index``／
+        # ``lexical_path``），放赋值之后会在抛 ``ValueError`` 前把 store 五个
+        # 字段全部改写——「拒绝的载入不改 store」契约被破坏（实测探针：
+        # before/after 五字段全变）。
+        if lexical_path.exists() and embeddings is not None and faiss_index is None:
+            raise ValueError(
+                "知识快照不自洽：向量矩阵存在而语义索引缺失"
+                "（且存在 lexical.index，不会触发索引重建）。"
+                " 快照可能在写入或复制过程中被截断，请重建。"
+            )
+        # 全部校验通过，到这里才改动 store。``_rebuild_indices`` 走 ``else`` 分支
+        # 时会读 ``self.documents``，因此必须排在这些赋值之后。
+        self.documents = documents
+        self.parent_documents = parent_documents
+        self.embeddings = embeddings
+        self.faiss_index = faiss_index
+        if lexical_path.exists():
+            self._tokenized_docs_cache = lexical_cache
+            self.bm25_index = lexical_bm25
         else:
             self._rebuild_indices()
-        self._normalize_loaded_documents()
 
     def import_legacy_snapshot(
         self,

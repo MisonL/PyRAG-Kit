@@ -1,0 +1,287 @@
+"""守卫变异器：对 ``(行号, 列偏移)`` 唯一确定的 AST 节点施加语义相邻变异。
+
+支持的 kind：
+
+* ``drop``：``not X`` → ``X``，删除 ``not`` 关键字本身（只删三个字符，
+  不替换整个节点——``not (a and b)`` 的操作数跨度不含括号，整段替换会
+  产出语法错误）。
+* ``notin``：``x not in y`` → ``x in y``，只替换运算符区段。
+* ``isnot``：``x is not y`` → ``x is y``，只替换运算符区段。
+* ``eqneq``：``x == y`` → ``x != y``（反之亦然），只替换运算符区段；
+  多操作数比较只翻转第一个 ``Eq``/``NotEq``。
+* ``cmpdir``：``x < y`` → ``x > y``、``x <= y`` → ``x >= y``（反之亦然），
+  方向反转；多操作数比较只翻转第一个 ``Lt``/``LtE``/``Gt``/``GtE``。
+* ``boolc``：``True`` → ``False``（反之亦然），只替换布尔字面量本身；``1``／
+  ``0``／``"True"`` 等取值不同型，不是本 kind 的位点。
+* ``boolop``：``a and b`` ↔ ``a or b``，只翻转**第一个**运算符；短路语义变了，
+  但两侧取值表达式不变。站点键取**第一个值的结尾**——链式 ``a and b or c``
+  的两层 ``BoolOp`` 起点 ``col_offset`` 都指向 ``a``，用起点会碰撞而整片漏扫。
+* ``arith``：``x + y`` ↔ ``x - y``、``x * y`` ↔ ``x / y``（加减互换、乘除互换）。
+  只收**数值**二元运算：任一操作数是字符串字面量的 ``BinOp``（``"a" + "b"``
+  这类拼接）不是算术，其变异体在运行期抛 ``TypeError`` 而非改变计算，故排除。
+
+坐标约定：``line`` 为 1 起始行号，``col`` 为 CPython AST 的 ``col_offset``
+（**UTF-8 字节**偏移）。旧版 ``mut_cmp.py`` 把 ``col_offset`` 当字符偏移
+用，含中文的行会错位——本模块统一走 ``_char_offset`` 换算。
+
+用法::
+
+    python mutate.py <相对路径> <行号> <列偏移> <kind>
+
+退出码：0=已施加；2=未找到位点；3=变异体语法错误。
+"""
+
+import ast
+import io
+import pathlib
+import re
+import sys
+import tokenize
+
+KINDS = ("drop", "notin", "isnot", "eqneq", "cmpdir", "boolc", "boolop", "arith")
+
+_OP_KINDS = {
+    "notin": (ast.NotIn,),
+    "isnot": (ast.IsNot,),
+    "eqneq": (ast.Eq, ast.NotEq),
+    "cmpdir": (ast.Lt, ast.LtE, ast.Gt, ast.GtE),
+}
+
+# ``arith`` 的 BinOp kind 与区段正则。加减互换、乘除互换各归一组；``%``、
+# ``//``、``**`` 不在面内——它们的语义相邻变异（如 ``//``↔``/``）是另一组
+# 方向，且现存位点极少（``//`` 9 处、``%`` 6 处），收益不抵扫描成本。
+_ARITH_GROUP = {
+    "addsub": (ast.Add, ast.Sub),
+    "muldiv": (ast.Mult, ast.Div),
+}
+_ARITH_OPS = tuple({op for ops in _ARITH_GROUP.values() for op in ops})
+_ARITH_PATTERN = {
+    ast.Add: (r"\+", "-"),
+    ast.Sub: (r"-", "+"),
+    ast.Mult: (r"\*", "/"),
+    ast.Div: (r"(?<!/)/(?!/)", "*"),
+}
+
+
+class SiteNotFound(Exception):
+    """目标坐标上没有恰好一个符合 kind 的节点。"""
+
+
+class MutantSyntaxError(Exception):
+    """变异后的源码无法通过 ``compile()``。"""
+
+
+def _char_offset(lines: list[str], lineno: int, byte_col: int) -> int:
+    """把 ``(行号, UTF-8 字节列)`` 换算成全文**字符**偏移。"""
+    line_start = sum(len(x) for x in lines[: lineno - 1])
+    line_text = lines[lineno - 1]
+    prefix_bytes = line_text.encode("utf-8")[:byte_col]
+    return line_start + len(prefix_bytes.decode("utf-8"))
+
+
+def _is_arith_site(node: ast.BinOp) -> bool:
+    """``arith`` 的位点判据：组内运算符，且不是字符串字面量参与的表达式。"""
+    if not isinstance(node.op, _ARITH_OPS):
+        return False
+    for operand in (node.left, node.right):
+        if isinstance(operand, ast.Constant) and isinstance(operand.value, str):
+            return False
+    return True
+
+
+def iter_sites(tree: ast.AST, kind: str):
+    """产出 ``(lineno, col_offset, node)``：全树中所有该 kind 的位点。"""
+    if kind == "drop":
+        for node in ast.walk(tree):
+            if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+                yield node.lineno, node.col_offset, node
+        return
+    if kind == "boolc":
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, bool):
+                yield node.lineno, node.col_offset, node
+        return
+    if kind == "boolop":
+        # 站点键取**第一个值的结尾**（同 ``arith`` 用左操作数结尾的理由）：
+        # ``a and b or c`` 里两层 ``BoolOp`` 的起点 ``col_offset`` 都指向 ``a``。
+        # 实测 src/ 735 个 BoolOp 位点该键零碰撞；即便未来碰撞，``find_site``
+        # 也会因命中 2 个节点而抛 SiteNotFound（MUTFAIL），不会静默错位。
+        for node in ast.walk(tree):
+            if isinstance(node, ast.BoolOp):
+                yield node.values[0].end_lineno, node.values[0].end_col_offset, node
+        return
+    if kind == "arith":
+        # 站点键取**左操作数的结尾**而不是 BinOp 的起点：链式表达式
+        # ``a + b + c`` 会被解析成两层 BinOp，两层起点的 ``col_offset`` 都指向
+        # 第一个 ``a``，用起点会让 ``find_site`` 命中两个节点而判 MUTFAIL、把
+        # 链式位点整片漏掉。左操作数各自的结尾互不相同（左子树占据不相交的
+        # 源码区间），因此是唯一键；``verify_sites`` 只把它当不透明坐标使用。
+        for node in ast.walk(tree):
+            if isinstance(node, ast.BinOp) and _is_arith_site(node):
+                yield node.left.end_lineno, node.left.end_col_offset, node
+        return
+    wanted = _OP_KINDS[kind]
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Compare) and any(isinstance(op, wanted) for op in node.ops):
+            yield node.lineno, node.col_offset, node
+
+
+def find_site(tree: ast.AST, line: int, col: int, kind: str) -> ast.AST:
+    """精确定位唯一节点；未命中或重复命中抛 ``SiteNotFound``。"""
+    matches = [
+        node
+        for lineno, col_offset, node in iter_sites(tree, kind)
+        if (lineno, col_offset) == (line, col)
+    ]
+    if len(matches) != 1:
+        raise SiteNotFound(f"{kind} 位点在 {line}:{col} 找到 {len(matches)} 个，期望 1")
+    return matches[0]
+
+
+def find_nearest_site(
+    tree: ast.AST, line: int, col: int, kind: str, window: int
+) -> tuple[int, int] | None:
+    """漂移定位：``±window`` 行内找同 kind 节点，**唯一最近**才返回坐标。
+
+    平局时用列偏移消解：同距候选中若恰有一个 ``col_offset`` 与原列一致，
+    取它（行号漂移而列未变是最常见的形态）。仍无法唯一确定则返回
+    ``None``——宁可 MUTFAIL 也不能把变异施加到别的守卫上。
+    """
+    candidates = sorted(
+        (lineno, col_offset)
+        for lineno, col_offset, _ in iter_sites(tree, kind)
+        if abs(lineno - line) <= window
+    )
+    if not candidates:
+        return None
+    best_distance = min(abs(lineno - line) for lineno, _ in candidates)
+    nearest = [(lineno, c) for lineno, c in candidates if abs(lineno - line) == best_distance]
+    if len(nearest) == 1:
+        return nearest[0]
+    col_matches = [(lineno, c) for lineno, c in nearest if c == col]
+    if len(col_matches) == 1:
+        return col_matches[0]
+    return None
+
+
+def mutate_source(src: str, node: ast.AST, kind: str) -> str:
+    """返回对 ``node`` 施加 ``kind`` 变异后的全文（不写盘、不校验）。"""
+    lines = src.splitlines(keepends=True)
+    if kind == "boolc":
+        # ``Constant`` 带完整位置信息，直接按字面量跨度替换（这不是运算符
+        # 节点，不需要区段正则）。字面量本身必须真的是 ``True``／``False``——
+        # 否则是 ``1``／``0``／``"True"`` 之类取了别名的取值，不是本 kind 的位点。
+        start = _char_offset(lines, node.lineno, node.col_offset)
+        end = _char_offset(lines, node.end_lineno, node.end_col_offset)
+        literal = src[start:end]
+        if literal not in ("True", "False"):
+            raise SiteNotFound(f"boolc 定位不符: {literal!r}")
+        replacement = "False" if literal == "True" else "True"
+        return src[:start] + replacement + src[end:]
+
+    if kind == "drop":
+        start = _char_offset(lines, node.lineno, node.col_offset)
+        if src[start : start + 3] != "not":
+            raise SiteNotFound(f"drop 定位不符: {src[start : start + 3]!r}")
+        end = start + 3
+        # 后面若是空格则一并删掉一个，避免留下双空格。
+        if end < len(src) and src[end] == " ":
+            end += 1
+        return src[:start] + src[end:]
+
+    if kind not in _OP_KINDS and kind != "arith" and kind != "boolop":
+        raise ValueError(f"未知 kind: {kind}")
+    if kind == "boolop":
+        # 第一个值与第二个值之间的区段即运算符夹缝（可能跨行、夹注释与括号）。
+        # 不能用正则找关键字——注释里出现 ``and``／``or`` 文本会先命中（实测
+        # 形态：``a  # keep and note\\n    and b``），故用 tokenize 精确取第一个
+        # AND/OR 的 NAME 令牌（注释是 COMMENT、字符串是 STRING，不会误配）。
+        prev, nxt = node.values[0], node.values[1]
+        seg_start = _char_offset(lines, prev.end_lineno, prev.end_col_offset)
+        seg_end = _char_offset(lines, nxt.lineno, nxt.col_offset)
+        target = None
+        for token in tokenize.generate_tokens(io.StringIO(src).readline):
+            if token.type != tokenize.NAME or token.string not in ("and", "or"):
+                continue
+            start = _char_offset(lines, token.start[0], token.start[1])
+            if seg_start <= start < seg_end:
+                target = (start, _char_offset(lines, token.end[0], token.end[1]), token.string)
+                break
+        if target is None:
+            raise SiteNotFound(f"boolop 区段内未找到 and/or: {src[seg_start:seg_end]!r}")
+        start, end, keyword = target
+        return src[:start] + ("or" if keyword == "and" else "and") + src[end:]
+    if kind == "arith":
+        # 运算符节点（ast.Add 等）不带位置信息，与 ``cmpdir`` 同构：先切出
+        # 操作数之间的区段，再在区段内做带边界的正则替换。
+        prev, nxt = node.left, node.right
+        seg_start = _char_offset(lines, prev.end_lineno, prev.end_col_offset)
+        seg_end = _char_offset(lines, nxt.lineno, nxt.col_offset)
+        segment = src[seg_start:seg_end]
+        pattern, replacement = _ARITH_PATTERN[type(node.op)]
+        new_segment, count = re.subn(pattern, replacement, segment, count=1)
+        if count != 1:
+            raise SiteNotFound(f"运算符区段内未找到 {pattern!r}: {segment!r}")
+        return src[:seg_start] + new_segment + src[seg_end:]
+    wanted = _OP_KINDS[kind]
+    index = next(i for i, op in enumerate(node.ops) if isinstance(op, wanted))
+    prev = node.left if index == 0 else node.comparators[index - 1]
+    nxt = node.comparators[index]
+    seg_start = _char_offset(lines, prev.end_lineno, prev.end_col_offset)
+    seg_end = _char_offset(lines, nxt.lineno, nxt.col_offset)
+    segment = src[seg_start:seg_end]
+    if kind == "notin":
+        pattern, replacement = r"\bnot\s+in\b", "in"
+    elif kind == "isnot":
+        pattern, replacement = r"\bis\s+not\b", "is"
+    elif kind == "eqneq":
+        pattern, replacement = r"==|!=", "!=" if isinstance(node.ops[index], ast.Eq) else "=="
+    else:
+        # 运算符节点（ast.Lt 等）不带位置信息，只能靠区段正则；按最长优先
+        # 排列，避免 ``<`` 先于 ``<=`` 命中而在 ``<=`` 里切出 ``> =``。
+        pattern = r"<=|>=|<|>"
+
+        def replacement(match: re.Match[str]) -> str:
+            return {"<": ">", "<=": ">=", ">": "<", ">=": "<="}[match.group(0)]
+
+    new_segment, count = re.subn(pattern, replacement, segment, count=1)
+    if count != 1:
+        raise SiteNotFound(f"运算符区段内未找到 {pattern!r}: {segment!r}")
+    return src[:seg_start] + new_segment + src[seg_end:]
+
+
+def apply_mutation(path: str | pathlib.Path, line: int, col: int, kind: str) -> str:
+    """定位、变异、语法校验并写盘；返回 kind。"""
+    file_path = pathlib.Path(path)
+    src = file_path.read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    node = find_site(tree, line, col, kind)
+    new_src = mutate_source(src, node, kind)
+    # 变异必须产出合法 Python：语法错误会让 pytest 在收集期就失败，
+    # 被验证器记成「已杀死」——那是假阴性，会把真缺口藏起来。
+    try:
+        compile(new_src, str(file_path), "exec")
+    except SyntaxError as exc:
+        raise MutantSyntaxError(str(exc)) from exc
+    file_path.write_text(new_src, encoding="utf-8")
+    return kind
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 5:
+        print(f"用法: {argv[0]} <相对路径> <行号> <列偏移> <kind>", file=sys.stderr)
+        return 2
+    path, line, col, kind = argv[1], int(argv[2]), int(argv[3]), argv[4]
+    try:
+        print(apply_mutation(path, line, col, kind))
+    except SiteNotFound as exc:
+        print(f"SITE-NOT-FOUND {exc}", file=sys.stderr)
+        return 2
+    except MutantSyntaxError as exc:
+        print(f"MUTANT-SYNTAX {exc}", file=sys.stderr)
+        return 3
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

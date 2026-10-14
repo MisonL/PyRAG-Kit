@@ -172,3 +172,590 @@ def test_recursive_text_splitter():
         current_settings.kb_chunk_size = original_chunk_size
         current_settings.kb_chunk_overlap = original_chunk_overlap
         current_settings.kb_splitter_separators = original_separators
+
+
+# ── 回归：清洗器不得用会被用户内容命中的哨兵 ──
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "本文档说明 __DOUBLE_NEWLINE_PLACEHOLDER__ 的用途。",
+        "A\n\nB __DOUBLE_NEWLINE_PLACEHOLDER__ C\n\nD",
+        "__DOUBLE_NEWLINE_PLACEHOLDER____DOUBLE_NEWLINE_PLACEHOLDER__",
+    ],
+)
+def test_basic_cleaner_does_not_rewrite_content_that_looks_like_its_sentinel(text):
+    """用户内容里出现旧哨兵字面量时不得被改写。
+
+    原实现硬编码 ``"__DOUBLE_NEWLINE_PLACEHOLDER__"`` 作为双换行的临时替身，
+    与用户内容碰撞：文档里出现同样的字符串会被改写成双换行，而整段由它构成的
+    内容会被抹成空串（实测两个该字面量相连 -> 清洗后得到 ``""``）。内容是用户
+    数据，不该被实现细节改写。
+    """
+    cleaner = BasicCleaner()
+
+    cleaned = cleaner.clean([Document(content=text, metadata={})])
+
+    assert cleaned[0].content == text.strip()
+
+
+def test_basic_cleaner_keeps_original_nul_when_sentinel_candidates_exhausted():
+    """哨兵候选耗尽时不得把正文里原有的 NUL 改写成双换行。
+
+    候选扫描在「正文缺失的非空白码点」里找哨兵；正文包含**全部**非空白码点时
+    扫描耗尽，``placeholder`` 停留初始值 ``"\x00"``——第 4 步的还原替换会把
+    正文里原本就有的 NUL 全部换成双换行（实测复现），内容静默损坏。耗尽时
+    应放弃占位保护、让原文原样保留。
+    """
+    from src.etl.cleaners import basic_cleaner as bc
+
+    all_non_whitespace = []
+    for code in range(0x110000):
+        if 0xD800 <= code <= 0xDFFF:
+            continue  # 孤立代理项
+        char = chr(code)
+        if bc._WHITESPACE_RE.match(char):
+            continue
+        all_non_whitespace.append(char)
+    content = "".join(all_non_whitespace) + "\x00tail" + "\n\nend"
+
+    cleaned = BasicCleaner().clean([Document(content=content, metadata={})])
+
+    assert "\x00tail" in cleaned[0].content  # 原始 NUL 原样保留
+    assert "\n\ntail" not in cleaned[0].content  # 未被改写成双换行
+
+
+# 复杂度判据的规模与阈值。基准取 20k 而不是 2k：2k 的耗时约 0.1ms，已接近
+# ``time.perf_counter()`` 的可靠量级，机器负载的抖动会让比值从 ~50 跳到 ~900
+# （实测同一台机器上 8 次采样出现 967、598 两个越界值），是一条会间歇误报的
+# 断言。20k 的基准约 0.7ms，采样稳定得多。
+_SENTINEL_BASE_COUNT = 20_000
+_SENTINEL_LARGE_COUNT = 200_000
+# 每档取多次采样的**最小值**：最小值逼近「无干扰」耗时，而最大值会把 GC 与
+# 调度抖动算进去。
+_SENTINEL_REPEATS = 5
+# 规模放大 10 倍：线性实现实测比值 7.8~11.5，平方实现实测 700。取 60 作为判据
+# ——给线性留约 5 倍余量，同时把平方增长稳稳判红（离阈值还有 12 倍）。
+_SENTINEL_MAX_RATIO = 60
+
+
+def test_basic_cleaner_sentinel_length_is_computed_in_one_pass():
+    """哨兵长度必须一次算够——逐字符增长是 O(n²)，能把建库挂死。
+
+    原写法 ``while placeholder in content: placeholder += "\x00"`` 每次 ``in``
+    都是一次全串扫描、每次 ``+=`` 又让哨兵长一位，于是 N 个 NUL 要扫 N 次。
+    实测 20 万个 NUL 耗时 19.8 秒（旧的字面量哨兵是 O(1)），100 万 NUL 按平方
+    外推约 1300 秒。
+
+    触发输入很现实：零填充的 md（写入中断／预分配／误拷的二进制残片）或
+    Windows 用户存成 UTF-16LE 的纯 ASCII 文档——``read_text(encoding="utf-8")``
+    对两者**都不报错**，因此 ``Pipeline._process_file`` 的解码失败分支拦不住，
+    用户只看到「向量化处理」卡死数分钟且无任何提示。
+
+    这里断言的是**复杂度**而不是绝对耗时：单纯卡一个秒数阈值会在慢机器上误报，
+    而平方增长（10 倍规模 → 100 倍耗时）无论如何都超出线性量级。
+    """
+    import time
+
+    cleaner = BasicCleaner()
+
+    def clean_duration(count: int) -> float:
+        content = "\x00" * count
+        start = time.perf_counter()
+        cleaner.clean([Document(content=content, metadata={})])
+        return time.perf_counter() - start
+
+    def best_duration(count: int) -> float:
+        # 预热一次，避免把首次调用的 import/编译开销算进基准。
+        clean_duration(1_000)
+        return max(min(clean_duration(count) for _ in range(_SENTINEL_REPEATS)), 1e-5)
+
+    small = best_duration(_SENTINEL_BASE_COUNT)
+    large = best_duration(_SENTINEL_LARGE_COUNT)
+
+    assert large / small < _SENTINEL_MAX_RATIO, (
+        f"{_SENTINEL_LARGE_COUNT} 个 NUL 耗时 {large:.3f}s，"
+        f"而 {_SENTINEL_BASE_COUNT} 个耗时 {small:.3f}s"
+        f"（比值 {large / small:.0f}，阈值 {_SENTINEL_MAX_RATIO}）"
+        "——哨兵长度可能又退回逐字符增长。"
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("a\x00\x00\x00\n\nb", id="nul-run-then-paragraph-break"),
+        pytest.param("a\n\n\x00\x00\x00b", id="paragraph-break-then-nul-run"),
+        pytest.param("a\x00\n\n\x00b", id="nul-runs-on-both-sides"),
+        pytest.param("a\x00\n\nb", id="single-nul"),
+        pytest.param("\x00\x00\n\n", id="nul-run-and-break-only"),
+    ],
+)
+def test_basic_cleaner_keeps_paragraph_breaks_adjacent_to_nul_runs(text):
+    """双换行紧邻 NUL 游程时，正文必须逐字保留、双换行仍还原成 ``\n\n``。
+
+    哨兵用「NUL 游程 + 1」这种多字符形态时，边界上是歧义的：内容
+    ``"a\x00\x00\x00\n\nb"`` 换出 4 个 NUL 后与原有 3 个 NUL 连成 7 个，
+    ``str.replace`` 取最左匹配、只吃掉前 4 个，剩下 3 个 NUL 被留在双换行
+    **之后**——实测得到 ``'a\n\n\x00\x00\x00b'``，用户内容被静默改写。
+    单个且内容中不存在的字符不会有这种歧义。
+    """
+    cleaner = BasicCleaner()
+
+    cleaned = cleaner.clean([Document(content=text, metadata={})])
+
+    assert cleaned[0].content == text.strip()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("a\x01\n\nb", id="soh"),
+        pytest.param("a\x02\n\nb", id="stx"),
+        pytest.param("a\x00\x01\n\nb", id="soh-after-nul"),
+    ],
+)
+def test_basic_cleaner_sentinel_survives_hostile_control_characters(text):
+    """内容里已有候选哨兵字符时，必须另选一个不在内容里的。
+
+    ``\x00``／``\x01`` 都是「非空白且可能被用作哨兵」的字符。内容里已经出现
+    它们时，若仍拿它当哨兵，替换回双换行那一步会把用户自己的字符也改成
+    ``\n\n``——正是「哨兵必须不在内容里」这条要求要挡住的情形。
+    """
+    cleaner = BasicCleaner()
+
+    cleaned = cleaner.clean([Document(content=text, metadata={})])
+
+    assert cleaned[0].content == text.strip()
+
+
+def test_basic_cleaner_sentinel_is_not_a_whitespace_character():
+    r"""哨兵不能是空白字符，否则会被 ``re.sub(r"\s+", " ")`` 一起折叠掉。
+
+    内容里塞满各种空白（含 Unicode 空白）时，第一个非空白候选必然是控制字符，
+    双换行必须仍然还原。若哨兵退化成空格/制表符之类，双换行会被折叠成单个
+    空格，这条会变红。
+    """
+    cleaner = BasicCleaner()
+
+    text = "\t\n\r \u00a0\u3000\u200b\n\n尾"
+    cleaned = cleaner.clean([Document(content=text, metadata={})])
+
+    assert "\n\n" in cleaned[0].content
+
+
+def test_basic_cleaner_preserves_paragraph_breaks_and_collapses_whitespace():
+    """收紧不能误伤：双换行保留、连续空白折叠、首尾去空白的既有行为不变。"""
+    cleaner = BasicCleaner()
+
+    cleaned = cleaner.clean([Document(content="你好  世界 \n\n\n  再见.  ", metadata={})])
+
+    assert cleaned[0].content == "你好 世界 \n\n 再见."
+
+
+# ── 回归：子分片尺寸关系只在**层级模式**下校验 ──
+#
+# 这两条约束原先写在 ``Settings`` 的 model_validator 里，但**模式不在 Settings
+# 里**——它是分片时的运行时参数（``build(splitter_structure_mode)``／CLI 的
+# ``--mode``）。无条件校验的后果是一组「standard 下完全合法」的取值连配置都
+# 加载不了：实测 ``kb_chunk_size=100, kb_child_chunk_size=300`` 被
+# ``ValidationError`` 拒绝，而 standard 模式只调用普通分片器
+# （``_split_standard_documents``），子分片器的参数根本不参与。
+#
+# 判定现在放在 ``RecursiveTextSplitter._validate_hierarchical_sizes()``：层级
+# 分支一定会构造子分片器，非层级分支一定不会，因此校验的正是真正会用到的参数。
+
+
+def _settings_with(monkeypatch, **overrides):
+    """返回一份按 overrides 覆盖过的 settings 替身，供分片器读取。"""
+    real = get_settings()
+    # 用 ``model_fields`` 而不是 ``dir()``：后者会连带访问 ``model_computed_fields``
+    # 等 pydantic 内部属性，触发 PydanticDeprecatedSince211 警告。
+    values = {name: getattr(real, name) for name in type(real).model_fields}
+    values.update(overrides)
+    stub = type("_StubSettings", (), values)()
+    monkeypatch.setattr("src.etl.splitters.recursive_text_splitter.get_settings", lambda: stub)
+    return stub
+
+
+@pytest.mark.parametrize(
+    ("label", "overrides"),
+    [
+        ("子分片大于父分片", {"kb_chunk_size": 300, "kb_child_chunk_size": 1500}),
+        ("子分片等于父分片", {"kb_chunk_size": 300, "kb_child_chunk_size": 300}),
+        (
+            "子分片 overlap 不小于 size",
+            {"kb_chunk_size": 300, "kb_child_chunk_size": 100, "kb_child_chunk_overlap": 100},
+        ),
+    ],
+)
+def test_hierarchical_mode_rejects_degenerate_child_sizes(monkeypatch, label, overrides):
+    """层级模式下必须拒绝会让层级静默退化（或无法推进）的子分片尺寸。"""
+    _settings_with(monkeypatch, **overrides)
+    splitter = RecursiveTextSplitter(structure_mode="hierarchical")
+
+    with pytest.raises(ValueError, match="kb_child"):
+        splitter.split([Document(content="正文" * 300, metadata={"source": "a.md"})])
+
+
+@pytest.mark.parametrize(
+    ("label", "bad_value"),
+    [
+        ("整数", 10**4301),
+        ("列表", ["standard"]),
+        ("字典", {"mode": "standard"}),
+        ("集合", {"standard"}),
+    ],
+    ids=["huge-int", "list", "dict", "set"],
+)
+def test_splitter_rejects_illegal_structure_mode_with_value_error(label, bad_value):
+    """非法 ``structure_mode`` 必须报 ``ValueError``，不能漏出 ``TypeError``／位数上限。
+
+    两条独立缺陷，同一个入口：集合成员判断对不可哈希的值抛
+    ``TypeError: unhashable type``；消息里插值 ``{structure_mode}`` 对位数超限的
+    整数抛 ``ValueError: Exceeds the limit``（``str(10**4301)``）。后者尤其误导
+    ——用户看到的是整数转换问题，而真实原因是模式名写错了。
+
+    这个入口的用户可达路径是 ``embed_knowledge_base.py`` 的 ``--mode``（argparse
+    有 ``choices`` 拦着）与直接调用分片器的库使用者，因此按库契约要求
+    ``ValueError``。
+    """
+    with pytest.raises(ValueError) as excinfo:
+        RecursiveTextSplitter(structure_mode=bad_value)
+
+    message = str(excinfo.value)
+    assert "不支持的结构模式" in message, f"{label}: {message}"
+    assert "Exceeds the limit" not in message, f"{label}: {message}"
+
+
+# ── 回归：分割模式与尺寸参数的形态必须报 ValueError ──
+#
+# ``mode`` 原先完全没有校验，直接赋值后在 ``_get_length_function`` 里只判
+# ``== "token"``：任何拼错／大小写不符／非字符串的取值都**静默退回 char 模式**
+# （实测 ``"Token"``／``"tokens"``／``None``／``["token"]`` 全部得到 char 分片）。
+# ``chunk_size=1500`` 于是意味着 1500 **字符**而不是 1500 token，中文下每 token
+# 约一字，分片规模与配置意图不符且无任何提示——违反 AGENTS.md「不用静默回退或
+# 占位结果掩盖失败」。
+#
+# 尺寸参数原先只做比较，不做类型检查：``child_chunk_size='300'`` 构造成功、到
+# split 时才抛 ``TypeError: '>=' not supported between instances of 'int' and
+# 'str'``，而契约是同文件的 ``ValueError``。
+
+
+@pytest.mark.parametrize(
+    ("label", "bad_value"),
+    [
+        ("大小写不符", "Token"),
+        ("拼写错误", "tokens"),
+        ("None", None),
+        ("列表", ["token"]),
+        ("整数", 123),
+        ("位数超限整数", 10**4301),
+    ],
+    ids=["capitalized", "plural", "none", "list", "int", "huge-int"],
+)
+def test_splitter_rejects_illegal_mode_with_value_error(label, bad_value):
+    """非法 ``mode`` 必须报 ``ValueError``，不能静默退回 char 模式。"""
+    with pytest.raises(ValueError) as excinfo:
+        RecursiveTextSplitter(mode=bad_value)
+
+    message = str(excinfo.value)
+    assert "不支持的分割模式" in message, f"{label}: {message}"
+    assert "Exceeds the limit" not in message, f"{label}: {message}"
+
+
+def test_splitter_accepts_valid_modes():
+    """收紧不能误伤：两个合法模式照常构造，且分片行为确实不同。"""
+    text = "这是一段中文测试文本，用于观察分片行为。" * 60
+
+    # overlap 必须一并给出：settings 的默认 overlap（150）大于这里的
+    # parent_chunk_size，LangChain 会在构造期就拒绝。
+    def chunks_for(mode: str) -> list:
+        splitter = RecursiveTextSplitter(mode=mode, parent_chunk_size=100, parent_chunk_overlap=10)
+        return splitter.split([Document(content=text, metadata={"source": "a.md"})])
+
+    token_chunks = chunks_for("token")
+    char_chunks = chunks_for("char")
+
+    assert token_chunks and char_chunks
+    # 模式确实生效（若两者相同，说明 mode 又被忽略了）。
+    assert len(token_chunks) != len(char_chunks)
+
+
+@pytest.mark.parametrize(
+    ("label", "kwargs"),
+    [
+        ("size 是数字字符串", {"child_chunk_size": "300"}),
+        ("overlap 是列表", {"child_chunk_overlap": ["x"]}),
+        ("parent size 是数字字符串", {"parent_chunk_size": "1500"}),
+        ("parent overlap 是布尔值", {"parent_chunk_overlap": True}),
+        ("size 是 None 之外的假值", {"child_chunk_size": 0}),
+    ],
+    ids=["size-str", "overlap-list", "parent-str", "overlap-bool", "size-zero"],
+)
+def test_splitter_rejects_malformed_size_arguments(label, kwargs):
+    """尺寸参数形态非法时必须在**构造期**报 ``ValueError``。
+
+    原先这些值被静默接受，直到 ``split()`` 里做比较时才抛 ``TypeError``——
+    错误现场离写错的调用很远，且 ``TypeError`` 不是本模块的契约类型。
+    """
+    with pytest.raises(ValueError) as excinfo:
+        RecursiveTextSplitter(structure_mode="hierarchical", **kwargs)
+
+    assert "必须是整数" in str(excinfo.value) or "必须大于等于" in str(excinfo.value), label
+
+
+def test_splitter_accepts_valid_size_arguments():
+    """收紧不能误伤：合法尺寸（含 None 表示用 settings）照常构造。"""
+    splitter = RecursiveTextSplitter(
+        structure_mode="hierarchical",
+        parent_chunk_size=500,
+        parent_chunk_overlap=50,
+        child_chunk_size=100,
+        child_chunk_overlap=10,
+    )
+
+    assert splitter.parent_chunk_size == 500
+    assert splitter.child_chunk_overlap == 10
+
+    defaults = RecursiveTextSplitter(structure_mode="hierarchical")
+    assert defaults.parent_chunk_size is None
+
+
+def test_splitter_rejects_oversized_separator_table(monkeypatch):
+    """分隔符表过长必须在构造期报 ``ValueError``，而不是到切分时抛 ``RecursionError``。
+
+    LangChain 的 ``_split_text`` 按分隔符表**递归**，每层消耗一项。实测 1500 项
+    抛 ``RecursionError: maximum recursion depth exceeded``——它不是
+    ``ValueError``，穿透调用方的错误分类与脱敏。表来自用户可写的
+    ``kb_splitter_separators``，``Settings`` 的 validator 只做 ``str -> list``
+    拆分、没有长度上界。
+    """
+    _settings_with(monkeypatch, kb_splitter_separators=[f"sep{i}" for i in range(1500)])
+
+    with pytest.raises(ValueError, match="分隔符表最多"):
+        RecursiveTextSplitter(structure_mode="standard")
+
+
+def test_splitter_accepts_a_reasonable_separator_table(monkeypatch):
+    """收紧不能误伤：真实规模的表照常工作。"""
+    _settings_with(monkeypatch, kb_splitter_separators=["###", "\n", " ", ""])
+
+    chunks = RecursiveTextSplitter(structure_mode="standard").split(
+        [Document(content="a" * 2000, metadata={"source": "a.md"})]
+    )
+
+    assert chunks
+
+
+def test_splitter_accepts_valid_structure_modes():
+    """收紧不能误伤：两个合法模式照常构造。"""
+    for mode in ("standard", "hierarchical"):
+        assert RecursiveTextSplitter(structure_mode=mode).structure_mode == mode
+
+
+def test_hierarchical_overlap_message_survives_an_unprintable_integer():
+    """越界消息本身不得抛异常——它是唯一会插值 ``child_overlap`` 的地方。
+
+    构造器参数是 ``Settings`` 之外的第二条入口：``RecursiveTextSplitter``
+    的 ``child_chunk_overlap`` 直接来自调用方，``Settings`` 的上界拦不住它。
+    实测修复前 ``child_chunk_overlap=10**4301`` 时，本该报「overlap 必须小于
+    size」的消息自己插值这个整数，用户看到的是
+    ``ValueError: Exceeds the limit (4300 digits)``——与重叠参数毫无关系，
+    而且 ``Exceeds the limit`` 会让人以为是整数转换的 bug。
+
+    ``repr(10**4301)`` 抛 ``ValueError`` 是因为 ``sys.get_int_max_str_digits()``
+    默认 4300 位；判据用 ``safe_repr`` 兜住。
+    """
+    splitter = RecursiveTextSplitter(structure_mode="hierarchical", child_chunk_overlap=10**4301)
+
+    with pytest.raises(ValueError) as excinfo:
+        splitter.split([Document(content="正文" * 300, metadata={"source": "a.md"})])
+
+    message = str(excinfo.value)
+    assert "kb_child_chunk_overlap" in message, message
+    assert "Exceeds the limit" not in message, message
+
+
+def test_standard_mode_ignores_unused_child_sizes(monkeypatch):
+    """收紧不能误伤：standard 模式不使用子分片器，那组取值必须照常可用。
+
+    这是本组问题的**用户可见**后果：只想用 standard 的用户，原先必须先改掉
+    用不到的 ``kb_child_*`` 字段才能加载配置。
+    """
+    _settings_with(monkeypatch, kb_chunk_size=300, kb_child_chunk_size=1500)
+    splitter = RecursiveTextSplitter(structure_mode="standard")
+
+    chunks = splitter.split([Document(content="正文" * 300, metadata={"source": "a.md"})])
+
+    assert chunks, "standard 模式必须照常产出分片"
+
+
+def test_hierarchical_mode_accepts_valid_child_sizes(monkeypatch):
+    """收紧不能误伤：合法的层级尺寸照常工作。"""
+    _settings_with(
+        monkeypatch, kb_chunk_size=300, kb_child_chunk_size=100, kb_child_chunk_overlap=10
+    )
+    splitter = RecursiveTextSplitter(structure_mode="hierarchical")
+
+    chunks = splitter.split([Document(content="正文" * 300, metadata={"source": "a.md"})])
+
+    assert chunks
+    assert splitter.parent_documents, "层级模式必须产出父块"
+
+
+# ── 基础清洗器与分片器的容器形态判据 ──
+#
+# 下列判据在整套测试里从未执行（行覆盖 + 变异扫描双证；把它们的 ``raise`` 换成
+# ``pass`` 后全量 3725 条仍全绿）。删除后行为确实改变（实测）：
+# * ``basic_cleaner`` 的 ``documents`` 容器／元素形态 → 删掉 43 后 ``5`` 变成裸
+#   ``TypeError: 'int' object is not iterable``（不是本模块承诺的 ``ValueError``）；
+# * ``_require_separators`` 的 135（非列表）→ 同样退化成裸 ``TypeError``；
+#   138（元素非字符串）→ **静默接受** ``["a", 5]``，后续按分隔符切分时
+#   才以形态各异的错误崩掉（或更糟：静默产出错误的分片）。
+#
+# 既有用例只喂合法输入（``["document"]`` 之类），两条判据从未被反向覆盖。
+def test_basic_cleaner_rejects_non_sequence_documents():
+    """``documents`` 非序列必须给带字段名的 ``ValueError``，不是裸 ``TypeError``。"""
+    import pytest
+
+    from src.etl.cleaners.basic_cleaner import BasicCleaner
+
+    with pytest.raises(ValueError, match="documents 必须是文档列表"):
+        BasicCleaner().clean(5)
+
+
+def test_basic_cleaner_rejects_non_document_entries():
+    """``documents`` 的元素必须是 ``Document``，不能静默丢弃不合规条目。"""
+    import pytest
+
+    from src.etl.cleaners.basic_cleaner import BasicCleaner
+
+    with pytest.raises(ValueError, match=r"documents\[1\] 必须是 Document"):
+        BasicCleaner().clean([Document(content="ok", metadata={}), "not-a-document"])
+
+
+def test_recursive_text_splitter_requires_list_of_string_separators():
+    """分隔符表必须是非空字符串的列表：容器与元素两条判据都要生效。"""
+    import pytest
+
+    with pytest.raises(ValueError, match="分隔符表必须是列表"):
+        RecursiveTextSplitter._require_separators(5)
+
+
+def test_recursive_text_splitter_rejects_non_string_separator_entry():
+    """元素非字符串必须报错，不能静默接受后产出错误的分片。"""
+    import pytest
+
+    with pytest.raises(ValueError, match="每一项都必须是字符串"):
+        RecursiveTextSplitter._require_separators(["\n\n", 5])
+
+
+# ── 回归：ETL 日志插值不得因 metadata 取值形态而崩 ──
+#
+# ``Document.metadata`` 声明为 ``dict[str, Any]``，取值不受控。``str(10**4301)``
+# 撞 CPython 的整数位数上限（默认 4300 位）抛 ``ValueError: Exceeds the limit``，
+# 而 ETL 的日志行直接把它插进 f-string——一条日志／一次分片让建库主路径崩掉，
+# 报出的还是与「来源字段形态异常」无关的整数转换错误。
+
+
+class _PassthroughExtractor(MarkdownExtractor):
+    pass
+
+
+def _passthrough_pipeline() -> Pipeline:
+    """构造一个各阶段都不改数据的管线，单独暴露 ``process`` 的日志插值。"""
+    from src.etl.cleaners.base import BaseCleaner
+    from src.etl.splitters.base import BaseSplitter
+
+    class _Cleaner(BaseCleaner):
+        def clean(self, documents):
+            return documents
+
+    class _Splitter(BaseSplitter):
+        def split(self, documents):
+            return documents
+
+    return Pipeline(_PassthroughExtractor(), _Cleaner(), _Splitter())
+
+
+def test_pipeline_process_survives_oversized_integer_source():
+    """``metadata['source']`` 是位数超限整数时，日志插值不得让 ``process`` 崩。
+
+    删除守卫后 ``logger.info(f"开始处理文档: {source}")`` 抛
+    ``ValueError: Exceeds the limit (4300 digits)``——建库主路径失败，且错误
+    与「来源字段形态异常」毫无关系。
+    """
+    document = Document(content="正文", metadata={"source": 10**4301})
+
+    chunks = _passthrough_pipeline().process(document)
+
+    assert len(chunks) == 1
+
+
+def test_pipeline_process_survives_non_string_source():
+    """``source`` 是非字符串形态（列表）时同样不得崩。"""
+    document = Document(content="正文", metadata={"source": ["a.md"]})
+
+    chunks = _passthrough_pipeline().process(document)
+
+    assert len(chunks) == 1
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [10**4301, ["a.md"], {"path": "a.md"}, 42],
+    ids=["huge-int", "list", "dict", "int"],
+)
+def test_splitter_survives_malformed_source_in_logs(entry):
+    """分片器两条路径的 ``source`` 日志插值都不得因形态异常而崩。"""
+    document = Document(content="正文内容" * 50, metadata={"source": entry})
+
+    assert RecursiveTextSplitter().split([document])
+    assert RecursiveTextSplitter(structure_mode="hierarchical").split_hierarchical([document])
+
+
+def test_splitter_keeps_string_source_verbatim_in_logs(caplog):
+    """正常字符串来源的日志输出逐字不变（守卫只在非字符串时兜底）。"""
+    import logging
+
+    with caplog.at_level(logging.DEBUG, logger="src.etl.splitters.recursive_text_splitter"):
+        RecursiveTextSplitter().split(
+            [Document(content="正文内容" * 50, metadata={"source": "a.md"})]
+        )
+
+    assert "正在分割文档: a.md" in caplog.text
+    assert "文档 'a.md' 分割完成" in caplog.text
+
+
+def test_document_repr_survives_oversized_integer_metadata():
+    """``Document`` 的 ``__str__``／``__repr__`` 必须对任何 metadata 都能渲染。
+
+    ``__repr__`` 是 pytest 失败报告、日志与调试器的**兜底渲染**；``metadata``
+    里一个位数超过 ``sys.get_int_max_str_digits()`` 的整数就让整条 f-string 抛
+    ``ValueError: Exceeds the limit``，报错现场反而什么都看不到（实测 pytest 把
+    失败对象显示成 ``<[ValueError(...) raised in repr()] Document object at ...>``）。
+    """
+    document = Document(content="正文", metadata={"source": 10**4301})
+
+    assert repr(document)
+    assert str(document)
+
+
+def test_document_repr_keeps_normal_metadata_verbatim():
+    """正常 metadata 的渲染逐字不变（降级只在渲染真的失败时发生）。"""
+    metadata = {"source": "knowledge_base/sample.md", "chunk_index": 0, "token_count": 320}
+    document = Document(content="正文", metadata=metadata)
+
+    assert str(document) == f"Document(content='正文...', metadata={metadata})"
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [{"source": 10**4301}, {"source": ["a.md"]}, {"source": 42}, {"source": {"p": 1}}],
+    ids=["huge-int", "list", "int", "dict"],
+)
+def test_document_repr_survives_malformed_metadata(metadata):
+    """非字符串 metadata 取值同样不得让 ``repr`` 抛。"""
+    assert repr(Document(content="正文", metadata=metadata))

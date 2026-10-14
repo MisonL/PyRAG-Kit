@@ -2,7 +2,6 @@ import base64
 import binascii
 import inspect
 import json
-import math
 import os
 import re
 import time
@@ -17,6 +16,7 @@ from google.genai import types
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from src.providers.__base__.model_provider import (
+    _MAX_CLIENT_TIMEOUT_SECONDS,
     _UNSET_TEMPERATURE,
     CompletionRequest,
     CompletionResult,
@@ -25,15 +25,19 @@ from src.providers.__base__.model_provider import (
     TextEmbeddingModel,
     close_resource_sync,
     coerce_completion_request,
+    enum_field,
     extract_system_prompt,
     field,
     is_retryable_error,
     iterate_async,
+    normalize_client_timeout,
     normalize_embedding_vector,
     normalize_messages,
     normalize_usage,
     raise_for_stream_error_event,
     reject_unsupported_kwargs,
+    require_text_list,
+    require_token_count,
     retry_async_call,
     retry_async_stream,
     retry_sync_call,
@@ -41,16 +45,42 @@ from src.providers.__base__.model_provider import (
     validate_complete_tool_call,
 )
 from src.providers.resources import AsyncGoogleResources, GoogleResources
-from src.utils.config import get_settings
+from src.utils.config import (
+    _MAX_EMBEDDING_DIMENSION,
+    get_settings,
+    is_double_convertible,
+    parse_decimal_int,
+    require_model_name,
+    safe_repr,
+)
 from src.utils.log_manager import get_module_logger
 from src.utils.security import (
     _model_dump_mapping,
     redact_sensitive_text,
+    safe_exception_text,
     validate_secret_free_payload,
     validate_secret_free_request_overrides,
 )
 
 logger = get_module_logger(__name__)
+
+
+# Google 整数型生成参数的上界。与项目其它上界常量同一用途：TOML 整数没有
+# 上界，不设界时 ``options.max_output_tokens = 10**400`` 会被原样编进请求体
+# 发给服务端。取值本身也不需要超过这个量——主流模型的最大输出是数万 token。
+_MAX_GENERATION_TOKENS = 1_000_000
+
+# Vertex ``PartialArg.json_path`` 里数组下标的**上界**。
+#
+# 下标由模型输出决定，而 ``_partial_args_to_mapping`` 用
+# ``while len(current) <= token: current.append(None)`` 把列表**填充**到该下标，
+# 因此这个值直接决定一次分片要分配多少个元素。实测 ``$.items[20000000]``
+# 分配 2000 万个 ``None``（RSS 峰值 +76MB、耗时 6.5 秒），而它只是一个
+# 字符串字段的下标——模型（或中转网关）用一个数字就能让进程卡住。
+#
+# 上界取 10 万：真实函数参数里的数组不会有比这更长的，而 10 万个元素是
+# 毫秒级、几 MB 的量。与 ``_MAX_GENERATION_TOKENS`` 同一用途。
+_MAX_PARTIAL_ARG_INDEX = 100_000
 
 
 class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
@@ -200,7 +230,11 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
     )
 
     def __init__(self, model_name: str, options: dict[str, Any] | None = None):
-        self._model_name = model_name
+        # ``GoogleProvider`` 是公开类，嵌入方可以绕过工厂直接构造。工厂路径已用
+        # ``require_model_name`` 收敛（``cc10585``），这里同样要判：非字符串取值
+        # 会在下面的 ``logger.info`` 插值处抛裸 ``ValueError: Exceeds the limit``
+        # （位数超限的整数），或静默原样发给 SDK（列表／``None``）。
+        self._model_name = require_model_name(model_name)
         if options is not None and not isinstance(options, Mapping):
             raise ValueError("Google options 必须是对象。")
         self._options = dict(options or {})
@@ -355,6 +389,19 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
     def _validate_options(cls, options: Mapping[str, Any]) -> None:
         if not isinstance(options, Mapping):
             raise ValueError("Google options 必须是对象。")
+        # 键形态必须先收敛：``sorted(set(options).difference(_OPTION_KEYS))`` 对
+        # 非字符串键抛裸 ``TypeError: sequence item 0: expected str instance,
+        # int found``（混合类型键则是 ``'<' not supported between instances of
+        # ...``）。本类是公开类，嵌入方可以直接 ``GoogleProvider("m", {1: "x"})``
+        # ——本仓测试就这么构造——而本方法的其余判据都按 ``ValueError`` 收敛。
+        # 与 ``utils.security.validate_secret_free_options`` 的同名判据一致；
+        # 本类不走那个共享入口，故在此单列。
+        for key in options:
+            if not isinstance(key, str):
+                raise ValueError(
+                    f"Google options 的键必须是字符串，但得到 {safe_repr(key)}。"
+                    " 请检查配置里的 options 表。"
+                )
         unknown = sorted(set(options).difference(cls._OPTION_KEYS))
         if unknown:
             raise ValueError("Google options 包含不支持的字段: " + ", ".join(unknown))
@@ -368,6 +415,12 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             cls._validate_http_options(options["http_options"])
         if "timeout" in options:
             cls._validate_timeout(options["timeout"], "Google options.timeout")
+        # 整数型生成参数在构造期一并校验，与 ``timeout`` 同一时机。若留到
+        # ``_generation_options()``（请求期）才判，非法取值要等首次提问才暴露，
+        # 而配置错误应当在配置加载时就报出来。
+        for key in ("max_output_tokens", "candidate_count"):
+            if key in options and options[key] is not None:
+                cls._validate_generation_count(options[key], key)
         configured_body = options.get("extra_body")
         model_conflicts: list[str] = []
         if options.get("http_options") is not None:
@@ -470,19 +523,35 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
 
         if "timeout" in payload and payload["timeout"] is not None:
             timeout = payload["timeout"]
+            # 先判可转换性：``math.isfinite(float(x))`` 对超出双精度范围的整数
+            # 自己就抛 ``OverflowError``（**不是** ``ValueError``）。
+            # 判据与 ``options.timeout`` 同源：先判可转换性
+            # （``math.isfinite(float(x))`` 对超出双精度范围的整数自己就抛
+            # ``OverflowError``），再判正数与**上界**。上界此前缺失，实测
+            # ``http_options.timeout = 1e308`` 能通过这里，到真实
+            # ``genai.Client(...)`` 构造时才抛 pydantic 的
+            # ``Unable to parse input string as an integer``——错误消息与
+            # Google 配置毫无关联。毫秒上界即秒上界换算而来。
             if (
                 isinstance(timeout, bool)
                 or not isinstance(timeout, (int, float))
-                or not math.isfinite(float(timeout))
+                or not is_double_convertible(timeout)
                 or float(timeout) <= 0
                 or int(float(timeout)) != float(timeout)
+                or float(timeout) > _MAX_CLIENT_TIMEOUT_SECONDS * 1000
             ):
                 raise ValueError("Google options.http_options.timeout 必须是正整数毫秒。")
 
         found: list[str] = []
 
         def normalized_key(key: Any) -> str:
-            return "".join(char for char in str(key).lower() if char.isalnum())
+            # 字符串直接规范化：``safe_repr`` 对字符串加引号、并在 80 字符处
+            # 截断成 ``'xxx...'``，超长键名的后缀（``...apikey``／``...secret``）
+            # 会被截掉，``is_sensitive_key`` 的 ``endswith`` 判据随即失配——
+            # 一个长键名的凭证键就会被放行（实测复现）。非字符串才走
+            # ``safe_repr``（不崩）。
+            text = key if isinstance(key, str) else safe_repr(key)
+            return "".join(char for char in text.lower() if char.isalnum())
 
         def is_sensitive_key(key: Any) -> bool:
             normalized = normalized_key(key)
@@ -518,7 +587,12 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         def visit(item: Any, path: str = "") -> None:
             if isinstance(item, Mapping):
                 for key, nested in item.items():
-                    current = f"{path}.{key}" if path else str(key)
+                    if not isinstance(key, str):
+                        raise ValueError(
+                            "Google options.http_options 的键必须是字符串，"
+                            f"但得到 {safe_repr(key)}。"
+                        )
+                    current = f"{path}.{key}" if path else key
                     if nested is None:
                         continue
                     if is_sensitive_key(key):
@@ -550,15 +624,16 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
 
     @staticmethod
     def _validate_timeout(value: Any, field_name: str) -> float:
-        """将请求 timeout 规范为有限正数，避免底层比较抛出 TypeError。"""
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(float(value))
-            or float(value) <= 0
-        ):
-            raise ValueError(f"{field_name} 必须是正数。")
-        return float(value)
+        """将请求 timeout 规范为有限正数，避免底层比较抛出 TypeError。
+
+        走与其它渠道同一个 helper，因此带**上界**：Google 是唯一把秒换算成
+        毫秒再交给 SDK 的渠道（``_build_http_options`` 的
+        ``int(timeout * 1000)``），无上界时该派生值对超过 ``DBL_MAX/1000``
+        的秒数抛 ``OverflowError``——实测 ``options.timeout = 1e306`` 时配置
+        加载与 provider 构造都成功，首次提问才炸，且 ``OverflowError`` 不是
+        ``ValueError``，穿透全部错误边界。
+        """
+        return normalize_client_timeout(value, "Google", field_name)
 
     @classmethod
     def _validate_resource_config(cls, config: Any) -> None:
@@ -575,7 +650,10 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         def visit(value: Any) -> None:
             if isinstance(value, Mapping):
                 for key, nested in value.items():
-                    normalized = "".join(char for char in str(key).lower() if char.isalnum())
+                    # ``safe_repr`` 而非裸 ``str``：这个递归是**发现** ``http_options``
+                    # 用的，非字符串键只需不崩即可（它也不会等于 ``httpoptions``）。
+                    # ``str(10**4301)`` 会抛 ``ValueError: Exceeds the limit``。
+                    normalized = "".join(char for char in safe_repr(key).lower() if char.isalnum())
                     if normalized == "httpoptions":
                         cls._validate_http_options(nested)
                         continue
@@ -595,6 +673,14 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         """将配置文件中的 DebugConfig 表转换为 SDK 对象。"""
         if value is None or not isinstance(value, Mapping):
             return value
+        # 键形态先收敛：``sorted(set(value).difference(allowed))`` 对非字符串键抛
+        # 裸 ``TypeError: sequence item 0: expected str instance, int found``
+        # （混合类型键则是 ``'<' not supported between instances of ...``）。
+        # 与 ``_validate_options``／``utils.security.validate_secret_free_options``
+        # 同一判据、同一理由。
+        for key in value:
+            if not isinstance(key, str):
+                raise ValueError(f"Google debug_config 的键必须是字符串，但得到 {safe_repr(key)}。")
         allowed = {"client_mode", "replays_directory", "replay_id"}
         unknown = sorted(set(value).difference(allowed))
         if unknown:
@@ -824,7 +910,33 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             "document_ocr",
             "audio_track_extraction",
         }
-        return {key: value for key, value in self._options.items() if key in supported}
+        values = {key: value for key, value in self._options.items() if key in supported}
+        # ``output_dimensionality`` 此前只过键名白名单，取值原样透传给
+        # ``EmbedContentConfig``。实测 ``-1``／``0``／``"abc"``／``1.5``／``True``
+        # 全部构造成功并进入 ``embedContent`` 请求体，由服务端返回语义不明的 400；
+        # ``10**4301`` 更糟——它在 ``json.dumps`` 编码请求体时才抛「整数转字符串
+        # 超限」。项目里 ``_MAX_EMBEDDING_DIMENSION`` 早就是这个量的上界，
+        # ``openai_compatible._validate_embedding_dimensions`` 已在同一语义上
+        # 校验，这里是 google 渠道的对应实现。
+        if "output_dimensionality" in values:
+            values["output_dimensionality"] = self._validate_embedding_dimensions(
+                values["output_dimensionality"]
+            )
+        return values
+
+    @staticmethod
+    def _validate_embedding_dimensions(value: Any) -> int:
+        """校验 ``options.output_dimensionality``，拒绝越界、非整数与超大字面量。"""
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                f"Google options.output_dimensionality 必须是整数，但得到 {safe_repr(value)}。"
+            )
+        if not 1 <= value <= _MAX_EMBEDDING_DIMENSION:
+            raise ValueError(
+                f"Google options.output_dimensionality 必须在 1 到 "
+                f"{_MAX_EMBEDDING_DIMENSION} 之间，但得到 {safe_repr(value)}。"
+            )
+        return value
 
     @staticmethod
     def _resource_config(config_type: Any, config: Any, values: dict[str, Any]) -> Any:
@@ -983,7 +1095,36 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             "model_armor_config",
             "should_return_http_response",
         }
-        return {key: value for key, value in self._options.items() if key in supported}
+        values = {key: value for key, value in self._options.items() if key in supported}
+        # 生成参数此前只做键名白名单，取值原样透传给
+        # ``types.GenerateContentConfig``。实测 ``options.max_output_tokens``
+        # 写成 ``10**400`` 时构造与调用都成功，请求体里就带着那个 401 位整数
+        # 发给服务端（MockTransport 抓包确认）；``candidate_count = -1``／``0``
+        # 同样静默通过。项目里 ``chat_top_k``／``kb_chunk_size``／
+        # ``_MAX_EMBEDDING_DIMENSION`` 都已有同类上界，这里是遗漏。
+        for key in ("max_output_tokens", "candidate_count"):
+            if key in values:
+                values[key] = self._validate_generation_count(values[key], key)
+        return values
+
+    @staticmethod
+    def _validate_generation_count(value: Any, field_name: str) -> int:
+        """校验 Google 的整数型生成参数（``max_output_tokens``／``candidate_count``）。
+
+        只接受正整数并给上界：TOML 整数无上界，不设界时超大值会被原样编进
+        请求体，非法取值则原样发给服务端，由远端返回语义不明的 400。
+        上界取 ``_MAX_GENERATION_TOKENS``，见该常量的说明。
+        """
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                f"Google options.{field_name} 必须是正整数，但得到 {safe_repr(value)}。"
+            )
+        if not 1 <= value <= _MAX_GENERATION_TOKENS:
+            raise ValueError(
+                f"Google options.{field_name} 必须在 1 到 {_MAX_GENERATION_TOKENS} 之间，"
+                f"但得到 {safe_repr(value)}。"
+            )
+        return value
 
     @staticmethod
     def _response_format_values(response_format: Any) -> dict[str, Any]:
@@ -1100,13 +1241,26 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
     def _convert_tools(tools: list[dict[str, Any]] | None) -> list[Any] | None:
         if not tools:
             return None
+        # 容器形态先判：``for ... in enumerate(tools)`` 对不可迭代的取值抛裸
+        # ``TypeError: 'int' object is not iterable``——而同函数对**可迭代但
+        # 元素非法**的形态（``"s"``／``{"a": 1}``／``b"x"``）给的都是带序号的
+        # ``ValueError``。同一判据的两半必须都在，否则「工具定义写错」的收场
+        # 取决于它是标量还是序列，且前者不落调用方按 ``ValueError`` 建立的
+        # 分类。``tools=5`` 走 ``invoke`` 实测即抛该 ``TypeError``。
+        if not isinstance(tools, (list, tuple)):
+            raise ValueError(f"Google 工具定义必须是列表，但得到 {safe_repr(tools)}。")
 
         converted_tools: list[Any] = []
         declarations = []
-        for tool in tools:
-            if not isinstance(tool, dict):
-                converted_tools.append(tool)
-                continue
+        for index, tool in enumerate(tools):
+            # 非 Mapping 的工具定义此前被原样放进 ``converted_tools``，直到
+            # ``types.Tool(**tool)`` 或 ``function.get("name")`` 才以裸
+            # ``AttributeError`` / ``TypeError`` 暴露——两者都不在调用方按
+            # ``ValueError`` 建立的错误分类内。Anthropic 的同一入口（
+            # ``anthropic.py`` 的 ``_convert_tools``）早已转成带序号的
+            # ``ValueError``，这里补齐同一判据。
+            if not isinstance(tool, Mapping):
+                raise ValueError(f"Google 工具定义[{index}] 必须是对象，但得到 {safe_repr(tool)}。")
             native_keys = {
                 "retrieval",
                 "computer_use",
@@ -1122,6 +1276,12 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                 "exa_ai_search",
             }
             type_name = tool.get("type")
+            # ``type_name in type_aliases`` 对不可哈希取值抛
+            # ``TypeError: unhashable type``；下面 ``native_keys.intersection(tool)``
+            # 同理。类型标记本来就该是字符串，非字符串一律按「不是原生工具」处理，
+            # 落到下面的 function schema 分支（与未知类型标记同一条路径）。
+            if not isinstance(type_name, str):
+                type_name = None
             type_aliases = {
                 "google_search": "google_search",
                 "code_execution": "code_execution",
@@ -1138,9 +1298,13 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                 converted_tools.append(types.Tool(**tool))
                 continue
             function = tool.get("function", tool)
+            if not isinstance(function, Mapping):
+                raise ValueError(
+                    f"Google 工具定义[{index}].function 必须是对象，但得到 {safe_repr(function)}。"
+                )
             name = function.get("name")
-            if not name:
-                raise ValueError("Google 工具定义缺少 function.name。")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(f"Google 工具定义[{index}] 缺少 function.name。")
             declarations.append(
                 types.FunctionDeclaration(
                     name=name,
@@ -1167,9 +1331,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                 # pydantic 会把违规取值原文写进 ``input_value=...``，调用方若直接
                 # ``str(exc)`` 就可能把凭证形态的值带出去。两个消毒器虽然都能
                 # 拦住（见 test_security_boundaries），但在源头收口才是纵深防御。
-                raise ValueError(
-                    f"Google tool_choice 无效: {redact_sensitive_text(str(exc))}"
-                ) from exc
+                raise ValueError(f"Google tool_choice 无效: {safe_exception_text(exc)}") from exc
         if isinstance(tool_choice, dict):
             if tool_choice.get("type") == "function":
                 function = tool_choice.get("function", {})
@@ -1234,7 +1396,16 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         if configured_max_tokens is not None and configured_max_output_tokens is not None:
             raise ValueError("Google options.max_tokens 与 options.max_output_tokens 重复。")
         if configured_max_tokens is not None:
-            values["max_output_tokens"] = configured_max_tokens
+            # 与 ``_generation_options`` 里的 ``max_output_tokens`` 同一判据：
+            # 此前这条赋值绕过了 ``_validate_generation_count``，于是
+            # ``options.max_tokens = -1``／``0``／``True``／``10**400`` 全部
+            # 原样进入 ``GenerateContentConfig``（实测 pydantic 对
+            # ``-1``／``True``／超大整数都不报错），非法取值由服务端返回语义
+            # 不明的 400。同一个量在 ``max_output_tokens`` 名下会被拒绝，
+            # 换个别名就放行，判据必须一致。
+            values["max_output_tokens"] = self._validate_generation_count(
+                configured_max_tokens, "max_tokens"
+            )
         configured_thinking = self._options.get("thinking")
         configured_thinking_config = values.get("thinking_config")
         if configured_thinking is not None and configured_thinking_config is not None:
@@ -1255,13 +1426,15 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         if temperature is not None or "temperature" not in values:
             values["temperature"] = 0.7 if temperature is None else temperature
         if max_tokens is not None:
-            values["max_output_tokens"] = max_tokens
+            values["max_output_tokens"] = self._validate_generation_count(max_tokens, "max_tokens")
         if top_p is not None:
             values["top_p"] = top_p
         if top_k is not None:
             values["top_k"] = top_k
         if candidate_count is not None:
-            values["candidate_count"] = candidate_count
+            values["candidate_count"] = self._validate_generation_count(
+                candidate_count, "candidate_count"
+            )
         if frequency_penalty is not None:
             values["frequency_penalty"] = frequency_penalty
         if presence_penalty is not None:
@@ -1476,7 +1649,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                 response_parts = raw_content if isinstance(raw_content, list) else [raw_content]
                 parts = []
                 for response_part in response_parts:
-                    if isinstance(response_part, dict) and response_part.get("type") in {
+                    if isinstance(response_part, dict) and enum_field(response_part, "type") in {
                         "tool_result",
                         "function_result",
                         "function_response",
@@ -1534,6 +1707,8 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                         parts.append(part)
                         continue
                     part_type = part.get("type")
+                    if not isinstance(part_type, str):
+                        part_type = None
                     if part_type in {"text", "input_text"}:
                         parts.append(types.Part(text=part.get("text", "")))
                     elif part_type in {"image_url", "input_image"}:
@@ -1641,6 +1816,16 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                         if not isinstance(function_name, str) or not function_name.strip():
                             raise ValueError("Google function_call 缺少 name。")
                         if call_id and function_name:
+                            # 同一 id 重复登记说明上游给了自相矛盾的调用序列
+                            # （两条 function_call 共用一个 id），静默覆盖会让
+                            # 后续 ``function_response`` 关联到后写的那条名字、
+                            # 与它实际回应的调用不符。宁可显式报错。
+                            existing = tool_call_names.get(call_id)
+                            if existing is not None and existing != function_name:
+                                raise ValueError(
+                                    f"Google 工具调用 id {call_id!r} 重复且名字冲突: "
+                                    f"{existing!r} vs {function_name!r}。"
+                                )
                             tool_call_names[call_id] = function_name
                         arguments = part.get("arguments", part.get("args", {}))
                         if isinstance(arguments, str):
@@ -1680,7 +1865,21 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                     else:
                         raise ValueError(f"Google 不支持的消息内容块类型: {part_type!r}。")
             else:
-                parts = [types.Part(text=str(raw_content))]
+                # 字符串 content 原样透传；其余标量 content 的渲染走 ``safe_repr``
+                # 而不是裸 ``str()``：``normalize_messages`` 只校验 ``messages``
+                # 是「对象序列」，不校验 content 的形态（实测
+                # ``{"role": "user", "content": 10**4301}`` 原样通过），因此这里
+                # 是标量 content 的唯一收口。``str(10**4301)`` 抛
+                # ``ValueError: Exceeds the limit``——类型对、内容却与「消息
+                # 内容写错了」无关。字符串**必须**排除在 ``safe_repr`` 之外：
+                # 后者会加引号并在 80 字符处截断，把普通长文本消息改写成
+                # ``'前 77 字...'`` 发给模型。非字符串的兜底判据与同文件的
+                # ``_normalize_finish_reason`` 一致。
+                parts = [
+                    types.Part(
+                        text=raw_content if isinstance(raw_content, str) else safe_repr(raw_content)
+                    )
+                ]
             for index, call in enumerate(message.get("tool_calls", []) or []):
                 if not isinstance(call, Mapping):
                     raise ValueError(f"Google assistant tool_calls[{index}] 必须是对象。")
@@ -1692,6 +1891,12 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                 if not isinstance(function_name, str) or not function_name.strip():
                     raise ValueError(f"Google assistant tool_calls[{index}] 缺少 function.name。")
                 if call_id and function_name:
+                    existing = tool_call_names.get(call_id)
+                    if existing is not None and existing != function_name:
+                        raise ValueError(
+                            f"Google 工具调用 id {call_id!r} 重复且名字冲突: "
+                            f"{existing!r} vs {function_name!r}。"
+                        )
                     tool_call_names[call_id] = function_name
                 arguments = function.get("arguments", function.get("args", {}))
                 if isinstance(arguments, str):
@@ -1718,13 +1923,13 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
     @staticmethod
     def _response_text(response: Any) -> str:
         """读取文本而不触发 Google SDK 纯工具响应的 ValueError。"""
-        candidates = field(response, "candidates", []) or []
+        candidates = GoogleProvider._require_candidates(response, source="响应")
         if candidates:
             chunks: list[str] = []
             saw_parts = False
             for candidate in candidates:
                 content = field(candidate, "content")
-                for part in field(content, "parts", []) or []:
+                for part in GoogleProvider._require_parts(content, source="响应"):
                     saw_parts = True
                     if field(part, "thought", False):
                         continue
@@ -1742,7 +1947,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         chunks = []
         for candidate in candidates:
             content = field(candidate, "content")
-            for part in field(content, "parts", []) or []:
+            for part in GoogleProvider._require_parts(content, source="响应"):
                 if field(part, "thought", False):
                     continue
                 text = field(part, "text", "")
@@ -1762,11 +1967,75 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         }
     )
 
+    @staticmethod
+    def _require_parts(owner: Any, *, source: str) -> list[Any]:
+        """把内容块里的 ``parts`` 收敛成列表，非法形态给出可读的 ``RuntimeError``。
+
+        ``parts`` 是 ``candidates[].content`` 下的**嵌套**容器，本文件有 **5 处**
+        直接迭代它。此前每一处都只写 ``field(content, "parts", []) or []``——与
+        顶层 ``candidates`` 修复前的写法完全相同，同样只挡住 ``None`` 与空值。
+        实测 ``content.parts = 5`` 抛裸 ``TypeError: 'int' object is not iterable``，
+        而本 provider 的错误分类按 ``RuntimeError`` 写。
+
+        与 ``_require_candidates`` 的**可达性说明相同**：google-genai 的响应经
+        ``GenerateContentResponse._from_response`` → ``cls.model_validate(response)``
+        构造，**会**执行 pydantic 校验，畸形容器在 SDK 层就被拒。因此本条守的是
+        替身场景与「将来 SDK 改成不校验」的契约一致性，不是线上流量。
+        """
+        parts = field(owner, "parts", []) or []
+        if not isinstance(parts, (list, tuple)):
+            raise RuntimeError(f"Google {source}的 parts 必须是列表，但得到 {safe_repr(parts)}。")
+        return list(parts)
+
+    @staticmethod
+    def _require_embeddings(owner: Any, *, source: str) -> list[Any]:
+        """把 Embedding 响应的 ``embeddings`` 收敛成列表，非法形态抛 ``RuntimeError``。
+
+        本文件有 **4 处**读它（同步／异步 × Vertex 单内容／批量），此前都写
+        ``list(field(response, "embeddings", []) or [])``——``or []`` 只挡 ``None``
+        与空值，``list(5)`` 抛裸 ``TypeError: 'int' object is not iterable``，而
+        调用方的错误分类按 ``RuntimeError`` 写（紧邻的「返回数量与输入文本数量
+        不一致」就是 ``RuntimeError``）。可达性同 ``_require_parts``。
+        """
+        embeddings = field(owner, "embeddings", []) or []
+        if not isinstance(embeddings, (list, tuple)):
+            raise RuntimeError(
+                f"Google {source}的 embeddings 必须是列表，但得到 {safe_repr(embeddings)}。"
+            )
+        return list(embeddings)
+
+    @staticmethod
+    def _require_candidates(owner: Any, *, source: str) -> list[Any]:
+        """把响应／流块里的 ``candidates`` 收敛成列表，非法形态给出可读的 ``RuntimeError``。
+
+        ``candidates`` 是 Gemini 响应的顶层容器，本文件有 **6 处**直接迭代它
+        （``_response_text``、``_extract_refusal``、``_extract_result`` 两处、
+        ``_stream_events_from_chunk``、``_stream_chunk_has_terminal_event``）。
+        此前每一处都只写 ``field(x, "candidates", []) or []``——那只挡住 ``None``
+        与空值。实测走**真实入口**（``GoogleProvider.complete``）时：
+
+        * ``candidates`` 是整数 -> 裸 ``TypeError: 'int' object is not iterable``；
+        * 是 JSON 对象 -> 更晚一步，在 ``candidates[0]`` 处抛裸 ``KeyError: 0``。
+
+        两者都不是 ``RuntimeError``——而本 provider 的错误分类（以及调用方的
+        ``except``）按 ``RuntimeError`` 写。同一个形态在
+        ``openai_compatible._raise_for_chat_response_error`` 早已有显式守卫
+        （「响应的 choices 必须是列表」），两个 provider 的收场必须一致。
+
+        返回列表而不是原值：调用方全都只做迭代，收敛后不必再各自 ``or []``。
+        """
+        candidates = field(owner, "candidates", []) or []
+        if not isinstance(candidates, (list, tuple)):
+            raise RuntimeError(
+                f"Google {source}的 candidates 必须是列表，但得到 {safe_repr(candidates)}。"
+            )
+        return list(candidates)
+
     @classmethod
     def _candidate_refusal(cls, candidate: Any) -> str | None:
         """读取 Gemini 内容块或安全拦截元数据中的拒答原因。"""
         content = field(candidate, "content")
-        for part in field(content, "parts", []) or []:
+        for part in GoogleProvider._require_parts(content, source="响应"):
             value = field(part, "refusal")
             if not value and field(part, "type") == "refusal":
                 value = field(part, "text") or field(part, "reason")
@@ -1793,17 +2062,31 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         if isinstance(name, str) and name.strip():
             return name.strip().upper()
         raw = getattr(value, "value", value)
-        text = str(raw).strip()
-        if not text:
+        if raw is None:
             return None
-        if "." in text:
-            text = text.rsplit(".", 1)[-1]
+        # 非字符串走 ``safe_repr`` 而不是裸 ``str()``：``str(10**4301)`` 抛
+        # ``ValueError: Exceeds the limit``，而 ``finish_reason`` 来自服务端响应、
+        # 形态不受本地控制，这个位置又在**响应解析**里——用户已经拿到部分输出后
+        # 才看到一条与「停止原因」毫无关系的整数转换错误。
+        #
+        # 去点号前缀只对**字符串**做：那条逻辑是给 ``"FinishReason.MAX_TOKENS"``
+        # 这类带模块前缀的枚举名准备的，而 ``safe_repr`` 的截断标记恰好也是
+        # ``...``——对它套 ``rsplit(".")`` 会把整段数字切光，只剩空串。这类取值
+        # 本就该原样呈现（下面的 ``upper()`` 即可），不该被当成带前缀的名字。
+        if isinstance(raw, str):
+            text = raw.strip()
+            if not text:
+                return None
+            if "." in text:
+                text = text.rsplit(".", 1)[-1]
+        else:
+            text = safe_repr(raw).strip()
         return text.upper()
 
     @classmethod
     def _extract_refusal(cls, response: Any) -> str | None:
         """提取 Gemini 响应中的显式拒答或安全拦截信息。"""
-        for candidate in field(response, "candidates", []) or []:
+        for candidate in cls._require_candidates(response, source="响应"):
             refusal = cls._candidate_refusal(candidate)
             if refusal:
                 return refusal
@@ -1819,7 +2102,19 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             message = field(feedback, "block_reason_message")
             if not isinstance(message, str) or not message.strip():
                 message = field(feedback, "message")
-            return str(message or f"Google 提示被安全策略拦截: {block_reason_text}")
+            # 非字符串的 ``message`` 也要能渲染：``field`` 明确支持**字典形态**
+            # 的响应（见其 docstring「兼容 Pydantic SDK 对象和字典响应」），而
+            # 字典里的 ``message`` 不受 SDK 的 ``Optional[str]`` 约束。位数超限的
+            # 整数让裸 ``str()`` 抛 ``ValueError: Exceeds the limit``——本方法的
+            # 职责是**报告拒答**，在正要报出拦截原因时自己崩掉，用户拿到的是与
+            # 「提示被安全策略拦截」毫无关联的整数转换错误，而本 provider 的错误
+            # 分类按 ``RuntimeError`` 写。
+            #
+            # 字符串走原样（``safe_repr`` 会加引号，改掉正常取值的显示形态），
+            # 非字符串才降级——与 ``_render_value``／``_path_text`` 同一取舍。
+            if not isinstance(message, str):
+                message = safe_repr(message) if message else ""
+            return message or f"Google 提示被安全策略拦截: {block_reason_text}"
         return None
 
     @staticmethod
@@ -1836,8 +2131,15 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
     @staticmethod
     def _partial_arg_tokens(json_path: str) -> list[str | int]:
         """解析 Vertex PartialArg 使用的常见 JSONPath 子集。"""
+        # ``json_path`` 来自模型的流式 function call 分片，形态不受控。两条拒绝
+        # 消息都用 ``safe_repr`` 而不是 ``!r``：``repr(10**4301)`` 自己抛
+        # ``ValueError: Exceeds the limit``——正要报出「json_path 无效」的那一步
+        # 变成整数转换错误。对字符串取值两者等价（``safe_repr`` 也加引号），
+        # 因此正常路径的显示形态不变。
         if not isinstance(json_path, str) or not json_path.startswith("$"):
-            raise ValueError(f"Google FunctionCall.partial_args 的 json_path 无效: {json_path!r}")
+            raise ValueError(
+                f"Google FunctionCall.partial_args 的 json_path 无效: {safe_repr(json_path)}"
+            )
         if json_path in {"", "$"}:
             return []
         rest = json_path[1:]
@@ -1850,7 +2152,26 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                 continue
             indexed = re.match(r"^\[(\d+)\]", rest)
             if indexed:
-                tokens.append(int(indexed.group(1)))
+                # ``\d+`` 对任意长度的数字串都匹配，而 ``int("9" * 4301)`` 撞上
+                # CPython 的 ``sys.get_int_max_str_digits()``（默认 4300）抛
+                # ``ValueError: Exceeds the limit``——类型是本函数的契约，内容却
+                # 是整数转换问题，与「json_path 不合法」无关，同函数另外两条拒绝
+                # 分支都带着原始 ``json_path`` 与指引。走 ``parse_decimal_int``
+                # （解析不了返回 ``None``，绝不抛）与全项目同一判据。
+                index_value = parse_decimal_int(indexed.group(1))
+                if index_value is None:
+                    raise ValueError(
+                        f"Google FunctionCall.partial_args 的 json_path 索引无效: {json_path!r}"
+                    )
+                # 上界与 ``_MAX_PARTIAL_ARG_INDEX`` 同源：下界由下面写入循环里的
+                # ``token < 0`` 判据覆盖，这里补上界。缺失时 ``_partial_args_to_mapping``
+                # 会按该下标把列表填充到那么大。
+                if index_value > _MAX_PARTIAL_ARG_INDEX:
+                    raise ValueError(
+                        f"Google FunctionCall.partial_args 的 json_path 索引过大: "
+                        f"{json_path!r}（下标不得超过 {_MAX_PARTIAL_ARG_INDEX}）。"
+                    )
+                tokens.append(index_value)
                 rest = rest[indexed.end() :]
                 continue
             quoted = re.match(r"^\[['\"]([^'\"]+)['\"]\]", rest)
@@ -1858,7 +2179,9 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                 tokens.append(quoted.group(1))
                 rest = rest[quoted.end() :]
                 continue
-            raise ValueError(f"Google FunctionCall.partial_args 不支持的 json_path: {json_path!r}")
+            raise ValueError(
+                f"Google FunctionCall.partial_args 不支持的 json_path: {safe_repr(json_path)}"
+            )
         return tokens
 
     @classmethod
@@ -2160,9 +2483,9 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         usage_dict = normalize_usage(usage)
         calls = []
         reasoning: list[str] = []
-        for candidate in field(response, "candidates", []) or []:
+        for candidate in GoogleProvider._require_candidates(response, source="响应"):
             content = field(candidate, "content")
-            for part in field(content, "parts", []) or []:
+            for part in GoogleProvider._require_parts(content, source="响应"):
                 function_call = field(part, "function_call")
                 if function_call:
                     calls.append(
@@ -2180,7 +2503,10 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             tool_calls=calls,
             usage=usage_dict,
             finish_reason=GoogleProvider._normalize_finish_reason(
-                field((field(response, "candidates", []) or [None])[0], "finish_reason")
+                field(
+                    next(iter(GoogleProvider._require_candidates(response, source="响应")), None),
+                    "finish_reason",
+                )
             ),
             response_id=field(response, "response_id"),
             refusal=GoogleProvider._extract_refusal(response),
@@ -2192,9 +2518,9 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
     def _stream_events_from_chunk(cls, chunk: Any) -> list[StreamEvent]:
         events: list[StreamEvent] = []
         response_id = field(chunk, "response_id")
-        for candidate in field(chunk, "candidates", []) or []:
+        for candidate in cls._require_candidates(chunk, source="流块"):
             content = field(candidate, "content")
-            parts = field(content, "parts", []) or []
+            parts = cls._require_parts(content, source="流块")
             refusal_emitted = False
             for part in parts:
                 function_call = field(part, "function_call")
@@ -2205,6 +2531,19 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                         "type": "function",
                         "name": field(function_call, "name"),
                         "arguments": cls._function_call_arguments(function_call),
+                        # Vertex 开启 ``stream_function_call_arguments`` 时会把一次
+                        # 调用的参数拆成多个 chunk（SDK 自带 fixture
+                        # ``test_function_call_streaming.py`` 记录的正是这个形状：
+                        # 分片1 带 ``will_continue=True``，分片2 带 ``partial_args``
+                        # 与 ``will_continue=False``，两者都**没有** id/index）。
+                        # 读侧 ``_merge_tool_call`` 专门为它写了判据（
+                        # ``tool_call.get("will_continue") is True``），
+                        # ``_merge_tool_call`` 的字段循环也早已把
+                        # ``will_continue`` 列入复制名单，唯独这里构造 delta 字典时
+                        # 漏掉了它——于是第二个分片三项判据全假，抛
+                        # ``RuntimeError: 缺少稳定 id/index``，该 SDK 模式下**每一个**
+                        # 多分片调用都失败。
+                        "will_continue": field(function_call, "will_continue"),
                     }
                     events.append(
                         StreamEvent(
@@ -2232,7 +2571,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                             )
                         )
 
-                part_type = field(part, "type")
+                part_type = enum_field(part, "type")
                 part_refusal = field(part, "refusal")
                 if not part_refusal and part_type == "refusal":
                     part_refusal = field(part, "text") or field(part, "reason")
@@ -2297,7 +2636,26 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
         block_reason = field(feedback, "block_reason")
         if block_reason:
             message = field(feedback, "block_reason_message") or field(feedback, "message")
-            refusal = str(message or f"Google 提示被安全策略拦截: {block_reason}")
+            # 与 ``_extract_refusal`` 同判据、同理由：``field`` 支持字典形态的
+            # 响应，那里的 ``message`` 不受 SDK 的 ``Optional[str]`` 约束，位数
+            # 超限的整数让裸 ``str()`` 抛 ``ValueError: Exceeds the limit``——而
+            # 这段代码正在**构造拒答事件**，崩掉会让一次真实的安全拦截表现为
+            # 整数转换错误。字符串原样，非字符串降级成量级描述。
+            if not isinstance(message, str):
+                message = safe_repr(message) if message else ""
+            # 兜底文案里插值的 ``block_reason`` 同样要收敛，判据与非流式的
+            # ``_extract_refusal`` 逐字一致（枚举取 name、字符串取 strip、其余
+            # 空串）：它同样来自字典形态的响应、不受 SDK 枚举约束，位数超限的
+            # 整数让裸插值抛 ``ValueError: Exceeds the limit``。``message`` 非空
+            # 时兜底文案不会被用到，但 f-string 在**求值期**就拼好——不收敛的话
+            # 这条路径仍会崩。
+            if isinstance(block_reason, Enum):
+                block_reason_text = block_reason.name or str(block_reason)
+            elif isinstance(block_reason, str):
+                block_reason_text = block_reason.strip()
+            else:
+                block_reason_text = ""
+            refusal = message or f"Google 提示被安全策略拦截: {block_reason_text}"
             if not any(event.type == "refusal_delta" for event in events):
                 events.append(
                     StreamEvent(
@@ -2345,7 +2703,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             return True
         return any(
             field(candidate, "finish_reason", None) is not None
-            for candidate in field(chunk, "candidates", []) or []
+            for candidate in GoogleProvider._require_candidates(chunk, source="流块")
         )
 
     def complete(self, request: CompletionRequest | None = None, **kwargs: Any) -> CompletionResult:
@@ -2482,10 +2840,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                 config=types.CountTokensConfig(**config_values) if config_values else None,
             )
         )
-        value = field(response, "total_tokens")
-        if value is None:
-            raise RuntimeError("Google token count 响应缺少 total_tokens。")
-        return int(value)
+        return require_token_count(field(response, "total_tokens"), "Google", "total_tokens")
 
     def compute_tokens(self, request: CompletionRequest | None = None, **kwargs: Any) -> Any:
         request = coerce_completion_request(request, kwargs, "Google compute_tokens")
@@ -2720,10 +3075,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                 config=types.CountTokensConfig(**config_values) if config_values else None,
             )
         )
-        value = field(response, "total_tokens")
-        if value is None:
-            raise RuntimeError("Google token count 响应缺少 total_tokens。")
-        return int(value)
+        return require_token_count(field(response, "total_tokens"), "Google", "total_tokens")
 
     async def async_compute_tokens(
         self, request: CompletionRequest | None = None, **kwargs: Any
@@ -4073,7 +4425,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             duration = time.perf_counter() - start_time
             logger.info(f"Google LLM ({self._model_name}) 调用完成，耗时: {duration:.2f}s")
         except Exception as e:
-            error_text = redact_sensitive_text(str(e))
+            error_text = safe_exception_text(e)
             logger.exception(
                 "Google LLM (%s) 出错: %s",
                 self._model_name,
@@ -4179,7 +4531,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             duration = time.perf_counter() - start_time
             logger.info(f"Google LLM ({self._model_name}) 异步调用完成，耗时: {duration:.2f}s")
         except Exception as e:
-            error_text = redact_sensitive_text(str(e))
+            error_text = safe_exception_text(e)
             logger.exception(
                 "Google LLM (%s) 异步出错: %s",
                 self._model_name,
@@ -4195,6 +4547,8 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
     )
     def embed_documents(self, texts: list[str], **kwargs: Any) -> list[list[float]]:
         """同步向量化文档。"""
+        # 形态校验必须先于日志里的 ``len(texts)``（同 openai_compatible）。
+        texts = require_text_list(texts, "Google")
         logger.info(f"调用 Google Embedding ({self._model_name})，数量: {len(texts)}")
         start_time = time.perf_counter()
 
@@ -4224,7 +4578,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                     response = client.models.embed_content(
                         model=self._model_name, contents=[text], config=config
                     )
-                    values = list(field(response, "embeddings", []) or [])
+                    values = GoogleProvider._require_embeddings(response, source="Embedding 响应")
                     if len(values) != 1:
                         raise RuntimeError(
                             "Google Vertex Embedding 单内容请求未返回唯一 embedding。"
@@ -4234,7 +4588,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                 response = client.models.embed_content(
                     model=self._model_name, contents=texts, config=config
                 )
-                values = list(field(response, "embeddings", []) or [])
+                values = GoogleProvider._require_embeddings(response, source="Embedding 响应")
                 if len(values) != len(texts):
                     raise RuntimeError("Google Embedding 返回数量与输入文本数量不一致。")
                 embeddings = [normalize_embedding_vector(field(item, "values")) for item in values]
@@ -4242,7 +4596,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             logger.info(f"Google Embedding ({self._model_name}) 完成，耗时: {duration:.2f}s")
             return embeddings
         except Exception as e:
-            error_text = redact_sensitive_text(str(e))
+            error_text = safe_exception_text(e)
             logger.exception(
                 "Google Embedding (%s) 出错: %s",
                 self._model_name,
@@ -4258,6 +4612,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
     )
     async def aembed_documents(self, texts: list[str], **kwargs: Any) -> list[list[float]]:
         """异步向量化文档。"""
+        texts = require_text_list(texts, "Google")
         logger.info(f"异步调用 Google Embedding ({self._model_name})，数量: {len(texts)}")
         start_time = time.perf_counter()
 
@@ -4289,7 +4644,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                             model=self._model_name, contents=[text], config=config
                         )
                     )
-                    values = list(field(response, "embeddings", []) or [])
+                    values = GoogleProvider._require_embeddings(response, source="Embedding 响应")
                     if len(values) != 1:
                         raise RuntimeError(
                             "Google Vertex Embedding 单内容请求未返回唯一 embedding。"
@@ -4301,7 +4656,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
                         model=self._model_name, contents=texts, config=config
                     )
                 )
-                values = list(field(response, "embeddings", []) or [])
+                values = GoogleProvider._require_embeddings(response, source="Embedding 响应")
                 if len(values) != len(texts):
                     raise RuntimeError("Google Embedding 返回数量与输入文本数量不一致。")
                 embeddings = [normalize_embedding_vector(field(item, "values")) for item in values]
@@ -4309,7 +4664,7 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             logger.info(f"Google Embedding ({self._model_name}) 异步完成，耗时: {duration:.2f}s")
             return embeddings
         except Exception as e:
-            error_text = redact_sensitive_text(str(e))
+            error_text = safe_exception_text(e)
             logger.exception(
                 "Google Embedding (%s) 异步出错: %s",
                 self._model_name,
@@ -4318,12 +4673,28 @@ class GoogleProvider(LargeLanguageModel, TextEmbeddingModel):
             raise
 
     def embed_query(self, text: str, **kwargs: Any) -> list[float]:
+        # 覆写只为设 ``task_type``，但基类 ``TextEmbeddingModel.embed_query``
+        # 还有一层**空结果兜底**（``if not vectors: raise ValueError(...)``），
+        # 覆写时被一并丢掉了，这里补回来——判据与消息与基类逐字对齐。
+        #
+        # 空返回不是假想输入：``embed_documents`` 的条数校验是按 ``len(texts)``
+        # 做的，传空 ``texts`` 时 ``len(values) == len(texts) == 0`` 成立，方法
+        # 正常返回 ``[]``；网关截断响应或返回空 ``embeddings`` 字段也走到同一
+        # 形态。此时原先抛裸 ``IndexError: list index out of range``——它不是
+        # ``ValueError``／``RuntimeError``，会穿透调用方按这两类做的错误分类与
+        # 日志脱敏，而消息与「provider 返回了什么」毫无关系。
         kwargs.setdefault("task_type", "RETRIEVAL_QUERY")
-        return self.embed_documents([text], **kwargs)[0]
+        vectors = self.embed_documents([text], **kwargs)
+        if not vectors:
+            raise ValueError("Embedding provider 返回空结果。")
+        return vectors[0]
 
     async def aembed_query(self, text: str, **kwargs: Any) -> list[float]:
         kwargs.setdefault("task_type", "RETRIEVAL_QUERY")
-        return (await self.aembed_documents([text], **kwargs))[0]
+        vectors = await self.aembed_documents([text], **kwargs)
+        if not vectors:
+            raise ValueError("Embedding provider 返回空结果。")
+        return vectors[0]
 
     def close(self) -> None:
         """释放同步 Client 及其关联的异步资源。

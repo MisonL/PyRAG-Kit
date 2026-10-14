@@ -1,11 +1,14 @@
 """凭证边界与脱敏的回归测试。"""
 
+import base64
+
 import pytest
 
 from src.utils.security import (
     find_sensitive_option_paths,
     is_sensitive_option_key,
     redact_sensitive_text,
+    safe_exception_text,
     validate_secret_free_options,
 )
 
@@ -103,7 +106,7 @@ def test_security_redacts_every_sensitive_key_name_in_text(key):
 def test_security_redacts_sensitive_key_names_in_url_query(key):
     """URL query 形态同样要覆盖，不能只处理 key=value。
 
-    值必须**短到只有 ``_URL_QUERY_SECRET_RE`` 能覆盖**：``_KEY_VALUE_TEXT_RE``
+    值必须**短到只有 ``_URL_QUERY_SECRET_RE`` 能覆盖**：``_CREDENTIAL_KEY_VALUE_RE``
     的空白/标点形态要求值至少 12 字符且含数字或符号，用一个长值会让这条断言
     由另一条规则满足——删掉 URL query 规则测试照样通过，即测错了对象。
     """
@@ -143,6 +146,93 @@ def test_security_redacts_masked_credentials_after_bearer_prefix(value):
     assert "****" not in redacted
 
 
+# ── 回归：无键名锚定的自证前缀裸凭证必须脱敏 ──
+#
+# ``sk-``／``AIza``／``AKLT`` 已有自证前缀规则，但 GitHub PAT／Slack token／
+# AWS Access Key／Jina（本项目 rerank 渠道实际在用）同样是无键名也能认出的
+# 固定前缀形态。触发面是**不可控文本**：SDK 异常回显、知识库正文、嵌入方回传
+# 的服务端消息——不能依赖 ``key=value`` 上下文。
+
+
+# 假凭证主体用 ``"".join`` 拼出而非字面量：GitHub Push Protection 会对
+# 字面量形态的 token 前缀 + 主体整串拦推送，而它们只是合成样本，不指向
+# 任何真实凭证。拼接后的运行时取值与原字面量逐字相同。体均**含数字**且
+# 长度在正则上界内（真实 token 是随机混合、必含数字；纯字母体是正文
+# 标识符，按 2026-10 第三轮审查决策显式不脱敏）。
+_GHP_BODY = "0123456789abcdefghijklmnopqrstuvwxyzAB9"
+_PAT_BODY = "11AAA0123aaaaBBBBcccc5678dddd"
+_XOX_BODY = "-123456789012-1234567890123-AbCdEfGhIjKlMnOpQrStUvWx"
+_AKIA_BODY = "IOSFODNN7EXAMPLE"
+_ASIA_BODY = "0123456789ABCDEF12"
+_JINA_BODY = "0123456789abcdef0123456789abc123"
+
+
+@pytest.mark.parametrize(
+    "credential",
+    [
+        "ghp_" + _GHP_BODY,
+        "github_pat_" + _PAT_BODY,
+        "xoxb" + _XOX_BODY,
+        "xoxp" + _XOX_BODY,
+        "invalid key AKIA" + _AKIA_BODY + " here",
+        "invalid key ASIA" + _ASIA_BODY + " here",
+        "invalid key 'jina_" + _JINA_BODY + "'",
+    ],
+)
+def test_security_redacts_bare_self_attesting_prefix_credentials(credential):
+    redacted = redact_sensitive_text(credential)
+    assert credential not in redacted
+    assert "[REDACTED]" in redacted
+
+
+@pytest.mark.parametrize(
+    "benign",
+    [
+        # 前缀词后面没有凭证体：普通文本不能被脱敏（否则正文被破坏）。
+        "the ghp variable is set",
+        "AKIAIOSFOD",
+        "xoxb is a prefix",
+        "jina_ is the key prefix",
+        "访问 ghp 文档",  # 中文正文里的裸前缀词
+    ],
+)
+def test_security_does_not_redact_bare_prefix_words_without_credential_body(benign):
+    assert redact_sensitive_text(benign) == benign
+
+
+# ── 回归：Basic 认证的 base64 必须脱敏 ──
+
+
+# ``Authorization: Basic <base64>`` 是 SDK 异常回显的常见形态。``Basic`` 是纯
+# 字母状态词，会被键值正则按「裸关键词 + 状态字面量」放行；而 ``_BEARER_TEXT_RE``
+# 只认 ``bearer``。此前 ``Authorization: Basic <base64 凭证>`` 脱敏后逐字
+# 不变，base64 凭证原样落进日志。
+#
+# base64 在运行时从明文占位符构造：源码里不落任何可被凭证扫描器（GitGuardian
+# 等）误判为硬编码密钥的 base64 字面量——扫描器只看源码文本，认不出这是测试
+# 夹具。占位符明文写死在下一行，编码结果每次相同，断言语义与硬编码字面量一致。
+_BASIC_AUTH_CREDENTIAL = base64.b64encode(b"fixture-user:fixture-password").decode()
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        f"Authorization: Basic {_BASIC_AUTH_CREDENTIAL}",
+        f"Proxy-Authorization: Basic {_BASIC_AUTH_CREDENTIAL}",
+        f"authorization=basic {_BASIC_AUTH_CREDENTIAL}",
+    ],
+)
+def test_security_redacts_basic_auth_credentials(header):
+    redacted = redact_sensitive_text(header)
+    assert _BASIC_AUTH_CREDENTIAL not in redacted
+    assert "[REDACTED]" in redacted
+
+
+def test_security_does_not_redact_basic_as_ordinary_word():
+    """前置 ``authorization`` 键名是判据：普通文本里的 ``basic`` 不是凭证。"""
+    assert "basic understanding of tokens" == redact_sensitive_text("basic understanding of tokens")
+
+
 # ── 回归：urlsplit 无法解析的值不能让凭证整体绕过边界 ──
 
 
@@ -152,6 +242,26 @@ def test_security_rejects_credential_hidden_behind_unparseable_url():
     unparseable = "https://[::1 token sk-FAKE0000FAKE0000FAKE0000FAKE0000"
     with pytest.raises(ValueError, match="凭证"):
         validate_secret_free_options({"note": unparseable}, "Provider")
+
+
+def test_security_unparseable_url_reports_the_real_field_path():
+    """回退分支的凭证消息必须带**真实字段路径**，不能退化成占位串 ``value``。
+
+    ``fallback = [path or "value"] if ... else []`` 里的 ``path or "value"`` 是
+    「路径为空时用占位串」的兜底；正常调用路径下 ``path`` 恒非空（``visit`` 从
+    字段名拼出）。把 ``or`` 互换为 ``and`` 后，非空 ``path`` 反而被换成
+    ``"value"``——凭证仍被拒（消息里仍有「凭证」二字），但用户看到的是
+    「凭证出现在 value」，无法定位是哪个配置字段写坏了。既有用例只
+    ``match="凭证"``，不校验路径，因此这条从未被覆盖。
+    """
+    unparseable = "https://[::1 token sk-FAKE0000FAKE0000FAKE0000FAKE0000"
+
+    with pytest.raises(ValueError) as excinfo:
+        validate_secret_free_options({"endpoint": unparseable}, "Provider")
+
+    message = str(excinfo.value)
+    assert "endpoint" in message
+    assert "value" not in message
 
 
 def test_security_parseable_and_unparseable_urls_are_equally_strict():
@@ -164,6 +274,24 @@ def test_security_parseable_and_unparseable_urls_are_equally_strict():
 
 
 # ── 回归：面向用户的异常输出必须脱敏 ──
+
+
+def test_redact_sensitive_text_survives_huge_integers():
+    """位数超限的整数必须降级为量级描述，而不是抛 ``ValueError``。"""
+    for value in (10**4301, -(10**4301)):
+        result = redact_sensitive_text(value)
+
+        assert isinstance(result, str)
+        assert "Exceeds the limit" not in result
+
+
+def test_redact_sensitive_text_still_redacts_non_string_containers():
+    """收紧不能误伤：容器形态的脱敏照常生效。"""
+    secret = "sk-live-abcdef123456"
+
+    assert secret not in redact_sensitive_text({"api_key": secret})
+    assert secret not in redact_sensitive_text({"a": [{"b": secret}]})
+    assert secret not in redact_sensitive_text(f"Bearer {secret}")
 
 
 def test_safe_exception_text_redacts_credentials():
@@ -182,6 +310,69 @@ def test_safe_exception_text_handles_empty_and_long_messages():
 
     assert safe_exception_text(ValueError()) == "ValueError"
     assert len(safe_exception_text(RuntimeError("x" * 500))) <= 260
+
+
+# ``safe_exception_text`` 是**最后一道展示边界**：22 处 ``except`` 都经它输出，
+# 它自己再抛，用户看到的就是解释器默认 handler 打出的裸 traceback——连脱敏都
+# 没有，比「消息不好看」严重得多。
+#
+# 触发条件是异常自身的 args 含位数超限的整数：``str(10**4301)`` 撞上 CPython
+# 的 ``sys.get_int_max_str_digits()``（默认 4300）抛 ``ValueError``。可达性经
+# 核实：JSON 与 TOML 两条路径送不进来（解析器自己就抛），但 ``pickle`` 是二进制
+# 格式、不受十进制位数限制，实测 ``pickle.loads(pickle.dumps(10**4301))`` 正常
+# 往返，而本项目加载 pickle 知识快照。
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ValueError(10**4301),
+        KeyError(10**4301),
+        TypeError(-(10**4301)),
+        RuntimeError(10**4301, "第二"),
+        RuntimeError("前缀", 10**4301),
+        OSError(10**4301),
+    ],
+    ids=["value", "key", "type-negative", "two-args", "mixed-args", "oserror"],
+)
+def test_safe_exception_text_survives_unprintable_exception_args(exc):
+    """异常 args 含位数超限的整数时，展示边界不得自己抛异常。"""
+    from src.utils.security import safe_exception_text
+
+    rendered = safe_exception_text(exc)
+
+    assert type(exc).__name__ in rendered
+    assert "Exceeds the limit" not in rendered
+
+
+def test_safe_exception_text_renders_each_arg_separately():
+    """逐元素渲染：不能把整个 args 元组交给 ``repr`` 后只退回 ``<tuple>``。
+
+    那样虽然不抛，却把「是哪个值出的问题」也丢掉了——本函数存在的意义就是让
+    用户看懂发生了什么。
+    """
+    from src.utils.security import safe_exception_text
+
+    rendered = safe_exception_text(RuntimeError("前缀", 10**4301))
+
+    assert "前缀" in rendered, rendered
+    assert "整数" in rendered, rendered
+
+
+def test_safe_exception_text_survives_pickle_roundtripped_huge_int():
+    """走真实的 pickle 往返构造异常——这是该值在生产里的唯一入口。
+
+    ``pickle`` 是二进制格式，不受 ``sys.get_int_max_str_digits()`` 限制，因此
+    快照里的畸形值可以携带 4301 位以上的整数进入异常对象。
+    """
+    import pickle
+
+    from src.utils.security import safe_exception_text
+
+    huge = pickle.loads(pickle.dumps(10**4301))
+
+    rendered = safe_exception_text(RuntimeError(huge))
+
+    assert "RuntimeError" in rendered
+    assert "Exceeds the limit" not in rendered
 
 
 def test_user_facing_error_paths_do_not_print_raw_exceptions():
@@ -297,11 +488,47 @@ def test_security_parseable_and_unparseable_urls_check_query_keys_equally():
         validate_secret_free_options({"endpoint": "https://host/v1?myApiKey="}, "Provider")
 
 
+def test_security_unparseable_url_accepts_benign_query_keys():
+    """畸形 URL 回退分支只对**敏感** query 键拒绝，普通键照常放行。
+
+    回退分支逐个 query 键判断 ``if key and is_sensitive_option_key(key)``：
+    ``key`` 非空**且**是敏感键才登记。把 ``and`` 互换为 ``or`` 后，任何非空键
+    （哪怕普通键如 ``a``）都被当成凭证——无害的畸形 URL 被误拒。既有
+    ``test_security_unparseable_url_still_checks_query_key_names`` 只喂敏感键
+    ``?myApiKey=``（两种变异都 raise），非敏感键这条从未被覆盖。
+    """
+    assert validate_secret_free_options({"endpoint": "https://[::1/v1?a=1"}, "Provider") == {
+        "endpoint": "https://[::1/v1?a=1"
+    }
+
+
 def test_security_accepts_benign_unparseable_url():
     """严格度提升不能把无害的畸形 URL 也一并拒掉。"""
     assert validate_secret_free_options({"endpoint": "https://[::1/v1/models"}, "Provider") == {
         "endpoint": "https://[::1/v1/models"
     }
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://user@host/v1",
+        "https://:pw@host/v1",
+        "https://user:pw@host/v1",
+    ],
+    ids=["only-user", "only-password", "user-and-password"],
+)
+def test_security_rejects_url_userinfo_whichever_half_is_present(url):
+    """URL 里**任一**半 userinfo（用户名或密码）都必须判为凭证。
+
+    判据是 ``parsed.username is not None or parsed.password is not None``：两半
+    各判各的（``https://user@h`` 只有用户名、``https://:pw@h`` 只有密码）。把
+    ``or`` 互换为 ``and`` 后，只有两半同时存在才判为凭证——「只带用户名」或
+    「只带密码」的 URL 整体漏检，凭证边界静默失效。既有用例只覆盖了 query 键名
+    与值内令牌，未覆盖 userinfo 任一半单独出现的形态。
+    """
+    with pytest.raises(ValueError, match="凭证"):
+        validate_secret_free_options({"endpoint": url}, "Provider")
 
 
 # ── 回归：CJK 紧邻时词边界失效导致密钥整体漏检 ──
@@ -629,3 +856,274 @@ def test_security_bearer_rule_redacts_alphabetic_token_adjacent_to_cjk():
 
     assert token not in rendered
     assert "[REDACTED]" in rendered
+
+
+# ── 回归：无键名的固定前缀凭证也要脱敏 ──
+#
+# SDK 的异常消息常回显请求头或 URL（``safe_exception_text`` 的 docstring 写明
+# 了这一点），此时凭证是**裸串**，没有键名可锚定。既有的
+# ``_TEXT_CREDENTIAL_KEYS`` 覆盖的是键名，``volc_access_key=...`` 这类会被
+# 脱敏，但 ``invalid access key 'AKLT...'`` 这种回显形态不会——实测
+# ``RedactingFormatter`` 对它原样输出。这与已存在的 ``AIza``（Google）规则
+# 是同一类：前缀可自证，因此不依赖上下文。
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "invalid access key 'AKLTZmE3YjA0YzQt'",
+        "Auth failed for access key LTAI5tAbCdEfGhIjKlMnOpQr",
+        "请求被拒绝: AKLTZmE3YjA0YzQtABCDEF",
+    ],
+)
+def test_security_redacts_bare_prefixed_credentials(value):
+    """没有键名、只有固定前缀的凭证必须被脱敏。"""
+    redacted = redact_sensitive_text(value)
+
+    assert "[REDACTED]" in redacted
+    assert "AKLTZmE3YjA0YzQt" not in redacted
+    assert "LTAI5tAbCdEfGhIjKlMnOpQr" not in redacted
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "AKLT 是火山引擎凭证的前缀",
+        "LTAI 开头的串",
+        "这是一段普通的中文说明文本",
+        "http://[::1]:8080/v1",
+    ],
+)
+def test_security_keeps_ordinary_text_with_short_prefixes(value):
+    """收紧不能误伤：前缀本身、或长度不足的串不得被改写。"""
+    assert redact_sensitive_text(value) == value
+
+
+# ── 回归：PEM 私钥正文必须脱敏 ──
+#
+# 这是本项目**自己点名要防**的一类凭证——``SENSITIVE_OPTION_KEYS`` 里同时列了
+# ``privatekey``／``sshkey``／``sshprivatekey``，Google Vertex AI 的 ADC 服务账号
+# JSON 里就带 ``private_key``。但键名规则只挡得住「键名 + 值」的形态：私钥
+# **正文**作为一段独立文本出现时没有任何锚点，会原样落进终端与日志。
+#
+# 实测两条真实泄漏路径：
+#   * ``validate_secret_free_options`` 把私钥当键名拒绝时，回显的消息里带着完整正文；
+#   * 裸 PEM 文本走 ``redact_sensitive_text`` 原样返回。
+#
+# 覆盖 BEGIN/END 成对与裸 ``BEGIN`` 两种：``safe_exception_text`` 会把消息截到
+# 240 字符，END 标记可能已被切掉，只匹配成对形态会漏。
+
+_PEM_BODY = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQ"
+
+
+@pytest.mark.parametrize(
+    "text,label",
+    [
+        (
+            f"-----BEGIN RSA PRIVATE KEY-----\n{_PEM_BODY}\n-----END RSA PRIVATE KEY-----",
+            "RSA 私钥块",
+        ),
+        (
+            f"-----BEGIN PRIVATE KEY-----\n{_PEM_BODY}\n-----END PRIVATE KEY-----",
+            "通用 PRIVATE KEY",
+        ),
+        (
+            (
+                "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n"
+                "-----END OPENSSH PRIVATE KEY-----"
+            ),
+            "OpenSSH 私钥",
+        ),
+        ("-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIB\n-----END EC PRIVATE KEY-----", "EC 私钥"),
+        (f"-----BEGIN RSA PRIVATE KEY-----\n{_PEM_BODY}", "被截断（无 END 标记）"),
+        (
+            (
+                f"ValueError: load failed:\n-----BEGIN PRIVATE KEY-----\n{_PEM_BODY}\n"
+                "-----END PRIVATE KEY-----"
+            ),
+            "在异常消息里",
+        ),
+    ],
+)
+def test_security_redacts_pem_private_key_blocks(text, label):
+    """私钥正文不得出现在脱敏结果里。"""
+    redacted = redact_sensitive_text(text)
+
+    assert _PEM_BODY not in redacted, label
+    assert "b3BlbnNzaC1rZXktdjEAAAAA" not in redacted, label
+    assert "MHcCAQEEIB" not in redacted, label
+    assert "[REDACTED PRIVATE KEY]" in redacted, label
+
+
+def test_security_redacts_pem_key_echoed_as_an_option_key():
+    """私钥作为 options 键名被拒绝时，回显的消息里不得带正文。
+
+    ``validate_secret_free_options`` 会把违规的键名放进错误消息，而消息随后经
+    ``safe_exception_text`` 展示给用户。键名本身可以显示（用户需要知道改哪一
+    处），但若键名是一段 PEM，正文必须被吃掉。
+    """
+    pem = f"-----BEGIN RSA PRIVATE KEY-----\n{_PEM_BODY}\n-----END RSA PRIVATE KEY-----"
+
+    with pytest.raises(ValueError) as excinfo:
+        validate_secret_free_options({pem: 1}, "Test")
+
+    message = safe_exception_text(excinfo.value)
+    assert _PEM_BODY not in message
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "这是一个普通的 Markdown 文档，讲的是加密与密钥管理。",
+        "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----",
+        "PRIVATE KEY 这个词单独出现不该被吃掉",
+        "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----",
+    ],
+)
+def test_security_keeps_non_private_pem_and_ordinary_text(text):
+    """收紧不能误伤：证书、公钥与普通文本不得被改写。
+
+    只匹配 ``PRIVATE KEY``，因此 ``CERTIFICATE`` 与 ``PUBLIC KEY`` 照常保留——
+    它们不是凭证，脱敏掉会让用户拿不到有用的上下文。
+    """
+    assert redact_sensitive_text(text) == text
+
+
+# ── 资源参数与路径形态判据的覆盖缺口 ──
+#
+# 下列判据在整套测试里从未执行（行覆盖 + 变异扫描双证；把它们的 ``raise`` 换成
+# ``pass`` 后全量 3725 条仍全绿）。删除后行为确实改变（实测，经真实入口）：
+# * 868 ``validate_secret_free_resource_args`` 的「位置参数必须是元组」→
+#   **静默接受** 字符串 ``"abc"``（字符串是合法可迭代对象，逐字符遍历后
+#   每个字符被当作一个独立参数）；
+# * 794 ``validate_secret_free_resource_kwargs`` 的「键必须是字符串」→ 消息
+#   退化成下一层的「键必须是字符串」——同样是 ``ValueError``，但不再点名
+#   ``资源参数`` 这个来源；
+# * 715 ``validate_secret_free_options`` 的「options 必须是对象」→ 裸
+#   ``TypeError: 'int' object is not iterable``（``set(5)``）。
+def test_resource_args_reject_non_tuple_sequence():
+    """位置参数必须是元组；字符串是合法可迭代对象，必须显式拒绝。"""
+    from src.utils.security import validate_secret_free_resource_args
+
+    with pytest.raises(ValueError, match="资源位置参数必须是元组"):
+        validate_secret_free_resource_args("abc", "OpenAI 资源")
+
+
+def test_resource_kwargs_reject_non_mapping():
+    """关键字参数必须是映射，不能静默接受列表。"""
+    from src.utils.security import validate_secret_free_resource_kwargs
+
+    with pytest.raises(ValueError, match="资源参数必须是对象"):
+        validate_secret_free_resource_kwargs([1], "OpenAI 资源")
+
+
+def test_options_must_be_a_mapping():
+    """``options`` 非对象必须给带 provider 名的 ``ValueError``，不是裸 ``TypeError``。"""
+    with pytest.raises(ValueError, match="options 必须是对象"):
+        validate_secret_free_options(5, "Anthropic")
+
+
+def test_secret_free_options_keeps_self_copied_sdk_model():
+    """``model_copy`` 返回自身时必须退回 ``deepcopy``（``copied is not value`` 不是 ``is value``）。
+
+    ``is value`` 变异后判据反转：返回自身的模型被当成「已复制」直接返回，
+    调用方拿到的是同一个可变对象——后续对返回值的修改会污染调用方的原对象。
+    """
+    from src.utils.security import validate_secret_free_options
+
+    class SelfCopy:
+        def __init__(self):
+            self.value = 1
+
+        def model_copy(self, deep=False):
+            return self
+
+        def __deepcopy__(self, memo):
+            clone = SelfCopy()
+            clone.value = 2
+            return clone
+
+    original = SelfCopy()
+    validated = validate_secret_free_options({"k": original}, "T")
+
+    assert validated["k"] is not original
+    assert validated["k"].value == 2
+
+
+def test_secret_free_options_nested_non_string_key_reports_path():
+    """嵌套层级的非字符串键消息必须带出路径（``label if not path else ...``）。
+
+    删掉 ``not`` 后判据反转：嵌套层级丢掉 ``outer.inner``，用户拿到
+    「Jina Rerank options 的键必须是字符串」却不知道是哪一层子表写错了键。
+    """
+    with pytest.raises(ValueError, match=r"Jina Rerank options 的 outer\.inner 的键必须是字符串"):
+        validate_secret_free_options({"outer": {"inner": {1: "x"}}}, "Jina Rerank")
+
+
+@pytest.mark.parametrize(
+    "credential",
+    [
+        # GitHub 非 PAT 家族：OAuth / server-to-server / user-to-server / refresh。
+        "gho_" + "A" * 26 + "0123456789" + "X",
+        "ghs_" + "B" * 26 + "0123456789" + "Y",
+        "ghu_" + "C" * 26 + "0123456789" + "Z",
+        "ghr_" + "D" * 26 + "0123456789" + "W",
+        # Slack refresh 与 app-level token。
+        "xoxe-" + "E" * 30,
+        "xapp-" + "F" * 30,
+    ],
+)
+def test_security_redacts_github_and_slack_prefix_variants(credential):
+    redacted = redact_sensitive_text(credential)
+    assert credential not in redacted
+    assert "[REDACTED]" in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # 知识库正文里的标识符：体不含数字，不得误脱敏（实测修复前误伤）。
+        "jina_" + "a" * 30,
+        "jina_embedding_model_v3_" + "x" * 30,
+        "github_pat_" + "_a" * 15,
+        "github_pat_" + "_" * 25,
+    ],
+)
+def test_security_does_not_redact_prefix_without_digit_in_body(text):
+    """体不含数字的自证前缀长串是普通文本，不是凭证。"""
+    assert "[REDACTED]" not in redact_sensitive_text(text)
+    assert redact_sensitive_text(text) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # gh 短前缀家族同样不做纯字母体脱敏（第三轮 M1：误伤目标要全家族一致）。
+        "leak: ghp_abcdefghijabcdefghijabcdefghijabcd end",
+        "leak: gho_abcdefghijabcdefghijabcdefghijabcd end",
+        # 体含 _ 的 github_pat_ 正文标识符。
+        "github_pat_" + "_a" * 15,
+    ],
+)
+def test_security_does_not_redact_gh_prefix_without_digit_in_body(text):
+    """gh 家族纯字母体是正文标识符，不是凭证（与 jina_/github_pat_ 同判据）。"""
+    assert "[REDACTED]" not in redact_sensitive_text(text)
+
+
+def test_security_prefix_re_is_linear_on_adjacent_prefix_runs():
+    """相邻 ``github_pat_`` 连串不得平方级回溯（第三轮 H1）。
+
+    体类含 ``_`` 时每个起点能把下一个前缀整个吞进体，直到串尾才失败——
+    无上界时实测 ``"github_pat_"*8000`` 17.8 秒。体上界截断回溯空间后必须
+    保持线性：32000 个前缀（38 万字符）应在百毫秒级。
+    """
+    import time
+
+    from src.utils.security import _SELF_ATTESTING_PREFIX_RE as pattern
+
+    for count in (8000, 32000):
+        text = "github_pat_" * count
+        start = time.perf_counter()
+        pattern.search(text)
+        elapsed = time.perf_counter() - start
+        assert elapsed < 1.0, f"n={count} 耗时 {elapsed:.2f}s，疑似平方回溯"

@@ -59,6 +59,33 @@ def test_google_provider_uses_credentials_without_api_key(monkeypatch):
     client_class.assert_called_once_with(credentials=credentials, vertexai=True)
 
 
+def test_google_provider_loads_credentials_file_and_forwards_it(monkeypatch):
+    """设置里的凭证文件路径加载出的凭证必须传给 SDK（``"credentials" not in client_options``）。
+
+    ``in`` 变异后仅在 ``client_options`` 已有 credentials 时才赋值——文件加载
+    出的凭证被静默丢弃，SDK 落回 ADC/API key 路径，而配置看起来完全正常。
+    """
+    credentials = object()
+    settings = MagicMock()
+    settings.google_api_key = None
+    settings.google_application_credentials = "/tmp/credentials.json"
+    monkeypatch.setattr(google_module, "get_settings", lambda: settings)
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    monkeypatch.setattr(
+        GoogleProvider, "_load_credentials_file", staticmethod(lambda path: credentials)
+    )
+    with patch.object(google_module.genai, "Client") as client_class:
+        client_class.return_value = MagicMock()
+        provider = GoogleProvider(
+            model_name="gemini-1.5-flash",
+            options={"vertexai": True},
+        )
+
+        provider._get_client()
+
+    client_class.assert_called_once_with(credentials=credentials, vertexai=True)
+
+
 def test_google_provider_accepts_gemini_api_key_alias(monkeypatch):
     settings = SimpleNamespace(google_api_key=None, gemini_api_key="gemini-key")
     monkeypatch.setattr(google_module, "get_settings", lambda: settings)
@@ -188,6 +215,9 @@ def test_google_get_client_requires_explicit_auth_without_key_or_vertex_mode(mon
         {"base_url": "https://proxy.invalid/v1?api_key=secret"},
         {"base_url": "https://user:password@proxy.invalid/v1"},
         {"httpx_client": object()},
+        # 长键名尾缀凭证：``normalized_key`` 若经 ``safe_repr`` 规范化，80 字符
+        # 截断会把超长键名的 ``apikey`` 后缀切掉，``endswith`` 判据失配而放行。
+        {"headers": {("x-" + "tooling" * 15 + "apikey"): "secret"}},
     ],
 )
 def test_google_http_options_reject_credentials_or_custom_clients(http_options):
@@ -240,6 +270,91 @@ def test_google_http_options_reject_connection_override_containers():
                 model_name="gemini-1.5-flash",
                 options={"http_options": {key: {"timeout": 1000}}},
             )
+
+
+class _ModelDumpRaisesTypeError:
+    """``model_dump(exclude_none=True)`` 抛 ``TypeError`` 的替身。
+
+    真实 ``google-genai`` 的 HttpOptions 接受 ``exclude_none``；这里模拟的是
+    SDK 签名变化或第三方对象只实现无参 ``model_dump`` 的情形。
+    """
+
+    def model_dump(self, *args, **kwargs):
+        raise TypeError("model_dump() got an unexpected keyword argument 'exclude_none'")
+
+
+class _ModelDumpRaisesOtherError:
+    def model_dump(self, *args, **kwargs):
+        raise KeyError("boom")
+
+
+class _ModelDumpReturnsScalar:
+    def model_dump(self, *args, **kwargs):
+        return 5
+
+
+class _ModelDumpTakesNoArguments:
+    """无参 ``model_dump``：第一次带参调用抛 ``TypeError``，第二次成功。"""
+
+    def model_dump(self, *args, **kwargs):
+        if args or kwargs:
+            raise TypeError("takes 1 positional argument but 2 were given")
+        return {"headers": {"X-Trace": "ok"}}
+
+
+# ``_validate_http_options`` 有两条输入路径：Mapping（直接 ``dict()``）与
+# 对象（走 ``model_dump``）。两条路径上的形态判据在整套测试里从未执行——
+# 既有用例只喂合法 Mapping 或真实 ``types.HttpOptions``。把它们的 ``raise``
+# 换成 ``pass`` 后全量 3353 条仍全绿（只有 585 那条被
+# ``test_google_http_options_reject_nested_non_string_key`` 钉住）。
+@pytest.mark.parametrize(
+    "value",
+    [5, "abc", [1, 2], object()],
+    ids=["int", "str", "list", "object"],
+)
+def test_google_http_options_reject_non_mapping_without_model_dump(value):
+    """非 Mapping 且无 ``model_dump`` 必须给出可读消息。
+
+    删除守卫后取值落到 ``model_dump`` 分支，得到「无法读取」——把一个**类型
+    错误**说成**读取失败**，照提示排查的人会去查权限而不是配置形态。
+    """
+    with pytest.raises(ValueError, match="必须是对象表或 google-genai HttpOptions"):
+        GoogleProvider._validate_http_options(value)
+
+
+def test_google_http_options_reports_model_dump_failure_readably():
+    """``model_dump`` 抛异常时必须收敛成 ``ValueError``，不能漏出 ``UnboundLocalError``。
+
+    删除两条 ``except`` 里的守卫后，``payload`` 从未赋值，异常从
+    「无法读取」退化成裸 ``UnboundLocalError: cannot access local variable
+    'payload'``——调用方按 ``ValueError`` 分类，接不住它。
+    """
+    with pytest.raises(ValueError, match="无法读取"):
+        GoogleProvider._validate_http_options(_ModelDumpRaisesOtherError())
+
+
+def test_google_http_options_falls_back_to_no_argument_model_dump():
+    """带参 ``model_dump`` 抛 ``TypeError`` 时回退到无参调用，不能吞掉合法对象。
+
+    回退成功仍走完整校验，因此这里是**反向守卫**：合法对象照常通过。
+    """
+    GoogleProvider._validate_http_options(_ModelDumpTakesNoArguments())
+
+
+def test_google_http_options_reports_dump_failure_after_fallback():
+    """回退（无参）也失败时必须给「无法读取」，不能漏出 ``UnboundLocalError``。"""
+    with pytest.raises(ValueError, match="无法读取"):
+        GoogleProvider._validate_http_options(_ModelDumpRaisesTypeError())
+
+
+def test_google_http_options_reject_model_dump_returning_non_mapping():
+    """``model_dump`` 返回非 Mapping 必须显式报错，而不是裸 ``TypeError``。
+
+    删除守卫后 ``"timeout" in payload`` 对整数抛裸
+    ``TypeError: argument of type 'int' is not iterable``。
+    """
+    with pytest.raises(ValueError, match="http_options 必须是对象"):
+        GoogleProvider._validate_http_options(_ModelDumpReturnsScalar())
 
 
 def test_google_invoke_non_stream_refusal_is_explicit_error():
@@ -442,6 +557,12 @@ def test_google_provider_invoke_non_stream(mock_settings, mock_genai_client):
     with patch.object(GoogleProvider, "_get_client", return_value=mock_genai_client):
         mock_response = MagicMock()
         mock_response.text = "Hello world"
+        # ``candidates`` 必须显式给成列表：真 SDK 的字段类型是
+        # ``list[Candidate] | None``，而裸 ``MagicMock`` 的属性是一个可迭代的
+        # ``MagicMock``（``iter()`` 返回空迭代器）——旧代码只做 ``or []`` 与迭代，
+        # 这种不真实形态恰好能通过。响应容器的形态守卫（google.py 的
+        # ``_require_candidates``）会把它拒掉，因此夹具要写成真实形状。
+        mock_response.candidates = []
         mock_genai_client.models.generate_content.return_value = mock_response
 
         result = list(provider.invoke("test prompt", stream=False))
@@ -498,3 +619,193 @@ def test_google_embedding_rejects_request_credentials_before_client_init(mock_se
             )
 
     asyncio.run(consume())
+
+
+# ── 回归：partial_args 的 json_path 索引位数超限时不得崩 ──
+#
+# ``_partial_arg_tokens`` 用 ``re.match(r"^\[(\d+)\]", rest)`` 取索引，再
+# ``int(indexed.group(1))``。``\d+`` 对任意长度的数字串都匹配，而
+# ``int("9" * 4301)`` 撞上 CPython 的 ``sys.get_int_max_str_digits()``
+# （默认 4300）抛 ``ValueError: Exceeds the limit``——异常类型是本函数契约里的
+# ``ValueError``，但**内容**是整数转换问题，与「json_path 不合法」无关，同函数
+# 另外两条拒绝分支都带着原始 ``json_path`` 与指引。
+#
+# json_path 来自模型的流式 function call 分片（``partial_args``），形态不受控；
+# 同一份响应里普通路径（``$.a``／``$[1]``）都能得到可读错误，只有这一支例外。
+
+
+@pytest.mark.parametrize(
+    "json_path",
+    ["$[" + "9" * 4301 + "]", "$[" + "9" * 5000 + "]"],
+    ids=["4301digits", "5000digits"],
+)
+def test_google_partial_args_rejects_oversized_index_readably(json_path):
+    """超长索引必须给出带 json_path 的 ``ValueError``，不是整数转换超限。"""
+    with pytest.raises(ValueError) as excinfo:
+        GoogleProvider._partial_arg_tokens(json_path)
+
+    message = str(excinfo.value)
+    assert "Exceeds the limit" not in message, message
+    assert "json_path" in message
+
+
+def test_google_partial_args_still_accepts_normal_paths():
+    """收紧不能误伤：普通 JSONPath 子集照常解析。"""
+    assert GoogleProvider._partial_arg_tokens("$.a[0].b") == ["a", 0, "b"]
+    assert GoogleProvider._partial_arg_tokens("$['k'][2]") == ["k", 2]
+    assert GoogleProvider._partial_arg_tokens("$") == []
+
+
+# ── 回归：嵌套路径的中间容器类型由**下一个** token 决定 ──
+#
+# ``_partial_args_to_mapping`` 在写入中途遇到「尚未创建的中间容器」时，用
+# ``isinstance(tokens[position + 1], int)`` 决定该填 ``[]`` 还是 ``{}``——路径
+# 下一段是数组下标就建 list，是对象键就建 dict。这条判据此前**从未被任何测试
+# 触达**：既有用例的 json_path 全是单段（``$.a[0]``／``$.country``），走到那
+# 一步时 ``position`` 已是最后一个 token（``last=True``），根本不会读
+# ``tokens[position + 1]``；只有 ``$.a[0][1]``／``$.a[0].b`` 这类**至少三段**
+# 的路径才经过它。把 ``position + 1`` 变异成 ``position - 1``（读上一段而非
+# 下一段的类型）时整套测试仍全绿，而真实行为已经改变——实测 ``$.a[0][1]``
+# 从 ``{'a': [[None, 'x']]}`` 变成抛 ``ValueError``（把内层 list 建成了 dict，
+# 写入时 ``isinstance(current, list)`` 判否）。
+def test_google_partial_args_nested_path_builds_container_from_next_token():
+    """中间容器的类型看**下一段**路径：数组下标建 list，对象键建 dict。"""
+    # ``$.a[0][1]``：在 ``a[0]`` 处下一段是下标 ``1`` -> 该位置建 list。
+    assert GoogleProvider._partial_args_to_mapping(
+        [{"json_path": "$.a[0][1]", "string_value": "x"}]
+    ) == {"a": [[None, "x"]]}
+    # ``$.a[0].b``：在 ``a[0]`` 处下一段是键 ``b`` -> 该位置建 dict。
+    assert GoogleProvider._partial_args_to_mapping(
+        [{"json_path": "$.a[0].b", "string_value": "x"}]
+    ) == {"a": [{"b": "x"}]}
+    # 更深一层：``$.a[0][1][2]`` 每段都按紧随其后的 token 建对应容器。
+    assert GoogleProvider._partial_args_to_mapping(
+        [{"json_path": "$.a[0][1][2]", "string_value": "x"}]
+    ) == {"a": [[None, [None, None, "x"]]]}
+
+
+def test_google_partial_args_nested_index_after_existing_list():
+    """中间容器已存在时按既有形态写入，不重建——区分「新建」与「复用」。"""
+    # 同一份 partial_args 里先建 ``a[0]`` 为 list，再往 ``a[0][1]`` 写。
+    result = GoogleProvider._partial_args_to_mapping(
+        [
+            {"json_path": "$.a[0][0]", "string_value": "first"},
+            {"json_path": "$.a[0][1]", "string_value": "second"},
+        ]
+    )
+    assert result == {"a": [["first", "second"]]}
+
+
+# ── 回归：Google 覆写的 embed_query 必须与基类保持同一兜底 ──
+#
+# ``TextEmbeddingModel`` 的默认 ``embed_query`` 先判 ``if not vectors`` 再取
+# ``[0]``，空结果得到的是带指引的 ``ValueError("Embedding provider 返回空结果。")``。
+# ``GoogleProvider`` 为了设 ``task_type`` 覆写了这两个方法，却把那条兜底丢了，
+# 直接下标取 ``[0]``——provider 返回空列表时抛裸
+# ``IndexError: list index out of range``。
+#
+# 空返回不是假想输入：``values`` 数量校验是按 ``len(texts)`` 做的，传空 ``texts``
+# 时 ``len(values) == len(texts) == 0`` 成立，方法正常返回 ``[]``。网关在截断
+# 响应、或返回空 ``embeddings`` 字段时也会走到同一形态。
+#
+# ``IndexError`` 不是 ``ValueError``／``RuntimeError``，会穿透调用方按这两类做的
+# 错误分类与日志脱敏，且消息与「provider 返回了什么」毫无关系。
+
+
+class _EmptyEmbeddingGoogle(GoogleProvider):
+    """绕过网络：让底层 ``embed_documents`` 返回空结果。"""
+
+    def __init__(self):
+        self._model_name = "m"
+
+    def embed_documents(self, texts, **kwargs):
+        self.seen_kwargs = kwargs
+        return []
+
+    async def aembed_documents(self, texts, **kwargs):
+        self.seen_kwargs = kwargs
+        return []
+
+
+def test_google_embed_query_reports_empty_result_as_value_error():
+    """空结果必须是 ``ValueError``，不是裸 ``IndexError``。"""
+    provider = _EmptyEmbeddingGoogle()
+
+    with pytest.raises(ValueError, match="空结果"):
+        provider.embed_query("查询文本")
+
+
+def test_google_aembed_query_reports_empty_result_as_value_error():
+    """异步路径同判据。"""
+    provider = _EmptyEmbeddingGoogle()
+
+    with pytest.raises(ValueError, match="空结果"):
+        asyncio.run(provider.aembed_query("查询文本"))
+
+
+def test_google_embed_query_still_sets_retrieval_query_task_type():
+    """收紧不能误伤：覆写存在的理由（``task_type``）必须保留。"""
+    provider = _EmptyEmbeddingGoogle()
+
+    with pytest.raises(ValueError):
+        provider.embed_query("查询文本")
+
+    assert provider.seen_kwargs["task_type"] == "RETRIEVAL_QUERY"
+
+
+def test_google_aembed_query_still_sets_retrieval_query_task_type():
+    provider = _EmptyEmbeddingGoogle()
+
+    with pytest.raises(ValueError):
+        asyncio.run(provider.aembed_query("查询文本"))
+
+    assert provider.seen_kwargs["task_type"] == "RETRIEVAL_QUERY"
+
+
+def test_google_embed_query_returns_the_first_vector():
+    """正常路径不受影响。"""
+
+    class _One(_EmptyEmbeddingGoogle):
+        def embed_documents(self, texts, **kwargs):
+            self.seen_kwargs = kwargs
+            return [[0.5, 1.5]]
+
+        async def aembed_documents(self, texts, **kwargs):
+            self.seen_kwargs = kwargs
+            return [[0.5, 1.5]]
+
+    assert _One().embed_query("查询文本") == [0.5, 1.5]
+
+
+# ── 回归：json_path 的拒绝消息自身用 ``!r`` 插值 ──
+#
+# ``_partial_arg_tokens`` 的两条拒绝分支写 ``f"...: {json_path!r}"``。判据是
+# ``isinstance(json_path, str)``，因此**非字符串**取值会走到第一条分支——而
+# ``repr(10**4301)`` 自己抛 ``ValueError: Exceeds the limit``：正要报出
+# 「json_path 无效」的那一步变成整数转换错误。上一条回归只覆盖了「字符串形态、
+# 索引位数超限」，这条覆盖「取值本身是位数超限的整数」。
+#
+# 可达路径：``_partial_args_to_mapping`` 读模型流式分片的 ``json_path`` 字段，
+# 形态不受控。
+
+
+@pytest.mark.parametrize(
+    "json_path",
+    [pytest.param(10**4301, id="huge-int"), pytest.param(["$"], id="list")],
+)
+def test_google_partial_args_rejects_malformed_json_path_readably(json_path):
+    """非字符串 ``json_path`` 不得让「报告无效路径」自己抛裸异常。"""
+    with pytest.raises(ValueError) as excinfo:
+        GoogleProvider._partial_arg_tokens(json_path)
+
+    message = str(excinfo.value)
+    assert "Exceeds the limit" not in message, message
+    assert "json_path" in message
+
+
+def test_google_partial_args_mapping_surfaces_malformed_json_path_readably():
+    """从公开入口进入时同样给出可读消息。"""
+    with pytest.raises(ValueError) as excinfo:
+        GoogleProvider._partial_args_to_mapping([{"json_path": 10**4301, "number_value": 1}])
+
+    assert "Exceeds the limit" not in str(excinfo.value)

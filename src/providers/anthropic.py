@@ -5,7 +5,7 @@ import json
 import re
 import time
 from collections.abc import AsyncGenerator, Generator, Mapping
-from typing import Any
+from typing import Any, get_args, get_type_hints
 
 import anthropic
 
@@ -17,31 +17,107 @@ from src.providers.__base__.model_provider import (
     close_resource_sync,
     coerce_completion_request,
     content_to_text,
+    enum_field,
     extract_system_prompt,
     field,
     iterate_async,
     merge_tool_call_fragment,
+    normalize_client_retries,
+    normalize_client_timeout,
     normalize_messages,
     normalize_usage,
     raise_for_stream_error_event,
     reject_unsupported_kwargs,
+    require_token_count,
     retry_async_call,
     retry_async_stream_context,
     retry_sync_call,
     retry_sync_stream_context,
+    validate_complete_tool_call,
     validate_secret_free_options,
     validate_secret_free_request_overrides,
 )
 from src.providers.resources import AnthropicResources, AsyncAnthropicResources
-from src.utils.config import get_settings
+from src.utils.config import (
+    get_settings,
+    is_double_convertible,
+    require_model_name,
+    safe_repr,
+    to_finite_float,
+)
 from src.utils.log_manager import get_module_logger
 from src.utils.security import (
     redact_sensitive_text,
+    safe_exception_text,
     validate_secret_free_payload,
     validate_secret_free_resource_kwargs,
 )
 
 logger = get_module_logger(__name__)
+
+
+def _safe_type_hint(model: Any, field_name: str) -> Any:
+    """读取模型字段的类型注解，读不到时返回 ``None``。"""
+    try:
+        return get_type_hints(model).get(field_name)
+    except Exception:  # noqa: BLE001 - 注解解析失败只影响该成员的推导
+        logger.debug("无法解析 %s 的类型注解，跳过。", getattr(model, "__name__", model))
+        return None
+
+
+def _server_tool_types() -> frozenset[str]:
+    """从 SDK 的 ``ToolUnionParam`` 联合类型推导「非普通函数工具」的 ``type`` 取值。
+
+    为什么要推导而不是写死白名单：``_convert_tools`` 原先只认 ``server_`` 前缀与
+    三个 2025-01-24 时代的字面量（``computer_``／``bash_``／``text_editor_``）。
+    而 SDK 里真实存在的服务端工具类型有二十种（``web_search_20250305``、
+    ``code_execution_20250522``、``memory_20250818``、``web_fetch_20250910``、
+    ``browser_toolset_20260801`` …），它们既不匹配那个前缀、也不在那三个字面量里，
+    于是被降级成空 schema 的普通函数工具——``max_uses`` 等专属字段被丢弃，服务端
+    收到的是自定义函数工具而不是服务端检索工具，用户看到 web_search 静默失效。
+    实测发出的请求体从 ``{'type': 'web_search_20250305', 'name': 'web_search',
+    'max_uses': 5}`` 变成 ``{'name': 'web_search', 'description': '',
+    'input_schema': {...}}``。
+
+    推导口径：联合类型里除 ``ToolParam``（普通函数工具，其 ``type`` 是
+    ``Literal['custom']``）之外，每个成员都是某个服务端工具的专用参数模型，
+    取其 ``type`` 的字面量取值。SDK 升级新增工具时集合自动跟随，不需要改这里的
+    代码——写死白名单的失效模式正是「SDK 加了新工具、本地静默降级」。
+
+    推导失败（SDK 结构变化）时退回 ``server_`` 前缀判据：宁可少认几个工具，也不能
+    让普通函数工具被当成服务端工具原样透传。
+    """
+    members = get_args(getattr(anthropic.types, "ToolUnionParam", None) or ())
+    function_tool = getattr(anthropic.types, "ToolParam", None)
+    types: set[str] = set()
+    for member in members:
+        if member is function_tool:
+            continue
+        # 单个成员解析失败不影响其余成员：``get_type_hints`` 对无法解析的注解会抛
+        # 任意异常，而一个成员的模型结构变化不该让整张表退化成空集。
+        hint = _safe_type_hint(member, "type")
+        for literal in get_args(hint) if hint is not None else ():
+            if isinstance(literal, str):
+                types.add(literal)
+    return frozenset(types)
+
+
+# 历史上被硬编码认可、但已从当前 SDK 联合类型中移除的服务端工具字面量。
+#
+# 推导集合跟随 SDK，而 SDK 会**移除**旧版本的工具模型（实测 ``computer_20250124``
+# 已被 ``computer_toolset_20260801`` 取代、不再出现在 ``ToolUnionParam`` 里）。
+# 只取推导集合会让这些仍在服务端生效的旧取值从「原样透传」退回「降级成空 schema
+# 的函数工具」——比修复前更糟。与推导集合取并集。
+_LEGACY_SERVER_TOOL_TYPES = frozenset(
+    {
+        "computer_20250124",
+        "bash_20250124",
+        "text_editor_20250124",
+    }
+)
+
+# 服务端工具（非普通函数 schema）的 ``type`` 取值集合，启动时从 SDK 推导一次。
+_SERVER_TOOL_TYPES = _server_tool_types() | _LEGACY_SERVER_TOOL_TYPES
 
 
 class AnthropicProvider(LargeLanguageModel):
@@ -96,8 +172,18 @@ class AnthropicProvider(LargeLanguageModel):
     )
 
     def __init__(self, model_name: str, options: dict[str, Any] | None = None):
-        self._model_name = model_name
+        # ``AnthropicProvider`` 是公开类，嵌入方可以绕过工厂直接构造。工厂路径已用
+        # ``require_model_name`` 收敛（``cc10585``），这里同样要判：非字符串取值
+        # 会在下面的 ``logger.info`` 插值处抛裸 ``ValueError: Exceeds the limit``
+        # （位数超限的整数），或静默原样发给 SDK（列表／``None``）。
+        self._model_name = require_model_name(model_name)
         self._options = validate_secret_free_options(options, "Anthropic")
+        # 客户端构造参数在配置边界就校验。``timeout``／``max_retries`` 会被原样
+        # 透传给 ``anthropic.Anthropic(...)``，而 SDK 不校验：实测
+        # ``max_retries=-1`` 让 SDK 的重试循环 ``range(max_retries + 1)`` 一次都不
+        # 执行，HTTP 请求数为 **0**，最终抛 ``RuntimeError: could not resolve
+        # response (should never happen)``；``10**400`` 则等价于无限重试。
+        self._normalized_client_options = self._normalize_client_options(self._options)
         settings = get_settings()
         self._api_key = settings.anthropic_api_key
 
@@ -117,26 +203,43 @@ class AnthropicProvider(LargeLanguageModel):
     def async_resources(self) -> AsyncAnthropicResources:
         return AsyncAnthropicResources(self)
 
+    @classmethod
+    def _normalize_client_options(cls, options: Mapping[str, Any]) -> dict[str, Any]:
+        """校验并规范化客户端构造参数（``timeout``／``max_retries``）。
+
+        判据与 OpenAI 兼容渠道、Ark 渠道一致，三个渠道共用
+        ``normalize_client_retries`` 与 ``is_double_convertible``，不再各写一份。
+        """
+        normalized: dict[str, Any] = {}
+        if "timeout" in options:
+            timeout = options["timeout"]
+            if hasattr(timeout, "connect"):
+                # httpx.Timeout：SDK 接受，且无法用 TOML 表达，原样保留。
+                normalized["timeout"] = timeout
+            else:
+                normalized["timeout"] = normalize_client_timeout(
+                    timeout, "Anthropic", "options.timeout"
+                )
+        if "max_retries" in options:
+            normalized["max_retries"] = normalize_client_retries(
+                options["max_retries"], "Anthropic"
+            )
+        return normalized
+
     def _get_client(self) -> anthropic.Anthropic:
         if self._client is None:
             validate_secret_free_options(self._options, "Anthropic")
-            client_options = {
-                key: value
-                for key, value in self._options.items()
-                if key in {"timeout", "max_retries"}
-            }
-            self._client = anthropic.Anthropic(api_key=self._api_key, **client_options)
+            self._client = anthropic.Anthropic(
+                api_key=self._api_key, **self._normalized_client_options
+            )
         return self._client
 
     def _get_aclient(self) -> anthropic.AsyncAnthropic:
         if self._aclient is None:
             validate_secret_free_options(self._options, "Anthropic")
-            client_options = {
-                key: value
-                for key, value in self._options.items()
-                if key in {"timeout", "max_retries"}
-            }
-            self._aclient = anthropic.AsyncAnthropic(api_key=self._api_key, **client_options)
+            self._aclient = anthropic.AsyncAnthropic(
+                api_key=self._api_key, **self._normalized_client_options
+            )
         return self._aclient
 
     @staticmethod
@@ -189,10 +292,11 @@ class AnthropicProvider(LargeLanguageModel):
         if getattr(self, "_options", {}).get("allow_deprecated_sampling") is True:
             return value
         if name == "temperature":
-            try:
-                numeric = float(value)
-            except (TypeError, ValueError) as exc:
-                raise ValueError("Anthropic temperature 必须是数字。") from exc
+            # ``float(10**400)`` 抛 ``OverflowError``——它不是 ``ValueError``，
+            # 因此不能只 catch ``(TypeError, ValueError)``。
+            numeric = to_finite_float(value)
+            if numeric is None:
+                raise ValueError("Anthropic temperature 必须是数字。")
             if numeric in {0.7, 1.0}:
                 # 0.7 is the application's historical default; 1.0 is the
                 # backwards-compatible server value. Omitting either avoids a
@@ -200,10 +304,9 @@ class AnthropicProvider(LargeLanguageModel):
                 return None
             raise ValueError("当前 Claude 模型不支持该 temperature；请省略该字段或使用 1.0。")
         if name == "top_p":
-            try:
-                numeric = float(value)
-            except (TypeError, ValueError) as exc:
-                raise ValueError("Anthropic top_p 必须是数字。") from exc
+            numeric = to_finite_float(value)
+            if numeric is None:
+                raise ValueError("Anthropic top_p 必须是数字。")
             if numeric >= 0.99:
                 return None
             raise ValueError(
@@ -211,15 +314,51 @@ class AnthropicProvider(LargeLanguageModel):
             )
         raise ValueError("当前 Claude 模型不支持 top_k；请移除该字段。")
 
+    @staticmethod
+    def _require_positive_max_tokens(value: Any, field_name: str) -> int:
+        """把 ``max_tokens`` 收敛成正整数，非法取值给出带来源的 ``ValueError``。
+
+        两个入口共用：``options.max_tokens``（经 ``_default_max_tokens``）与
+        请求级 ``max_tokens``。后者此前**完全无校验**，取值原样进 params，由 SDK
+        深处的 ``_calculate_nonstreaming_timeout`` 执行
+        ``maximum_time * max_tokens / 128_000`` 时才炸：实测 ``10**400`` 抛
+        ``OverflowError: integer division result too large for a float``（它是
+        ``ArithmeticError`` 子类，既不落 ``except ValueError`` 也不落
+        ``except RuntimeError``）、``"abc"`` 与 ``[1]`` 抛 ``TypeError``，而
+        ``1.5``／``-5``／``True`` 静默通过、原样发给服务端。
+
+        判据用 ``is_double_convertible`` 而不是 ``math.isfinite``：后者对超出
+        双精度范围的整数自己就抛 ``OverflowError``（实测 ``math.isfinite(10**400)``
+        抛错），拿它当守卫等于没有守卫。
+        """
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"Anthropic {field_name} 必须是正整数。")
+        if not is_double_convertible(value):
+            raise ValueError(f"Anthropic {field_name} 必须是正整数。")
+        number = int(value)
+        if number <= 0 or number != value:
+            raise ValueError(f"Anthropic {field_name} 必须是正整数。")
+        return number
+
     def _default_max_tokens(self) -> int:
         configured = getattr(self, "_options", {}).get("max_tokens")
         if configured is not None:
             if isinstance(configured, bool) or not isinstance(configured, (int, float)):
                 raise ValueError("Anthropic options.max_tokens 必须是正整数。")
-            configured_int = int(configured)
-            if configured_int <= 0 or configured_int != configured:
-                raise ValueError("Anthropic options.max_tokens 必须是正整数。")
-            return configured_int
+            # 余下判据（有限性、整数性、正数）在 ``_require_positive_max_tokens``
+            # 里，请求级 ``max_tokens`` 走同一个 helper——同一个量在两个入口的
+            # 判据必须一致。
+            # 有限性必须先判，再 ``int()``：``inf`` 让 ``int()`` 抛
+            # ``OverflowError: cannot convert float infinity to integer``，
+            # ``nan`` 抛 ``ValueError: cannot convert float NaN to integer``——
+            # 两者都**不是**本方法承诺的「必须是正整数」消息，而且
+            # ``OverflowError`` 连 ``except ValueError`` 都接不住。实测
+            # ``options.max_tokens = inf`` 正是这种收场，而同为非法取值的
+            # ``1.5``／``0``／``-1`` 都能得到带指引的消息。
+            # 判据用 ``is_double_convertible`` 而不是 ``math.isfinite``：后者对
+            # 超出双精度范围的整数自己就抛 ``OverflowError``（实测
+            # ``math.isfinite(10**400)`` 抛错），拿它当守卫等于没有守卫。
+            return self._require_positive_max_tokens(configured, "options.max_tokens")
         model = str(getattr(self, "_model_name", "")).lower()
         if "claude-3-opus" in model or "claude-3-haiku" in model:
             return 4096
@@ -230,7 +369,104 @@ class AnthropicProvider(LargeLanguageModel):
         return 8192
 
     @staticmethod
+    def _require_string_header_values(
+        extra_headers: Mapping[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """校验 ``extra_headers`` 的**取值**都是字符串，返回浅拷贝。
+
+        为什么值也要判：``validate_secret_free_request_overrides`` 只校验
+        ``extra_headers`` 整体是 Mapping，不校验值——实测
+        ``CompletionRequest(extra_headers={"anthropic-beta": 42})`` 构造成功并原样
+        保留。非字符串值的两种收场都不在本渠道的错误契约内：
+
+        * 交给 httpx 时抛 ``TypeError: Header value must be str or bytes``；
+        * 本模块对 ``anthropic-beta`` 做 ``.split(",")`` 时抛
+          ``AttributeError: 'int' object has no attribute 'split'``。
+
+        HTTP 头的值本来就该是字符串，非字符串一律给出带头名的 ``ValueError``。
+        ``None`` **剔除**而不是放行，且必须是**在合并之前**剔除：合并分支对
+        ``anthropic-beta`` 做 ``.split(",")``，``None`` 在那里抛
+        ``AttributeError: 'NoneType' object has no attribute 'split'``（实测
+        ``_user_profile_fields("u1", {"anthropic-beta": None}, None, beta=False)``）；
+        交给 httpx 时则抛 ``TypeError: Header value must be str or bytes``。两者
+        都不在本渠道的错误契约内。剔除后它与「该头未设置」完全等价，符合调用方
+        写 ``extra_headers={"x": None}`` 时的意图。
+
+        只收 ``str`` 不收 ``bytes``：``bytes`` 虽是 httpx 接受的形态，但本模块对
+        ``anthropic-beta`` 做的是 ``.split(",")``（``str`` 分隔符），对 bytes 抛
+        ``TypeError: a bytes-like object is required``——放行它只是把问题挪个地方。
+        """
+        if extra_headers is None:
+            return None
+        headers = dict(extra_headers)
+        for name, value in headers.items():
+            if value is not None and not isinstance(value, str):
+                raise ValueError(
+                    f"Anthropic extra_headers[{safe_repr(name)}] 必须是字符串，"
+                    f"但得到 {safe_repr(value)}。"
+                )
+        return {name: value for name, value in headers.items() if value is not None}
+
+    @staticmethod
+    def _require_profile_id(user: Any) -> str | None:
+        """校验 ``user``（转成 ``user_profile_id``）是字符串。
+
+        声明类型是 ``str | None``，但 ``CompletionRequest`` 是普通 dataclass、
+        ``__post_init__`` 不校验它——实测 ``beta_create(prompt="hi", user=5)``
+        构造成功。SDK 把这个值当 HTTP 头的取值，非字符串抛
+        ``AttributeError: 'int' object has no attribute 'encode'``（``bytes``
+        抛 ``'bytes' object has no attribute 'encode'``，因为 httpx 对 ``bytes``
+        头值走的是另一条分支）。``AttributeError`` 不落本渠道的
+        ``except ValueError``／``except RuntimeError`` 分类。
+
+        走真实 SDK（``httpx2.MockTransport`` 拦网）实测：``invoke``／
+        ``beta_create``／``async_beta_create`` 三个入口对 ``5``／``["a"]``／
+        ``b"x"`` 都抛该 ``AttributeError``。
+        """
+        if user is None or isinstance(user, str):
+            return user
+        raise ValueError(f"Anthropic user 必须是字符串，但得到 {safe_repr(user)}。")
+
+    @staticmethod
+    def _require_beta_tokens(betas: Any) -> list[str] | None:
+        """把 ``betas`` 收敛成字符串列表；非法形态给带字段名的 ``ValueError``。
+
+        ``CompletionRequest.betas`` 声明为 ``Sequence[str] | None``，但同样不经
+        校验。三种形态的收场都不在渠道契约内（走真实 SDK 实测）：
+
+        * ``5`` 抛裸 ``TypeError: 'int' object is not iterable``（``list(5)``）；
+        * ``b"x"`` 被 ``list()`` 拆成 ``[120]``——整数进了 HTTP 头；
+        * ``{"a": 1}`` 静默取**键**得 ``["a"]``；
+        * ``["a", 1]`` 的元素原样进请求体。
+
+        后三类更隐蔽：SDK 把它们直接拼进 ``anthropic-beta`` 头（实测
+        ``betas=[1, 2]`` 发出 ``anthropic-beta: 1,2``、``betas=b"x"`` 发出
+        ``120``），服务端收到一个不存在的 beta 名——要么报一个与调用方写法
+        毫无关系的错，要么静默忽略掉本想启用的特性。字符串是唯一的合法元素
+        形态，与 ``_require_string_header_values`` 同一判据。
+        """
+        if betas is None:
+            return None
+        # 字符串与 bytes 要**先**拒：两者都是可迭代的，``list("ab")`` 会得到
+        # ``["a", "b"]``（把单个 beta 名拆成两个），``list(b"x")`` 得到
+        # ``[120]``（整数进 HTTP 头）。``Mapping`` 同样可迭代，但迭代的是**键**
+        # ——``{"a": 1}`` 静默变成 ``["a"]``，值被丢弃而调用方无从察觉。
+        if isinstance(betas, (str, bytes, Mapping)):
+            raise ValueError(f"Anthropic betas 必须是字符串列表，但得到 {safe_repr(betas)}。")
+        try:
+            values = list(betas)
+        except TypeError as exc:
+            raise ValueError(
+                f"Anthropic betas 必须是字符串列表，但得到 {safe_repr(betas)}。"
+            ) from exc
+        for value in values:
+            if not isinstance(value, str):
+                raise ValueError(f"Anthropic betas 的元素必须是字符串，但得到 {safe_repr(value)}。")
+        return values
+
+    @classmethod
     def _user_profile_fields(
+        cls,
         user: str | None,
         extra_headers: Mapping[str, str] | None = None,
         betas: Any = None,
@@ -238,45 +474,62 @@ class AnthropicProvider(LargeLanguageModel):
         beta: bool,
     ) -> tuple[dict[str, str] | None, Any]:
         """补齐 user profile 所需的 SDK beta 资源声明。"""
+        # 头值校验放在**两条分支之前**：``user=None`` 时这里直接返回原样的
+        # ``extra_headers``，非字符串值会一路交给 httpx，在那里抛
+        # ``TypeError: Header value must be str or bytes``——既不落
+        # ``except ValueError`` 也不落 ``except RuntimeError``。而 ``user=None``
+        # 恰恰是最常见的调用形态，这条路径比下面的合并分支更容易走到。
+        headers = cls._require_string_header_values(extra_headers)
+        user = cls._require_profile_id(user)
         if user is None:
-            return dict(extra_headers) if extra_headers is not None else None, betas
+            return headers, betas
         header = "user-profiles-2026-08-18"
         if beta:
-            if isinstance(betas, str):
-                values = [betas]
-            else:
-                values = list(betas or [])
+            values = cls._require_beta_tokens(betas) or []
             if header not in values:
                 values.append(header)
-            return dict(extra_headers) if extra_headers is not None else None, values
-        headers = dict(extra_headers or {})
-        existing = headers.get("anthropic-beta", "")
+            # 返回**校验过**的副本（``headers`` 可能是 ``None``，此时语义就是
+            # 「没有额外头」），不能用原始的 ``extra_headers``——那会绕过上面刚做的
+            # 取值校验。
+            return headers, values
+        # ``headers`` 可能是 ``None``（调用方没传 extra_headers），而
+        # ``_require_string_header_values`` 对 ``None`` 输入原样返回 ``None``。
+        # 合并必须建立在副本上：直接写 ``headers`` 会在 ``None`` 上抛裸
+        # ``TypeError``，而写在原字典上会让调用方的 ``request.extra_headers``
+        # 被就地修改。
+        merged = dict(headers or {})
+        existing = merged.get("anthropic-beta") or ""
         values = [item.strip() for item in existing.split(",") if item.strip()]
         if header not in values:
             values.append(header)
-        headers["anthropic-beta"] = ",".join(values)
-        return headers, betas
+        merged["anthropic-beta"] = ",".join(values)
+        return merged, betas
 
     @staticmethod
     def _convert_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
         if not tools:
             return None
 
+        # 容器形态先判：``enumerate(tools)`` 对不可迭代的取值抛裸
+        # ``TypeError: 'int' object is not iterable``，而同函数对可迭代但元素
+        # 非法的形态给的是带序号的 ``ValueError``——同一判据的两半必须都在。
+        # 实测 ``_build_message_params(prompt="hi", tools=5)`` 抛该 ``TypeError``。
+        if not isinstance(tools, (list, tuple)):
+            raise ValueError(f"Anthropic 工具定义必须是列表，但得到 {safe_repr(tools)}。")
         converted: list[dict[str, Any]] = []
         for index, tool in enumerate(tools):
             if not isinstance(tool, Mapping):
                 raise ValueError(f"Anthropic 工具定义[{index}] 必须是对象。")
             tool_type = tool.get("type")
-            # Anthropic 的 server_* 工具不是 function schema，原样传递其
-            # 专属字段，避免统一 OpenAI schema 破坏服务端工具配置。
+            # Anthropic 的服务端工具不是 function schema，原样传递其专属字段，
+            # 避免统一 OpenAI schema 破坏服务端工具配置。判据取自 SDK 联合类型
+            # （见 ``_SERVER_TOOL_TYPES``），而不是写死的白名单——后者在 SDK
+            # 新增工具时会静默降级。``custom`` 也是 ``ToolParam`` 自己声明的
+            # 合法取值（``Literal['custom']``），同样原样透传。
             if isinstance(tool_type, str) and (
-                tool_type.startswith("server_")
-                or tool_type
-                in {
-                    "computer_20250124",
-                    "bash_20250124",
-                    "text_editor_20250124",
-                }
+                tool_type in _SERVER_TOOL_TYPES
+                or tool_type == "custom"
+                or tool_type.startswith("server_")
             ):
                 converted.append(dict(tool))
                 continue
@@ -323,6 +576,8 @@ class AnthropicProvider(LargeLanguageModel):
             raise ValueError("Anthropic tool_choice 必须是字符串或对象。")
         choice = dict(tool_choice)
         choice_type = choice.get("type")
+        if not isinstance(choice_type, str):
+            choice_type = None
         if choice_type in {"auto", "any", "none"}:
             return choice
         if choice_type == "tool":
@@ -356,6 +611,8 @@ class AnthropicProvider(LargeLanguageModel):
                 converted.append(part)
                 continue
             part_type = part.get("type")
+            if not isinstance(part_type, str):
+                part_type = None
             if part_type in {"text", "input_text"}:
                 converted.append({"type": "text", "text": part.get("text", "")})
             elif part_type in {"image_url", "input_image"}:
@@ -492,15 +749,29 @@ class AnthropicProvider(LargeLanguageModel):
         return converted
 
     @staticmethod
-    def _response_format_config(response_format: dict[str, Any] | None) -> dict[str, Any] | None:
+    def _response_format_config(response_format: Any) -> dict[str, Any] | None:
+        """把统一的 ``response_format`` 转成 Anthropic 的 ``output_config.format``。
+
+        容器形态必须在这里判：``options.response_format`` 那一侧已有守卫（见
+        ``_build_message_params``），但**请求参数**来源（``request.response_format``）
+        直接进本函数，非 Mapping 时 ``.get()`` 抛裸 ``AttributeError``。同一语义的
+        两个来源，守卫只盖住了一处；``google.py`` 的 ``_response_format_values``
+        对同一判据给的是显式 ``ValueError``。
+        """
         if not response_format:
             return None
+        if not isinstance(response_format, Mapping):
+            raise ValueError(
+                f"Anthropic response_format 必须是对象，但得到 {safe_repr(response_format)}。"
+            )
         if response_format.get("type") == "json_schema":
             schema = response_format.get("json_schema", response_format)
             return {"type": "json_schema", "schema": schema.get("schema", schema)}
         if response_format.get("type") == "json_object":
             return {"type": "json_schema", "schema": {"type": "object"}}
-        return response_format
+        # ``dict(...)`` 而不是原样返回：入参经上面的守卫收窄成 ``Mapping``，而本函数
+        # 的契约是返回可自由改写的 ``dict``（调用方会把它嵌进 params）。
+        return dict(response_format)
 
     def _build_message_params(
         self,
@@ -552,7 +823,12 @@ class AnthropicProvider(LargeLanguageModel):
             "context_management": context_management,
             "mcp_servers": mcp_servers,
             "speed": speed,
-            "betas": betas,
+            # ``betas`` 必须在这里校验，不能只在 ``_user_profile_fields`` 里判：
+            # 那个函数仅在 ``user is not None`` 时被调用，而 ``betas`` 走
+            # ``beta_values`` 直接进 params（见下方 ``if beta:`` 的 update）。
+            # 实测 ``beta_create(prompt="hi", betas=5)`` 在加这条之前抛裸
+            # ``TypeError``、``betas=[1, 2]`` 把 ``1,2`` 拼进 anthropic-beta 头。
+            "betas": self._require_beta_tokens(betas),
             "diagnostics": diagnostics,
             "fallback_credit_token": fallback_credit_token,
             "fallbacks": fallbacks,
@@ -568,7 +844,11 @@ class AnthropicProvider(LargeLanguageModel):
         normalized = normalize_messages(prompt, system_prompt, messages)
         params: dict[str, Any] = {
             "model": self._model_name,
-            "max_tokens": max_tokens if max_tokens is not None else self._default_max_tokens(),
+            "max_tokens": (
+                self._require_positive_max_tokens(max_tokens, "请求级 max_tokens")
+                if max_tokens is not None
+                else self._default_max_tokens()
+            ),
             "messages": self._convert_messages(normalized),
         }
         effective_system = extract_system_prompt(messages) or system_prompt
@@ -766,17 +1046,33 @@ class AnthropicProvider(LargeLanguageModel):
 
     @classmethod
     def _extract_result(cls, response: Any) -> CompletionResult:
+        # ``content`` 是 Anthropic 响应的顶层块容器。此前写
+        # ``field(response, "content", []) or []``
+        # ——那只挡住 ``None`` 与空值。实测 ``content=5`` 抛裸
+        # ``TypeError: 'int' object is not iterable``，而本 provider 的错误分类
+        # 按 ``RuntimeError`` 写（同一文件对拒答等情形用的就是它）。
+        #
+        # **本条线上可达**：anthropic SDK 的 ``_base_client`` 在
+        # ``_strict_response_validation`` 为假时走 ``construct_type``——该标志
+        # 实测默认 ``False``，与 openai／Ark 同类，不执行 pydantic 校验。
         blocks = field(response, "content", []) or []
+        if not isinstance(blocks, (list, tuple)):
+            raise RuntimeError(f"Anthropic 响应的 content 必须是列表，但得到 {safe_repr(blocks)}。")
+        blocks = list(blocks)
         # ``field`` 只在键不存在时返回默认值；键存在而值为 None 时仍返回 None，
         # 而 SDK 的部分块（如 thinking / redacted_thinking）确实会给出 None。
-        # 直接 join 会抛 ``TypeError: expected str instance, NoneType found``。
+        # 直接 join 会抛 ``TypeError: expected str instance, NoneType found``；
+        # **真值非字符串**（``5``／``10**4301``）同样会抛——``or ""`` 只挡住
+        # ``None`` 与空串。统一走 ``_block_text``（与 ``_refusal_text`` 同判据）。
         text = "".join(
-            field(block, "text", "") or "" for block in blocks if field(block, "type") == "text"
+            cls._block_text(field(block, "text", ""))
+            for block in blocks
+            if field(block, "type") == "text"
         )
         reasoning = "".join(
-            field(block, "thinking", "") or ""
+            cls._block_text(field(block, "thinking", ""))
             for block in blocks
-            if field(block, "type") in {"thinking", "redacted_thinking"}
+            if enum_field(block, "type") in {"thinking", "redacted_thinking"}
         )
         tool_calls = [
             {
@@ -789,9 +1085,20 @@ class AnthropicProvider(LargeLanguageModel):
             if field(block, "type") == "tool_use"
         ]
         usage_dict = normalize_usage(field(response, "usage"))
+        # 取值优先级必须与流式路径（``_stream_event`` 的 content_block_start 与
+        # content_block_delta 两个分支）**逐字一致**：三处都是
+        # ``refusal or text or reason``。此前这里漏了 ``refusal`` 键，于是同一份
+        # 响应在两条路径上给出不同结果——实测 content 为
+        # ``[{"type": "refusal", "refusal": "被拒绝"}]`` 时非流式得到
+        # ``refusal=None``、``text=''``、``finish_reason='end_turn'``，``invoke()``
+        # 输出空列表：一次**安全拦截**变成「空成功」，而流式路径正确抛出
+        # ``RuntimeError: Anthropic 请求被拒绝``。``refusal`` 是 SDK 的
+        # ``RefusalBlock`` 的正式字段名（``text``／``reason`` 只是兼容形态）。
         refusal = next(
             (
-                field(block, "reason", "") or field(block, "text", "")
+                cls._refusal_text(
+                    field(block, "refusal") or field(block, "text") or field(block, "reason")
+                )
                 for block in blocks
                 if field(block, "type") == "refusal"
             ),
@@ -802,11 +1109,20 @@ class AnthropicProvider(LargeLanguageModel):
             stop_details = field(response, "stop_details") or field(
                 response, "refusal_stop_details"
             )
-            details_type = field(stop_details, "type")
+            details_type = enum_field(stop_details, "type")
             if stop_reason == "refusal" or details_type == "refusal":
                 explanation = field(stop_details, "explanation")
                 category = field(stop_details, "category")
-                refusal = str(explanation or category or "Anthropic 请求被安全策略拒绝")
+                # 两处拒答详情同理（见 ``_refusal_text``）：``explanation`` 与
+                # ``category`` 都来自服务端 JSON，裸 ``str()`` 会在超大整数上抛
+                # ``ValueError: Exceeds the limit``。后果比崩溃更糟——这是**安全
+                # 拦截**的信号，抛异常会让一次本该显式上报的拒答变成一条与安全
+                # 策略无关的整数转换错误。取值为空时仍给默认文案。
+                refusal = (
+                    cls._refusal_detail(explanation)
+                    or cls._refusal_detail(category)
+                    or "Anthropic 请求被安全策略拒绝"
+                )
         return CompletionResult(
             text=text,
             tool_calls=tool_calls,
@@ -866,13 +1182,13 @@ class AnthropicProvider(LargeLanguageModel):
             for text in response.text_stream:
                 cls._raise_for_stream_snapshot_refusal(response)
                 if text:
-                    yield text
+                    yield cls._block_text(text)
             cls._raise_for_stream_snapshot_refusal(response)
             return
 
         for text in response.text_stream:
             if text:
-                yield text
+                yield cls._block_text(text)
 
     @classmethod
     async def _aiter_invoke_stream_text(cls, response: Any) -> AsyncGenerator[str, None]:
@@ -901,17 +1217,72 @@ class AnthropicProvider(LargeLanguageModel):
             async for text in iterate_async(response.text_stream):
                 cls._raise_for_stream_snapshot_refusal(response)
                 if text:
-                    yield text
+                    yield cls._block_text(text)
             cls._raise_for_stream_snapshot_refusal(response)
             return
 
         async for text in iterate_async(response.text_stream):
             if text:
-                yield text
+                yield cls._block_text(text)
+
+    @staticmethod
+    def _refusal_detail(value: Any) -> str:
+        """收敛 ``stop_details`` 里的拒答详情取值；空值返回空串。
+
+        与 ``_refusal_text`` 同一判据，差别只在**空值语义**：``stop_details`` 的
+        ``explanation``／``category`` 可以合法缺失（两者都没有时调用方会给默认
+        文案），所以 ``None`` 返回空串而不是「非字符串就给描述」——否则一个缺失
+        的 ``explanation`` 会渲染成 ``"None"`` 并挡住后面的 ``category``。
+        """
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        return safe_repr(value)
+
+    @staticmethod
+    def _block_text(value: Any) -> str:
+        """把响应块里的文本字段（``text``／``thinking``／``refusal``）收敛成字符串。
+
+        这些字段都来自服务端 JSON，形态不受本地控制（SDK 在
+        ``_strict_response_validation=False`` 时走 ``construct_type``，不执行
+        pydantic 校验）。裸 ``"".join(... or "")`` 只挡住 ``None`` 与空串——
+        **真值非字符串**（``5``／``{"a": 1}``／``10**4301``）原样进 ``join``，抛裸
+        ``TypeError: sequence item 0: expected str instance, int found``，而本
+        provider 的错误分类按 ``RuntimeError`` 写。
+
+        非字符串给 ``safe_repr`` 的可读描述而不是空串：空串会让调用方以为「这块
+        没有内容」。判据与 ``_refusal_text`` 逐字相同，两者共用本实现。
+        """
+        if isinstance(value, str):
+            return value
+        if value is None:
+            return ""
+        return safe_repr(value)
+
+    @staticmethod
+    def _refusal_text(value: Any) -> str:
+        """把服务端返回的拒答取值收敛成字符串。
+
+        ``refusal`` 来自服务端 JSON（``content_block`` 或 ``delta`` 里的字段），
+        形态不受本地控制。原写法是
+        ``value if isinstance(value, str) else str(value or "")``——非字符串走裸
+        ``str()``，而 JSON 里一个超大整数字面量（``10**4301``）会让它撞上 CPython
+        的整数位数上限，抛 ``ValueError: Exceeds the limit``。
+
+        这个异常发生在**流式解析**过程中（``_iterate_stream_events`` 的生成器
+        里）：用户已经看到部分输出，随后拿到一条与「服务端拒答」毫无关系的整数
+        转换错误；而同一函数对 ``42`` 正常转成 ``"42"``、对 ``None`` 给出 ``""``，
+        只有位数超限的那一个炸——收场方式取决于取值的**大小**而不是形态。
+
+        非字符串一律给可读描述而不是空串：空串会让调用方以为「没有拒答」。
+        收敛判据与 ``_block_text`` 相同，委托给它。
+        """
+        return AnthropicProvider._block_text(value)
 
     @classmethod
     def _stream_event(cls, event: Any, response_id: str | None = None) -> StreamEvent | None:
-        event_type = field(event, "type", "")
+        event_type = enum_field(event, "type")
         if event_type == "message_start":
             message = field(event, "message")
             message_id = field(message, "id") or response_id
@@ -919,12 +1290,12 @@ class AnthropicProvider(LargeLanguageModel):
             return StreamEvent(type="start", usage=usage, response_id=message_id, raw=event)
         if event_type == "content_block_start":
             block = field(event, "content_block")
-            block_type = field(block, "type")
+            block_type = enum_field(block, "type")
             if block_type == "refusal" or field(block, "refusal"):
                 refusal = field(block, "refusal") or field(block, "text") or field(block, "reason")
                 return StreamEvent(
                     type="refusal_delta",
-                    refusal=refusal if isinstance(refusal, str) else str(refusal or ""),
+                    refusal=cls._refusal_text(refusal),
                     response_id=response_id,
                     raw=event,
                 )
@@ -937,7 +1308,11 @@ class AnthropicProvider(LargeLanguageModel):
                         else ""
                     )
                 else:
-                    initial_arguments = str(initial_input) if initial_input else ""
+                    # 非映射的 ``input`` 走 ``_block_text`` 而不是裸 ``str()``：
+                    # 位数超限的整数让 ``str()`` 抛 ``ValueError: Exceeds the
+                    # limit``，而 ``arguments`` 的契约是字符串（非流式路径经
+                    # ``normalize_tool_arguments`` 收敛）。
+                    initial_arguments = cls._block_text(initial_input)
                 return StreamEvent(
                     type="tool_call_delta",
                     tool_call={
@@ -960,18 +1335,23 @@ class AnthropicProvider(LargeLanguageModel):
             return None
         if event_type == "content_block_delta":
             delta = field(event, "delta")
-            delta_type = field(delta, "type")
+            delta_type = enum_field(delta, "type")
             if delta_type == "text_delta":
                 return StreamEvent(
                     type="text_delta",
-                    text=field(delta, "text", "") or "",
+                    # ``or ""`` 只挡住 ``None`` 与空串；真值非字符串（``5``／
+                    # ``{"a": 1}``）原样进 ``StreamEvent.text``（声明为 ``str``），
+                    # 而消费方 ``_iter_invoke_stream_text`` 直接 ``yield`` 它——
+                    # ``Generator[str]`` 的契约被打破，调用方拼接时抛裸
+                    # ``TypeError``。走 ``_block_text``（与 ``_refusal_text`` 同判据）。
+                    text=cls._block_text(field(delta, "text", "")),
                     response_id=response_id,
                     raw=event,
                 )
             if delta_type == "thinking_delta":
                 return StreamEvent(
                     type="reasoning_delta",
-                    reasoning=field(delta, "thinking", "") or "",
+                    reasoning=cls._block_text(field(delta, "thinking", "")),
                     response_id=response_id,
                     raw=event,
                 )
@@ -979,7 +1359,7 @@ class AnthropicProvider(LargeLanguageModel):
                 refusal = field(delta, "refusal") or field(delta, "text") or field(delta, "reason")
                 return StreamEvent(
                     type="refusal_delta",
-                    refusal=refusal if isinstance(refusal, str) else str(refusal or ""),
+                    refusal=cls._refusal_text(refusal),
                     response_id=response_id,
                     raw=event,
                 )
@@ -988,7 +1368,10 @@ class AnthropicProvider(LargeLanguageModel):
                     type="tool_call_delta",
                     tool_call={
                         "index": field(event, "index"),
-                        "arguments": field(delta, "partial_json", "") or "",
+                        # 同上：``arguments`` 的契约是字符串（非流式路径经
+                        # ``normalize_tool_arguments`` 收敛），非字符串原样透传会让
+                        # 两条路径给出不同类型。字符串片段原样透传，拼接语义不变。
+                        "arguments": cls._block_text(field(delta, "partial_json", "")),
                     },
                     response_id=response_id,
                     raw=event,
@@ -999,11 +1382,20 @@ class AnthropicProvider(LargeLanguageModel):
             delta = field(event, "delta")
             reason = field(delta, "stop_reason")
             stop_details = field(delta, "stop_details") or field(delta, "refusal_stop_details")
-            details_type = field(stop_details, "type")
+            details_type = enum_field(stop_details, "type")
             if reason == "refusal" or details_type == "refusal":
                 explanation = field(stop_details, "explanation")
                 category = field(stop_details, "category")
-                refusal = str(explanation or category or "Anthropic 请求被安全策略拒绝")
+                # 两处拒答详情同理（见 ``_refusal_text``）：``explanation`` 与
+                # ``category`` 都来自服务端 JSON，裸 ``str()`` 会在超大整数上抛
+                # ``ValueError: Exceeds the limit``。后果比崩溃更糟——这是**安全
+                # 拦截**的信号，抛异常会让一次本该显式上报的拒答变成一条与安全
+                # 策略无关的整数转换错误。取值为空时仍给默认文案。
+                refusal = (
+                    cls._refusal_detail(explanation)
+                    or cls._refusal_detail(category)
+                    or "Anthropic 请求被安全策略拒绝"
+                )
                 return StreamEvent(
                     type="refusal_delta",
                     refusal=refusal,
@@ -1014,7 +1406,7 @@ class AnthropicProvider(LargeLanguageModel):
                 return StreamEvent(
                     type="finish",
                     usage=usage,
-                    finish_reason=str(reason),
+                    finish_reason=cls._refusal_text(reason),
                     response_id=response_id,
                     raw=event,
                 )
@@ -1128,6 +1520,12 @@ class AnthropicProvider(LargeLanguageModel):
                     elif converted.type == "finish":
                         for key, tool_call in tool_calls.items():
                             if key not in completed_tool_calls:
+                                # 与 openai_compatible / google / volcengine 的
+                                # 交付前校验保持一致：Anthropic 的流式片段同样不带
+                                # ``type``（由 merge_tool_call_fragment 补成
+                                # ``function``），若不在这里校验，半截 JSON 会被
+                                # 当作完整工具调用交给调用方。
+                                validate_complete_tool_call(tool_call, "Anthropic Messages")
                                 completed_tool_calls.add(key)
                                 yield StreamEvent(
                                     type="tool_call_completed",
@@ -1215,6 +1613,12 @@ class AnthropicProvider(LargeLanguageModel):
                     elif converted.type == "finish":
                         for key, tool_call in tool_calls.items():
                             if key not in completed_tool_calls:
+                                # 与 openai_compatible / google / volcengine 的
+                                # 交付前校验保持一致：Anthropic 的流式片段同样不带
+                                # ``type``（由 merge_tool_call_fragment 补成
+                                # ``function``），若不在这里校验，半截 JSON 会被
+                                # 当作完整工具调用交给调用方。
+                                validate_complete_tool_call(tool_call, "Anthropic Messages")
                                 completed_tool_calls.add(key)
                                 yield StreamEvent(
                                     type="tool_call_completed",
@@ -1392,10 +1796,7 @@ class AnthropicProvider(LargeLanguageModel):
         if request.timeout is not None:
             params["timeout"] = request.timeout
         response = self._get_client().messages.count_tokens(**params)
-        value = field(response, "input_tokens")
-        if value is None:
-            raise RuntimeError("Anthropic token count 响应缺少 input_tokens。")
-        return int(value)
+        return require_token_count(field(response, "input_tokens"), "Anthropic", "input_tokens")
 
     def beta_create(self, request: CompletionRequest | None = None, **kwargs: Any) -> Any:
         """调用 Anthropic Beta Messages，保留 Beta 专属参数转发能力。"""
@@ -1458,7 +1859,12 @@ class AnthropicProvider(LargeLanguageModel):
             params["speed"] = request.speed
         if request.user is not None:
             params["user_profile_id"] = request.user
-        _, profile_betas = self._user_profile_fields(
+        # 取**校验后**的 ``profile_headers``，不能用 ``request.extra_headers``——
+        # 后者仍带着 ``_user_profile_fields`` 已经剔除掉的非字符串/``None`` 值，
+        # 原样透传会让 httpx 抛 ``TypeError: Header value must be str or bytes``。
+        # 同文件的 ``beta=False`` 分支（``messages.count_tokens``）用的就是校验后的
+        # 返回值，这里原先漏了。
+        profile_headers, profile_betas = self._user_profile_fields(
             request.user, request.extra_headers, request.betas, beta=True
         )
         if profile_betas is not None:
@@ -1469,17 +1875,16 @@ class AnthropicProvider(LargeLanguageModel):
                 "Anthropic Beta Messages token count",
                 "extra_body",
             )
-        if request.extra_headers is not None:
-            params["extra_headers"] = request.extra_headers
+        if profile_headers is not None:
+            params["extra_headers"] = profile_headers
         if request.extra_query is not None:
             params["extra_query"] = request.extra_query
         if request.timeout is not None:
             params["timeout"] = request.timeout
         response = self._get_client().beta.messages.count_tokens(**params)
-        value = field(response, "input_tokens")
-        if value is None:
-            raise RuntimeError("Anthropic Beta token count 响应缺少 input_tokens。")
-        return int(value)
+        return require_token_count(
+            field(response, "input_tokens"), "Anthropic Beta", "input_tokens"
+        )
 
     def beta_stream(self, request: CompletionRequest | None = None, **kwargs: Any) -> Any:
         """返回 Anthropic Beta Messages 流式上下文管理器。"""
@@ -1607,10 +2012,7 @@ class AnthropicProvider(LargeLanguageModel):
         response = await self._resolve_async_result(
             self._get_aclient().messages.count_tokens(**params)
         )
-        value = field(response, "input_tokens")
-        if value is None:
-            raise RuntimeError("Anthropic token count 响应缺少 input_tokens。")
-        return int(value)
+        return require_token_count(field(response, "input_tokens"), "Anthropic", "input_tokens")
 
     async def async_beta_create(
         self, request: CompletionRequest | None = None, **kwargs: Any
@@ -1677,7 +2079,12 @@ class AnthropicProvider(LargeLanguageModel):
             params["speed"] = request.speed
         if request.user is not None:
             params["user_profile_id"] = request.user
-        _, profile_betas = self._user_profile_fields(
+        # 取**校验后**的 ``profile_headers``，不能用 ``request.extra_headers``——
+        # 后者仍带着 ``_user_profile_fields`` 已经剔除掉的非字符串/``None`` 值，
+        # 原样透传会让 httpx 抛 ``TypeError: Header value must be str or bytes``。
+        # 同文件的 ``beta=False`` 分支（``messages.count_tokens``）用的就是校验后的
+        # 返回值，这里原先漏了。
+        profile_headers, profile_betas = self._user_profile_fields(
             request.user, request.extra_headers, request.betas, beta=True
         )
         if profile_betas is not None:
@@ -1688,8 +2095,8 @@ class AnthropicProvider(LargeLanguageModel):
                 "Anthropic Beta Messages token count",
                 "extra_body",
             )
-        if request.extra_headers is not None:
-            params["extra_headers"] = request.extra_headers
+        if profile_headers is not None:
+            params["extra_headers"] = profile_headers
         if request.extra_query is not None:
             params["extra_query"] = request.extra_query
         if request.timeout is not None:
@@ -1697,10 +2104,9 @@ class AnthropicProvider(LargeLanguageModel):
         response = await self._resolve_async_result(
             self._get_aclient().beta.messages.count_tokens(**params)
         )
-        value = field(response, "input_tokens")
-        if value is None:
-            raise RuntimeError("Anthropic Beta token count 响应缺少 input_tokens。")
-        return int(value)
+        return require_token_count(
+            field(response, "input_tokens"), "Anthropic Beta", "input_tokens"
+        )
 
     def async_beta_stream(self, request: CompletionRequest | None = None, **kwargs: Any) -> Any:
         """返回 AsyncAnthropic Beta 流式上下文管理器。"""
@@ -1935,7 +2341,7 @@ class AnthropicProvider(LargeLanguageModel):
             duration = time.perf_counter() - start_time
             logger.info(f"Anthropic LLM ({self._model_name}) 调用完成，耗时: {duration:.2f}s")
         except Exception as e:
-            error_text = redact_sensitive_text(str(e))
+            error_text = safe_exception_text(e)
             logger.exception(
                 "Anthropic LLM (%s) 出错: %s",
                 self._model_name,
@@ -2010,7 +2416,7 @@ class AnthropicProvider(LargeLanguageModel):
             duration = time.perf_counter() - start_time
             logger.info(f"Anthropic LLM ({self._model_name}) 异步调用完成，耗时: {duration:.2f}s")
         except Exception as e:
-            error_text = redact_sensitive_text(str(e))
+            error_text = safe_exception_text(e)
             logger.exception(
                 "Anthropic LLM (%s) 异步出错: %s",
                 self._model_name,

@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from src.retrieval import retriever
 from src.retrieval.retriever import retrieve_documents
 from src.services.retrieval_service import RetrievalService
 from src.utils.config import RetrievalMethod
@@ -529,3 +530,179 @@ def test_validate_rerank_output_rejects_invalid_provider_results(indices, scores
     """契约失败必须是显式异常，而不是让错误顺序静默进入检索结果。"""
     with pytest.raises(RuntimeError, match=match):
         RetrievalService._validate_rerank_output(indices, scores, document_count=3)
+
+
+# ---------------------------------------------------------------------------
+# 超出双精度范围的整数
+# ---------------------------------------------------------------------------
+#
+# provider 的 score 来自网络 JSON，里面出现一个超大整数字面量就足以让
+# ``float(score)`` 抛 ``OverflowError``——它不是 ``ValueError``，原实现里的
+# ``except (TypeError, ValueError)`` 接不住，于是本该是 ``RuntimeError``
+# 的契约失败变成了裸异常。
+#
+# 参数 id 必须显式给出：``10**4301`` 超过 ``sys.get_int_max_str_digits()``，
+# pytest 自动生成 id 时调 ``str(val)`` 会自己抛 ``ValueError``。
+_BEYOND_DOUBLE_INTS = [
+    pytest.param(10**400, id="400digits"),
+    pytest.param(-(10**400), id="negative-400digits"),
+    pytest.param(10**4301, id="4301digits-over-int-max-str-digits"),
+]
+
+
+@pytest.mark.parametrize("score", _BEYOND_DOUBLE_INTS)
+def test_validate_rerank_output_rejects_scores_beyond_double_range(score):
+    """超出双精度范围的 score 必须报成 ``RuntimeError``，不是 ``OverflowError``。"""
+    with pytest.raises(RuntimeError, match="超出双精度范围"):
+        RetrievalService._validate_rerank_output([0], [score], document_count=2)
+
+
+# ── 向量存储接口缺失与 rerank 返回值形态的覆盖缺口 ──
+#
+# 下列判据在整套测试里从未执行（行覆盖 + 变异扫描双证；把它们的 ``raise`` 换成
+# ``pass`` 后全量 3725 条仍全绿）。删除后行为确实改变（实测，均经真实入口）：
+# * 742 ``_call_vector_store`` 的「store 未实现该接口」→ 裸
+#   ``TypeError: 'NoneType' object is not callable``（拿 ``None`` 当方法调），
+#   而调用方按 ``NotImplementedError`` 分类；
+# * 753 ``_legacy_search`` 的「store 既没有 asearch 也没有 search」→ 同样
+#   退化成裸 ``TypeError``；
+# * 1015 ``_validate_rerank_output`` 的「provider 返回不可迭代」→ 裸
+#   ``UnboundLocalError: normalized_indices``（变量未绑定）；
+# * 1045 同一函数的 ``float(score)`` 失败分支 → ``None`` 这类取值裸
+#   ``UnboundLocalError: normalized_score``。
+#
+# 既有的 ``test_validate_rerank_output_rejects_invalid_provider_results`` 覆盖
+# 的是 ``bool``／越界／重复 index 等**取值**判据，两条**形态**判据从未被反向覆盖。
+def test_call_vector_store_reports_missing_interface_readably():
+    """store 未实现该接口时必须抛 ``NotImplementedError``，不是裸 ``TypeError``。"""
+
+    class BareStore:
+        pass
+
+    service = object.__new__(RetrievalService)
+    service.vector_store = BareStore()
+
+    with pytest.raises(NotImplementedError, match="未实现 semantic_search 接口"):
+        asyncio.run(service._call_vector_store("semantic_search", None))
+
+
+def test_legacy_search_reports_missing_interface_readably():
+    """store 既无 asearch 也无 search 时必须抛 ``NotImplementedError``。"""
+
+    class BareStore:
+        pass
+
+    service = object.__new__(RetrievalService)
+    service.vector_store = BareStore()
+
+    with pytest.raises(NotImplementedError, match="未实现兼容 search 接口"):
+        asyncio.run(service._legacy_search("query", 1, "semantic"))
+
+
+def test_validate_rerank_output_rejects_non_iterable_result():
+    """provider 返回不可迭代的取值时必须抛 ``RuntimeError``，不是裸 ``UnboundLocalError``。"""
+    with pytest.raises(RuntimeError, match="必须是可迭代的索引和分数"):
+        RetrievalService._validate_rerank_output(5, 5, document_count=3)
+
+
+@pytest.mark.parametrize(
+    "bad_score",
+    [
+        pytest.param(None, id="none"),
+        pytest.param([0.5], id="list"),
+    ],
+)
+def test_validate_rerank_output_rejects_unconvertible_score(bad_score):
+    """``float(score)`` 转换失败的取值必须抛 ``RuntimeError``，不是裸 ``UnboundLocalError``。"""
+    with pytest.raises(RuntimeError, match="score 无效"):
+        RetrievalService._validate_rerank_output([0], [bad_score], document_count=3)
+
+
+class _CloseFailingService:
+    """检索成功但 ``aclose`` 抛错的服务替身。"""
+
+    def __init__(self, results=None, close_error=None):
+        self._results = results or []
+        self._close_error = close_error
+
+    async def retrieve(self, **_kwargs):
+        return list(self._results)
+
+    async def aclose(self):
+        if self._close_error is not None:
+            raise self._close_error
+
+
+def _aretrieve_with_service(monkeypatch, service):
+    """用替身服务跑一次 ``aretrieve_documents``，绕开真实 embedding/工厂。"""
+    monkeypatch.setattr("src.retrieval.retriever.RetrievalService", lambda **_kwargs: service)
+    monkeypatch.setattr("src.retrieval.retriever.EmbeddingService", lambda *_a, **_k: object())
+    return asyncio.run(
+        retriever.aretrieve_documents(
+            query="q",
+            vector_store=object(),
+            console=MagicMock(),
+            retrieval_method=RetrievalMethod.SEMANTIC_SEARCH,
+            top_k=3,
+            vector_weight=0.7,
+            keyword_weight=0.3,
+            rerank_enabled=False,
+            active_rerank_configuration="",
+            score_threshold=0.0,
+        )
+    )
+
+
+def test_aretrieve_returns_results_when_service_close_fails(monkeypatch, caplog):
+    """关闭失败不能顶替掉一次成功的检索结果。
+
+    ``finally`` 里裸 ``await aclose()`` 时，检索已返回的命中结果被丢弃，
+    调用方只看到与检索无关的关闭异常（实测返回 1 条命中的检索整体抛
+    ``RuntimeError: 关闭失败``）。契约与 ``retrieval_test.core`` 的
+    ``_aclose_quietly``、``Chatbot.close`` 一致：释放失败只记警告。
+    """
+    import logging
+
+    service = _CloseFailingService(
+        results=[{"page_content": "命中", "score": 0.9, "metadata": {}}],
+        close_error=RuntimeError("关闭失败"),
+    )
+    with caplog.at_level(logging.WARNING, logger="src.retrieval.retriever"):
+        results = _aretrieve_with_service(monkeypatch, service)
+    assert results == [{"page_content": "命中", "score": 0.9, "metadata": {}}]
+    assert "释放检索服务失败" in caplog.text
+
+
+def test_aretrieve_keeps_original_error_when_both_retrieve_and_close_fail(monkeypatch, caplog):
+    """检索与关闭都失败时，保留**原始**异常，不被关闭异常顶替。
+
+    ``finally`` 里的异常会替换掉 ``try`` 中正在上抛的那个——真正的失败原因
+    从栈上消失，排查时看到的是与检索无关的关闭错误。
+    """
+    import logging
+
+    service = _CloseFailingService(close_error=RuntimeError("关闭也失败"))
+
+    async def _retrieve(**_kwargs):
+        raise ValueError("检索本身失败")
+
+    service.retrieve = _retrieve
+    with (
+        caplog.at_level(logging.WARNING, logger="src.retrieval.retriever"),
+        pytest.raises(ValueError, match="检索本身失败"),
+    ):
+        _aretrieve_with_service(monkeypatch, service)
+    assert "释放检索服务失败" in caplog.text
+
+
+def test_aretrieve_close_failure_is_redacted_in_log(monkeypatch, caplog):
+    """关闭异常的日志必须脱敏——``aclose`` 的异常文本可能带凭证。"""
+    import logging
+
+    service = _CloseFailingService(
+        results=[],
+        close_error=RuntimeError("api_key=sk-abcdefghijklmnopqrstuvwxyz123456"),
+    )
+    with caplog.at_level(logging.WARNING, logger="src.retrieval.retriever"):
+        _aretrieve_with_service(monkeypatch, service)
+    assert "sk-abcdefghijklmnopqrstuvwxyz123456" not in caplog.text

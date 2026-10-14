@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from copy import deepcopy
 
 from rich.console import Console
@@ -19,6 +20,10 @@ from ..services.retrieval_service import (
     _merge_hybrid_results,
 )
 from ..utils.config import RetrievalMethod, get_settings
+from ..utils.log_manager import get_module_logger
+from ..utils.security import safe_exception_text
+
+logger = get_module_logger(__name__)
 
 __all__ = [
     "HybridReranker",
@@ -126,4 +131,21 @@ async def aretrieve_documents(
             query=query, session_config=session_config, console=console
         )
     finally:
-        await retrieval_service.aclose()
+        # 释放失败**不能**顶替主流程的结果或异常。``finally`` 里裸 ``await``
+        # 的收场是二选一，两种都丢信息：
+        #   * 检索成功、关闭失败 —— 那批命中结果被丢弃，调用方只看到与检索
+        #     无关的关闭异常（实测：返回 1 条命中的检索整体抛
+        #     ``RuntimeError: 关闭失败``）；
+        #   * 检索已抛异常、关闭也失败 —— 关闭异常**替换**掉原始异常，真正的
+        #     失败原因从栈上消失。
+        # 与仓库内既有的两处退出清理同一契约（``retrieval_test.core`` 的
+        # ``_aclose_quietly`` 与 ``Chatbot.close``）：失败只记警告，不打断
+        # 主流程。
+        close = getattr(retrieval_service, "aclose", None)
+        if callable(close):
+            try:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as exc:  # noqa: BLE001 - teardown must not mask the main flow
+                logger.warning("释放检索服务失败: %s", safe_exception_text(exc))

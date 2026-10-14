@@ -1,5 +1,6 @@
 import json
 import sys
+from dataclasses import replace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -163,10 +164,12 @@ def _write_snapshot(root, snapshot_id, provider, model):
         chunk_count=1,
     )
     (snapshot_dir / "manifest.toml").write_text(manifest.to_toml(), encoding="utf-8")
-    # 快照目录校验除了「文件齐全」还要求 chunks.pkl 与 embeddings.npy 的行数自洽
-    # （见 SnapshotRepository._validate_snapshot_row_counts），因此这里写最小但
-    # 可解析的内容：1 个分块 + 1 行向量。兼容性检测本身发生在 load_snapshot 之前，
-    # 这些内容不参与断言。
+    # 快照目录校验除了「文件齐全」还要求 chunks.pkl／parents.pkl 可解析、且
+    # chunks.pkl 与 embeddings.npy 的行数自洽（见
+    # SnapshotRepository._validate_snapshot_row_counts），因此这里写最小但**真实**
+    # 的内容：1 个分块 + 1 行向量 + 空父块映射。兼容性检测本身发生在 load_snapshot
+    # 之前，这些内容不参与断言；但占位字节构造出的快照本来就无法被加载，等于绕过
+    # 被测行为（``semantic.index`` 此前就是这么写的，已一并改为真实索引）。
     import pickle
 
     import numpy as np
@@ -174,8 +177,15 @@ def _write_snapshot(root, snapshot_id, provider, model):
     with (snapshot_dir / "chunks.pkl").open("wb") as file:
         pickle.dump([{"page_content": "占位分块", "metadata": {"source": "placeholder.md"}}], file)
     np.save(snapshot_dir / "embeddings.npy", np.zeros((1, 4), dtype=np.float32))
-    (snapshot_dir / "parents.pkl").write_bytes(b"")
-    (snapshot_dir / "semantic.index").write_bytes(b"")
+    with (snapshot_dir / "parents.pkl").open("wb") as file:
+        pickle.dump({}, file)
+    # 可解析的 FAISS 索引：占位字节会让真实加载路径（faiss.read_index）失败，
+    # 构造出的快照本来就不可能被加载。
+    import faiss
+
+    index = faiss.IndexFlatL2(4)
+    index.add(np.zeros((1, 4), dtype=np.float32))
+    faiss.write_index(index, str(snapshot_dir / "semantic.index"))
     (snapshot_dir / "stats.json").write_text(
         json.dumps({"chunk_count": 1}, ensure_ascii=False), encoding="utf-8"
     )
@@ -288,3 +298,216 @@ def test_legacy_import_cleans_temp_dir_on_failure(tmp_path):
     )
     assert (snapshot_root / "ACTIVE_SNAPSHOT").read_text(encoding="utf-8") == "previous"
     assert (previous / "keep.txt").read_text(encoding="utf-8") == "保留"
+
+
+# ── 回归：legacy 分支缺 embedding 配置时给出与活动快照分支同类的错误 ──
+
+
+def test_legacy_import_reports_missing_embedding_provider_readably(tmp_path):
+    """legacy 分支读不到活动 embedding 配置时，不能抛裸 ``KeyError``。
+
+    ``_load_existing_state`` 的两条分支都要按 ``default_embedding_provider``
+    去 ``embedding_configurations`` 里取 ``model_name``：活动快照分支显式判过
+    「键不在映射里」，给出带字段名与可选值指引的 ``ValueError``；legacy 分支
+    却直接下标取值。配置里把 provider 名打错（或漏写整段
+    ``embedding_configurations``）时，用户拿到的是裸 ``KeyError: 'local-hash-typo'``
+    —— 没有字段名、没有可选值，也不是调用方按 ``ValueError`` 建立的错误分类。
+    同一个「embedding 配置缺失」的错误，收场不该取决于磁盘上恰好有没有活动快照。
+    """
+    import pickle
+    from pathlib import Path
+
+    import numpy as np
+
+    from src.retrieval.vdb.factory import VectorStoreFactory as RealFactory
+    from src.runtime.contracts import build_run_config
+    from src.utils.config import get_settings
+
+    settings = get_settings()
+    snapshot_root = Path(settings.snapshot_root)
+    snapshot_root.mkdir(parents=True, exist_ok=True)
+
+    # 没有活动快照，但有 legacy pkl —— 走到 legacy 分支。
+    legacy_path = Path(settings.pkl_path)
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    with legacy_path.open("wb") as file:
+        pickle.dump(
+            {
+                "documents": [{"page_content": "旧数据", "metadata": {"source": "old.md"}}],
+                "embeddings": np.zeros((1, 4), dtype=np.float32),
+                "parent_documents": {},
+            },
+            file,
+        )
+
+    run_config = build_run_config(settings)
+    # 模拟「配置里把 provider 名打错」：活动 provider 不在映射里。
+    run_config = replace(run_config, default_embedding_provider="local-hash-typo")
+
+    # 走到 manifest 构造那一步之前不需要真实落盘：缺配置的错误早于
+    # ``validate_snapshot_dir``。用一个只满足 ``load``／``save_snapshot`` 契约的
+    # 替身，让失败点落在被考察的取值上。
+    class _StubStore:
+        def __init__(self):
+            self.documents: list = []
+
+        def load(self, path, *, trusted_paths=None):
+            return
+
+        def save_snapshot(self, snapshot_dir):
+            return
+
+    with pytest.raises(ValueError, match="embedding"):
+        RealFactory._load_existing_state(_StubStore(), run_config)
+
+
+def test_legacy_import_rejects_unusable_embedding_detail_readably(tmp_path):
+    """embedding 配置的**取值**不可用时，legacy 分支也要给 ``ValueError``。
+
+    「键在」不证明「值可用」：``{"local-hash": None}`` 的键确实存在，于是不会走
+    「缺少活动提供商」的分支，而紧接着读 ``.model_name`` 时抛裸
+    ``AttributeError``。同一形态在 ``EmbeddingService.embedding_model_detail``
+    早已收敛成带字段名与 key 的 ``ValueError``，两条路径必须同判据。
+    """
+    import pickle
+    from pathlib import Path
+
+    import numpy as np
+
+    from src.retrieval.vdb.factory import VectorStoreFactory as RealFactory
+    from src.runtime.contracts import build_run_config
+    from src.utils.config import get_settings
+
+    settings = get_settings()
+    snapshot_root = Path(settings.snapshot_root)
+    snapshot_root.mkdir(parents=True, exist_ok=True)
+
+    legacy_path = Path(settings.pkl_path)
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    with legacy_path.open("wb") as file:
+        pickle.dump(
+            {
+                "documents": [{"page_content": "旧数据", "metadata": {"source": "old.md"}}],
+                "embeddings": np.zeros((1, 4), dtype=np.float32),
+                "parent_documents": {},
+            },
+            file,
+        )
+
+    run_config = build_run_config(settings)
+    # 键在、取值不可用（None 没有 provider／model_name 属性）。
+    run_config = replace(
+        run_config,
+        embedding_configurations={settings.default_embedding_provider: None},
+    )
+
+    class _StubStore:
+        def __init__(self):
+            self.documents: list = []
+
+        def load(self, path, *, trusted_paths=None):
+            return
+
+        def save_snapshot(self, snapshot_dir):
+            return
+
+    with pytest.raises(ValueError, match="取值必须是提供"):
+        RealFactory._load_existing_state(_StubStore(), run_config)
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        pytest.param(5, id="int"),
+        pytest.param(["a"], id="list"),
+        pytest.param(10**4301, id="beyond-int-str-digits"),
+    ],
+)
+def test_legacy_import_rejects_non_path_legacy_pkl_path(tmp_path, bad_path):
+    """legacy 分支对非路径的 ``legacy_pkl_path`` 必须给 ``ValueError``。
+
+    ``_load_existing_state`` 第一件事就是 ``Path(run_config.legacy_pkl_path)``，而
+    ``RunConfig`` 是 frozen dataclass、字段没有校验器（同文件
+    ``_require_embedding_detail`` 的 docstring 已认领这条可达性）。非路径取值在那里
+    抛裸 ``TypeError: expected str, bytes or os.PathLike object, not ...``，位数超限
+    的整数抛 ``ValueError: Exceeds the limit``——两条都不在本类其余拒绝路径承诺的
+    带指引 ``ValueError`` 契约内，而调用方（``get_default_vector_store`` 在
+    ``Chatbot`` 初始化时调用）按它分类。
+    """
+    from src.retrieval.vdb.factory import VectorStoreFactory as RealFactory
+    from src.runtime.contracts import build_run_config
+    from src.utils.config import get_settings
+
+    settings = get_settings()
+    run_config = build_run_config(settings)
+    run_config = replace(run_config, legacy_pkl_path=bad_path)
+
+    class _StubStore:
+        def __init__(self):
+            self.documents: list = []
+
+        def load(self, path, *, trusted_paths=None):
+            return
+
+        def save_snapshot(self, snapshot_dir):
+            return
+
+    with pytest.raises(ValueError, match="legacy"):
+        RealFactory._load_existing_state(_StubStore(), run_config)
+
+
+def test_legacy_import_reports_original_error_when_cleanup_fails(tmp_path, monkeypatch, caplog):
+    """临时快照清理失败时，抛出的仍是**原始**失败原因，而不是清理异常。
+
+    删除吞掉后 ``cleanup_temp_snapshot_dir`` 的异常顶替原始失败——用户
+    看到的失败与实际根因不符（``vdb/factory`` 与 ``knowledge_build_service``
+    两处同判据）。
+    """
+    import logging
+    import pickle
+    from pathlib import Path
+
+    import src.retrieval.vdb.factory as vdb_factory
+
+    class FailingCleanupRepository:
+        def __init__(self, _config):
+            pass
+
+        def generate_snapshot_id(self, prefix="kb"):
+            return f"{prefix}-cleanup-fail"
+
+        def create_temp_snapshot_dir(self, snapshot_id):
+            path = tmp_path / f".tmp-{snapshot_id}"
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+
+        def cleanup_temp_snapshot_dir(self, snapshot_id):
+            raise RuntimeError("清理本身失败")
+
+        def get_active_snapshot_dir(self):
+            return None
+
+    class FailingStore:
+        def load(self, path, *, trusted_paths=None):
+            return None
+
+        def save_snapshot(self, snapshot_dir):
+            raise RuntimeError("保存失败")
+
+    from src.runtime.contracts import build_run_config
+    from src.utils.config import get_settings
+
+    settings = get_settings()
+    legacy_path = Path(settings.pkl_path)
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    with legacy_path.open("wb") as file:
+        pickle.dump({"documents": [], "embeddings": None}, file)
+    run_config = build_run_config(settings)
+    monkeypatch.setattr(vdb_factory, "SnapshotRepository", FailingCleanupRepository)
+
+    with (
+        caplog.at_level(logging.ERROR, logger="src.retrieval.vdb.factory"),
+        pytest.raises(RuntimeError, match="保存失败"),
+    ):
+        vdb_factory.VectorStoreFactory._load_existing_state(FailingStore(), run_config)
+    assert "清理临时知识快照失败" in caplog.text
