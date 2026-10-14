@@ -107,6 +107,8 @@ cp .env.example .env
 uv run main.py
 ```
 
+命令行支持 `-h` / `--help`（查看用法）与 `--smoke-test`（非交互自检）；界面配色自动适配终端亮色 / 暗色主题，可用 `PYRAG_LIGHT=1` / `PYRAG_DARK=1` 强制指定。
+
 3. 在主菜单中按需执行：
    - `1`：重建知识快照
    - `2`：执行召回测试

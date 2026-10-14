@@ -6,6 +6,8 @@
 
 当您按照 [快速上手](./getting-started.md) 指南成功运行 `uv run main.py` 后，程序会进入主菜单。
 
+命令行支持 `-h` / `--help`（查看用法）与 `--smoke-test`（非交互自检）；界面配色自动适配终端亮色 / 暗色主题，检测不符时可用 `PYRAG_LIGHT=1` 或 `PYRAG_DARK=1` 强制指定。
+
 您会看到类似以下的选项：
 
 ```
@@ -59,7 +61,7 @@ uv run python -m scripts.embed_knowledge_base --mode standard
     *   **Rerank重排**: 启用或禁用 Rerank 模型进行二次精排。
     *   **混合搜索权重**: 当使用“混合检索”时，调整向量和关键词搜索结果的权重。
 *   **切换模型**:
-    *   **语言模型 (LLM)**: 动态切换当前对话使用的聊天模型（例如，从 `google` 切换到 `openai`）。切换后，程序会自动重载模型。
+    *   **语言模型 (LLM)**: 动态切换当前对话使用的聊天模型（在 `config.toml` 中 `llm_configurations` 里定义的配置项之间切换，例如从 `gpt-5-6-sol` 切到 `deepseek-v4-flash`）。切换后，程序会自动重载模型；重载失败时自动回滚到原模型并提示。
     *   **重排模型 (Rerank)**: 切换用于精排的 Rerank 模型。
 *   **查看当前完整配置**: 显示所有当前生效的聊天和模型参数。
 
