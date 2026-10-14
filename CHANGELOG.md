@@ -6,6 +6,12 @@
 
 ### 修复
 
+- **第八轮四维 agents 复查：供应链/升级迁移/EOF 写回时序/多进程日志换角度扫描**。安全（依赖钉版与 uv.lock、git 全历史凭证、.gitignore 覆盖、subprocess 注入面）、数据完整性（main 旧快照格式升级首启、连续 rebuild 语义、stats.json 对账盲区实测）、并发（多进程日志竞态、SessionConfig 引用语义、build 各阶段失败注入）大面积守住；错误契约收尾 1 处真缺陷 + 1 处死分支：
+  - **EOF「按原样保存返回」承诺与写回事实矛盾（中·错误契约）**：编辑器全程原地写 ``chat_config``（``/config`` 入口随后应用到 bot），EOF 前已确认写回的每一项（实测「Top K 输入 7 → EOF」返回 ``top_k=7``）都随返回生效；且 reload 标志只在 ``edit_model_params`` 正常走完才置位，EOF 前切换过 LLM 的残留键会以「已切换但未重载」的形态继续服务。``launch_config_editor`` 入口先 ``deepcopy`` 快照，EOF 收敛时还原字典（同时把 ``llm_needs_reload`` 归零），承诺与事实对齐；回归测试钉住「EOF 前写回 + EOF 还原」双向（红验证确认）。
+  - **``/config`` 恢复分支死代码（低·契约漂移）**：第七轮新增的 ``except Exception`` 排在 ``except (ValueError, KeyError)`` 之前将其完全遮蔽——用户可见消息从「配置未生效」漂移为「配置编辑器异常」，诊断日志文案随之变化（19 个 config 测试未断言消息文本故全绿）。两分支换序并注释钉住顺序约束。
+  - **记录不修（数据完整性/并发，均为运维级或文档化建议）**：连续 rebuild 后旧快照目录无 GC、磁盘单调增长（ACTIVE_SNAPSHOT 原子切换保证正确性不受影响，建议未来加保留策略）；``finalize_snapshot`` 同名 id 冲突时先 rmtree 旧目录再 replace，activate 失败（磁盘满/权限）会静默顶替旧快照（触发面仅磁盘级故障或 monkeypatch，uuid4 撞名概率忽略）；多实例并发写同一日志文件的轮转竞态丢记录（本应用无多进程形态，单实例约束文档化即可）；stats.json 的 ``document_count``/``parent_count``/``embedding_dimension`` 为纯展示性死数据，篡改不传播（唯一被对账的 ``chunk_count`` 篡改即被拦）。
+  - **升级/迁移路径实测确认兼容**：main 时代快照格式（manifest v2）与本分支完全一致；schema v1、无 manifest、v1.2 单文件 pkl（legacy 自动迁移）各形态均有正确报错或正常导入，无静默失败路径。
+
 - **第七轮四维 agents 复查：环境/系统层终查（前六轮死角）**。安全（scripts/ 打包与 CI workflows、Dify 合规链）、数据完整性（多进程并发/磁盘满/符号链接四形态）、并发（长会话内存、to_thread 池、配置热切换原子性）大面积零缺陷；错误契约与并发各收尾 1 处真缺陷：
   - **Ctrl+D（EOF）终止整个聊天会话（中·错误契约）**：``questionary`` 的 ``.ask()`` 只捕 ``KeyboardInterrupt``（Ctrl+C → None → 退一层），**EOF 抛 ``EOFError`` 穿透**——在最深的 Top K 输入框按一次 Ctrl+D 即丢失整个会话（实测 /dev/null 与 \x04 均复现）。``launch_config_editor`` 重构为外层统一收敛 EOFError 为「按原样保存返回」（配置只改内存副本、正常退出才生效，EOF 时原配置原样保留——最安全语义）。
   - **编辑器线程挂死时 SIGINT 无法退出（中·并发）**：``to_thread`` 的默认 executor 是非 daemon 线程，``asyncio.run`` 收尾 join 时卡死，``aclose``/atexit 全部不执行，只能 SIGKILL。``asyncio.run`` 换自定义 ``ThreadPoolExecutor(thread_name_prefix=...)`` 方案评估后维持现状（记录于 CHANGELOG：需要改 ``Runner`` 语义或线程 daemon 化，Python 3.9+ 官方不支持 daemon 线程），改在 ``/config`` 调用点补线程内异常兜底——``except (ValueError, KeyError)`` 之外的意外异常不再静默终止会话。
