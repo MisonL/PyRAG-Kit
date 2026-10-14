@@ -371,6 +371,16 @@ def run_cli(argv: list[str] | None = None) -> int:
     import 期的失败由 ``get_settings`` 的边界负责（此处尚未执行）。
     """
     args = list(sys.argv[1:] if argv is None else argv)
+    if "-h" in args or "--help" in args:
+        # 交互式程序被静默吞参数的体验很差：新用户照惯例敲 ``--help`` 时
+        # 直接进了交互菜单（实测），只能 Ctrl+C 退出重来。给出简明用法
+        # 后退出，不初始化依赖（``--help`` 必须瞬时返回）。
+        console.print(markup_text("PyRAG-Kit {}", VERSION))
+        console.print("用法: python main.py [选项]")
+        console.print("  --smoke-test   非交互式启动自检（构建验证用）")
+        console.print("  -h, --help     显示本帮助并退出")
+        console.print("  无参数          进入交互式菜单（向量化 / 召回测试 / 聊天）")
+        return 0
     try:
         if "--smoke-test" in args:
             return run_smoke_test()
