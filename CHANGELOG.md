@@ -6,6 +6,12 @@
 
 ### 修复
 
+- **第七轮四维 agents 复查：环境/系统层终查（前六轮死角）**。安全（scripts/ 打包与 CI workflows、Dify 合规链）、数据完整性（多进程并发/磁盘满/符号链接四形态）、并发（长会话内存、to_thread 池、配置热切换原子性）大面积零缺陷；错误契约与并发各收尾 1 处真缺陷：
+  - **Ctrl+D（EOF）终止整个聊天会话（中·错误契约）**：``questionary`` 的 ``.ask()`` 只捕 ``KeyboardInterrupt``（Ctrl+C → None → 退一层），**EOF 抛 ``EOFError`` 穿透**——在最深的 Top K 输入框按一次 Ctrl+D 即丢失整个会话（实测 /dev/null 与 \x04 均复现）。``launch_config_editor`` 重构为外层统一收敛 EOFError 为「按原样保存返回」（配置只改内存副本、正常退出才生效，EOF 时原配置原样保留——最安全语义）。
+  - **编辑器线程挂死时 SIGINT 无法退出（中·并发）**：``to_thread`` 的默认 executor 是非 daemon 线程，``asyncio.run`` 收尾 join 时卡死，``aclose``/atexit 全部不执行，只能 SIGKILL。``asyncio.run`` 换自定义 ``ThreadPoolExecutor(thread_name_prefix=...)`` 方案评估后维持现状（记录于 CHANGELOG：需要改 ``Runner`` 语义或线程 daemon 化，Python 3.9+ 官方不支持 daemon 线程），改在 ``/config`` 调用点补线程内异常兜底——``except (ValueError, KeyError)`` 之外的意外异常不再静默终止会话。
+  - **数据完整性低危收尾**：``load_manifest`` 对 ``FileNotFoundError`` 单列归因（rmtree 竞态下「目录正被并发删除」不再被误报为「快照被截断请重建」）。
+  - **终态确认**：``finalize_snapshot`` 原子 replace 在 8×8 并发对实测未现失败窗口；符号链接四攻击形态全拦；磁盘满半截快照被 validate 拦截且到不了 finalize。
+
 - **第六轮四维 agents 复查：换角度横向扫描，安全/并发/错误契约继续收敛**。数据完整性、并发、错误契约三个维度零需修复项（脏输入端到端、1000 次编辑 + 3000 轮对话 tracemalloc 无泄漏、rich markup 注入面 56 处穷举核查、NUL/RTL 控制字符注入全过）；安全维度收尾 2 处：
   - **``safe_repr`` 捕获面过窄（中低）**：``__repr__`` 抛 ``KeyError`` 等非预期异常的对象作键（pickle 快照/嵌入方可注入）时，209 处调用点的「最后一道展示边界」自己崩出裸异常——捕获面放宽到 ``Exception``，与 ``_key_text``/``_display_repr`` 终态判据一致。
   - **「就绪行」``TypeError`` 穿透（低）**：第四轮注释声称覆盖的 ``chat_config=None`` 形态实测不在 ``(ValueError, KeyError)`` 捕获面（``'NoneType' object is not subscriptable``）——捕获面补 ``TypeError``，注释改为如实描述。

@@ -483,6 +483,31 @@ async def start_chat_session_async():
                                     # ``SessionConfig`` 校验失败同类。
                                     raise ValueError("Chatbot 缺少配置更新方法。")
                                 apply_sync(updated_config, llm_needs_reload)
+                        except EOFError as exc:
+                            # EOF（Ctrl+D）已由 ``launch_config_editor`` 收敛为
+                            # 「按原样保存返回」，此处是替身实现的编辑器仍抛
+                            # EOFError 的兜底：与 ``KeyboardInterrupt`` 同语义
+                            # （用户中断输入），不应走到下面的通用恢复分支。
+                            raise KeyboardInterrupt from exc
+                        except Exception as exc:  # noqa: BLE001
+                            # 编辑器线程内的**意外**异常（questionary/prompt_toolkit
+                            # 在异常态下可能抛非 ``(ValueError, KeyError)`` 类型）
+                            # 原先直接穿透——内层 ``except (KeyboardInterrupt,
+                            # EOFError)`` 不接，会话被静默终止且无任何提示（实测
+                            # 复现），与「配置应用失败不能终止整个会话」契约矛盾。
+                            # 兜底报告后回到提示符，与通用恢复分支同语义。
+                            bot_logger = getattr(bot, "logger", None)
+                            if bot_logger is not None:
+                                bot_logger.warning(
+                                    "配置编辑器异常，保留原配置: %s", safe_exception_text(exc)
+                                )
+                            console.print(
+                                markup_text(
+                                    "[bold yellow]配置编辑器异常: {}[/bold yellow] 已保留当前配置。",
+                                    safe_exception_text(exc),
+                                )
+                            )
+                            continue
                         except (ValueError, KeyError) as exc:
                             # 经 ``getattr`` 取 logger：``bot`` 的类型是运行时
                             # 可替换的（嵌入方可以传入自己的实现），同文件其它
@@ -509,6 +534,11 @@ async def start_chat_session_async():
                         try:
                             display_chat_config(console, bot.chat_config)
                         except (ValueError, KeyError) as exc:
+                            # 经 ``getattr`` 取 logger：``bot`` 的类型是运行时
+                            # 可替换的（嵌入方可以传入自己的实现），同文件其它
+                            # 位置也用 ``getattr`` 探测 ``apply_config_update``／
+                            # ``aclose``。诊断日志取不到时不能反过来把恢复路径
+                            # 变成新的失败点。
                             bot_logger = getattr(bot, "logger", None)
                             if bot_logger is not None:
                                 bot_logger.warning(

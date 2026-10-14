@@ -297,6 +297,15 @@ class SnapshotRepository:
         try:
             with (snapshot_dir / "manifest.toml").open("rb") as file:
                 data = tomllib.load(file)
+        except FileNotFoundError as exc:
+            # 与「文件存在但内容坏」分开归因：rmtree/replace 竞态（另一进程
+            # 正在删除）实测会把 FileNotFoundError 归成「写入或复制截断」，
+            # 用户会去重建一个好快照——文件**不存在**和文件**坏了**是两种故障。
+            raise ValueError(
+                "知识快照不完整：manifest.toml 不存在"
+                f"（目录: {snapshot_dir}）。目录可能正被并发构建或删除，"
+                "请稍后重试或重新构建知识快照。"
+            ) from exc
         except Exception as exc:
             raise ValueError(
                 f"知识快照不自洽：manifest.toml 无法解析（{type(exc).__name__}）。"

@@ -1019,3 +1019,75 @@ def test_menu_shows_unknown_for_invalid_fusion_strategy(monkeypatch):
     fusion_item = next(item for item in seen if "融合策略" in str(item))
     assert "未知" in str(fusion_item)
     assert "NONE" not in str(fusion_item)
+
+
+def test_editor_converges_eof_to_save_and_return(monkeypatch):
+    """Ctrl+D/EOF 在任意编辑器层收敛为「按原样保存返回」，不终止聊天会话。
+
+    ``questionary`` 的 ``.ask()`` 只捕 ``KeyboardInterrupt``（Ctrl+C → None →
+    退一层）；EOF 抛 ``EOFError`` 直接穿透——它经 ``asyncio.to_thread`` 到达
+    聊天主循环的 ``except (KeyboardInterrupt, EOFError): break``，在最深的
+    Top K 输入框按一次 Ctrl+D 就终止整个会话（实测复现）。
+    """
+    from src.ui import config_menu
+    from src.utils.config import RetrievalMethod
+
+    class EOFAsk:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def ask(self):
+            raise EOFError()
+
+    monkeypatch.setattr(config_menu.questionary, "select", EOFAsk)
+    monkeypatch.setattr(config_menu.questionary, "Separator", lambda *a, **k: object())
+
+    chat_config = {
+        "retrieval_method": RetrievalMethod.HYBRID_SEARCH,
+        "hybrid_fusion_strategy": "rrf",
+        "retrieval_candidate_multiplier": 3,
+        "top_k": 5,
+        "vector_weight": 0.5,
+        "keyword_weight": 0.5,
+        "rerank_enabled": False,
+        "active_llm_configuration": "old",
+        "llm_configurations": {"old": object()},
+    }
+
+    llm_needs_reload, returned = config_menu.launch_config_editor(chat_config)
+
+    assert llm_needs_reload is False
+    assert returned is chat_config  # 配置按原样返回（未生效任何改动）
+
+
+def test_editor_keeps_reload_flag_through_normal_exit(monkeypatch):
+    """正常退出路径的重载标记不受 EOF 收敛重构影响。"""
+
+    from src.ui import config_menu
+
+    # 第一次 select 返回「切换模型」（edit_model_params 被替换、返回 True），
+    # 第二次返回 exit 正常保存。
+    counter = {"n": 0}
+
+    class SequenceAsk:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def ask(self):
+            counter["n"] += 1
+            if counter["n"] == 1:
+                return "2. 切换模型"
+            return "exit"
+
+    monkeypatch.setattr(config_menu.questionary, "select", SequenceAsk)
+    monkeypatch.setattr(config_menu.questionary, "Separator", lambda *a, **k: object())
+    monkeypatch.setattr(config_menu, "edit_model_params", lambda _cfg: True)
+
+    chat_config = {
+        "active_llm_configuration": "old",
+        "llm_configurations": {"old": object()},
+    }
+    llm_needs_reload, returned = config_menu.launch_config_editor(chat_config)
+
+    assert llm_needs_reload is True
+    assert returned is chat_config

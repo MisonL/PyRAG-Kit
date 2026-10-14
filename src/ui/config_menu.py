@@ -491,8 +491,32 @@ def launch_config_editor(chat_config: dict[str, Any]) -> tuple[bool, dict[str, A
         Panel("进入配置模式...", title="[yellow]配置编辑器[/yellow]", border_style="yellow")
     )
 
-    llm_needs_reload = False
+    state = {"llm_needs_reload": False}
 
+    try:
+        _run_config_editor_loop(chat_config, state)
+    except EOFError:
+        # ``questionary`` 的 ``.ask()`` 只捕 ``KeyboardInterrupt``（Ctrl+C 返回
+        # ``None`` → 各层循环退一层）；**Ctrl+D/EOF 抛 ``EOFError`` 直接穿透**
+        # （实测 /dev/null 与 \x04 均复现）。它经 ``asyncio.to_thread`` 到达
+        # 聊天主循环的 ``except (KeyboardInterrupt, EOFError): break``——
+        # 在最深的 Top K 输入框按一次 Ctrl+D 会**终止整个聊天会话**，与
+        # Ctrl+C 的「退一层」语义不对称。配置只改内存副本、编辑器正常退出
+        # 才生效，EOF 中断时原配置原样保留，因此按「放弃编辑、保存返回」
+        # 收敛最安全。
+        console.print(markup_text("[yellow]输入已结束（EOF），配置编辑器按原样保存返回。[/yellow]"))
+        logger.info("配置编辑器因 EOF 提前退出，配置保持原样。")
+
+    return state["llm_needs_reload"], chat_config
+
+
+def _run_config_editor_loop(chat_config: dict[str, Any], state: dict[str, bool]) -> None:
+    """配置编辑器主循环（``launch_config_editor`` 的主体）。
+
+    独立成函数是为了让 ``launch_config_editor`` 在外层统一收敛 ``EOFError``：
+    各层 ``while True`` 只判 ``choice is None``（Ctrl+C 语义），EOF 从任何一层
+    的 ``.ask()`` 抛出都会沿调用栈到达这里。
+    """
     while True:
         choice = questionary.select(
             "主菜单: 请选择要执行的操作",
@@ -525,12 +549,11 @@ def launch_config_editor(chat_config: dict[str, Any]) -> tuple[bool, dict[str, A
             logger.debug("用户选择切换模型。")
             # 如果LLM发生变化，标记需要重载
             if edit_model_params(chat_config):
-                llm_needs_reload = True
+                state["llm_needs_reload"] = True
         elif "3." in choice:
             logger.debug("用户选择查看当前完整配置。")
             display_chat_config(console, chat_config)
             questionary.press_any_key_to_continue("按任意键返回主菜单...").ask()
             logger.debug("用户已查看配置并返回。")
 
-    logger.info(f"配置编辑器完成，LLM需要重载: {llm_needs_reload}")
-    return llm_needs_reload, chat_config
+    logger.info(f"配置编辑器完成，LLM需要重载: {state['llm_needs_reload']}")
