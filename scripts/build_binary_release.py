@@ -370,9 +370,17 @@ def validate_bundle(bundle_root: Path) -> None:
         cwd=bundle_root,
         text=True,
         capture_output=True,
-        check=True,
+        check=False,
         timeout=30,
     )
+    if result.returncode != 0:
+        # ``check=True`` 抛出的 ``CalledProcessError`` 不携带子进程输出——
+        # Windows exe 自检 exit 1 时（v1.5.0 首次发版实测）日志里只有一行
+        # 退出码，真实故障原因完全不可见。这里把 stdout/stderr 原样带出来。
+        raise RuntimeError(
+            f"发布包自检失败（退出码 {result.returncode}）。\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
     if "smoke test ok" not in result.stdout:
         raise RuntimeError("发布包自检输出不符合预期。")
 
