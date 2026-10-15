@@ -1051,207 +1051,118 @@
 
 ## [1.4.0] - 2026-09-20
 
-### Provider 与协议
+> 本版本围绕 Provider 体系重构展开：统一四类线协议与原生资源入口，补齐凭证校验与日志脱敏防线，收紧失败语义，并移除 Dify 上游子模块、刷新全部渠道配置示例。
 
-- 建立统一 Provider 工厂与抽象请求模型，补齐 LLM、Embedding、Rerank 的能力声明、配置校验、缓存与同步/异步生命周期管理。
-- 新增 `complete()`/`acomplete()` 高级调用入口，统一支持多轮消息、工具调用、结构化输出、多模态内容、usage 与结束原因；`invoke()`/`ainvoke()` 保留文本流兼容行为。
-- 修复多轮工具调用的历史归一化：共享的 `normalize_messages` 不再强制要求工具调用带 `id`，因为 Gemini 的 `FunctionCall.id` 是可选字段且 SDK 默认 `None`，否则把上一轮工具调用回填给 Google 会在请求发出前被本地拒绝；需要 `id` 的 Chat Completions 与 Responses 改为显式校验。同一处还修复了 `input` 参数别名被静默清空，以及 `function_call`/`custom_tool_call` 类型未映射为 `function` 的问题。
-- 支持 Chat Completions、Responses、Google Generate Content 和 Anthropic Messages 四类线协议；OpenAI 兼容渠道与 Ark 可通过 `protocol = "responses"` 选择 Responses，Ark 的 `ark` 取值是 Chat Completions 的别名。
-- Responses 对非官方端点要求 `options.server_verified_protocols = ["responses"]` 显式登记；未登记时工厂、Provider 和资源 Facade 均在请求前拒绝，避免把本地 SDK 资源误发到未实现 `/responses` 的服务端。
-- Ark Responses 在构造阶段拒绝 `instructions` 与 `caching={"type": "enabled"}` 同时出现：官方规定配置 `instructions` 后本轮请求无法写入或使用缓存，`caching` 为 `enabled` 时服务端直接报错，而 SDK 不做本地校验。错误信息会指出 `instructions` 来自 `system_prompt` 的兼容默认值，并给出改走 `messages` 的修复方式。
-- 新增原生资源 Facade，显式暴露文件、批处理、缓存、向量库、token 计数、调优等 SDK 能力，不再把资源生命周期混入普通聊天请求。
-- 深度适配 Google GenAI、Anthropic、Volcengine Ark、Jina 与 SiliconFlow Rerank；OpenAI 兼容渠道复用 `openai` SDK，Jina 与 SiliconFlow Rerank 使用 HTTP JSON。
-- 收紧动态资源树的能力门禁：此前按路径分段判断时只认复数 `responses`，而 `input_items`（实际请求 `/responses/{id}/input_items`）不含该分段，在未登记 `server_verified_protocols` 的渠道上也能把请求发到远端；同时动态路径只做能力检查、不执行 Facade 的参数校验，可带着互斥参数直接发出。现在两条路径共用同一套校验，`extra_body` 里的 `instructions`/`caching` 同样参与互斥检查。
-- 顶层 Responses item 形态（`{"type": "input_audio", ...}`）补齐变体校验：此前只在缺少 `content` 键时检查，加一个无关的 `content` 键即可改走消息分支绕过全部校验；现在按 `type` 分流并复用同一套内容块实现。
-- 修复 Responses 流式工具调用的 `id` 语义：`id` 此前在 delta 事件取输出项 ID、在 done 事件取调用 ID、合并时又互相覆盖，同一轮工具调用在 delta 与 completed 事件里得到不同的值，调用方按 `tool_call["id"]` 回填 `role=tool` 时会配不上。现在与非流式路径统一取调用标识符。
-- 放宽 Ark Responses 的失败判定：内置工具调用项（`web_search_call`、`mcp_call`、`mcp_list_tools`、`image_process`、`agent_tool_call` 等）都是 SDK 输出项联合的正式成员，且都是需要后续轮次的中间态，此前被误判为「响应结构与预期不符」而无法处理。空摘要的 `reasoning` 不在豁免之列——它不是工具调用，豁免会让「completed 但什么都没有」静默返回空成功。
-- 动态资源路径的能力门禁补齐：兼容渠道的路径映射此前只覆盖 responses/files，其余资源树（batches、vector_stores、images 等）拿到空能力直接放行，而显式 Facade 名会被拦；Ark 的动态路径按动词白名单决定是否做参数校验，漏掉 `async_create` 这类写法。两者都改为按资源分段与参数内容判断。判断依据用「参数里是否出现受校验字段」而不是动词，`extra_body` 不在此列——它是 retrieve/delete/list 的合法参数，放进触发集会把只读操作误判为创建请求、要求提供 `model` 与 `input`，使 Facade 可用而动态路径不可用。
-- 资源代理不再经私有名转发到底层 SDK：`proxy.__dict__["_client"]` 此前能拿到未包装的原始客户端，绕开全部凭证扫描与能力门禁；`dir()` 也把这些通路提示给使用者。出口只保留文档化的 `.native`。
-- 修正动态资源路径的能力映射与官方声明集不一致：SDK 客户端的属性是复数 `moderations`，段映射只写单数会让 `resources.moderations.create` 拿到空能力直接放行，而 `create_moderation` 会被拦；同时段映射列出了 `skills`/`realtime`/`webhooks`/`admin`/`content_provenance_checks` 五项官方声明集之外的能力名，把官方端点从放行变成显式报错——而这些资源在 `capabilities` 里声明为可用。段映射现在限定在声明集内。
-- Google 的实验性资源门禁此前只认显式 Facade 名：动态路径是点分形式（`google.interactions.create`），资源名是独立分段，按前缀匹配全部落空、直接放行——用户拿一个不含该资源的客户端走 `resources.interactions` 就能绕开。改为同时按路径分段匹配。
-- Embedding 区分文档与查询任务类型：Google 使用 `RETRIEVAL_DOCUMENT` 与 `RETRIEVAL_QUERY`。
+### 新增功能
 
-### 安全
+- 建立统一 Provider 工厂与抽象请求模型：LLM、Embedding、Rerank 均具备能力声明、配置校验、缓存与同步/异步生命周期管理
+- 新增 `complete()`/`acomplete()` 高级调用入口，统一支持多轮消息、工具调用、结构化输出、多模态内容、usage 与结束原因；`invoke()`/`ainvoke()` 保留文本流兼容行为
+- 支持 Chat Completions、Responses、Google Generate Content、Anthropic Messages 四类线协议；OpenAI 兼容渠道与 Ark 可通过 `protocol = "responses"` 选择 Responses
+- 新增原生资源 Facade，显式暴露文件、批处理、缓存、向量库、token 计数、调优等 SDK 能力，不再把资源生命周期混入普通聊天请求
+- 深度适配 Google GenAI、Anthropic、Volcengine Ark、Jina 与 SiliconFlow Rerank；OpenAI 兼容渠道复用 `openai` SDK，Jina 与 SiliconFlow Rerank 使用 HTTP JSON
+- Embedding 区分文档与查询任务类型（Google 使用 `RETRIEVAL_DOCUMENT` 与 `RETRIEVAL_QUERY`）
+- 新增配置、请求与日志三处边界的凭证校验：模型级 `options` 与请求级扩展不得携带密钥、请求头、query 或 Base URL 覆盖，资源 Facade 的参数同样受检
+- 引入 Ruff、Bandit、MyPy 与 `.github/workflows/quality.yml`：PR 与 main 推送自动执行格式化检查、lint、类型检查、安全扫描与全量测试
+- 发布脚本新增目标环境校验：`--target` 与主机系统/架构不匹配时在清理构建产物前显式失败，不再生成错误架构的发布包
 
-- 新增配置、请求与日志边界的凭证校验：模型级 `options` 与请求级扩展不得携带密钥、请求头、query 或 Base URL 覆盖，资源 Facade 的关键字与位置参数同样受检。
-- 凭证键识别补齐火山引擎的 `ak`/`sk` 与 Azure 存储的 `account_key`；此前这些键可绕过请求覆盖校验，而 `api_key` 会被拒绝。
-- 日志与错误信息统一脱敏常见凭证表示（Bearer、API key、URL userinfo 与 query）；补齐 `ak=`/`sk=`/`account_key=` 形式，以及服务端错误里「首尾可见、中间掩码」的凭证形态（如 `sk-abc***...***xyz`，此前会原样落进日志）。
-- 修复脱敏日志 formatter 的缓存泄漏：`logging.Formatter` 会把格式化后的 traceback 缓存在 `record.exc_text` 上供后续 handler 复用，先格式化后脱敏会让同一 logger 上的非脱敏 handler 输出原始凭证；现在脱敏结果会写回缓存。
-- 文本脱敏的键名识别与配置边界对齐：此前词表更窄，且键名前要求非字母数字字符，`dbPassword`、`myApiKey` 这类驼峰键在配置边界被拒绝、在日志里却明文输出。同时给值加上形态约束，避免 `auth: none`、`cookie: enabled` 这类普通文本被误判为凭证而让合法 options 在边界被拒。
-- 词边界改用「非 ASCII 字母数字」而非 `\b`：中文属 `\w`，`\b` 在 `密钥sk-...` 两侧都不成立，国产网关（SiliconFlow、Ark、DashScope）的中文错误消息此前会让密钥整串落进终端与日志。
-- 键名识别改用「非字母数字或 camelCase 边界」：既让 `dbPassword`、`myApiKey` 这类驼峰键脱敏，又不把 `topsecret`、`sessiontoken` 从词中间切开（配置边界按 camelCase 切词判它们非敏感，切开会导致合法配置被误拒）。排除误判源改用非凭证字面量枚举，而不是值的长度/字符构成——后者会把 `password: FakePwOnly` 这类短纯字母凭证一并放过。
-- 修复掩码规则的二次回溯：尾部前瞻逐字符重复扫描剩余串，在尾部无冒号时退化成 O(n²)（4000 字符的掩码密钥前缀加长 token 耗时 1.4 秒）。该函数挂在每条日志的 formatter 上，一个回显错误体的网关响应即可拖住进程。
-- 掩码规则不再吞掉键值对的键名后留下孤儿值：`sk-abc***xxxtoken=<secret>` 里的键名不是敏感键（按 camelCase 切词判非敏感），键值规则不会接手，而掩码又已把键名吃掉，值失去锚点后明文落进日志。现在掩码匹配把键值尾部一并纳入，只保留键名作为可读上下文。
-- 文本脱敏的键名判定改为调用 `is_sensitive_option_key`，与配置边界共用同一个函数：此前文本侧用正则的字符断言去逼近切词逻辑，`passwordHash`、`tokenCount`、`cookieJar` 这类「凭证词 + 另一个词」的键两个方向都不一致——真凭证在日志里明文输出，而键名相同的合法配置值又在边界被误拒。一致性现在由构造保证，不再依赖两条独立实现碰巧对齐。
-- 短凭证键（`ak`/`sk`）的值补上非凭证字面量排除：这两个键在配置里常作开关（`sk: off`），与裸关键词（`auth: none`）是同一类误判源，此前只给裸关键词加了约束。
-- 脱敏替换不再改写分隔符：此前把 `key: value` 归一化成 `key=value`，会篡改被脱敏文本的结构（JSON 片段因此变成非法 JSON）。现在保留原文的 `:`/`=` 与引号。
-- 基类 `_require_provider_resource` 的 `kwargs` 契约写明当前实现状态：只有 Volcengine 在 Facade 上做参数校验、因而需要 `kwargs`，其余 Provider 忽略它与契约一致；同时注明凭证边界不依赖本钩子，代理层在调用门禁前已统一校验。
-- 修复替换函数里的二次回溯：尾部游程查找用无锚点的 `re.search(r"[A-Za-z0-9_-]+$")`，在每个起点重试 `+$`；尾部以 `.` 这类掩码占位符收尾时游程够不到 `$`，退化成 O(n²)（32010 字符 9.6 秒，4010 字符 86ms）。仓库原有线性测试的用例恰好无尾随字符，所以只跑 1.2ms 就通过、没能拦住。改为单遍扫描，并给该测试补上以掩码占位符收尾的形态。
-- 非凭证字面量枚举改为大小写不敏感：`auth: None`、`token: Null`、`cookie: Enabled` 此前不被识别为状态字面量而判成凭证，`find_sensitive_option_paths` 据此把合法配置在边界误拒。
-- 文本脱敏的界断言补齐第三条驼峰分支：`is_sensitive_option_key` 的切词含「大写串接小写词」，文本侧只实现了「非字母数字」与「小写接大写」两条，`HTTPBearer`/`HTTPSSecret` 这类首字母缩写键在配置边界判敏感、在日志里却明文输出。
-- 配置校验失败不再把凭证交给解释器默认 handler：`Settings()` 在 import 期就被调用（`log_manager.get_module_logger`），早于任何入口的 `try`，pydantic 默认渲染会把 `input_value` 明文打印。现在在 `get_settings` 边界重抛已脱敏的消息，并给 `run_cli` 补上覆盖整个启动阶段的异常边界。
-- 兼容渠道不再被当作官方 OpenAI 端点放行 SDK 专属资源；仅精确匹配 `https://api.openai.com/v1` 时按 SDK 契约放行。
-- 收紧失败语义：凭证、SDK 或远端调用失败时显式报错，不再以空 embedding、零分 rerank 或占位回答掩盖失败。
+### 优化改进
 
-### 移除与调整
+- Responses 对非官方端点要求 `options.server_verified_protocols = ["responses"]` 显式登记，未登记时工厂、Provider 与 Facade 均在请求前拒绝，避免把本地 SDK 资源误发到未实现 `/responses` 的服务端
+- 动态资源路径与显式 Facade 共用同一套能力门禁与参数校验，`extra_body` 内的字段同样参与互斥检查；能力映射限定在官方声明集内，资源代理出口只保留文档化的 `.native`
+- 日志与错误信息统一脱敏常见凭证表示（Bearer、API key、URL userinfo 与 query），覆盖中文语境、驼峰键名与「首尾可见、中间掩码」的服务端凭证形态
+- 兼容渠道仅在精确匹配 `https://api.openai.com/v1` 时按官方 SDK 契约放行专属资源
+- 收紧失败语义：凭证、SDK 或远端调用失败时显式报错，不再以空 embedding、零分 rerank 或占位回答掩盖失败
+- 数值配置补齐加载期校验：上下界、布尔混入拒绝（pydantic lax 强转曾让全部 `isinstance(value, bool)` guard 不可达）、跨字段约束（overlap < size、子分片严格小于父分片、混合检索权重不同时为 0）
+- `SessionConfig` 补齐与 `Settings` 同级的字段校验，UI 与库调用方的写入路径不再放行非法值
+- 移除 Dify 上游子模块；`src/etl/`、`src/retrieval/` 等移植代码继续遵守 `DIFY_LICENSE` 并保留上游版权声明
+- 清理死代码与重复实现：`field()` 统一复用、Volcengine helper 委托到 `openai_compatible`、删除零调用兼容层与孤儿文件，移除未使用的 `langchain` 依赖
+- 全仓库应用 `ruff format`（行宽 100、双引号、4 空格），统一此前混用的单引号、行尾空白与手工对齐
+- 核对各渠道官方现状并刷新配置示例与内置默认模型（Google/OpenAI/Anthropic/DeepSeek/火山/Qwen/SiliconFlow/Grok/Ollama 全部对齐在售列表，清理已退役与不存在的模型 ID）
+- 更新 `README.md`、`AGENTS.md`、`docs/` 与 `.env.example`，同步协议选择、`options` 边界、原生资源入口与配置覆盖口径
+- 新增 Provider 协议适配、SDK 能力、凭证边界、Rerank 契约、快照兼容性、流式重试与失败语义等回归测试；测试总数增至 1262，新增断言均经红/绿或定向变异验证，并修复数处恒真断言与无断言用例
 
-- 移除 Dify 上游子模块；`src/etl/`、`src/retrieval/` 等移植代码继续遵守 `DIFY_LICENSE` 并保留上游版权声明。
-- 清理死代码：移除 `has_system_message`、`_configured_extra_body_keys`、`SnapshotRepository.write_stats`/`load_stats`/`load_active_manifest`，以及 `recursive_text_splitter` 中未被引用的 `DEFAULT_CHILD_CHUNK_*` 常量。这些逻辑均已在调用点内联或由框架通过装饰器调用，保留会造成同一行为的两处实现。
-- 移除 iFlow 渠道及其配置示例。
-- 移除 qwen rerank 配置示例；该渠道不提供 rerank 能力，调用时会显式报错。
-- 发布脚本新增目标环境校验，`--target` 与主机系统/架构不匹配时在清理构建产物前显式失败，不再生成错误架构的发布包。
-- Qwen Base URL 改为 OpenAI 兼容接口 `https://dashscope.aliyuncs.com/compatible-mode/v1`；Volcengine Base URL 改为 Ark API `https://ark.cn-beijing.volces.com/api/v3`。配置仍为旧值时会在加载时给出显式升级警告：DashScope 原生 `api/v1` 不提供本仓库请求的 `{base_url}/chat/completions` 路径，火山旧域名 `maas-api.ml-platform-cn-beijing.volces.com` 则已停止服务。百炼的 `/responses` 只挂在业务空间专属域名下，默认共享域名不可用，文档已补充说明。
-- Jina Rerank 与 SiliconFlow Rerank 一致，`return_documents` 固定为 `True` 且不允许被 `options` 覆盖。
+### Bug 修复
 
-### 测试与文档
+- 修复多轮工具调用的历史归一化：Gemini 的 `FunctionCall.id` 为可选字段，不再强制要求工具调用带 `id`（否则回填给 Google 在请求前被本地拒绝）；同时修复 `input` 参数别名被静默清空与 `function_call` 类型未映射
+- 修复 Responses 流式工具调用 `id` 在 delta 与 completed 事件中取值不一致，统一为调用标识符，调用方回填 `role=tool` 不再配不上
+- 修复 Ark Responses 构造期 `instructions` 与 `caching=enabled` 互斥未校验（服务端直接报错），错误信息指出默认值来源并给出修复方式
+- 修复 Ark 内置工具调用项（`web_search_call`、`mcp_call` 等）被误判为「响应结构与预期不符」而无法处理；空 `reasoning` 不在豁免之列，不再静默返回空成功
+- 修复脱敏的多处缺陷：日志 formatter 缓存泄漏致非脱敏 handler 输出原始凭证、掩码规则平方级回溯（4000 字符耗时 1.4 秒，可被一个回显错误体的响应拖住进程）、掩码吞掉键名后孤儿值明文落日志、文本侧与配置侧键名判定不一致、中文边界 `\b` 失效、驼峰键与短键（`ak`/`sk`）误判双向修齐
+- 修复配置校验失败时凭证明文打印：`Settings()` 异常改为脱敏消息重抛，`run_cli` 补齐覆盖整个启动阶段的异常边界
+- 修复 Responses `json_schema` 缺 `schema` 时伪造约束静默发送，调用方以为拿到了结构化输出而实际没有；`strict` 不再覆盖调用方取值
+- 修复 Google `tool_choice` 静默接受未知模式（枚举合成同名成员发往服务端），改为显式映射，未知值报错并给出可选值
+- 修复 Anthropic 响应解析在 `thinking` 块为 `None` 时崩溃；采样字段弃用识别不再限定 `opus`/`sonnet`/`haiku` 家族名，新命名模型不再被透传 SDK 已移除的参数
+- 修复 Ark Chat Completions 工具调用缺 `type` 键，与 OpenAI 兼容侧契约对齐
+- 修复检索规模上界缺失：`chat_top_k=10**9` 单次查询分配约 3.6 GB 数组并挂起 8.4 秒，现限制 `chat_top_k ≤ 10000`、`retrieval_candidate_multiplier ≤ 100`
+- 修复分片在「分隔符耗尽」时整篇文档变成一个块（默认配置下任何不含 `###` 的文档全中），以及分片开头标点被永久删除、句号开头的输入产出 0 块
+- 修复混合检索权重同时为 0 时结果被全部丢弃且无任何报错；关键词检索 0 分文档截断正分结果与 BM25 空语料 `ZeroDivisionError`
+- 修复向量写入侧拒绝 NaN/inf 而载入侧放行的分叉：坏向量不再能落盘并通过校验，载入后静默产出错误检索结果；快照完整性校验补上 chunks/embeddings/stats 行数自洽
+- 修复退出钩子对 `cache_path` 的无条件删除：配置写错一个值即可删掉任意目录（实测 `/`、`~`、`/etc` 全被接受），现拒绝文件系统根目录、家目录与常见系统目录
+- 修复快照 pickle 加载无来源边界：新增 `resolve_within()`/`ensure_trusted_source()`（符号链接逃逸拦截）与 `ACTIVE_SNAPSHOT` 指针校验；manifest 增加 schema 版本准入，未知版本不再被静默按当前代码解释
+- 修复 legacy 导入失败后的临时目录残留与 `FileNotFoundError` 归因；无快照时不再打印虚假的「知识快照加载成功」
+- 修复 Excel 召回日志相对路径与文本日志分叉、发布包 ZIP 分支悬空符号链接裸崩溃、`.env.example` 默认渠道环境变量覆盖 TOML 配置、`capability_report` 与 `protocol_status` 角色语义不一致等
+- 修复三处测试有效性缺陷（恒真断言、零区分度取值、单次采样阈值间歇误报）；pytest 警告过滤收紧为按第三方模块限定，不再全局静音
 
-- 新增 Provider 协议适配、SDK 能力、凭证边界、Rerank 契约与失败语义回归测试；测试总数增至 1262。新增断言经红绿验证（回退对应源码后测试变红）；其中一部分是**反向守卫**——回退源码不会变红，需要定向变异（例如「让守卫连 Ark 一起拒」）才能验证，这类断言守的是「不能过度收紧」，同样有区分度。
-- 修复三处测试有效性缺陷：掩码尾部可见片段的断言用 `startswith("[REDACTED]")`，而掩码前缀在任何实现下都会被替换成 `[REDACTED]`，该断言恒真——尾部片段原样泄漏时也能通过，改为全文相等；短纯字母凭证的 7 个用例里有 4 个取值 ≥12 字符，旧规则本就能命中、对被测属性零区分度，改为真正短于 12 字符的值并断言值本身被替换；掩码线性度用例用单次采样配 100ms 阈值，实测本机 p99.9 即到 100ms、满载时更高，会间歇误报，改为放大规模到线性与二次相差三个数量级、取多轮最小值。
-- 为活动快照的 embedding 兼容性检测补充回归测试：快照记录的 embedding provider 或模型名与当前运行配置不一致时必须显式失败，避免用错向量空间后静默产出错误检索结果。
-- 引入 Ruff、Bandit 与 MyPy 到开发依赖，并补齐对应配置；新增 `.github/workflows/quality.yml`，在 PR 与 `main` 推送时执行格式化检查、lint、类型检查、安全扫描与完整测试，此前这些工具只在本地手动运行。
-- 全仓库应用 `ruff format`（行宽 100、双引号、4 空格），此前未配置 formatter，`main.py`、`src/`、`scripts/`、`tests/` 中存在混用单引号、行尾空白和手工对齐等不一致；格式化只改表示不改语义，已用 AST 比对确认语法树等价，`AGENTS.md` 的质量检查与风格段落同步更新。
-- 更新 `README.md`、`AGENTS.md` 与 `docs/`，同步协议选择、`options` 边界、原生资源入口和 Vertex ADC 配置口径。
-- 核对各渠道官方现状并刷新配置示例：Google Embedding 改用 `gemini-embedding-2`（`text-embedding-004` 已于 2026-01-14 退役），OpenAI 改用 `gpt-5.6-*`（`gpt-3.5-turbo` 于 2026-10-23 退役），Anthropic 改用 `claude-sonnet-4-6`（`claude-3-5-sonnet-20240620` 已于 2025-10-28 退役），DeepSeek 改用 `deepseek-v4-pro`/`deepseek-v4-flash`（`deepseek-chat` 已于 2026-07-24 退役），火山改用 `doubao-seed-2-0-lite-260428` 与 `doubao-embedding-text-240715`（`doubao-pro-32k`、`bge-large-zh` 已不在方舟模型列表），Qwen 改用 `qwen3.8-max`/`qwen3.7-plus`，SiliconFlow 改用 `Qwen/Qwen3.5-27B`/`deepseek-ai/DeepSeek-V3.2`（复核发现 `Qwen/Qwen3-8B` 已不在该平台在售列表，其 Qwen 对话模型现从 Qwen3.5-27B 起步），Grok 改用 `grok-4.6`（`llama3-70b-8192` 实为 Groq 的 ID，不属于 xAI），Ollama 改用 `llama3.1`/`gemma3`。示例配置的键名同步改为与模型一致，模型内置默认值一并更新；内置 embedding 与 rerank 兜底值此前含无效 ID（Google 的裸名 `embedding-001`、SiliconFlow 不存在的 `alibaba/` 命名空间与已下线的 `bge-reranker-large`、Ollama 的 `llama3`），现分别改为 `gemini-embedding-2`、`BAAI/bge-large-zh-v1.5`、`BAAI/bge-reranker-v2-m3` 与 `llama3.1`。
-- 需要重建知识库快照：`gemini-embedding-2` 与 `text-embedding-004` 的向量空间不兼容，旧 FAISS 索引不能复用。火山的 `doubao-embedding-text-240715` 已于 2025-12-26 停止新购（EOM），且已不在方舟「向量化能力」模型列表中；官方下线公告给出的迁移目标是 `doubao-embedding-vision-251215`，该模型同时接受纯文本输入，但它按 `/api/v3/embeddings/multimodal` 提供，与本项目使用的文本 `embeddings.create` 路径不同，迁移前需实测。embedding 模型只有 EOM 阶段、不涉及 EOS，存量接入点不受影响，因此示例配置暂未改动该值。
-- 修复 Anthropic 采样字段弃用识别：家族名不再限定 `opus`/`sonnet`/`haiku`，覆盖 5 代新增的 `claude-fable-5`、`claude-mythos-5` 等命名；此前这些模型会被透传 `temperature`/`top_p`/`top_k`，而 Python SDK v1.0+ 已移除这些参数，请求会直接失败。
+### 升级说明
 
-### 审查修复
-
-- **补回 `GoogleProvider.embed_query`／`aembed_query` 丢失的空结果兜底**：基类 `TextEmbeddingModel.embed_query` 先判 `if not vectors` 再取 `[0]`，空结果得到带指引的 `ValueError("Embedding provider 返回空结果。")`；`GoogleProvider` 为设 `task_type` 覆写了这两个方法，却把那条兜底一并丢掉，直接下标取 `[0]`——provider 返回空列表时抛裸 `IndexError: list index out of range`。空返回不是假想输入：`embed_documents` 的条数校验按 `len(texts)` 做，传空 `texts` 时 `len(values) == len(texts) == 0` 成立、方法正常返回 `[]`；网关截断响应或返回空 `embeddings` 字段也走到同一形态。`IndexError` 不是 `ValueError`／`RuntimeError`，会穿透调用方按这两类做的错误分类与日志脱敏，消息也与「provider 返回了什么」毫无关系。现按基类逐字对齐补回，`task_type` 覆写的理由保持不变。
-- **补齐父块索引写入侧的顶层形态守卫**：`register_parent_documents` 直接写 `for ... in parent_documents.items()`，非映射传进来时抛裸 `AttributeError: 'int' object has no attribute 'items'`；而载入侧的 `_normalize_documents` 对同一形态给的是带指引的 `ValueError: 知识快照不自洽：父块索引的顶层不是映射（int）…`。两者都是 `VectorStoreBase` 的公开契约方法，而 `_normalize_documents` 的注释本就写明「直接调它们的嵌入方不经过那道校验」——同一取舍只在一侧执行了。本仓自带流程到不了写入侧这条分支（`knowledge_build_service` 传的是 `dict`，且前面已用 `isinstance(..., dict)` 过滤），因此这是一致性修复而非崩溃修复。
-- **补齐向量载入侧的非有限值校验**：写入侧 `EmbeddingService._as_float32_matrix` 早就拒绝 NaN／inf 向量，理由也写在注释里（FAISS 把 NaN 向量照单收下，`ntotal` 正常增加，既不报错也不跳过），但两个载入入口 `FaissStore.load`（legacy pkl）与 `load_snapshot` 共用的 `_validate_embeddings_shape` 只判 `ndim`——同一份内容**写入侧拒绝、载入侧放行**。实测载入后 `semantic_search` 对任意查询都只返回好文档、坏文档的下标干脆不出现，用户看到的是「搜到了」而不是「这份快照坏了」；而 `upsert_embeddings` 是 `VectorStoreBase` 的公开契约方法，直接调它的嵌入方绕开 `EmbeddingService`，坏向量还会被 `save_snapshot` 落盘、由 `validate_snapshot_dir` 放行成活动快照。判据落在 `astype(np.float32)` **之后**：`1e300` 在 float64 里是有限的，cast 成 float32 才溢出成 `inf`——只对原数组调 `isfinite` 会让载入侧在这一点上再次与写入侧分叉。cast 只是校验用副本，失败时 store 仍保持原状。
-- **补齐配置编辑器模型菜单的容器形态校验**：`edit_model_params` 原先直接写 `list(chat_config["llm_configurations"].keys())`，取值不是映射时抛裸 `AttributeError: 'int' object has no attribute 'keys'`——不是 `ValueError`，会以裸 traceback 终止会话（主循环只捕获 `KeyboardInterrupt`／`EOFError`）。现经 `_configuration_keys` 收敛，判据与 `display_utils._require_model_detail` 一致。**只判容器、不判取值**：`display_chat_config` 在上游读值时会直接拒绝形态坏掉的配置项，菜单是用户唯一还能把激活项切走的入口，按取值判会让配置写坏后彻底没有修复路径——这条取舍由 `test_edit_model_params_lists_unusable_details_without_reading_them` 锁住。
-- **补齐配置映射「取值」与「容器」两处形态校验**（同一缺陷类，`llm_configurations`／`embedding_configurations`／`rerank_configurations` 三个角色同源）：
-  - **取值不可用**：`key in mapping` 只证明**键**在，不证明**值**可用。`{"k": None}` 的键确实存在，于是 `ModelProviderFactory._get_model_detail` 不会走「未找到key」那条分支，而是把 `None` 原样返回给调用方；三个入口紧接着都读 `config.provider`，在那里抛裸 `AttributeError: 'NoneType' object has no attribute 'provider'`——它不是 `ValueError`，穿透 `Chatbot.reload_llm` 的 `except ValueError` 分类。取值来源是 `SessionConfig.llm_configurations` 等可直写映射（`_VALIDATORS` 明确不登记这几个字段）。现新增 `require_detail_attributes` 统一收敛，三处调用点（工厂、`RetrievalService._get_rerank_provider`、`display_utils._require_model_detail`）共用。**判据用属性存在性而不是 `isinstance(detail, ModelDetail)`**：使用方只要求取值提供这几个属性，按具体类型收窄会把仓库里用 `SimpleNamespace` 构造的等价配置一并拒掉（实测一次按类型收窄让 17 个既有用例变红）。
-  - **容器不可迭代**：`_get_model_detail` 直接写 `provider_key not in configurations`。取值不可迭代时抛裸 `TypeError: argument of type 'int' is not iterable`；是字符串时走**子串**判定（`"k" in "k"` 为真），随后 `"k"["k"]` 抛 `TypeError: string indices must be integers`。两者都不是 `ValueError`。取值经 `Chatbot.reload_llm` 从 `session_config.llm_configurations` 原样传到这里。
-- **修复 `RetrievalService._get_rerank_provider` 对 rerank 缓存键两个分量的形态假设**：
-  - `provider`／`model_name` 此前只经 `getattr(..., "")` 取值，有默认值但**没有类型判据**。`ModelDetail` 是 pydantic 模型、**构造**时会拒绝非字符串，但普通属性没有赋值守卫（`validate_assignment` 未开）——实测 `detail.provider = ["p"]` 与 `detail.model_name = ["m"]` 都直接成功。两者都进 `cache_key` 元组，在 `self._rerank_providers.get(...)` 处抛裸 `TypeError: unhashable type: 'list'`。
-  - 属性被 `del` 掉时（实测 `del detail.provider` 成功）`getattr` 兜出的空串会把「属性没了」伪装成「provider 名为空」，一路带到工厂再抛 `AttributeError`。
-  - 新增 `_is_hashable`：判据用**可哈希**而不是 `isinstance(..., str)`，非字符串但可哈希的取值（整数、元组）本来就能正常工作，按类型收窄会误伤；位数超限的整数是可哈希的，不必在此拦截。
-- **修复注释里的 `type:` 被 mypy 当成类型注释**：`#     type: 'list'``；` 这类行在 Python 解析器看来是普通注释（`ast.parse`／`ruff`／`compileall` 全部通过、测试全绿），但 mypy 会把紧跟缩进后的 `type:` 识别为**类型注释**（PEP 484 风格）并去解析其后的内容，于是报 `Invalid syntax` 且**阻断整个项目的类型检查**（`errors prevented further checking`）。本次是写注释时踩到的，改动只是把该行拆成两句。记录在此是因为该类行的失败模式很隐蔽：语法错误只在 mypy 出现，其余工具全绿。
-
-- 恢复 `src/etl/splitters/recursive_text_splitter.py` 的 Dify 移植声明头。该文件在引入 tiktoken 与层级分片的重写中被误删头部，此后 `sync dify rag hierarchical retrieval` 又向这个已无头的文件移植了父子分片逻辑，导致文件含 Dify 衍生代码却没有版权与许可证声明，与 `AGENTS.md` 的合规要求及 Apache 2.0 第 4(b) 条不符。
-- Responses 错误出口补齐脱敏：`_raise_for_response_error` 此前把服务端消息直接拼进异常，而同一适配器的 Chat Completions 出口已经过 `redact_sensitive_text`。服务端错误常回显请求头或 URL，异常文本会进日志与终端，是凭证最容易泄漏的出口，现两个出口行为一致。
-- 修复召回测试 Excel 记录的落盘位置：`ExcelLogger` 硬编码相对路径 `data/logs`，而文本日志使用经 `ROOT_DIR` 解析的 `settings.log_path`。相对路径基于 CWD，从仓库外运行程序时两者会分叉，Excel 记录落到当前工作目录。现默认复用 `settings.log_path`。
-- `capability_report` 与 `protocol_status` 对齐角色语义：前者在 embedding/rerank 角色下仍报告 `server_verified_protocols` 并接纳运行期登记，而后者对同一输入显式报错。协议只适用于 LLM 角色，两个诊断入口现给出相同结论。
-- 补充重排乱序路径与重排契约的回归测试：既有替身恒返回 `[0]`（恒等置换），`_rerank_if_needed` 的重排与按分数降序排序从未被执行，`_validate_rerank_output` 的布尔混入与越界 index 分支也无覆盖。
-- 修复无断言测试：`test_rerank_accepts_top_n_larger_than_document_count` 只调用 `_validate_inputs` 而无断言，即使行为变更也不会失败；现补断言并新增 `top_n` 非法值（含 `bool` 混入）的参数化用例。
-- 文档校正：`REFACTORING_PLAN.md` 标注为 v1.2.0 历史归档并修正三处与现状不符的表述（`PipelineManager` 实为 `Pipeline`、依赖应声明在 `pyproject.toml`、当时配置格式为 `config.ini`）；`README.md` 移除已退役的模型举例、修正 `/config` 可调项描述、补全 `src/` 目录树、把许可说明指向实际存在的许可证文件；`getting-started.md` 移除不存在的 `exit` 退出方式；`developer-guide.md` 补全目录树。
-- 修复 Anthropic 响应解析在字段为 `None` 时崩溃：`field()` 只在键不存在时返回默认值，而 SDK 的 `thinking`/`redacted_thinking` 块会给出 `None`，此时 `"".join(...)` 抛 `TypeError: expected str instance, NoneType found`。非流式的正文与推理拼接、流式的 `text_delta`/`thinking_delta`/`input_json_delta` 三处一并加兜底。同类拼接在 Google 与 Volcengine 已有 `isinstance` 守卫，仅 Anthropic 缺。
-- Google `tool_choice` 不再静默接受未知模式：`FunctionCallingConfigMode` 是大小写不敏感枚举，未命中时会合成一个同名成员、只发 `UserWarning`，随后被静默发往服务端；OpenAI 风格的 `{"type": "tool"}` 正会落到这里。现按已知模式显式映射，未知值报 `ValueError`，并给出可选值。`ToolConfig` 的未知键也从裸 pydantic `ValidationError` 归一为本项目的 `ValueError`。
-- Responses `json_schema` 缺 `schema` 时显式报错：此前会回退成 `schema` 本身，伪造出 `{"type": "json_schema"}` 的 schema 发给服务端，调用方以为拿到了结构化输出约束而实际没有；同时 `strict` 不再被硬编码的 `True` 覆盖调用方取值。
-- 补充流式重试助手的回归测试：`retry_sync_stream`/`retry_async_stream` 的建立阶段重试此前零覆盖，现覆盖「建立失败重试」「首事件后不再重试（避免重复输出）」「空流不算失败」「校验器只作用于首事件」「消费方提前退出时关闭迭代器」以及异步等价场景。
-- 修复 Ark Chat Completions 工具调用缺 `type` 键：`VolcengineProvider._extract_result` 的 Chat Completions 分支只产出 `{"id", "name", "arguments"}`，而同一函数的 Responses 分支与 `openai_compatible.py` 的 `_extract_tool_calls` 都产出契约声明的扁平 `{"id", "type", "name", "arguments"}`（`model_provider.py:343` 与 `docs/user_guide/llm-providers.md:108` 双重写明）。调用方按契约回填 `role=tool` 历史时会配不上；现补 `type`（缺省 `function`）并新增两条钉住该键与逐键对齐 OpenAI 兼容侧的回归测试。
-- 数值配置补齐加载期校验：`log_retention_days`、`kb_chunk_size`、`kb_chunk_overlap`、`kb_child_chunk_size`、`kb_child_chunk_overlap`、`kb_embedding_batch_size`、`chat_vector_weight`、`chat_keyword_weight` 此前接受任意数值，`kb_chunk_size=0` 会一路通过配置校验、直到 langchain 在分片阶段才抛 `chunk_size must be > 0`，负权重会反向加成分数；而 UI 层（`src/ui/config_menu.py`）对权重已有 `0..1` 校验，TOML/env 路径没有，形成不对称。现按字段加 validator，并用 `model_validator` 补上「overlap 必须严格小于 size」这条无法用单字段表达、但会让切分器无法推进的跨字段约束。
-
-- 清理死代码与重复实现（零功能影响，单独一次提交以便审阅）：删除 `config.py` 中零调用的向后兼容层 `get_backward_compatible_configs()`（85 行）及其失效注释；删除 `LargeLanguageModel.supports()`（零调用，但**保留**它读取的 `capabilities`——那是 `factory.capabilities()` 经 `getattr` 读取的活数据）；删除 `volcengine._ARK_CLASSIFICATION_KEYS`（纯冗余，`classify()` 的三个同名形参无法落进 `**kwargs`，真正的校验由内联集合完成且完整）；删除 `faiss_store.FaissStore` 中从未获取的 `asyncio.Lock` 及其函数内局部 import；简化 `anthropic.py` 中条件永不产生可区分行为的恒等 `if/else`。
-- 消除 `openai_compatible.py` 与 `model_provider.field()` 的重复实现：`_field` 与 `field` 逐字节相同却各存一份，且被 143 处调用（`self._field` 28 + `cls._field` 115）。现删除重复定义、统一复用 `field`，并按字母序补入 import。
-- `volcengine` 的 4 个 helper（`_merge_options`/`_validate_model_options`/`_validated_extra_body`/`_merge_extra_body`）此前是 `openai_compatible` 的逐字节副本，现改为委托到后者，只保留一份实现，消除漂移风险。
-- `jina.py` 与 `siliconflow_rerank.py` 是近似副本（行级相似度约 0.78，7 个方法同名，`_get_headers` 逐字节相同），但存在 4 处真实语义差异（`_OPTION_KEYS`、`_base_url` 来源、构造期 base_url 校验、`_parse_response` 的 `results` 校验时机）。**有意保持独立实现**，改在两侧 docstring 中写明差异清单与「改动必须同步」的约束，而不再引入一层抽象。
-- 删除孤儿文件 `logo_ASCII.py`：全仓零引用、不在任何构建/CI 配置中，其 `create_gradient` 与 `main.py` 的同名函数逐字节重复，且未格式化（一旦纳入 `quality.yml` 扫描范围会直接失败）。
-- 移除 4 个从未被 import 的依赖中的 2 个：`langchain` 与 `langchain-community`。保留 `langchain-core`（`langchain-text-splitters` 的必需依赖）与 `requests`（`google-genai`、`tiktoken` 的必需依赖）——它们的「未使用」是传递依赖的正常形态，删除会破坏真实依赖链。
-- Google `tool_choice` 的异常文本在源头脱敏：裸 pydantic `ValidationError` 会把违规取值原文写进 `input_value=...`，而 `types.ToolConfig` 允许的键集里就有 `api_key` 这类凭证形态的键。两个消毒器（`redact_sensitive_text`、`safe_exception_text`）虽然都能拦住，但在拼消息前收口才是纵深防御。
-- `release.yml` 的手动发布路径补交叉校验：`workflow_dispatch` 的 `tag`/`version` 是手填的，此前直接透传，会发出一个版本号与 `pyproject.toml`/`CHANGELOG.md` 不符的 release。现校验 `version` 与 `pyproject.toml` 一致、`tag` 等于 `v{version}`、且 CHANGELOG 已有该版本条目。
-
-- 检索规模补齐上界：`chat_top_k` 此前只校验下界，而 `effective_top_k = chat_top_k * retrieval_candidate_multiplier` 会直通 `faiss_index.search()`，FAISS 既不报错也不截断。实测 `chat_top_k=10**9` 被接受，单次查询真实分配约 3.6 GB 数组、进程 RSS 涨 10.3 GB 并挂起 8.4 秒。现限制 `chat_top_k ≤ 10000`、`retrieval_candidate_multiplier ≤ 100`。
-- 补齐父子分片的层级约束：`kb_child_chunk_size >= kb_chunk_size` 此前被静默接受，实测 `parent=child=300` 时不同父块数等于分块数（15/15），即每个父块只产出一个子块，「先粗后细」的父子检索退化为单层。现要求子分片严格小于父分片——与既有的 `overlap < size` 同属无法用单字段 validator 表达的约束。
-- 混合检索权重不得同时为 0：`retrieval_service._weight_tuple()` 在 `total <= 0` 时返回 `(0.0, 0.0)`，所有候选得分为 0，再叠加 `weighted` 策略启用阈值过滤（默认 0.4）会导致**检索结果被全部丢弃且无任何报错**。单个权重为 0 仍合法（纯向量 / 纯关键词检索）。
-- 修复布尔值绕过数值校验的真因：`bool` 是 `int` 的子类，而 pydantic 的 lax 模式会在 `field_validator` **之前**把 `True` 强转成 `1`，因此原有的 6 处 `isinstance(value, bool)` guard 全部是**不可达的死代码**——实测 `Settings(chat_top_k=True)`、`log_retention_days=True`、`chat_vector_weight=True` 等 10 个字段均被静默接受为 `1`/`1.0`。现给这些 validator 加 `mode="before"` 让 guard 真正生效，并新增 `_coerce_number()` 统一处理 `mode="before"` 下收到的原始输入（字符串数值来自 `.env`/TOML，必须继续支持）。
-- `chat_temperature` 与 `retrieval_candidate_multiplier` 的 validator 补上同样的布尔短路（两者此前也用 `float(v)`/`int(v)` 静默接受 `True`）。
-- 修复 `.env.example` 的默认渠道覆盖：`DEFAULT_LLM_PROVIDER="openai"` 是生效的环境变量，而环境变量优先于 `config.toml`，因此按示例原样复制后 `default_llm_provider` 被改成 `openai`、覆盖了 TOML 里的 `google`，导致 14 条模型配置因密钥为空串在运行期失败（而 `default_embedding_provider=local-hash`、`default_vector_store=faiss` 都选了零凭证通道，证明零凭证默认可行）。现改为注释并说明原因。
-- 修复三例「假绿」测试：`test_numeric_settings_reject_illegal_values` 原先用 `match=field_name` 断言，而跨字段 `model_validator` 的报错文本里也含 `kb_chunk_size` 等字段名（「kb_chunk_overlap 必须小于 kb_chunk_size。」），删除被保护的 `validate_positive_sizes` 后这 3 例仍然全绿。现改为断言各 validator **独有的消息片段**，变异验证下失败数从 2 提升到 5。
-- 补强 Ark `tool_calls` 的 `type` 回归测试：夹具原先写 `type="function"`，与硬编码值相同，因此把透传改成硬编码 `"function"` 的变异体无法被捕获（零区分度）。现夹具改用非 `"function"` 的取值，并新增一条覆盖「缺 `type` 时两侧默认值对齐」的交叉断言——此前断言只覆盖显式传值路径，两条路径的 default 一旦分叉测试仍全绿。
-- 新增 12 例布尔短路测试，覆盖 `log_retention_days`、`kb_chunk_size`、`kb_chunk_overlap`、`chat_top_k`、`retrieval_candidate_multiplier`、`chat_vector_weight`、`chat_score_threshold`、`chat_temperature` 等字段拒绝 `True`。
-
-- 修复分片在「分隔符耗尽」时完全失效：LangChain 的 `RecursiveCharacterTextSplitter._split_text` 走到 `if not new_separators: final_chunks.append(s)` 是原样追加、不再按 `chunk_size` 切，而默认配置 `kb_splitter_separators = ["###"]` 只有一项匹配项、`new_separators` 直接为空，于是**任何不含 `###` 的文档整篇变成一个块**。实测 `chunk_size=1500` 时 3600 token 的纯列表文本产出单个 3599 token 块；对真实知识库 39 个文件扫描，34 个产出超限块（子块上限 300，实测最坏 4595）。现让分隔符表统一以 `""` 收尾，兜底只在前面所有分隔符都不匹配时生效——含 `###` 的文档切分结果不变（实测 3 块/最大 252 字符）。
-- 修复分片开头标点被直接删除：`_strip_leading_punctuation` 用 `re.sub(r"^[\s.。]+", "", text)` 删除开头连续的空白与句号。当分隔符本身就是句号时，`keep_separator=True` 会把上一句的句号留在下一个分片开头，于是那个句号被永久丢弃；整篇以句号开头的输入更会被判空并 `continue`，产出 0 个块。现改为**只**匹配空白（`re.sub(r"^\s+", ...)`），标点原样保留。**此条此前是假的**：上一版写的是「替换为等长空格」，被替换的字符集恰好等于紧随其后的 `strip()` 会删掉的字符集，替换出来的空格立刻又被删掉，与原始实现逐字符等价（实测 3 万条随机输入零差异，`"。" * 200` 依然产出 0 块，`separators=["。"]` 下依然丢 2.9% 的字符）。当时配套的测试也绕开了被测字符（`if char == "。": continue`），因此对缺陷零区分度。现断言改为「分片按序拼接等于原文」。
-- 给知识快照的 pickle 加载补上来源边界：快照内的 `chunks.pkl`/`parents.pkl`/`lexical.index` 都是 pickle，反序列化即执行代码，而 `AGENTS.md` 要求「只从本项目生成的本地快照或明确受信的 legacy 文件加载」——此前代码不做任何来源校验，`load_snapshot(dir)` 接受任意目录、`load(path)` 接受任意路径、`FaissStore(file_path=...)` 还会隐式加载。现新增 `resolve_within()`/`ensure_trusted_source()`（两侧先 `resolve()` 再比归属，符号链接逃逸会被拦下；信任根为空时一律拒绝），并要求 `load_snapshot` 满足三件事：目录在信任根内、目录本身不是符号链接、`ACTIVE_SNAPSHOT` 标记指向的就是该目录。第三条是关键——仅「在 root 之下」不足以证明目录可用，未激活或半成品目录同样在 root 之下。
-- 快照 manifest 补上 schema 版本准入：`load_manifest` 此前只 `str(data["schema_version"])` 解析、不比对，未知版本被静默接受并照着当前代码解释，而 v1→v2 调整过分块与 embedding 的落盘结构，这样会得到错误结果而不是报错。现版本不符即拒绝，消息给出快照版本与当前版本。版本判断放在 `load_manifest` 而非 `from_mapping`，后者保持纯解析。
-- 快照完整性校验补上数据源自洽：`validate_snapshot_dir` 此前只查文件**存在性**。实测 `documents=3` 而 `embeddings=(2,4)`（`faiss_index.ntotal=2`）的 store 能正常落盘、通过校验、加载后零报错，之后 `semantic_search` 拿 `indices` 索引 `self.documents` 才越界。现在校验 chunks / embeddings / `stats.json` 三者行数一致，并把截断文件的解析失败（原先裸 `EOFError`）归类为「快照不自洽」。
-- 修复 legacy 导入失败后的临时目录残留：`factory.py` 的 legacy 分支此前没有 `KnowledgeBuildService.build` 那样的 `finalized`/`finally` 结构，`create_temp_snapshot_dir` 之后任何失败都会在快照根留下 `.tmp-legacy-*` 并随时间累积。现照搬同一结构，并把 `validate_snapshot_dir(temp_dir)` 提到 `finalize_snapshot` **之前**——finalize 会更新 `ACTIVE_SNAPSHOT`，校验放到它后面就只剩「坏快照已经被激活」这一种收场方式。
-- 修复 `SessionConfig` 完全无校验：`Settings` 只在启动时校验一次，而 UI 与库调用方经 `__setitem__` 写入的 `SessionConfig` 此前不校验任何字段。实测 `chat_config["top_k"] = 10**9` 能一路走到 `faiss_index.search()`（实测 `10**6` 时就已按满槽位分配并耗时 1.56 秒），同时接受 `vector_weight=-5`、`retrieval_method='totally-invalid'`、`score_threshold=None`。现为 9 个标量字段补上校验器注册表，并加结构断言防止漏登记——漏登记会静默回落为无校验，且不会让任何行为测试变红。
-- 修复关键词检索的静默空结果：`keyword_search` 用 `if score <= 0: break`，既分不清「该词无判别力」与「0 分文档排在前面把正分结果截断」，又在分数整片为 0 时静默返回空列表。rank_bm25 的 idf 是 `log(N-n+0.5) - log(n+0.5)` 且只对 `idf < 0` 做 epsilon 浮动，某个词**恰好**出现在一半文档里（`n == N/2`）时 idf 恰为 0、不属于「负」因此不被浮动，该词分数就全是 0。现先看全局最高分，再按分数降序收集、0 分只跳过不终止。
-- 修复空语料导致的 BM25 崩溃：`load_snapshot` 从 `lexical.index` 读回 `[]` 时 `BM25Okapi` 在 `avgdl = num_doc / corpus_size` 处抛 `ZeroDivisionError`。现空语料返回 `None` 并在 `keyword_search` 里短路，不再崩溃。
-- 给嵌入向量矩阵补上有限性校验：`_as_float32_matrix` 此前只校验维度、非空与行数，NaN/inf 会被接受并写入 FAISS（`ntotal` 正常增加），直到查询时才以 3.4e38 的哨兵距离暴露出来，届时已无法定位是哪个文档坏了；`1e300` 还会先触发 `RuntimeWarning: overflow encountered in cast` 静默溢出为 inf。现对齐 `retrieval_service` 既有的 `math.isfinite` 校验。
-- 移除退出钩子的无条件删除：`cleanup_temp_files()` 已在 `atexit` 注册、每次程序正常退出都对 `settings.cache_path` 执行 `shutil.rmtree`，但删除前没有任何安全判断，而 `cache_path` 是用户可配置项且校验只做相对路径转绝对路径。实测 `Settings(cache_path="/")`、`"/etc"`、`"/usr"`、`"~"`、`"/var"`、`"/System"`、`"../.."` 全部被接受，随后整个目录被删掉——不可逆的数据丢失，触发条件只是「配置文件写错一个值」。现拒绝文件系统根目录、家目录本身与常见系统目录，判定只看「是否危险」而不看目录名（用户可能有意把缓存放到 `data/cache`）。该缺陷不在任何一轮审查报告里，是靠盘点「从未被测试引用的生产模块」找到的。
-- 修复配置数值解析的宽松放行：`_coerce_number` 的 `int()`/`float()` 会接受 `"1_0"`、`"+7"`、`"0x10"`（`int("1_0") == 10`、`float("1_0") == 10.0`），把写错的配置静默读成另一个数。现先做十进制字面量形状校验。同时修复 `chat_score_threshold=10**400` 抛裸 `OverflowError`（它不是 `ValidationError`，会穿透 `get_settings` 的 `except` 变成未脱敏 traceback），把范围判断移到转 float 之前。
-- 给无上界的数值字段补上界：`log_retention_days`、`kb_chunk_size`、`kb_child_chunk_size`、`kb_embedding_batch_size` 此前只有下界，实测 `10**400` 全部被接受，直到参与运算（日期减法、内存申请）才炸。
-- 修复列表类 env 字段的未处理异常：`KB_SPLITTER_SEPARATORS='###'`（非 JSON 形态）抛的是 pydantic-settings 的 `SettingsError`，它继承 `ValueError` 但**不是** `ValidationError`，原 handler 接不住，用户看到的是解释器默认 handler 打出的多屏 traceback。现转成一行脱敏消息。
-- 修复发布包 ZIP 分支对悬空符号链接的裸崩溃：`ZipFile.write` 会解引用符号链接去取元数据，目标缺失时抛的是不带任何线索的 `FileNotFoundError`，而 tar.gz 分支对同一目录完全正常——两分支行为不一致，且在 Windows（唯一的 zip 目标）上表现为难以归因的构建失败。现归档前显式检查并列出全部悬空路径。经本地 `--target macos-x64 --validate` 实测，真实产物内符号链接 0 个，该检查在当前构建下属纯防御性。
-- 修复 `_initialize_vector_store` 的虚假成功提示：没有快照时 store 为空（`documents=0`、`faiss_index=None`），却仍打印「知识快照加载成功。」，让用户先看到成功再看到永远是「无相关文档」，把构建缺失误诊成检索质量差。现按实际分块数区分提示。
-- UI 的 `top_k` 与 `retrieval_candidate_multiplier` 输入补上界：两处 validator 此前只校验下界，接受任意大的值后再交给 `SessionConfig`。
-- 收紧 pytest 的警告过滤：`pytest.ini` 原先用全局 `ignore::UserWarning` / `ignore::DeprecationWarning`，把四个快速迭代的 SDK 升级警告和本项目自身的警告一起静音（实测同一探针用例在全局忽略下静默通过、在 `-W error::UserWarning` 下失败）。现改为按第三方 module 前缀限定，并新增断言守住本仓库配置加载路径不产生这两类警告。
-- 补齐此前完全空缺的测试覆盖：legacy 导入路径（含失败清理）、`archive_bundle`（此前零测试）、`cleanup_temp_files`（atexit 删除路径，失败后果不可逆）、以及 pickle 信任边界的 6 类拒绝用例与合法路径成功用例。测试总数增至 1262。
+- 移除 iFlow 渠道与 qwen rerank 配置示例（该渠道不提供 rerank 能力，调用时显式报错）
+- Qwen Base URL 迁移到 DashScope 兼容模式、Volcengine 迁移到 Ark API v3；配置仍为旧值时加载期给出升级警告（旧域名已停止服务或不提供所需路径）
+- `gemini-embedding-2` 与已退役的 `text-embedding-004` 向量空间不兼容，从旧版本升级需重建知识库快照
+- Jina 与 SiliconFlow Rerank 的 `return_documents` 固定为 `True`，不允许被 `options` 覆盖
 
 ## [1.3.0] - 2026-03-20
 
-### 运行与配置
+> 本版本完成运行时分层重构与快照化持久化：父子分段检索、RRF 融合、sidecar 父文档等 RAG 核心能力落地，主配置迁移到 `config.toml`，默认构建链路摆脱外部 Embedding API 依赖。
 
-- 将主配置迁移到 `config.toml`，并明确 `config.toml` 为本地文件，不再纳入版本控制。
-- 新增 `local-hash` 本地嵌入提供方，默认知识库构建链路不再依赖外部 Embedding API。
-- 新增 `iflow-qwen3-max` 的 OpenAI 兼容配置示例，并补齐 `config.toml.example` 与 `.env` 的文档口径。
+### 新增功能
 
-### 稳定性与检索
+- 主配置迁移到 `config.toml`，明确为本地文件、不再纳入版本控制
+- 新增 `local-hash` 本地嵌入提供方，默认知识库构建链路不再依赖外部 Embedding API
+- 知识库持久化升级为快照目录：`ACTIVE_SNAPSHOT` 指针、快照清单与按快照加载的运行时流程
+- 引入 `RunConfig`、`SessionConfig`、`KnowledgeBuildService`、`RetrievalService`、`ChatService` 等分层运行时服务
+- 完成父子分段检索、RRF 融合、sidecar 父文档存储等 RAG 核心能力的适配与校验
+- 新增 `iflow-qwen3-max` 的 OpenAI 兼容配置示例（后于 1.4.0 移除）
 
-- 修复聊天会话和召回测试中的异步输入问题，消除 `asyncio.run()` 与事件循环冲突。
-- 收紧 Provider 失败契约：当凭证、SDK 或远端调用失败时，统一改为显式报错并保留日志，不再返回占位回答、空 embedding 或零分 rerank 结果。
-- 修复聊天 `/config` 切换 LLM 时的状态回滚问题；当新模型加载失败时，活动模型配置会回退到旧值，避免界面状态与实际模型实例不一致。
-- 修正 `grok` 与 `volcengine` Provider 的真实导入链路，并新增 Provider 导入烟测，避免“测试通过但模块无法导入”的假收敛。
-- 优化知识库重建流程，向量化时不再加载旧索引追加写入。
-- 增强本地检索质量：索引文本引入来源文件标题上下文，聊天检索使用意图文本而不是原始提示约束语。
-- 完成父子分段检索、RRF 融合、sidecar 父文档存储等 RAG 核心能力的适配与校验。
-- 将知识库持久化升级为快照目录，新增 `ACTIVE_SNAPSHOT` 指针、快照清单和按快照加载的运行时流程。
-- 引入 `RunConfig`、`SessionConfig`、`KnowledgeBuildService`、`RetrievalService`、`ChatService` 等分层运行时服务。
-- 修正真实交互场景中的展示与输入边界：来源路径改为相对路径，聊天空输入不再触发检索和模型调用。
+### 优化改进
 
-### 测试与文档
+- 知识库重建时向量化不再加载旧索引追加写入
+- 索引文本引入来源文件标题上下文；聊天检索使用意图文本而不是原始提示约束语
+- 来源路径显示为相对路径；聊天空输入不再触发检索和模型调用
+- 新增多组回归测试，覆盖本地嵌入、异步交互、索引文本构建、RRF 行为、sidecar 持久化和配置默认值；文档同步启动方式、配置结构与运行口径
 
-- 增加多组回归测试，覆盖本地嵌入、异步交互、索引文本构建、RRF 行为、sidecar 持久化和配置默认值。
-- 更新 `README.md`、`docs/` 和 `AGENTS.md`，同步当前启动方式、配置结构和运行口径。
+### Bug 修复
+
+- 修复聊天会话和召回测试中 `asyncio.run()` 与事件循环冲突导致的异步输入问题
+- 修复 `/config` 切换 LLM 失败时活动模型配置不回滚，界面状态与实际模型实例不一致
+- 修正 `grok` 与 `volcengine` Provider 的真实导入链路，新增 Provider 导入烟测，消除「测试通过但模块无法导入」的假收敛
+- 收紧 Provider 失败契约：凭证、SDK 或远端调用失败时统一显式报错并保留日志，不再返回占位回答、空 embedding 或零分 rerank 结果
 
 ## [1.2.0] - 2025-07-03
 
-### 架构重构
+> 第二至第四阶段架构重构完成：向量存储解耦、文档处理流水线成型、核心模块补齐测试与文档，同时完成 Dify 许可证合规整理。
 
-- 完成第二阶段重构：解耦向量存储。
-  - 定义了 `VectorStoreBase` 抽象基类，统一了向量存储接口。
-  - 实现了 `FaissStore`，将 FAISS 逻辑封装其中。
-  - 创建了 `VectorStoreFactory`，实现了向量存储的动态加载。
-- 完成第三阶段重构：构建文档处理流水线。
-  - 创建了 `etl` 模块，并为 `extractors`、`cleaners`、`splitters` 定义了抽象基类。
-  - 实现了针对 Markdown 的抽取器、基础文本清洗器和递归文本分割器。
-  - 创建了 `PipelineManager`，实现了数据处理的动态组合。
-- 完成第四阶段重构：提升健壮性与开发者体验。
-  - 为核心模块如模型提供商工厂、向量存储工厂、ETL 流水线编写了全面的单元测试。
-  - 优化了日志记录，并完善了项目文档。
+### 新增功能
 
-### 许可证合规性
+- 定义 `VectorStoreBase` 抽象基类统一向量存储接口，实现 `FaissStore` 封装 FAISS 逻辑，`VectorStoreFactory` 支持动态加载
+- 新增 `etl` 模块：`extractors`/`cleaners`/`splitters` 抽象基类，Markdown 抽取器、基础文本清洗器与递归文本分割器，`PipelineManager` 实现数据处理的动态组合
 
-- 检查了 Dify 的许可证，并为项目添加了 `DIFY_LICENSE` 文件。
-- 为项目中非 Dify 移植代码的部分添加了 `LICENSE` 文件。
-- 在所有移植自 Dify 的代码文件顶部添加了许可证声明。
-- 在 `README.md` 中明确列出了所有移植自 Dify 的代码文件。
+### 优化改进
+
+- 为模型提供商工厂、向量存储工厂、ETL 流水线等核心模块编写全面单元测试；优化日志记录并完善项目文档
+- 许可证合规：新增 `DIFY_LICENSE` 与 `LICENSE`，所有移植自 Dify 的代码文件顶部添加许可证声明，`README.md` 明确列出移植清单
 
 ## [1.1.0] - 2025-07-02
 
-### 架构重构
+> 项目定位明确为 Dify 核心逻辑的本地验证器，并启动系统性重构：第一阶段模型管理系统落地，配置系统与启动界面重做。
 
-- 明确项目目标为 Dify 核心逻辑的本地验证器，通过轻量级 Python 实现对齐并验证 Dify 的核心工作流。
-- 启动向配置、抽象基类和工厂模式的系统性重构。
-- 完成第一阶段重构：模型管理系统。
-  - 废除了在代码中硬编码模型实例的方式。
-  - 建立了 `LargeLanguageModel`、`TextEmbeddingModel`、`RerankModel` 等模型抽象基类。
-  - 实现了 `ModelProviderFactory`，用于根据配置动态加载和实例化不同的模型提供商。
+### 新增功能
 
-### 新功能与优化
+- 建立 `LargeLanguageModel`、`TextEmbeddingModel`、`RerankModel` 等模型抽象基类，废除代码中硬编码模型实例的方式
+- 实现 `ModelProviderFactory`，根据配置动态加载和实例化不同的模型提供商
+- 新增 `pyfiglet` 生成的 ASCII Art 启动横幅（标题蓝红渐变）与含版本、描述、作者、GitHub 链接的欢迎面板
 
-- 优化启动界面。
-  - 新增由 `pyfiglet` 生成的 ASCII Art 启动横幅。
-  - 为标题实现从左到右的蓝红颜色渐变效果。
-  - 添加了包含版本、描述、作者和 GitHub 链接的欢迎面板，并确保其宽度与标题对齐。
-- 重构配置系统。
-  - 从 `.env` 和 `python-dotenv` 迁移到 `config.ini` 和内置的 `configparser`，以解决复杂 JSON 配置解析问题。
-  - 实现环境变量优先的配置加载策略，当环境变量存在时会覆盖 `config.ini` 中的设置。
-  - 更新 Google LLM 的默认模型为 `gemini-2.5-flash` 和 `gemini-2.5-pro`。
-- 提升代码质量。
-  - 解耦了 Rerank 提供商，通过依赖注入将 `top_n` 作为参数传递给 `rerank` 方法，移除了对全局配置的直接依赖。
+### 优化改进
+
+- 配置系统从 `.env`/`python-dotenv` 迁移到 `config.ini`/`configparser`，解决复杂 JSON 配置解析问题；环境变量优先，存在时覆盖配置文件
+- Google LLM 默认模型更新为 `gemini-2.5-flash` 与 `gemini-2.5-pro`
+- Rerank 提供商解耦：`top_n` 经依赖注入传递给 `rerank` 方法，移除对全局配置的直接依赖

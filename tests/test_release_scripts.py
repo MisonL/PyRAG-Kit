@@ -163,7 +163,7 @@ def test_extract_section_returns_version_content():
     section = extract_section("1.4.0")
 
     assert section.startswith("## [1.4.0]")
-    assert "Provider 与协议" in section
+    assert "升级说明" in section
 
 
 def test_validate_bundle_uses_smoke_test(monkeypatch, tmp_path):
