@@ -26,6 +26,28 @@ logger = get_module_logger(__name__)  # 获取当前模块的日志器
 # 全局UI宽度定义
 CONSOLE_WIDTH = 120
 
+
+def create_console(**kwargs):
+    """构造 rich ``Console``，对 Windows 非 tty 管道禁用 legacy 渲染。
+
+    rich 在 Windows 上通过 ``GetConsoleMode`` 探测 VT 支持；stdout 被重定向到
+    管道时探测必然失败，``legacy_windows`` 却仍判定为 True，渲染走 win32
+    console API 按 cp1252 编码中文，抛 ``UnicodeEncodeError``（v1.5.0 发布
+    自检实测：PyInstaller exe 的 stdout 是管道，凡含中文的输出即崩）。非
+    tty 时根本不存在可写的控制台句柄，legacy 渲染不可能正确，必须显式
+    关闭。真实终端（tty）下判定不变，正常走 Windows 渲染。
+    """
+    import sys
+
+    if (
+        "legacy_windows" not in kwargs
+        and sys.platform == "win32"
+        and not (sys.stdout is not None and sys.stdout.isatty())
+    ):
+        kwargs["legacy_windows"] = False
+    return Console(**kwargs)
+
+
 # 模板里的占位符。用 NUL 而不是 ``{}`` 直接进 ``Text.from_markup``：NUL 不可能
 # 出现在任何正常的模板字面量里，替换后也不会被 rich 的标记语法解释。
 _MARKUP_PLACEHOLDER = "\x00"

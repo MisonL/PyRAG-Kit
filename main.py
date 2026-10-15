@@ -7,7 +7,6 @@ from pathlib import Path
 import pyfiglet
 from prompt_toolkit import prompt
 from prompt_toolkit.formatted_text import HTML
-from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
@@ -51,14 +50,14 @@ import src.utils.log_manager
 
 # 导入UI工具
 from src.models.document import Document
-from src.ui.display_utils import CONSOLE_WIDTH, markup_text
+from src.ui.display_utils import CONSOLE_WIDTH, create_console, markup_text
 from src.ui.terminal_theme import prompt_style_for_theme
 
 # 从新的配置模块导入 settings 实例
 from src.utils.config import get_settings, resolve_app_root
 from src.utils.security import safe_exception_text
 
-console = Console()
+console = create_console()
 
 
 def _resolve_version() -> str:

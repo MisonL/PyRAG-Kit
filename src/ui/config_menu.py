@@ -3,7 +3,6 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 import questionary
-from rich.console import Console
 from rich.panel import Panel
 
 from ..utils.config import (
@@ -18,11 +17,11 @@ from ..utils.config import (
     safe_repr,
 )
 from ..utils.log_manager import get_module_logger  # 导入日志管理器
-from .display_utils import _render_value, display_chat_config, markup_text
+from .display_utils import _render_value, create_console, display_chat_config, markup_text
 from .terminal_theme import questionary_style_for_theme
 
 logger = get_module_logger(__name__)  # 获取当前模块的日志器
-console = Console()
+console = create_console()
 
 
 def _rerank_menu_label(chat_config: dict[str, Any]) -> str:

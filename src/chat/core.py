@@ -30,6 +30,7 @@ from ..services.embedding_service import EmbeddingService
 from ..services.retrieval_service import RetrievalService
 from ..ui.config_menu import launch_config_editor
 from ..ui.display_utils import (
+    create_console,
     display_chat_config,
     document_content,
     document_score,
@@ -385,7 +386,7 @@ class Chatbot:
 
 
 async def start_chat_session_async():
-    console = Console()
+    console = create_console()
     bot = Chatbot(console)
     try:
         session = PromptSession(style=prompt_style_for_theme())

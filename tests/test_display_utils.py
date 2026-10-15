@@ -565,16 +565,16 @@ _UNTRUSTED_FREE_ARGUMENTS = {
         "table 是 Table 对象，不是字符串",
         "console.print(table)",
     ),
-    "src/chat/core.py:383": (
+    "src/chat/core.py:384": (
         "f'{document_score(doc):.4f}'：document_score 只返回有限浮点，格式化结果不含 [",
         'f"{document_score(doc):.4f}"',
     ),
-    "src/chat/core.py:384": ("table 是 Table 对象，不是字符串", "self.console.print(table)"),
-    "src/retrieval_test/core.py:70": (
+    "src/chat/core.py:385": ("table 是 Table 对象，不是字符串", "self.console.print(table)"),
+    "src/retrieval_test/core.py:71": (
         "str(index+1) 与 f'{document_score(doc):.4f}' 均为数字，不含 [",
         'f"{document_score(doc):.4f}"',
     ),
-    "src/retrieval_test/core.py:71": ("table 是 Table 对象，不是字符串", "console.print(table)"),
+    "src/retrieval_test/core.py:72": ("table 是 Table 对象，不是字符串", "console.print(table)"),
 }
 
 

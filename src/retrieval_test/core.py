@@ -5,7 +5,6 @@ from typing import Any
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import HTML
-from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -19,6 +18,7 @@ from ..runtime.contracts import build_run_config, build_session_config
 from ..services.embedding_service import EmbeddingService
 from ..services.retrieval_service import RetrievalService
 from ..ui.display_utils import (
+    create_console,
     document_content,
     document_score,
     document_source,
@@ -30,7 +30,7 @@ from ..utils.log_manager import get_module_logger
 from ..utils.security import safe_exception_text
 from .excel_logger import ExcelLogger
 
-console = Console()
+console = create_console()
 logger = get_module_logger(__name__)
 
 
