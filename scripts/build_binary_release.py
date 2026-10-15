@@ -374,12 +374,15 @@ def validate_bundle(bundle_root: Path) -> None:
         timeout=30,
         env={
             **os.environ,
-            # Windows 下 exe 的 stdout 是管道（capture_output=True），rich 的
-            # legacy console renderer 会按 cp1252 编码中文输出，抛
-            # ``UnicodeEncodeError``（v1.5.0 首次发版实测，stderr 带出后才
-            # 可见）。强制子进程走 UTF-8 模式：真实用户在终端交互运行时
-            # stdout 是控制台而非管道，不走这条路径，不受影响。
+            # Windows 下 exe 的 stdout/stderr 是管道（capture_output=True），
+            # 编码按 locale 落到 cp1252，凡含中文输出即抛 ``UnicodeEncodeError``
+            # （v1.5.0 发版两轮实测）。``PYTHONUTF8=1``（第四轮）未生效——
+            # PyInstaller 冻结包内 stdio 编码仍按 locale 初始化；``rich`` 自己
+            # 的崩溃提示也是指名 ``PYTHONIOENCODING``。两个都设，后者显式
+            # 覆盖 stdio 编码，是强保证。真实用户在终端交互运行时 stdio 是
+            # 控制台（win32 API 写入），不走编码层，不受影响。
             "PYTHONUTF8": "1",
+            "PYTHONIOENCODING": "utf-8",
         },
     )
     if result.returncode != 0:

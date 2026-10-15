@@ -57,6 +57,39 @@ from src.ui.terminal_theme import prompt_style_for_theme
 from src.utils.config import get_settings, resolve_app_root
 from src.utils.security import safe_exception_text
 
+
+def _ensure_utf8_stdio() -> None:
+    """Windows 冻结包在管道下 stdio 按 locale 落到 cp1252，中文输出即崩。
+
+    发布自检（``build_binary_release.validate_bundle``）与任何把本程序输出
+    接进管道的场景（``| tee``、CI 日志采集）都命中：rich 写缓冲走
+    ``sys.stdout.write``，cp1252 编码中文抛 ``UnicodeEncodeError``。环境变量
+    方案（``PYTHONUTF8``／``PYTHONIOENCODING``）经 PyInstaller bootloader
+    传递不可靠（v1.5.0 两轮发版实测），这里直接重包装 stdio 为 UTF-8：
+    仅当当前编码确实写不了 UTF-8 范围字符时才动，真实终端（控制台 API 或
+    已是 UTF-8）不受影响。
+    """
+    import io
+
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        if stream is None or stream.isatty() or not hasattr(stream, "buffer"):
+            continue
+        encoding = getattr(stream, "encoding", "") or ""
+        try:
+            "中文".encode(encoding)
+        except (LookupError, UnicodeEncodeError):
+            pass
+        else:
+            continue
+        wrapped = io.TextIOWrapper(
+            stream.buffer, encoding="utf-8", errors="replace", line_buffering=True
+        )
+        setattr(sys, name, wrapped)
+
+
+_ensure_utf8_stdio()
+
 console = create_console()
 
 

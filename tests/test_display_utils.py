@@ -549,15 +549,15 @@ _MARKUP_PARSING_CONSTRUCTORS = {"Table", "Panel"}
 # 上面增删几行，行号就会漂到另一处 rich 调用上——而邻近的行几乎都是 rich 调用，
 # 于是豁免会静默地覆盖一个真正的违规。原文一比对，漂移立刻暴露。
 _UNTRUSTED_FREE_ARGUMENTS = {
-    "main.py:170": (
+    "main.py:203": (
         "gradient_part / padding / attribution_text 三者都是本函数内构造的 Text",
         "console.print(gradient_part + padding + attribution_text)",
     ),
-    "main.py:193": (
+    "main.py:226": (
         "welcome_text 是本函数内逐段 append 出来的 Text",
         'console.print(Panel(welcome_text, border_style="green", width=banner_width))',
     ),
-    "main.py:206": (
+    "main.py:239": (
         "menu_content 是本函数内的字面量拼接（上面的测试已断言它是纯字面量）",
         "Panel(",
     ),
