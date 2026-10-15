@@ -195,7 +195,9 @@ def test_validate_bundle_uses_smoke_test(monkeypatch, tmp_path):
     validate_bundle(bundle_root)
 
     assert recorded["command"][-1] == "--smoke-test"
-    assert recorded["kwargs"]["check"] is True
+    # 退出码由 validate_bundle 自行检查（失败时携带 stdout/stderr），不经 check=True 抛出
+    assert recorded["kwargs"]["check"] is False
+    assert recorded["kwargs"]["capture_output"] is True
 
 
 @pytest.mark.parametrize(
