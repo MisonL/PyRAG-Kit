@@ -13,6 +13,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# GitHub Release notes 的 API 上限是 125000 字符（HTTP 422 body is too long，
+# v1.5.0 发版实测：264861 字符被拒）。留出余量。
+RELEASE_NOTES_MAX_CHARS = 120_000
+
+
 def extract_section(version: str) -> str:
     lines = CHANGELOG_PATH.read_text(encoding="utf-8").splitlines()
     start_marker = f"## [{version}]"
@@ -30,7 +35,22 @@ def extract_section(version: str) -> str:
     if start_index is None:
         raise ValueError(f"在 CHANGELOG.md 中未找到版本 {version}。")
 
-    return "\n".join(lines[start_index:end_index]).strip() + "\n"
+    content = "\n".join(lines[start_index:end_index]).strip() + "\n"
+    if len(content) <= RELEASE_NOTES_MAX_CHARS:
+        return content
+    # 超长时按整行边界截断，绝不在截断处伪装成完整记录。
+    truncated_lines = []
+    current = 0
+    for line in content.splitlines():
+        if current + len(line) + 1 > RELEASE_NOTES_MAX_CHARS:
+            break
+        truncated_lines.append(line)
+        current += len(line) + 1
+    return (
+        "\n".join(truncated_lines).rstrip()
+        + f"\n\n> 本版本变更条目较多，已超出 GitHub Release 说明的长度上限，"
+        f"以上为前段；完整记录见仓库 CHANGELOG.md 的 [{version}] 节。\n"
+    )
 
 
 def main() -> None:

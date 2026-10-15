@@ -512,3 +512,28 @@ def test_extract_section_reports_missing_version():
     """
     with pytest.raises(ValueError, match="未找到版本"):
         extract_section("99.99.99")
+
+
+def test_extract_release_notes_truncates_to_github_limit(tmp_path, monkeypatch):
+    """超长版本的 notes 必须截断——GitHub Release API 上限 125000 字符。
+
+    v1.5.0 发版实测：1.5.0 节 264861 字符，``gh release create`` 以
+    ``body is too long (maximum is 125000 characters)`` 拒绝，publish job
+    失败（五平台产物全部构建成功却发不出去）。截断按整行边界，尾部附
+    完整记录指引，绝不伪装成完整记录。
+    """
+    from scripts.extract_release_notes import extract_section
+
+    changelog = tmp_path / "CHANGELOG.md"
+    bulk = "\n".join(f"- 条目 {index}：" + "x" * 200 for index in range(1000))
+    changelog.write_text(
+        f"## [9.9.9] - 2026-01-01\n\n### 修复\n\n{bulk}\n\n## [9.8.0]\n\n旧版。\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("scripts.extract_release_notes.CHANGELOG_PATH", changelog)
+    notes = extract_section("9.9.9")
+
+    assert len(notes) <= 120_000
+    assert "超出 GitHub Release 说明的长度上限" in notes
+    assert notes.rstrip().endswith("。")
