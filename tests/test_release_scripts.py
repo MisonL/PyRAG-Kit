@@ -198,6 +198,9 @@ def test_validate_bundle_uses_smoke_test(monkeypatch, tmp_path):
     # 退出码由 validate_bundle 自行检查（失败时携带 stdout/stderr），不经 check=True 抛出
     assert recorded["kwargs"]["check"] is False
     assert recorded["kwargs"]["capture_output"] is True
+    # Windows 管道下 rich legacy renderer 按 cp1252 编码中文会崩（v1.5.0 发版实测），
+    # 自检子进程必须强制 UTF-8 模式
+    assert recorded["kwargs"]["env"]["PYTHONUTF8"] == "1"
 
 
 @pytest.mark.parametrize(

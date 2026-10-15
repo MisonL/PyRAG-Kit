@@ -372,6 +372,15 @@ def validate_bundle(bundle_root: Path) -> None:
         capture_output=True,
         check=False,
         timeout=30,
+        env={
+            **os.environ,
+            # Windows 下 exe 的 stdout 是管道（capture_output=True），rich 的
+            # legacy console renderer 会按 cp1252 编码中文输出，抛
+            # ``UnicodeEncodeError``（v1.5.0 首次发版实测，stderr 带出后才
+            # 可见）。强制子进程走 UTF-8 模式：真实用户在终端交互运行时
+            # stdout 是控制台而非管道，不走这条路径，不受影响。
+            "PYTHONUTF8": "1",
+        },
     )
     if result.returncode != 0:
         # ``check=True`` 抛出的 ``CalledProcessError`` 不携带子进程输出——
