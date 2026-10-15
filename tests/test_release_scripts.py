@@ -8,6 +8,7 @@ from scripts.build_binary_release import (
     APP_NAME,
     APP_ROOT_FILES,
     PACKAGE_FILES,
+    load_version,
     prepare_runtime_layout,
     stage_bundle,
     validate_bundle,
@@ -177,11 +178,19 @@ def test_validate_bundle_uses_smoke_test(monkeypatch, tmp_path):
     def fake_run(command, **kwargs):
         recorded["command"] = command
         recorded["kwargs"] = kwargs
+        # 版本必须与 ``load_version()`` 动态同源：硬编码会在每次升版本时
+        # 触发「发布包自报版本与 pyproject.toml 不一致」的守卫（发 1.5.0
+        # 时实测）。这正是本守卫要拦的漂移形态，夹具不能自己 reproduces 它。
+        version = load_version()
         return subprocess.CompletedProcess(
-            command, 0, stdout="PyRAG-Kit 1.4.0 smoke test ok\n", stderr=""
+            command, 0, stdout=f"PyRAG-Kit {version} smoke test ok\n", stderr=""
         )
 
     monkeypatch.setattr("scripts.build_binary_release.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "scripts.build_binary_release.load_version",
+        lambda: load_version(),
+    )
 
     validate_bundle(bundle_root)
 
