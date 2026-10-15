@@ -272,11 +272,12 @@ def initialize_dependencies():
     # 2. 预热jieba并完全抑制其所有启动日志
     with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
         import jieba
-        import jieba.posseg as pseg
 
         jieba.setLogLevel(jieba.logging.ERROR)
         jieba.dt.tmp_dir = str(cache_dir)
-        list(pseg.cut(""))
+        # 预热的是词典加载与 cut 通路（检索只用 jieba.cut/lcut）；
+        # 不引 posseg——其依赖的 lac_small 模型约占 12 MB，会被一并打进发布包。
+        list(jieba.cut(""))
 
     console.print("[dim]依赖项初始化完成。[/dim]")
 

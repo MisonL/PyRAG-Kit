@@ -270,6 +270,91 @@ def test_stage_bundle_copies_package_files_including_subdirectories(
         assert not (bundle_root / relative).exists(), relative
 
 
+# ── 打包数据裁剪（pyfiglet 字体 / jieba 附加模型） ──
+
+
+def test_prune_bundle_extras_keeps_only_used_fonts(tmp_path):
+    """横幅只用 font="big"，pyfiglet 缺省字体是 standard；其余字体
+    （打包后约 7.7 MB）运行时永远读不到，staging 时必须裁掉。"""
+    from scripts.build_binary_release import prune_bundle_extras
+
+    fonts = tmp_path / "_internal" / "pyfiglet" / "fonts"
+    fonts.mkdir(parents=True)
+    for name in ("big.flf", "standard.flf", "defleppard.flf", "bigmono12.tlf"):
+        (fonts / name).write_bytes(b"font-data")
+
+    prune_bundle_extras(tmp_path)
+
+    assert sorted(p.name for p in fonts.iterdir()) == ["big.flf", "standard.flf"]
+
+
+def test_prune_bundle_extras_removes_jieba_unused_subpackages(tmp_path):
+    """hook-jieba 把 posseg/analyse/lac_small 的数据模型原样复制进包
+    （约 24 MB）；项目只用 jieba.cut/lcut，三个子目录必须删掉，
+    词典 dict.txt 与 finalseg 保留。"""
+    from scripts.build_binary_release import prune_bundle_extras
+
+    jieba = tmp_path / "_internal" / "jieba"
+    (jieba / "posseg").mkdir(parents=True)
+    (jieba / "analyse").mkdir()
+    (jieba / "lac_small" / "model_baseline").mkdir(parents=True)
+    (jieba / "finalseg").mkdir()
+    (jieba / "dict.txt").write_bytes(b"dict")
+    (jieba / "posseg" / "prob_emit.p").write_bytes(b"p")
+
+    prune_bundle_extras(tmp_path)
+
+    assert not (jieba / "posseg").exists()
+    assert not (jieba / "analyse").exists()
+    assert not (jieba / "lac_small").exists()
+    assert (jieba / "dict.txt").is_file()
+    assert (jieba / "finalseg").is_dir()
+
+
+def test_prune_bundle_extras_silent_when_directories_missing(tmp_path):
+    """pyfiglet / jieba 任一未被打进包时（防御分支）不得抛错。"""
+    from scripts.build_binary_release import prune_bundle_extras
+
+    prune_bundle_extras(tmp_path)  # 不应抛 FileNotFoundError
+
+
+def test_stage_bundle_prunes_bundle_extras(monkeypatch, tmp_path, bpe_source):
+    """staging 流程整体接入字体裁剪：真实 PyInstaller 产物里的字体目录
+    在 stage_bundle 之后只应剩两个字体文件。"""
+    dist_root = tmp_path / "dist" / "PyRAG-Kit"
+    app_dist = dist_root / APP_NAME
+    fonts_dir = app_dist / "_internal" / "pyfiglet" / "fonts"
+    fonts_dir.mkdir(parents=True)
+    for name in ("big.flf", "standard.flf", "defleppard.flf"):
+        (fonts_dir / name).write_bytes(b"font-data")
+    jieba_dir = app_dist / "_internal" / "jieba" / "posseg"
+    jieba_dir.mkdir(parents=True)
+    (jieba_dir / "prob_emit.p").write_bytes(b"p")
+
+    artifact_root = tmp_path / "release_artifacts"
+    monkeypatch.setattr("scripts.build_binary_release.DIST_ROOT", dist_root)
+    monkeypatch.setattr("scripts.build_binary_release.ARTIFACT_ROOT", artifact_root)
+    monkeypatch.setattr("scripts.build_binary_release.PROJECT_ROOT", tmp_path)
+    for relative in PACKAGE_FILES + APP_ROOT_FILES:
+        source = tmp_path / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("content", encoding="utf-8")
+
+    import hashlib
+
+    payload = b"stub-bpe"
+    monkeypatch.setattr(
+        "scripts.build_binary_release.TIKTOKEN_BLOB_SHA256", hashlib.sha256(payload).hexdigest()
+    )
+    (bpe_source / _tiktoken_cache_key()).write_bytes(payload)
+
+    bundle_root = stage_bundle("linux-x64", "1.4.0")
+
+    staged_fonts = bundle_root / APP_NAME / "_internal" / "pyfiglet" / "fonts"
+    assert sorted(p.name for p in staged_fonts.iterdir()) == ["big.flf", "standard.flf"]
+    assert not (bundle_root / APP_NAME / "_internal" / "jieba" / "posseg").exists()
+
+
 # ── 回归：ZIP 分支对悬空符号链接的确定行为 ──
 
 

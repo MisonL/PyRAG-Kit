@@ -22,6 +22,7 @@
 - ETL 清洗器在哨兵候选耗尽时保留正文原始 NUL 字符，不再误改写为双换行
 - `.env.example` 补 `GOOGLE_GENAI_USE_ENTERPRISE` 与 `LM_STUDIO_API_KEY`；用户文档补 `DEFAULT_LLM_PROVIDER` 覆盖警示
 - 发布包自检增加 provider 模块导入与 tiktoken 编码加载断言，漏收模块在构建期即被拦截
+- 发布包体积压减约三分之一（macos-x64 实测 81.2MB → 54.0MB）：裁剪 pyfiglet 未使用字体、jieba 词性标注/深度学习模型数据，并排除 mypy、setuptools、pygments、langsmith 等运行时不需要的模块；分片与关键词检索通路不受影响
 - 全仓引入 ruff format 统一格式；`scripts/audit/` 变异审计工具链收口进仓库（可复现、带防呆检查）
 - 文档同步命令行参数、主题适配与模型切换示例（示例 key 与 `config.toml.example` 一致）
 

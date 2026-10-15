@@ -62,6 +62,27 @@ EXCLUDED_MODULES = [
     "sklearn",
     "pytest",
     "_pytest",
+    # pydantic 的 mypy 类型检查插件只在 IDE/类型检查期使用，运行时无用，
+    # 却把 mypy 全家拉进包（约 1.4 MB 纯 Python 模块）。
+    "pydantic.mypy",
+    "pydantic.v1.mypy",
+    "mypy",
+    "mypy_extensions",
+    # setuptools 仅被 pyi_rth_setuptools 运行时钩子引用，本项目冻结包
+    # 不做任何构建/分发操作（约 0.9 MB）。
+    "setuptools",
+    "pkg_resources",
+    # rich 的语法高亮依赖（rich.syntax / rich.traceback 延迟导入），本项目
+    # 的输出路径不使用二者（约 1.7 MB）。
+    "pygments",
+    # jieba 的词性标注 / 关键词提取 / 深度学习分词模型，项目只使用
+    # jieba.cut / jieba.lcut（主 warmup 已同步改为 jieba.lcut；
+    # lac_small 模型文件约占 12 MB，posseg 与 analyse 各约 5 MB）。
+    "jieba.posseg",
+    "jieba.analyse",
+    "jieba.lac_small",
+    # langchain_core 的可选 tracing 依赖，冻结包不接 LangSmith（约 0.9 MB）。
+    "langsmith",
 ]
 
 _TARGET_ENVIRONMENTS = {
@@ -191,6 +212,7 @@ def stage_bundle(target: str, version: str) -> Path:
         destination = app_target / relative_file
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(PROJECT_ROOT / relative_file, destination)
+    prune_bundle_extras(app_target)
     prepare_runtime_layout(bundle_root)
     # BPE 预置单独一步：它需要联网（缓存缺失时），与「建目录」是两件事，
     # 拆开后布局逻辑的单元测试不必依赖网络或宿主缓存。
@@ -201,6 +223,35 @@ def stage_bundle(target: str, version: str) -> Path:
     (app_target / "VERSION.txt").write_text(version + "\n", encoding="utf-8")
 
     return bundle_root
+
+
+def prune_bundle_extras(app_target: Path) -> None:
+    """裁剪 PyInstaller 进包、但运行时永远读不到的数据文件。
+
+    两处来源：
+
+    - pyfiglet 字体：``--collect-data pyfiglet`` 带进全部 577 个字体
+      （约 7.7 MB），而横幅只用 ``Figlet(font="big")``（main.py），
+      pyfiglet 缺省字体是 ``standard``，保留两个字体文件即可。
+    - jieba 附加数据：贡献方 hook ``hook-jieba.py`` 用
+      ``collect_data_files('jieba')`` 把整个包的数据原样复制
+      （analyse/posseg 的 HMM 概率表与 lac_small 深度学习模型，约 24 MB），
+      而项目只使用 ``jieba.cut``/``jieba.lcut``（主 warmup 已同步改为
+      ``jieba.cut``），posseg/analyse/lac_small 三个子包的 Python 模块
+      已在 ``EXCLUDED_MODULES`` 中排除，其数据文件随之失效。
+
+    对应目录不存在时静默返回（相应依赖未打包的防御分支）。
+    """
+    fonts_dir = app_target / "_internal" / "pyfiglet" / "fonts"
+    if fonts_dir.is_dir():
+        keep = {"big.flf", "standard.flf"}
+        for font_file in fonts_dir.iterdir():
+            if font_file.name not in keep:
+                font_file.unlink()
+
+    jieba_root = app_target / "_internal" / "jieba"
+    for extra in ("lac_small", "posseg", "analyse"):
+        shutil.rmtree(jieba_root / extra, ignore_errors=True)
 
 
 def prepare_runtime_layout(bundle_root: Path) -> None:
