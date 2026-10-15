@@ -369,21 +369,15 @@ def validate_bundle(bundle_root: Path) -> None:
         [str(executable), "--smoke-test"],
         cwd=bundle_root,
         text=True,
+        # 父进程读侧编码：exe（app 侧 ``_ensure_utf8_stdio``）保证输出是
+        # UTF-8，而本脚本在 Windows 上按 locale（cp1252）decode 管道会抛
+        # ``UnicodeDecodeError``（第五轮发版实测，reader thread 崩溃）。
+        encoding="utf-8",
+        errors="replace",
         capture_output=True,
         check=False,
         timeout=30,
-        env={
-            **os.environ,
-            # Windows 下 exe 的 stdout/stderr 是管道（capture_output=True），
-            # 编码按 locale 落到 cp1252，凡含中文输出即抛 ``UnicodeEncodeError``
-            # （v1.5.0 发版两轮实测）。``PYTHONUTF8=1``（第四轮）未生效——
-            # PyInstaller 冻结包内 stdio 编码仍按 locale 初始化；``rich`` 自己
-            # 的崩溃提示也是指名 ``PYTHONIOENCODING``。两个都设，后者显式
-            # 覆盖 stdio 编码，是强保证。真实用户在终端交互运行时 stdio 是
-            # 控制台（win32 API 写入），不走编码层，不受影响。
-            "PYTHONUTF8": "1",
-            "PYTHONIOENCODING": "utf-8",
-        },
+        env={**os.environ, "PYTHONUTF8": "1"},
     )
     if result.returncode != 0:
         # ``check=True`` 抛出的 ``CalledProcessError`` 不携带子进程输出——
