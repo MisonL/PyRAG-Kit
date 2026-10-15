@@ -35,7 +35,15 @@ def extract_section(version: str) -> str:
     if start_index is None:
         raise ValueError(f"在 CHANGELOG.md 中未找到版本 {version}。")
 
-    content = "\n".join(lines[start_index:end_index]).strip() + "\n"
+    # Release notes 只面向用户：遇到维护者向的存档节标题即止（完整记录仍在
+    # CHANGELOG）。当前项目的存档节以「内部存档」命名。
+    cut_index = end_index
+    for index in range(start_index, end_index):
+        if "内部存档" in lines[index] and lines[index].startswith("#"):
+            cut_index = index
+            break
+
+    content = "\n".join(lines[start_index:cut_index]).strip() + "\n"
     if len(content) <= RELEASE_NOTES_MAX_CHARS:
         return content
     # 超长时按整行边界截断，绝不在截断处伪装成完整记录。

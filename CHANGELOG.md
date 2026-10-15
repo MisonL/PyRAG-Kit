@@ -4,11 +4,52 @@
 
 ## [1.5.0] - 2026-10-15
 
-### 新增
+> 本版本以稳定性与正确性为主：对检索、快照、配置与 TUI 全链路完成 9 轮对抗性审查与多轮外部模型复核，修复 40 余处缺陷，测试从 4185 增至 4548。
 
-- **``main.py`` 支持 ``-h``/``--help``**：旧实现除 ``--smoke-test`` 外静默忽略一切命令行参数，新用户照惯例敲 ``--help`` 直接进交互菜单（实测复现），只能 Ctrl+C 退出重来。现在 ``-h``/``--help`` 在初始化依赖之前打印用法（``--smoke-test``、无参数行为说明）并瞬时退出；回归测试红/绿验证。
+### 新增功能
 
-### 修复
+- `main.py` 支持 `-h` / `--help`：打印用法说明并瞬时退出，不再静默进入交互菜单
+- 界面提示色自动适配终端亮色 / 暗色主题（主菜单、聊天、召回三处提示符与全部选择菜单指针）；检测不符时可用 `PYRAG_LIGHT=1` / `PYRAG_DARK=1` 强制指定
+- 发布产物自检失败时输出完整的子进程 stdout/stderr，便于排查平台差异
+
+### 优化改进
+
+- 混合检索父块去重后恢复按分数降序输出，rerank 关闭时 top_k 截断不再丢失全局最高分文档
+- 配置编辑器内 Ctrl+D（EOF）收敛为「放弃编辑、保存返回」，不再终止整个聊天会话，且此前部分生效的修改会被完整还原
+- 权重编辑写回顺序修正：默认 (1.0, 0.0) 组合下可以正常切换到纯关键词检索
+- 切换 LLM 后重载失败时自动回滚到原模型；`/config` 恢复分支的「配置未生效」消息恢复可达
+- `lexical.index` 快照守卫补齐 `set`/`frozenset` 拒绝：无序容器不再能造成关键词检索静默错配
+- ETL 清洗器在哨兵候选耗尽时保留正文原始 NUL 字符，不再误改写为双换行
+- `.env.example` 补 `GOOGLE_GENAI_USE_ENTERPRISE` 与 `LM_STUDIO_API_KEY`；用户文档补 `DEFAULT_LLM_PROVIDER` 覆盖警示
+- 发布包自检增加 provider 模块导入与 tiktoken 编码加载断言，漏收模块在构建期即被拦截
+- 全仓引入 ruff format 统一格式；`scripts/audit/` 变异审计工具链收口进仓库（可复现、带防呆检查）
+- 文档同步命令行参数、主题适配与模型切换示例（示例 key 与 `config.toml.example` 一致）
+
+### Bug 修复
+
+- 修复 `lexical.index` 顶层为 `set`/`frozenset` 时关键词检索静默返回错误文档（且结果随 `PYTHONHASHSEED` 每次启动变化）
+- 修复 Windows 冻结包在管道输出下中文崩溃（`UnicodeEncodeError`）：stdio 自动重包装为 UTF-8，发布自检与 `| tee` 等 CI 场景恢复可用
+- 修复发布说明超出 GitHub 上限导致 Release 发布失败：超长时按整行截断并附完整记录指引
+- 修复 `--help` 退出时删除缓存目录、坏配置下无法显示用法的问题
+- 修复启动横幅、聊天就绪行、配置回显在畸形配置下的裸异常终止会话
+- 修复 `retry_sync_stream` 正常耗尽时 `close()` 抛错跳过 response 补刀的资源泄漏
+- 修复 `github_pat_` 凭证正则的平方级回溯（特定输入下脱敏耗时分钟级）
+- 修复 factory 可选值拼接在超限整数键下的自身崩溃；`safe_repr` 捕获面放宽到 `Exception`
+- 修复快照守卫的原子性回归：载入被拒绝时 store 不再残留半新半旧状态
+- 修复知识快照 manifest 的 `FileNotFoundError` 误报为「快照被截断」的归因
+- 其余 20 余处边界与契约修复（凭证正则、并发关闭矩阵、上界校验、显示统一等）详见 CHANGELOG 存档节
+
+### 升级说明
+
+- 知识快照格式与 1.4.0 完全兼容（manifest v2），无需重建
+- 配置项无新增；`.env` 与 `config.toml` 原样可用
+- 测试总数 4185 → 4548，全部经变异审计红/绿验证
+
+### 内部存档：审查与加固过程
+
+以下为 9 轮 agents 审查与外部模型复核的完整过程记录（面向维护者）：
+
+#### 修复
 
 - **外部模型（codex）全 diff 复核收口 2 处**（九轮 agents 之外的独立视角，逐条探针核实均属实）：
   - **``lexical.index`` 顶层为 ``set``/``frozenset`` 时静默错配（major·数据完整性）**：有 ``__len__``、不是 str/bytes/dict 的无序容器能穿过 ``validate_snapshot_dir`` 与 ``FaissStore.load_snapshot`` 的全部形态守卫（实测），而 BM25 按迭代序收语料、``keyword_search`` 按下标读 ``documents``——顺序不同即关键词检索静默返回错误文档，且 set 迭代序随 ``PYTHONHASHSEED`` 跨进程翻转（实测同一对象 seed=0/1 与 seed=2 顺序相反），同一份坏快照每次启动可能给出不同的错误召回。两处守卫补 ``set``/``frozenset`` 拒绝，参数化回归测试钉住。
@@ -199,7 +240,7 @@
 
 - **死代码消融：删除 `OpenAICompatibleProvider._chat_stream_event`**（`src/providers/openai_compatible.py`）。用 AST 对 `src/`、`scripts/`、`main.py` 的 1075 个函数/方法/类定义逐个统计真实引用（按 `ast.Name(Load)` 与 `ast.Attribute.attr` 计，排除注释与 docstring 噪声），并用「删掉它、跑全量」实测承重性。全仓对该方法零引用（唯一的同名调用在 `VolcengineProvider` 的**另一份**实现上），删除后全量 4366 passed，判定为死代码。同批排查的其余「静态零引用」候选经证伪后**保留**：13 个 provider 类由 `factory.py` 的 `importlib.import_module` + `getattr(module, "XxxProvider")` 动态加载；14 个 `beta_*` 资源属性由 `getattr(provider.resources, f"beta_{name}")` 动态访问且见于 `docs/user_guide/llm-providers.md`；VDB 的 `semantic_search`/`keyword_search`/`asearch`/`search`/`resolve_parent_content` 由 `RetrievalService._get_vector_store_method` 按字符串名取用；`apply_config_update`/`apply_config_update_async` 由 `chat/core.py` 的 `getattr(bot, ...)` 探测；`validate_*`/`split_separators`/`get_field_value`/`settings_customise_sources`/`warn_retired_base_urls` 由 pydantic 装饰器与 SettingsSource 协议按名回调；`import_legacy_snapshot` 是文档化的旧快照迁移入口。结论：**静态引用计数只能筛出候选，动态派发（`getattr` 字面量、f-string 名、装饰器注册）会让真死代码与承重代码同样显示为「零引用」，必须逐项证伪**。8 项质量门全绿。
 
-### 测试
+#### 测试
 
 - **布尔字面量互换扫描：46 处「默认值/开关反向」盲区补齐**（`tests/` 下 10 个回归文件，22 条新用例 + 1 处既有用例补断言）。对 `src/` 的 354 个候选位点（`True`↔`False`）逐点互换字面量后跑全量：199 KILLED、152 SURVIVED、3 TIMEOUT。152 个存活点连同 3 个超时点（共 155 处）列为分诊对象，本轮用真实入口探针（base 与变异体逐字对比载荷/异常消息/日志）先分诊并补齐其中 **46 处真缺口**。真缺口：14 个 `Settings` 凭据字段的 `repr=False` 反向成 `True` 后，密钥经 `repr()`/`str()`/`model_dump()` 全量回显（此前用例只走了带 `repr=False` 的正路）；层级分割器两处 `is_separator_regex=False` 反向后把字面分隔符当正则用，`"***"` 触发 `re.error: nothing to repeat`；Google `keep_blank_values`/`validate=True`/`saw_parts` 三处判据反向分别丢空查询值、放行非法 base64、吞掉 parts 兜底；Jina 与 SiliconFlow rerank 的 `reraise=True` 反向后重试耗尽的原始异常被静默吞掉；OpenAI/Volcengine 的 `require_tool_call_ids=True` 反向后无 id 的 tool_call 被静默放行；`Resources` 四个门面类的 `_delegate_native=True` 反向后原生资源委托失效；`_responses_has_content` 末行 `return True` 反向后，带 `tool_calls` 的 assistant 消息里 int/dict 等非法 `content` 被判「无内容」整段丢弃、助手文本无声消失；`resolve_app_root` 冻结分支、4 个 `kb_*` 清洗开关默认值（反向变 `True` 静默改变预处理）、`config_menu` 检索菜单 `while True` 循环与模型切换重载标志、`stream=True` 两处（chat 与 chat_service 默认走流式）、展示表头 `show_header`（chat 检索详情、retrieval CLI 结果、chat 配置表）、SiliconFlow rerank `return_documents` 默认请求体字段——共 46 处，每处均经选择器模式红验证 KILLED。等价变异（附反证）：`usedforsecurity` 三处（`retrieval_service`/`snapshot_repository`，哈希收场逐字相同，实测 base 与变异体 digest 一致）、`openai 1829`（`parse_decimal_int("")` 返回 `None`、集合查找失败，空状态仍为 `False`）、Google `native_value is True` 死分支（1922，不可达）等 109 处。扫描 3 个 TIMEOUT 全部闭环：`config_menu:104` 与 `model_provider:561` 后续判 KILLED，`retrieval_service:498`（`usedforsecurity`）判等价。全量 4314 passed；8 项质量门全绿。（**勘误**：本条原先声称余下 109 处为「等价变异」——该结论不成立，且与同句的 152 对不上账（46+109≠152）。三个前置提交落地后于 HEAD 对 155 处存活点复扫：87 处已被用例杀死、余 68 处仍需分诊；那 68 处后续逐条判定为 50 处真缺口与 18 处等价变异，故原「109 处等价」不成立。同批复扫还给出自报数与实测的对账：三个前置提交自报合计 98 处真缺口（18+34+46），复扫实测 87 处（差 11）；抽查确认 `1e86d10` 声称覆盖的位点在其**自身提交上**逐点变异仍存活（如 `_temperature_explicit` 的用例只断言被 `repr=False`/`compare=False` 屏蔽的观察面，变异前后逐字相同），这些位点真正的 killer 用例由其后的请求层批引入（`git log -S` 溯源）。**提交自报的覆盖数不作数，一律以复扫实测为准。**）
 - **布尔字面量互换扫描（续）：公共请求层、Anthropic 与工具/服务/检索批 50 处真缺口补齐**（`tests/providers/test_guard_coverage_regressions.py`、`tests/test_guard_coverage_regressions.py`，新增 52 个用例实例）。对上一轮扫描存活的 155 处（152 SURVIVED + 3 TIMEOUT）在三个前置提交落地后于 HEAD 复扫（87 处已被杀死），对**剩余 68 处**用 `scripts/audit/verify_sites.py` 在干净 worktree 上复核（全部 68 处确认在 HEAD 上 SURVIVED），再逐条用真实入口探针（base 与变异体逐字对比载荷/异常消息/日志）分诊：**50 处真缺口、18 处等价变异（附反证）**。真缺口：`RunConfig`/`KnowledgeSnapshotManifest` 的 `@dataclass(frozen=True)` 反向成 `False` 后配置与清单可被原地改写（且清单 `__hash__` 消失）；`Settings.model_dump` 的 `_safe_dump_exclude` 里 `{name: True for name in secret_exclude}` 的 `True` 反向成 `False` 后 14 个凭据字段全部泄漏进导出结果；`log_manager` 两处 `with_location`（模块 logger 调用点 `True`、`_build_rotating_handler` 默认 `False`）反向后模块日志丢掉 `%(filename)s:%(lineno)d`、聊天日志反而带上；`FaissStore.save_snapshot` 的 `mkdir(parents=True)` 反向成 `False` 后写到嵌套缺失目录抛 `FileNotFoundError`；`RetrievalService._get_rerank_provider` 的 `json.dumps(..., sort_keys=True)` 反向成 `False` 后键序不同的等价 options 生成不同缓存键、每次检索重建 provider；各 Provider 的 `invoke`/`ainvoke` `stream=True` 默认值与私有 `_build_chat_request`/`_build_responses_request` 默认值；7 处独立的 `@retry(reraise=True)`（OpenAI 兼容与 Google、Ark 的 `embed_documents`/`aembed_documents`/`complete`）反向成 `False` 后重试耗尽的原始异常被包成 `RetryError`；Google 原生工具的 `native_value is True or is None`（`True` 标记被判非法 `ValidationError`）与分片关联的 `will_continue is True`（可关联分片被误报「无法确认是否为同一调用」）；OpenAI 兼容 `_convert_responses_tools` 的 `setdefault("strict", False)`、`_chat_status_is_error` 对空白状态的 `return False`、`astream_events`/`_invoke_responses` 的 `terminal_seen = True`（完整流被误报「终止事件之前结束」）、`parse`/`async_parse` 的 `copy_with(stream=False)` 与 `stream_responses`/`async_stream_responses` 的 `copy_with(stream=True)`（background 请求的拒绝消息错位或被放行）；Ark 异步 Responses 流的 `terminal_seen`。等价变异（附反证）：Google `model_dump(exclude_none=True)`（真实 `types.HttpOptions` 各形态 base 与变异体逐字相同）、`count_tokens`/`compute_tokens` 的 `vertexai is False`/`is True` 分支（`_validate_compute_token_fields` 先拒 tools、`_contents` 提前返回）、`_response_text` 第二循环的 `thought` 死代码（第一循环已 return）、`usedforsecurity` 两处（摘要逐字相同）、`SessionConfig`/`get_field_value` 无观察入口、快照 `mkdir` 的 `parents`/`exist_ok`（`__init__` 已建目录、rmtree 先于 mkdir）、`finalized` 标志（rename 后 cleanup 为 no-op）、`faiss` 的 `ensure_ascii=False`（stats 仅 ASCII/int）、Ark `getattr(..., True)`（真实请求总有该属性）。50 处真缺口逐条经选择器模式红验证（施加变异后对应用例必红、还原后绿），18 处等价变异逐条附真实对象反证。全量 4366 passed；8 项质量门全绿。
@@ -920,7 +961,7 @@
 
   共 19 处读取点接入守卫；`None` 与空值的既有语义保持不变（`None` 继续表示「该字段不存在」，正常中间态依赖它）。
 
-### 测试
+#### 测试
 
 - 新增第十九轮的回归用例（20 个用例；回退源码后其中 21 个参数化实例变红）：Google 嵌套 `parts`／`embeddings`、Ark 嵌套 `content`／tokenization `data`、OpenAI 兼容 Responses `choices` 与嵌套 `content`、Anthropic 顶层 `content` 六类读取点各对 `int`／`mapping`／`str` 三种非法形态的拒绝；以及三条「不误伤」反向守卫——Google `parts`、Ark 嵌套 `content`、Anthropic `content` 的正常响应照旧解析。
 

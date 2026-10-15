@@ -537,3 +537,29 @@ def test_extract_release_notes_truncates_to_github_limit(tmp_path, monkeypatch):
     assert len(notes) <= 120_000
     assert "超出 GitHub Release 说明的长度上限" in notes
     assert notes.rstrip().endswith("。")
+
+
+def test_extract_release_notes_stops_at_internal_archive_section(tmp_path, monkeypatch):
+    """维护者向的存档节不进 Release notes。
+
+    存档节是审查过程记录（十万字符级），对用户是噪声；完整内容仍在
+    CHANGELOG。截断保险与存档排除是两条独立防线，各自都要有测试。
+    """
+    from scripts.extract_release_notes import extract_section
+
+    changelog = tmp_path / "CHANGELOG.md"
+    changelog.write_text(
+        "## [9.9.9] - 2026-01-01\n\n"
+        "### 新增功能\n\n- 用户可见改动。\n\n"
+        "### 内部存档：审查与加固过程\n\n以下为过程记录：\n\n"
+        "- **第 N 轮 agents 复查**：大量维护者细节。\n\n"
+        "## [9.8.0]\n\n旧版。\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("scripts.extract_release_notes.CHANGELOG_PATH", changelog)
+    notes = extract_section("9.9.9")
+
+    assert "用户可见改动" in notes
+    assert "内部存档" not in notes
+    assert "agents 复查" not in notes
+    assert notes.rstrip().endswith("用户可见改动。")
